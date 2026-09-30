@@ -167,6 +167,36 @@ pub fn snapRound(step: i32, steps: i32) i32 {
     return @divFloor(step + @divTrunc(steps, 2), steps) * steps;
 }
 
+/// 把步对齐到网格（向上取整）；`steps` = 网格步数
+pub fn snapCeil(step: i32, steps: i32) i32 {
+    if (steps <= 1) return step;
+    return @divFloor(step + steps - 1, steps) * steps;
+}
+
+/// **拉伸边缘的“已越过格线”吸附**：`edge` = 边缘当前步，`mouse` = 鼠标所在步。
+/// 边缘只落到**鼠标已经越过**的格线上：
+/// - 鼠标在边缘右侧：`max(edge, ≤鼠标的最近格线)`——鼠标走满一格才向右延一格；
+/// - 鼠标在边缘左侧：`min(edge, ≥鼠标的最近格线)`——向左同理。
+///
+/// 动机（实测事故）：若直接取“离鼠标最近的格线”，
+/// **本来就比一格短的音符/片段**（如 1/32 音符在 1/1 网格下）
+/// 只需移动几像素就会被吸到远处小节线——鼠标根本没走过“一格”的距离。
+/// 改成本规则后，拉长一格必须真的走满一格。
+pub fn snapEdgeCrossed(edge: i32, mouse: i32, steps: i32) i32 {
+    if (mouse >= edge) return @max(edge, snapFloor(mouse, steps));
+    return @min(edge, snapCeil(mouse, steps));
+}
+
+/// **拉伸下限**（每帧重算）：
+/// - 长度 < 一格（网格调粗后遗留的短音符/片段）：下限 = `min(原长, 一格)`——
+///   按下**不会**被强行拉长（“按下一格就跳成整格”是实测 bug），也不允许比原来更短；
+/// - 长度 ≥ 一格：下限升为**一格**（放行拉长、阻止收回——收回不得低于一格）。
+pub fn trimMinLen(orig_len: i32, cur_len: i32, snap_steps: i32) i32 {
+    const grid = @max(1, snap_steps);
+    if (cur_len >= grid) return grid;
+    return @max(1, @min(orig_len, grid));
+}
+
 test "snapSteps / snapFloor / snapRound（U=96）" {
     // 档位 → 步数：1/1 = 96、1/4 = 24、1/8 = 12、1/3 = 32、1/12 = 8、1/96 = 1
     try std.testing.expectEqual(@as(i32, 96), snapSteps(0)); // 1/1
@@ -184,6 +214,83 @@ test "snapSteps / snapFloor / snapRound（U=96）" {
     // 网格 = 1 步时不改动
     try std.testing.expectEqual(@as(i32, 37), snapFloor(37, 1));
     try std.testing.expectEqual(@as(i32, 37), snapRound(37, 1));
+}
+
+test "snapCeil / snapEdgeCrossed: 边缘只吸已越过的格线（短音符不再一碰就跳）" {
+    // snapCeil：1/4 网格（24 步）
+    try std.testing.expectEqual(@as(i32, 24), snapCeil(5, 24));
+    try std.testing.expectEqual(@as(i32, 24), snapCeil(24, 24));
+    try std.testing.expectEqual(@as(i32, 48), snapCeil(25, 24));
+    try std.testing.expectEqual(@as(i32, 0), snapCeil(-1, 24));
+
+    // **实测事故回归**：1/32 音符（右缘 = 3 步）+ 1/1 网格（96 步）
+    // 鼠标在 3..95 游走 → 边缘必须原地不动（不能吸到 0 或 96）
+    try std.testing.expectEqual(@as(i32, 3), snapEdgeCrossed(3, 3, 96));
+    try std.testing.expectEqual(@as(i32, 3), snapEdgeCrossed(3, 50, 96));
+    try std.testing.expectEqual(@as(i32, 3), snapEdgeCrossed(3, 95, 96));
+    // 到达/越过小节线 96 → 吸到 96；再往上要越过 192
+    try std.testing.expectEqual(@as(i32, 96), snapEdgeCrossed(3, 96, 96));
+    try std.testing.expectEqual(@as(i32, 96), snapEdgeCrossed(96, 191, 96));
+    try std.testing.expectEqual(@as(i32, 192), snapEdgeCrossed(96, 192, 96));
+    // 回拉：在 1..96 之间不动；到达/越过 0 才缩回
+    try std.testing.expectEqual(@as(i32, 96), snapEdgeCrossed(96, 50, 96));
+    try std.testing.expectEqual(@as(i32, 96), snapEdgeCrossed(96, 1, 96));
+    try std.testing.expectEqual(@as(i32, 0), snapEdgeCrossed(96, 0, 96));
+    try std.testing.expectEqual(@as(i32, 0), snapEdgeCrossed(96, -1, 96));
+
+    // 已在格线上（1/4 网格，边缘 = 24）：走满 24 步才延到 48
+    try std.testing.expectEqual(@as(i32, 24), snapEdgeCrossed(24, 47, 24));
+    try std.testing.expectEqual(@as(i32, 48), snapEdgeCrossed(24, 48, 24));
+    // 自由精度（1 步网格）：直接跟随鼠标
+    try std.testing.expectEqual(@as(i32, 77), snapEdgeCrossed(24, 77, 1));
+    try std.testing.expectEqual(@as(i32, 3), snapEdgeCrossed(77, 3, 1));
+}
+
+test "trimMinLen: 短音符不被动拉长；达到一格后收回不得低于一格" {
+    // 1/32 音符（3 步）+ 1/1 网格（96 步）
+    try std.testing.expectEqual(@as(i32, 3), trimMinLen(3, 3, 96)); // 按下：下限 = 原长
+    try std.testing.expectEqual(@as(i32, 96), trimMinLen(3, 96, 96)); // 已延到一格 → 升为一格
+    // 1/8 音符（12 步）+ 1/4 网格（24 步）
+    try std.testing.expectEqual(@as(i32, 12), trimMinLen(12, 12, 24));
+    try std.testing.expectEqual(@as(i32, 24), trimMinLen(12, 24, 24)); // 延到一格 → 阻止收回
+    // 长于一格：下限 = 一格
+    try std.testing.expectEqual(@as(i32, 96), trimMinLen(300, 300, 96));
+    // 自由精度（1 步）
+    try std.testing.expectEqual(@as(i32, 1), trimMinLen(5, 5, 1));
+}
+
+test "拉伸手感（回归）：走满一格才延、按下不拉长、延后收回被阻止" {
+    const grid = snapSteps(0); // 1/1 = 96
+    // 场景 1：1/32 音符（3 步，起点 0）+ 1/1 网格
+    const len0: i32 = 3;
+    // 按下：下限 = 3 → 不拉长
+    try std.testing.expectEqual(@as(i32, 3), trimMinLen(len0, len0, grid));
+    // 鼠标在下一格线之前游走：右缘不动
+    var edge: i32 = len0;
+    for ([_]i32{ len0, 50, 95 }) |m| {
+        edge = @max(len0, snapEdgeCrossed(edge, m, grid)); // 下限 = 原长
+        try std.testing.expectEqual(@as(i32, 3), edge);
+    }
+    // 鼠标越过后面的格线：右缘吸到该线（必须真的走满一格）
+    edge = @max(len0, snapEdgeCrossed(edge, grid, grid));
+    try std.testing.expectEqual(@as(i32, 96), edge);
+    // 达到一格 → 下限升为一格 → 收回被阻止
+    const min2 = trimMinLen(len0, edge - 0, grid);
+    try std.testing.expectEqual(@as(i32, 96), min2);
+    for ([_]i32{ 95, 50, 0 }) |m| {
+        edge = @max(0 + min2, snapEdgeCrossed(edge, m, grid));
+        try std.testing.expectEqual(@as(i32, 96), edge);
+    }
+
+    // 场景 2：1/8 音符（12 步，起点 0）+ 1/4 网格（24 步）——“放行拉长、阻止收回”
+    const g2: i32 = snapSteps(2); // 24
+    try std.testing.expectEqual(@as(i32, 12), trimMinLen(12, 12, g2)); // 按下不拉长
+    try std.testing.expectEqual(@as(i32, 12), @max(12, snapEdgeCrossed(12, 23, g2))); // 未到格线：不动
+    const e3 = @max(12, snapEdgeCrossed(12, 24, g2));
+    try std.testing.expectEqual(@as(i32, 24), e3); // 到格线：延到 24
+    const min3 = trimMinLen(12, e3, g2);
+    try std.testing.expectEqual(@as(i32, 24), min3); // 升为一格
+    try std.testing.expectEqual(@as(i32, 24), @max(min3, snapEdgeCrossed(e3, 0, g2))); // 收回被阻止（不再缩回 12）
 }
 
 /// 值域映射（minimap 的纵向压缩）：把 `[min_v, max_v]` 归一化到 `[0, 1]`。

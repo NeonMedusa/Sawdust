@@ -382,8 +382,11 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         if (clip_hit) |hit| {
             const c = app.clips.items[hit.index];
             app.sel.pattern = c.pattern;
-            // 拖动/拉伸中的最短长度（步）：= 吸附格（**放行拉长、阻止收回**）
-            app.playlist.resize_min_len = @max(1, snap_steps);
+            app.playlist.resize_orig_len = c.len; // 拉伸下限参照（见 model.trimMinLen）
+            // 拖动死区：先记录按下位置；超过阈值才真正编辑（防单击吸附）
+            app.playlist.drag_armed = false;
+            app.playlist.drag_down_x = ui.mouse_x;
+            app.playlist.drag_down_y = ui.mouse_y;
             switch (hit.mode) {
                 .left => {
                     app.playlist.resize_clip = hit.index;
@@ -409,42 +412,56 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
 
     // 拖动 / 拉伸更新（鼠标可移出区域；位置 clamp 到有效范围）
     if (ui.mouse_down) {
-        if (app.playlist.drag_clip) |ci| {
-            if (ci < app.clips.items.len) {
-                const c = &app.clips.items[ci];
-                // **目标位置**吸附到网格（而非鼠标位置——抓取点不在格上时会脱格）
-                const target = @max(0, step_i - app.playlist.drag_grab);
-                const new_start = @max(0, model.snapRound(target, snap_steps));
-                const new_track = std.math.clamp(track_i, 0, track_count - 1);
-                if ((new_start != c.start or new_track != c.track) and !model.clipOverlaps(app.clips.items, ci, new_track, new_start, c.len)) {
-                    c.track = new_track;
-                    c.start = new_start;
-                    app.dirty = true;
-                }
+        // 死区：位移超过 3px 才真正开始编辑（防单击片段边缘把它吸附到网格）
+        if (app.playlist.drag_clip != null or app.playlist.resize_clip != null) {
+            if (!app.playlist.drag_armed) {
+                const dx = ui.mouse_x - app.playlist.drag_down_x;
+                const dy = ui.mouse_y - app.playlist.drag_down_y;
+                if (dx * dx + dy * dy >= 3 * 3) app.playlist.drag_armed = true;
             }
         }
-        if (app.playlist.resize_clip) |ci| {
-            if (ci < app.clips.items.len) {
-                const c = &app.clips.items[ci];
-                if (app.playlist.resize_left) {
-                    // 左缘：折叠/展开（吸附到网格；不能超过自身第 1 步；**最短 = 一格**）
-                    if (model.clipTrimLeft(c.*, snap_step, app.playlist.resize_min_len)) |nc| {
-                        if (!model.clipOverlaps(app.clips.items, ci, nc.track, nc.start, nc.len)) {
-                            c.* = nc;
+        if (app.playlist.drag_armed) {
+            if (app.playlist.drag_clip) |ci| {
+                if (ci < app.clips.items.len) {
+                    const c = &app.clips.items[ci];
+                    // **目标位置**吸附到网格（而非鼠标位置——抓取点不在格上时会脱格）
+                    const target = @max(0, step_i - app.playlist.drag_grab);
+                    const new_start = @max(0, model.snapRound(target, snap_steps));
+                    const new_track = std.math.clamp(track_i, 0, track_count - 1);
+                    if ((new_start != c.start or new_track != c.track) and !model.clipOverlaps(app.clips.items, ci, new_track, new_start, c.len)) {
+                        c.track = new_track;
+                        c.start = new_start;
+                        app.dirty = true;
+                    }
+                }
+            }
+            if (app.playlist.resize_clip) |ci| {
+                if (ci < app.clips.items.len) {
+                    const c = &app.clips.items[ci];
+                    // 拉伸下限：min(原长, 一格)——按下不拉长；达到一格后收回不得低于一格
+                    const min_len = model.trimMinLen(app.playlist.resize_orig_len, c.len, snap_steps);
+                    if (app.playlist.resize_left) {
+                        // 左缘：折叠/展开（右端固定；相对吸附：走满一格才挪一格）
+                        const edge = model.snapEdgeCrossed(c.start, step_i, snap_steps);
+                        if (model.clipTrimLeft(c.*, edge, min_len)) |nc| {
+                            if (!model.clipOverlaps(app.clips.items, ci, nc.track, nc.start, nc.len)) {
+                                c.* = nc;
+                                app.dirty = true;
+                            }
+                        }
+                    } else {
+                        // 右缘：加长/缩短（相对吸附；上限：同轨下一个片段之前）；最短 = min(原长, 一格)
+                        var max_len: i32 = 1 << 20;
+                        for (app.clips.items, 0..) |o, oi| {
+                            if (oi == ci or o.track != c.track or o.start <= c.start) continue;
+                            max_len = @min(max_len, o.start - c.start);
+                        }
+                        const edge = model.snapEdgeCrossed(c.start + c.len, step_i, snap_steps);
+                        const new_len = std.math.clamp(edge - c.start, min_len, @max(min_len, max_len));
+                        if (new_len != c.len and !model.clipOverlaps(app.clips.items, ci, c.track, c.start, new_len)) {
+                            c.len = new_len;
                             app.dirty = true;
                         }
-                    }
-                } else {
-                    // 右缘：加长/缩短（吸附到网格；上限：同轨下一个片段之前）；最小 1 步
-                    var max_len: i32 = 1 << 20;
-                    for (app.clips.items, 0..) |o, oi| {
-                        if (oi == ci or o.track != c.track or o.start <= c.start) continue;
-                        max_len = @min(max_len, o.start - c.start);
-                    }
-                    const new_len = std.math.clamp(snap_step - c.start + 1, app.playlist.resize_min_len, @max(1, max_len));
-                    if (new_len != c.len) {
-                        c.len = new_len;
-                        app.dirty = true;
                     }
                 }
             }
@@ -452,6 +469,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     } else {
         app.playlist.drag_clip = null;
         app.playlist.resize_clip = null;
+        app.playlist.drag_armed = false; // 下次按下重新评估死区
     }
 
     // 纵向滚动：滚轮（主区）+ 右侧纵向滚动条
