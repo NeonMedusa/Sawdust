@@ -96,8 +96,17 @@ pub const PlaylistState = struct {
     resize_clip: ?usize = null,
     /// 拉伸的是左缘（true，折叠/展开）还是右缘（false，改长度）
     resize_left: bool = false,
-    /// 拉伸中的最短长度（步；按下时 = 吸附格——**放行拉长、阻止收回**）
-    resize_min_len: i32 = 1,
+    /// 拉伸基准（按下时快照）：原起点 / 原长（**全局步**）——
+    /// 增量式拉伸以它为锚（长度 = 原长 + k×格；`model.trimLenByGrid`）
+    resize_orig_start: i32 = 0,
+    resize_orig_len: i32 = 0,
+    /// 按下时的鼠标内容步——拉伸位移（delta）的基准
+    resize_down_step: i32 = 0,
+    /// 拖动死区（像素）：按下后位移超过 3px 才真正编辑——
+    /// 否则**单击片段**会在按下当帧被吸附（实测 bug：位置/长度跳变）
+    drag_armed: bool = false,
+    drag_down_x: i32 = 0,
+    drag_down_y: i32 = 0,
     /// 右键擦除拖动中（按住右键划过片段即删）
     erase_drag: bool = false,
 };
@@ -123,15 +132,25 @@ pub const PianoState = struct {
     drag_grab_pitch: i32 = 0,
     /// 音符拖动模式：移动（body）/ 拖左缘（改起点+长度，右端不动）/ 拖右缘（改长度）
     drag_note_mode: NoteHitMode = .body,
-    /// 拖左缘时的固定右端（步）
-    drag_note_right: i32 = 0,
-    /// 拖动中的最短长度（步；按下时 = 吸附格——**放行拉长、阻止收回**）
-    drag_min_len: i32 = 1,
+    /// 拉伸基准（按下时快照）：原起点 / 原长（步）——
+    /// 增量式拉伸的锚（长度 = 原长 + k×格；见 `model.trimLenByGrid`）
+    drag_orig_step: i32 = 0,
+    drag_orig_len: i32 = 0,
+    /// 按下时的鼠标内容步——拉伸位移（delta）的基准
+    drag_down_step: i32 = 0,
+    /// 上一个被点击/编辑过的音符长度（步；新音符放置时沿用；0 = 无参考）
+    last_note_len: i32 = 0,
 
     /// 量化/吸附网格档位（`model.snap_denoms` 下标；控制音符移动/拉伸对齐）
     snap: i32 = 2, // 默认 1/4
     /// 吸附网格下拉选单：展开中
     snap_menu_open: bool = false,
+
+    /// 拖动死区（像素）：按下后位移超过 3px 才真正编辑——
+    /// 否则**单击音符**会在按下当帧被吸附（实测 bug：位置/长度跳变）
+    drag_armed: bool = false,
+    drag_down_x: i32 = 0,
+    drag_down_y: i32 = 0,
 
     /// 正在试听的音高（null = 无）——**单一真源**：
     /// 琴键点击、音符放置、音符拖动换音都写它；行高亮/琴键高亮/发声都由它派生。

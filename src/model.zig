@@ -167,6 +167,34 @@ pub fn snapRound(step: i32, steps: i32) i32 {
     return @divFloor(step + @divTrunc(steps, 2), steps) * steps;
 }
 
+/// 位移（步）→ **网格倍数**（四舍五入到最近格：过半格即换一格；负数对称）。
+/// “增量式”拉伸的换算基础：网格决定长度增减的**步长**
+/// （网格 1/4 → 鼠标走约 1/4 小节，长度 ±1/4）。
+pub fn gridSteps(delta_steps: i32, grid: i32) i32 {
+    const g = @max(1, grid);
+    if (g <= 1) return delta_steps; // 自由精度
+    const half = @divTrunc(g, 2);
+    if (delta_steps >= 0) return @divTrunc(delta_steps + half, g);
+    return -@divTrunc(-delta_steps + half, g);
+}
+
+/// 拉伸下限（最小格点）：`原长 − k×格`（k >= 0）中仍 >= 1 的最小值。
+/// 例：1/8 音符（12 步）+ 1/4 格（24 步）→ 12（拖不短）；1/2 音符 → 24。
+/// 语义：只剩不足一格时**不能再减**（没有整格可减）。
+pub fn trimMinGridLen(orig_len: i32, grid: i32) i32 {
+    const g = @max(1, grid);
+    const l = @max(1, orig_len);
+    return l - @divFloor(l - 1, g) * g;
+}
+
+/// **拉伸长度（增量式）**：`长度 = 原长 + k×格`（`k = gridSteps`），钳到最小格点。
+/// 长度永远落在“原长 ± 整数格”的格点上——不会中途跳到无关的拍线/小节线。
+pub fn trimLenByGrid(orig_len: i32, delta_steps: i32, grid: i32) i32 {
+    const g = @max(1, grid);
+    const k = gridSteps(delta_steps, g);
+    return @max(trimMinGridLen(orig_len, g), orig_len + k * g);
+}
+
 test "snapSteps / snapFloor / snapRound（U=96）" {
     // 档位 → 步数：1/1 = 96、1/4 = 24、1/8 = 12、1/3 = 32、1/12 = 8、1/96 = 1
     try std.testing.expectEqual(@as(i32, 96), snapSteps(0)); // 1/1
@@ -184,6 +212,36 @@ test "snapSteps / snapFloor / snapRound（U=96）" {
     // 网格 = 1 步时不改动
     try std.testing.expectEqual(@as(i32, 37), snapFloor(37, 1));
     try std.testing.expectEqual(@as(i32, 37), snapRound(37, 1));
+}
+
+test "gridSteps / trimMinGridLen / trimLenByGrid：增量式拉伸（网格 = 长度增减步长）" {
+    // 位移 → 格数：**四舍五入**（过半格即换一格；负数对称）；网格 = 1 步时直接跟随
+    try std.testing.expectEqual(@as(i32, 0), gridSteps(11, 24)); // 不足半格：不变
+    try std.testing.expectEqual(@as(i32, 1), gridSteps(12, 24)); // 半格：进一格
+    try std.testing.expectEqual(@as(i32, 1), gridSteps(35, 24));
+    try std.testing.expectEqual(@as(i32, 0), gridSteps(-11, 24));
+    try std.testing.expectEqual(@as(i32, -1), gridSteps(-12, 24));
+    try std.testing.expectEqual(@as(i32, -1), gridSteps(-35, 24));
+    try std.testing.expectEqual(@as(i32, 25), gridSteps(25, 1));
+
+    // **实测手感**：1/8 音符（12 步）+ 1/4 网格（24 步）
+    try std.testing.expectEqual(@as(i32, 12), trimMinGridLen(12, 24)); // 只剩不足一格
+    try std.testing.expectEqual(@as(i32, 12), trimLenByGrid(12, 11, 24)); // 不足半格 → 不变
+    try std.testing.expectEqual(@as(i32, 36), trimLenByGrid(12, 12, 24)); // 过半格 → +1/4
+    try std.testing.expectEqual(@as(i32, 60), trimLenByGrid(12, 36, 24)); // 一格半 → +2/4
+    try std.testing.expectEqual(@as(i32, 12), trimLenByGrid(12, -12, 24)); // 拖回 → 复原
+    try std.testing.expectEqual(@as(i32, 12), trimLenByGrid(12, -96, 24)); // 再往左：不能减
+
+    // 1/2 音符（48 步）+ 1/4 网格：最低减到 1/4（24），不能更低
+    try std.testing.expectEqual(@as(i32, 24), trimMinGridLen(48, 24));
+    try std.testing.expectEqual(@as(i32, 24), trimLenByGrid(48, -24, 24));
+    try std.testing.expectEqual(@as(i32, 24), trimLenByGrid(48, -999, 24));
+    // 3/8 音符（36 步）：减一格到 1/8（仍是格点）、再减被挡
+    try std.testing.expectEqual(@as(i32, 12), trimLenByGrid(36, -24, 24));
+
+    // 自由精度（网格 = 1 步）：跟随位移、下限 1
+    try std.testing.expectEqual(@as(i32, 37), trimLenByGrid(12, 25, 1));
+    try std.testing.expectEqual(@as(i32, 1), trimLenByGrid(12, -999, 1));
 }
 
 /// 值域映射（minimap 的纵向压缩）：把 `[min_v, max_v]` 归一化到 `[0, 1]`。
@@ -302,8 +360,9 @@ pub fn noteOverlaps(notes: []const Note, exclude: usize, pattern: i32, instrumen
 }
 
 /// 拖音符左缘：改起点+长度（右端固定）。
-/// `new_step` 为鼠标所在步（局部坐标）；`min_len` 为最短长度（通常 = 吸附格）。
-/// 约束：`0 <= new_step <= right - min_len`（左缘不能右移超过最短长度）。
+/// `new_step` 为目标起点（局部坐标，已由调用方按增量式拉伸算好）；
+/// `min_len` 为最短长度（通常 = `trimMinGridLen`——原长减去整数格后仍 >= 1 的值）。
+/// 约束：`0 <= new_step <= right - min_len`、长度不可能变长（右端固定）。
 /// 无效返回 null（调用方保持原样）。
 pub fn noteTrimLeft(n: Note, new_step: i32, right: i32, min_len: i32) ?Note {
     const min_l = @max(1, min_len);

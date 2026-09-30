@@ -461,23 +461,39 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             const n = app.notes.items[hit.index];
             app.piano.drag_note = hit.index;
             app.piano.drag_note_mode = hit.mode;
-            app.piano.drag_note_right = n.step + n.len; // 拖左缘时右端固定
-            app.piano.drag_min_len = @max(1, snap_steps); // 最短 = 一格：放行拉长、阻止收回
+            // 拉伸基准（**按下时快照**）：原起点/原长/按下步——
+            // 增量式拉伸全程以它为锚（长度 = 原长 + k×格），避免“每帧以自身为基准”漂移
+            app.piano.drag_orig_step = n.step;
+            app.piano.drag_orig_len = n.len;
+            app.piano.drag_down_step = step_i;
+            app.piano.last_note_len = n.len; // 记住：新音符放置沿用此长度
             app.piano.drag_grab_step = step_i - n.step;
             app.piano.drag_grab_pitch = pitch_i - n.pitch;
+            // 拖动死区：先记录按下位置；超过阈值才真正编辑（防单击吸附）
+            app.piano.drag_armed = false;
+            app.piano.drag_down_x = ui.mouse_x;
+            app.piano.drag_down_y = ui.mouse_y;
             // 点击已有音符 → 试听（按住不放持续发声）
             app.piano.held_pitch = n.pitch;
             app.auditionOn(n.pitch);
         } else {
-            // 默认音符长度 = 当前吸附格（至少 1 格）
-            const new_len: i32 = @max(1, snap_steps);
+            // 新音符长度：沿用**上一个被点击/编辑过的音符**（无参考时 = 当前吸附格）
+            const new_len: i32 = if (app.piano.last_note_len > 0) app.piano.last_note_len else @max(1, snap_steps);
             if (!model.noteOverlaps(app.notes.items, app.notes.items.len, pattern, app.sel.instrument, snap_step, new_len, pitch_i)) {
                 app.addNote(.{ .step = snap_step, .len = new_len, .pitch = pitch_i, .pattern = pattern, .instrument = app.sel.instrument });
+                app.piano.last_note_len = new_len; // 放置的音符本身也成为“上一个”
                 // **放置即拖拽**：新音符立即进入拖动状态（按住左键可直接拖着跑）
                 app.piano.drag_note = app.notes.items.len - 1;
                 app.piano.drag_note_mode = .body;
                 app.piano.drag_grab_step = 0;
                 app.piano.drag_grab_pitch = 0;
+                app.piano.drag_orig_step = snap_step;
+                app.piano.drag_orig_len = new_len;
+                app.piano.drag_down_step = step_i;
+                // 新放置的音符视为“已拖动”（用户正按住左键）
+                app.piano.drag_armed = true;
+                app.piano.drag_down_x = ui.mouse_x;
+                app.piano.drag_down_y = ui.mouse_y;
                 // 放置时发声（按住不放持续发声）
                 app.piano.held_pitch = pitch_i;
                 app.auditionOn(pitch_i);
@@ -485,25 +501,40 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         }
     }
 
-    // 拖动 / 拉伸更新
+    // 拖动 / 拉伸更新（带**死区**：位移超过 3px 才真正编辑——
+    // 否则单击音符会在按下当帧被吸附，位置/长度跳变）
     if (ui.mouse_down) {
         if (app.piano.drag_note) |ni| {
-            if (ni < app.notes.items.len) {
+            if (!app.piano.drag_armed) {
+                const dx = ui.mouse_x - app.piano.drag_down_x;
+                const dy = ui.mouse_y - app.piano.drag_down_y;
+                if (dx * dx + dy * dy >= 3 * 3) app.piano.drag_armed = true;
+            }
+            if (app.piano.drag_armed and ni < app.notes.items.len) {
                 const n = &app.notes.items[ni];
                 switch (app.piano.drag_note_mode) {
                     .right => {
-                        // 右缘：改长度（吸附到网格；**最短 = 一格**）
-                        const new_len = @max(app.piano.drag_min_len, snap_step - n.step);
-                        if (!model.noteOverlaps(app.notes.items, ni, pattern, n.instrument, n.step, new_len, n.pitch)) {
+                        // 右缘：长度 = **原长 + k×格**（网格决定增减步长：
+                        // 鼠标过半格即 ±一格，往回拖按格递减，不会跳到无关格线）
+                        const delta = step_i - app.piano.drag_down_step;
+                        const new_len = model.trimLenByGrid(app.piano.drag_orig_len, delta, snap_steps);
+                        if (new_len != n.len and !model.noteOverlaps(app.notes.items, ni, pattern, n.instrument, n.step, new_len, n.pitch)) {
                             n.len = new_len;
+                            app.piano.last_note_len = new_len; // 记住编辑后的长度
                             app.dirty = true;
                         }
                     },
                     .left => {
-                        // 左缘：改起点+长度（右端固定；吸附到网格；**最短 = 一格**）
-                        if (model.noteTrimLeft(n.*, snap_step, app.piano.drag_note_right, app.piano.drag_min_len)) |nn| {
+                        // 左缘：右端固定；长度同增量式（鼠标左移 = 拉长、右移 = 缩短），
+                        // 且不能展开到样式第 1 步之前（new_step >= 0）
+                        const right = app.piano.drag_orig_step + app.piano.drag_orig_len;
+                        const min_len = model.trimMinGridLen(app.piano.drag_orig_len, snap_steps);
+                        const delta = app.piano.drag_down_step - step_i; // 左移为正（拉长方向）
+                        const len = @min(model.trimLenByGrid(app.piano.drag_orig_len, delta, snap_steps), right);
+                        if (model.noteTrimLeft(n.*, right - len, right, min_len)) |nn| {
                             if (!model.noteOverlaps(app.notes.items, ni, pattern, nn.instrument, nn.step, nn.len, nn.pitch)) {
                                 n.* = nn;
+                                app.piano.last_note_len = nn.len; // 记住编辑后的长度
                                 app.dirty = true;
                             }
                         }
@@ -534,6 +565,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         }
     } else {
         app.piano.drag_note = null;
+        app.piano.drag_armed = false; // 下次按下重新评估死区
         // 松开：停止试听（仅当不是琴键试听拖动时——琴键有自己的生命周期）
         if (ui.active_id != 6000 and app.piano.held_pitch != null) {
             if (app.piano.held_pitch) |hp| app.auditionOff(hp);
