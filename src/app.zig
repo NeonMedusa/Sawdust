@@ -84,6 +84,10 @@ pub const PlaylistState = struct {
     content_w: i32 = 0,
     /// 横向缩放（屏幕像素 / 内容像素）
     zoom: f32 = 1.0,
+    /// 量化/吸附网格档位（`model.snap_denoms` 下标；**与钢琴卷帘独立**）
+    snap: i32 = 2, // 默认 1/4
+    /// 吸附网格下拉选单：展开中
+    snap_menu_open: bool = false,
 
     /// 片段拖动状态（下标 + 抓取点在小节内的偏移）
     drag_clip: ?usize = null,
@@ -92,6 +96,8 @@ pub const PlaylistState = struct {
     resize_clip: ?usize = null,
     /// 拉伸的是左缘（true，折叠/展开）还是右缘（false，改长度）
     resize_left: bool = false,
+    /// 拉伸中的最短长度（步；按下时 = 吸附格——**放行拉长、阻止收回**）
+    resize_min_len: i32 = 1,
     /// 右键擦除拖动中（按住右键划过片段即删）
     erase_drag: bool = false,
 };
@@ -119,6 +125,13 @@ pub const PianoState = struct {
     drag_note_mode: NoteHitMode = .body,
     /// 拖左缘时的固定右端（步）
     drag_note_right: i32 = 0,
+    /// 拖动中的最短长度（步；按下时 = 吸附格——**放行拉长、阻止收回**）
+    drag_min_len: i32 = 1,
+
+    /// 量化/吸附网格档位（`model.snap_denoms` 下标；控制音符移动/拉伸对齐）
+    snap: i32 = 2, // 默认 1/4
+    /// 吸附网格下拉选单：展开中
+    snap_menu_open: bool = false,
 
     /// 正在试听的音高（null = 无）——**单一真源**：
     /// 琴键点击、音符放置、音符拖动换音都写它；行高亮/琴键高亮/发声都由它派生。

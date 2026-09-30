@@ -143,6 +143,49 @@ test "游标换算：最左片段 / 全局↔局部 / 折叠截断" {
     try std.testing.expectEqual(B, clipSongToLocal(fold, 4 * B).?);
 }
 
+/// **量化/吸附网格**：分母（1/1 … 1/96）→ 步数（U=96 单位）。
+/// 只列可整除 U 的分母（1/64 不可整除故不含）。
+/// 0 = 关闭吸附（自由精度）。
+pub const snap_denoms = [_]i32{ 1, 2, 4, 8, 16, 32, 3, 6, 12, 24, 48, 96 };
+
+/// 档位下标 → 步数（每格多少步）
+pub fn snapSteps(idx: i32) i32 {
+    if (idx < 0 or idx >= snap_denoms.len) return 1;
+    const d = snap_denoms[@intCast(idx)];
+    return @max(1, @divTrunc(units_per_whole, d)); // 96/d：1/96→1 步、1/1→96 步
+}
+
+/// 把步对齐到网格（向下取整）；`steps` = 网格步数
+pub fn snapFloor(step: i32, steps: i32) i32 {
+    if (steps <= 1) return step;
+    return @divFloor(step, steps) * steps;
+}
+
+/// 把步对齐到网格（就近取整）
+pub fn snapRound(step: i32, steps: i32) i32 {
+    if (steps <= 1) return step;
+    return @divFloor(step + @divTrunc(steps, 2), steps) * steps;
+}
+
+test "snapSteps / snapFloor / snapRound（U=96）" {
+    // 档位 → 步数：1/1 = 96、1/4 = 24、1/8 = 12、1/3 = 32、1/12 = 8、1/96 = 1
+    try std.testing.expectEqual(@as(i32, 96), snapSteps(0)); // 1/1
+    try std.testing.expectEqual(@as(i32, 24), snapSteps(2)); // 1/4
+    try std.testing.expectEqual(@as(i32, 12), snapSteps(3)); // 1/8
+    try std.testing.expectEqual(@as(i32, 32), snapSteps(6)); // 1/3（三连音）
+    try std.testing.expectEqual(@as(i32, 8), snapSteps(8)); // 1/12
+    try std.testing.expectEqual(@as(i32, 1), snapSteps(11)); // 1/96
+
+    // 对齐：1/4 网格（24 步）
+    try std.testing.expectEqual(@as(i32, 0), snapFloor(5, 24));
+    try std.testing.expectEqual(@as(i32, 24), snapFloor(30, 24));
+    try std.testing.expectEqual(@as(i32, 24), snapRound(30, 24));
+    try std.testing.expectEqual(@as(i32, 48), snapRound(40, 24));
+    // 网格 = 1 步时不改动
+    try std.testing.expectEqual(@as(i32, 37), snapFloor(37, 1));
+    try std.testing.expectEqual(@as(i32, 37), snapRound(37, 1));
+}
+
 /// 值域映射（minimap 的纵向压缩）：把 `[min_v, max_v]` 归一化到 `[0, 1]`。
 /// 适用于任何有纵向语义的序号：**音高**（钢琴卷帘/机架 minimap）、**轨道**（播放列表 minimap）。
 /// - **保底范围** `min_range`：值域过窄（或只有一个值）时扩到该宽度，
@@ -233,13 +276,15 @@ pub fn clipOverlaps(clips: []const Clip, exclude: usize, track: i32, start: i32,
 
 /// 左缘裁剪/展开：`new_start` 为鼠标所在步（**全局坐标**）。
 /// 折叠 = offset 增大、len 减小（右端不动）；展开反之。
-/// 约束：offset >= 0（局部坐标不能为负——不能展开到自身第 1 步之前）、len >= 1（步）。
+/// 约束：offset >= 0（局部坐标不能为负——不能展开到自身第 1 步之前）、
+/// `len >= min_len`（通常 = 吸附格——不能折得比一格还短）。
 /// 无效返回 null（调用方保持原样）。
-pub fn clipTrimLeft(c: Clip, new_start: i32) ?Clip {
+pub fn clipTrimLeft(c: Clip, new_start: i32, min_len: i32) ?Clip {
+    const min_l = @max(1, min_len);
     const delta = new_start - c.start;
     const new_offset = c.offset + delta;
     const new_len = c.len - delta;
-    if (new_offset < 0 or new_len < 1) return null;
+    if (new_offset < 0 or new_len < min_l) return null;
     var r = c;
     r.start = new_start;
     r.offset = new_offset;
@@ -257,10 +302,12 @@ pub fn noteOverlaps(notes: []const Note, exclude: usize, pattern: i32, instrumen
 }
 
 /// 拖音符左缘：改起点+长度（右端固定）。
-/// `new_step` 为鼠标所在步（局部坐标）；约束：`0 <= new_step <= right-1`（不能撞出局部第 1 步）。
+/// `new_step` 为鼠标所在步（局部坐标）；`min_len` 为最短长度（通常 = 吸附格）。
+/// 约束：`0 <= new_step <= right - min_len`（左缘不能右移超过最短长度）。
 /// 无效返回 null（调用方保持原样）。
-pub fn noteTrimLeft(n: Note, new_step: i32, right: i32) ?Note {
-    const s = std.math.clamp(new_step, 0, right - 1);
+pub fn noteTrimLeft(n: Note, new_step: i32, right: i32, min_len: i32) ?Note {
+    const min_l = @max(1, min_len);
+    const s = std.math.clamp(new_step, 0, @max(0, right - min_l));
     if (s == n.step) return null;
     var r = n;
     r.step = s;
@@ -301,64 +348,76 @@ test "clipOverlaps: 重叠检测、排除自身、不同轨道" {
     try std.testing.expect(!clipOverlaps(&clips, 0, 0, 4 * B, 4 * B)); // 排除自身
 }
 
-test "clipTrimLeft: 左缘折叠/展开（不能超过自身第 1 步）" {
+test "clipTrimLeft: 左缘折叠/展开（不能超过自身第 1 步、受最短长度约束）" {
     const B: i32 = units_per_whole;
     const c0 = Clip{ .track = 0, .start = 4 * B, .len = 8 * B, .pattern = 0 };
 
     // 向右折叠 2 小节：offset +2B、len -2B、右端（4B+8B=12B）不动
-    const folded = clipTrimLeft(c0, 6 * B).?;
+    const folded = clipTrimLeft(c0, 6 * B, 1).?;
     try std.testing.expectEqual(6 * B, folded.start);
     try std.testing.expectEqual(2 * B, folded.offset);
     try std.testing.expectEqual(6 * B, folded.len);
     try std.testing.expectEqual(c0.start + c0.len, folded.start + folded.len);
 
     // 再展开回来（offset 归 0、len 复原）
-    const unfolded = clipTrimLeft(folded, 4 * B).?;
+    const unfolded = clipTrimLeft(folded, 4 * B, 1).?;
     try std.testing.expectEqual(@as(i32, 0), unfolded.offset);
     try std.testing.expectEqual(8 * B, unfolded.len);
 
     // 凭空向左超过自身第 1 步 → 拒绝
-    try std.testing.expect(clipTrimLeft(c0, 4 * B - 1) == null);
+    try std.testing.expect(clipTrimLeft(c0, 4 * B - 1, 1) == null);
     // 折叠后最多展开回自身第 1 步（anchor = 4B）：到 4B 可以、更小不行
-    try std.testing.expect(clipTrimLeft(folded, 4 * B) != null);
-    try std.testing.expect(clipTrimLeft(folded, 4 * B - 1) == null);
+    try std.testing.expect(clipTrimLeft(folded, 4 * B, 1) != null);
+    try std.testing.expect(clipTrimLeft(folded, 4 * B - 1, 1) == null);
     // 步级折叠（U=96 精度）：右移 1 步也可以
-    const fine = clipTrimLeft(c0, 4 * B + 1).?;
+    const fine = clipTrimLeft(c0, 4 * B + 1, 1).?;
     try std.testing.expectEqual(@as(i32, 1), fine.offset);
     try std.testing.expectEqual(8 * B - 1, fine.len);
     // 折叠到不足 1 步 → 拒绝（最多折到 start = 12B - 1）
-    try std.testing.expect(clipTrimLeft(c0, 12 * B - 1) != null);
-    try std.testing.expect(clipTrimLeft(c0, 12 * B) == null);
+    try std.testing.expect(clipTrimLeft(c0, 12 * B - 1, 1) != null);
+    try std.testing.expect(clipTrimLeft(c0, 12 * B, 1) == null);
+
+    // **最短长度约束**（如吸附格 = 1 小节）：最多折到 start = 12B - B
+    const limited = clipTrimLeft(c0, 12 * B - B, B).?;
+    try std.testing.expectEqual(B, limited.len); // 长度为 1 格
+    try std.testing.expect(clipTrimLeft(c0, 12 * B - B + 1, B) == null);
 }
 
-test "noteTrimLeft: 左缘自由拖动（右端固定、不撞出第 1 步）" {
+test "noteTrimLeft: 左缘自由拖动（右端固定、不撞出第 1 步、受最短长度约束）" {
     const n0 = Note{ .step = 8, .len = 8, .pitch = 60, .pattern = 0 }; // 占 8-15
     const right = n0.step + n0.len; // 16
 
     // 向左扩到步 4：step 4、len 12、右端不动
-    const grew = noteTrimLeft(n0, 4, right).?;
+    const grew = noteTrimLeft(n0, 4, right, 1).?;
     try std.testing.expectEqual(@as(i32, 4), grew.step);
     try std.testing.expectEqual(@as(i32, 12), grew.len);
     try std.testing.expectEqual(right, grew.step + grew.len);
 
     // 向右收到步 12：step 12、len 4
-    const shrunk = noteTrimLeft(n0, 12, right).?;
+    const shrunk = noteTrimLeft(n0, 12, right, 1).?;
     try std.testing.expectEqual(@as(i32, 12), shrunk.step);
     try std.testing.expectEqual(@as(i32, 4), shrunk.len);
     try std.testing.expectEqual(right, shrunk.step + shrunk.len);
 
     // 拖到第 1 步左边 → 限在 0（len = 16）
-    const clamped = noteTrimLeft(n0, -5, right).?;
+    const clamped = noteTrimLeft(n0, -5, right, 1).?;
     try std.testing.expectEqual(@as(i32, 0), clamped.step);
     try std.testing.expectEqual(@as(i32, 16), clamped.len);
 
     // 拖到右端或越过 → 至少留 1 步（step = right-1）
-    const minned = noteTrimLeft(n0, 999, right).?;
+    const minned = noteTrimLeft(n0, 999, right, 1).?;
     try std.testing.expectEqual(@as(i32, 15), minned.step);
     try std.testing.expectEqual(@as(i32, 1), minned.len);
 
+    // **最短长度约束**（如吸附格 = 4 步）：左缘最多右移到 right - 4
+    const limited = noteTrimLeft(n0, 999, right, 4).?;
+    try std.testing.expectEqual(@as(i32, 12), limited.step);
+    try std.testing.expectEqual(@as(i32, 4), limited.len); // 长度为 1 格
+    // 最短 = 整段长度时（min_len >= len）无法再缩（step 不变 → null）
+    try std.testing.expect(noteTrimLeft(n0, 15, right, 8) == null);
+
     // 无变化 → null
-    try std.testing.expect(noteTrimLeft(n0, 8, right) == null);
+    try std.testing.expect(noteTrimLeft(n0, 8, right, 1) == null);
 }
 
 test "noteOverlaps: 同音高重叠检测、排除自身、不同音高/样式" {

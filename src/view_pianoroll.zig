@@ -13,6 +13,18 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     const title = std.fmt.bufPrint(&title_buf, "钢琴卷帘 — 样式 {d}", .{pattern + 1}) catch "钢琴卷帘";
     ui.panelTitled(x, y, w, h, title);
 
+    // 吸附网格选择器（标题栏内，**紧挨标题文字**）——
+    // 按钮在此绘制（在标题后面）；下拉在内容之后绘制（最上层，见函数末尾）。
+    const snap_menu_was_open = app.piano.snap_menu_open;
+    const title_w: i32 = @intFromFloat(ui.font.measure(title));
+    const snap_btn_x: i32 = x + 6 + title_w + 12;
+    const snap_btn_w: i32 = 96; // 与 helper 内的 mw 一致（下拉左对齐用）
+    _ = snap_btn_w;
+    var snap_clicked = false;
+    if (snap_btn_x + 40 < x + w - 24) {
+        snap_clicked = util.snapSelectorButton(ui, snap_btn_x, y, util.title_h, &app.piano.snap, &app.piano.snap_menu_open);
+    }
+
     const ruler_h: i32 = 20; // 标尺行高 = 滚动条厚度（与播放列表一致）
     const list_y = y + util.title_h;
     const list_h = h - util.title_h;
@@ -30,6 +42,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 每小节步数由**拍号**决定（动态；App 字段）
     const spb: i32 = app.steps_per_bar;
     const bar_w = spb * util.piano_step_w;
+    // 量化/吸附格（步）——音符移动/拉伸对齐到它；网格也按它加一层。
+    const snap_steps: i32 = model.snapSteps(app.piano.snap);
 
     // ── 时间轴长度与缩放下限（**同一个值**，否则会出现“滑块有行程但拖不动”）──
     // 时间轴 = 内容右缘（保底 4 小节）+ 右侧 3 小节留白。
@@ -215,6 +229,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             @floatFromInt(util.piano_step_w),
             spb,
             model.stepsPerBeat(app.time_den),
+            snap_steps,
         );
 
         // 试听/发声行高亮：**网格之上、音符之下**——否则行线/网格会“透”过高亮层，
@@ -373,13 +388,18 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         }
     }
     // 菜单展开时的点击只归菜单：屏蔽音符交互一帧
-    const menu_click = menu_was_open and ui.mouse_pressed;
+    // （乐器选单、吸附网格选单、以及本帧点击选择器按钮本身）
+    const menu_click = (menu_was_open or snap_menu_was_open or snap_clicked) and ui.mouse_pressed;
+
+    // 量化/吸附格（步）——音符移动/拉伸对齐到它；网格也按它加一层（已在函数顶部声明）。
 
     // ── 交互（音符区）──
     const in_lane = !menu_click and ui.hitRect(lane_x, lane_y, view_w, lane_h);
     // 鼠标 → 内容坐标（除以 zoom）→ 步号
     const mouse_cx: i32 = app.piano.scroll_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(ui.mouse_x - lane_x)) / zoom));
     const step_i = @divFloor(mouse_cx, util.piano_step_w);
+    // 吸附后的步（放置/移动/拉伸都用它——量化到当前网格）
+    const snap_step: i32 = @max(0, model.snapRound(step_i, snap_steps));
     const pitch_i = 127 - @divFloor(ui.mouse_y - lane_y + app.piano.scroll, app.piano.key_h);
 
     // 命中音符（下标 + 命中模式：中部 / 左缘 / 右缘，边缘区 8px）
@@ -442,16 +462,17 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             app.piano.drag_note = hit.index;
             app.piano.drag_note_mode = hit.mode;
             app.piano.drag_note_right = n.step + n.len; // 拖左缘时右端固定
+            app.piano.drag_min_len = @max(1, snap_steps); // 最短 = 一格：放行拉长、阻止收回
             app.piano.drag_grab_step = step_i - n.step;
             app.piano.drag_grab_pitch = pitch_i - n.pitch;
             // 点击已有音符 → 试听（按住不放持续发声）
             app.piano.held_pitch = n.pitch;
             app.auditionOn(n.pitch);
         } else {
-            // 默认音符长度 = 四分之一小节（≈ 四分音符；U=96 时 4/4 → 24 步）
-            const new_len: i32 = @max(1, @divTrunc(app.steps_per_bar, 4));
-            if (!model.noteOverlaps(app.notes.items, app.notes.items.len, pattern, app.sel.instrument, step_i, new_len, pitch_i)) {
-                app.addNote(.{ .step = step_i, .len = new_len, .pitch = pitch_i, .pattern = pattern, .instrument = app.sel.instrument });
+            // 默认音符长度 = 当前吸附格（至少 1 格）
+            const new_len: i32 = @max(1, snap_steps);
+            if (!model.noteOverlaps(app.notes.items, app.notes.items.len, pattern, app.sel.instrument, snap_step, new_len, pitch_i)) {
+                app.addNote(.{ .step = snap_step, .len = new_len, .pitch = pitch_i, .pattern = pattern, .instrument = app.sel.instrument });
                 // **放置即拖拽**：新音符立即进入拖动状态（按住左键可直接拖着跑）
                 app.piano.drag_note = app.notes.items.len - 1;
                 app.piano.drag_note_mode = .body;
@@ -471,16 +492,16 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 const n = &app.notes.items[ni];
                 switch (app.piano.drag_note_mode) {
                     .right => {
-                        // 右缘：改长度（最小 1 步）
-                        const new_len = @max(1, step_i - n.step + 1);
+                        // 右缘：改长度（吸附到网格；**最短 = 一格**）
+                        const new_len = @max(app.piano.drag_min_len, snap_step - n.step);
                         if (!model.noteOverlaps(app.notes.items, ni, pattern, n.instrument, n.step, new_len, n.pitch)) {
                             n.len = new_len;
                             app.dirty = true;
                         }
                     },
                     .left => {
-                        // 左缘：改起点+长度（右端固定；不能撞出局部第 1 步）
-                        if (model.noteTrimLeft(n.*, step_i, app.piano.drag_note_right)) |nn| {
+                        // 左缘：改起点+长度（右端固定；吸附到网格；**最短 = 一格**）
+                        if (model.noteTrimLeft(n.*, snap_step, app.piano.drag_note_right, app.piano.drag_min_len)) |nn| {
                             if (!model.noteOverlaps(app.notes.items, ni, pattern, nn.instrument, nn.step, nn.len, nn.pitch)) {
                                 n.* = nn;
                                 app.dirty = true;
@@ -488,8 +509,10 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                         }
                     },
                     .body => {
-                        // 中部：移动（步 + 音高）
-                        const new_step = @max(0, step_i - app.piano.drag_grab_step);
+                        // 中部：移动（**目标位置**吸附到网格；音高自由）
+                        // 注：吸附的是音符起点（而非鼠标），否则抓取点不在格上时会脱离网格。
+                        const target = @max(0, step_i - app.piano.drag_grab_step);
+                        const new_step = @max(0, model.snapRound(target, snap_steps));
                         const new_pitch = std.math.clamp(pitch_i - app.piano.drag_grab_pitch, 0, 127);
                         if ((new_step != n.step or new_pitch != n.pitch) and
                             !model.noteOverlaps(app.notes.items, ni, pattern, n.instrument, new_step, n.len, new_pitch))
@@ -543,4 +566,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     }
     _ = ui.scrollbarV(11, sb_x, lane_y, ruler_h, lane_h, &app.piano.scroll, content_h, lane_h);
     ui.renderer.vline(sb_x, lane_y, lane_h, ui.theme.panel_border);
+
+    // 吸附网格下拉（在**全部内容之后** → 绘制在最上层，不会被标尺/音符区盖住）
+    if (app.piano.snap_menu_open and snap_btn_x + 40 < x + w - 24) {
+        _ = util.snapSelectorMenu(ui, snap_btn_x, y + util.title_h, &app.piano.snap, &app.piano.snap_menu_open, snap_clicked);
+    }
 }

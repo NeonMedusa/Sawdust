@@ -54,6 +54,8 @@ pub const Theme = struct {
     grid: Color = r_mod.rgb(44, 48, 56),
     /// 拍线（比步线亮、比小节线暗）
     grid_beat: Color = r_mod.rgb(62, 67, 78),
+    /// 吸附格线（量化网格；介于步线与拍线之间）
+    grid_snap: Color = r_mod.rgb(54, 59, 70),
     /// 列表项：悬停 / 选中 / 交替行
     item_hover: Color = r_mod.rgb(52, 58, 68),
     item_selected: Color = r_mod.rgb(58, 84, 120),

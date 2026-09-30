@@ -3,9 +3,11 @@
 //! 这些是所有视图（播放列表/钢琴卷帘/机架/面板）都要用的东西，
 //! 单独成模块避免视图之间互相 import。
 
+const std = @import("std");
 const Ui = @import("ui.zig").Ui;
 const Theme = @import("ui.zig").Theme;
 const r_mod = @import("render.zig");
+const model = @import("model.zig");
 
 // ── 布局常量 ──
 pub const toolbar_h: i32 = 40; // 顶部工具栏高度
@@ -72,6 +74,8 @@ pub fn gridLevel(step: i32, steps_per_bar: i32, beat_steps: i32) GridLevel {
 /// - `step_w`：一步的**内容像素宽**（**浮点**——如播放列表 80/96≈0.833，
 ///   整数会被截断为 0 导致网格与内容错位）；
 /// - `steps_per_bar`/`beat_steps`：U=96 下的每小节/拍步数；
+/// - `snap_steps`：量化/吸附网格的格子大小（步）；> 1 时额外画一层“吸附格线”
+///   （比步线亮、比拍线暗）——让用户看到吸附位置；
 /// - 细小缩放（步宽 < 3px）时只画小节线（避免“实心墙”且限制迭代量）；
 /// - 自动裁剪到 [clip_x, clip_x+clip_w]（网格不会画到琴键列/轨道名列上）。
 pub fn drawTimelineGrid(
@@ -87,6 +91,7 @@ pub fn drawTimelineGrid(
     step_w: f32,
     steps_per_bar: i32,
     beat_steps: i32,
+    snap_steps: i32,
 ) void {
     if (steps_per_bar <= 0 or step_w <= 0) return;
     const view_w = clip_w;
@@ -122,6 +127,85 @@ pub fn drawTimelineGrid(
             ren.fillRect(bx, y, 2, h, theme.panel_border);
         }
     }
+
+    // 吸附格线（比步线亮、比拍线暗；仅在格宽 ≥ 6px 时画，太密就没意义）
+    if (snap_steps > 1) {
+        const snap_ws: f32 = step_w * @as(f32, @floatFromInt(snap_steps)) * zoom;
+        if (snap_ws >= 6.0) {
+            var k: i32 = @as(i32, @intFromFloat(@as(f32, @floatFromInt(scroll_x)) / (step_w * @as(f32, @floatFromInt(snap_steps)))));
+            k += 1;
+            while (true) : (k += 1) {
+                const gx = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(k)) * snap_ws - scroll_s));
+                if (gx > clip_x + view_w) break;
+                // 只画小节/拍线之外的位置（避免叠色）
+                const step_pos = k * snap_steps;
+                if (gridLevel(step_pos, bar_steps, beat_steps) == .step) {
+                    ren.vline(gx, y, h, theme.grid_snap);
+                }
+            }
+        }
+    }
+}
+
+/// 吸附网格选择器（标题栏内，紧挨标题文字；模仿乐器选单交互）。
+/// - `btn_x`：按钮左端（由调用方放在标题后面）；`y`/`h`：标题栏范围；
+/// - `snap`/`open`：调用方的状态字段（两视图各自独立）；
+/// - 返回 true = 本帧点击了按钮（调用方可用它屏蔽同帧的其它交互）。
+/// **本函数只绘制按钮与下拉；下拉内容在后（应确保绘制在最上层）**。
+pub fn snapSelectorButton(ui: *Ui, btn_x: i32, y: i32, bar_h: i32, snap: *i32, open: *bool) bool {
+    const btn_h: i32 = bar_h - 8;
+    const btn_y = y + 4;
+    var sbuf: [24]u8 = undefined;
+    const idx = std.math.clamp(snap.*, 0, @as(i32, @intCast(model.snap_denoms.len - 1)));
+    const label = std.fmt.bufPrint(&sbuf, "网格 1/{d} ▾", .{model.snap_denoms[@intCast(idx)]}) catch "网格 ▾";
+    const bw: i32 = @as(i32, @intFromFloat(ui.font.measure(label))) + 16;
+    const hovered = ui.hitRect(btn_x, btn_y, bw, btn_h);
+    ui.renderer.fillRect(btn_x, btn_y, bw, btn_h, if (open.*) ui.theme.accent else if (hovered) ui.theme.item_hover else ui.theme.toolbar);
+    ui.labelClipped(label, btn_x + 8, btn_y, bw - 12, ui.theme.text);
+    if (hovered and ui.mouse_pressed) open.* = !open.*;
+    return hovered and ui.mouse_pressed;
+}
+
+/// 吸附网格下拉列表（在**内容之后**调用 → 绘制在最上层）。
+/// `btn_x`/`btn_w`：与按钮对齐；`below_y`：展开位置（按钮下沿）；
+/// `skip_close`：本帧刚点击了按钮（用于打开菜单）——此时**跳过“点外部关闭”判断**，
+/// 否则同帧的点击会立刻把菜单关掉（实测 bug：菜单闪一下消失）。
+/// 返回 true = 本帧点击了列表（调用方用它屏蔽同帧的其它交互）。
+pub fn snapSelectorMenu(ui: *Ui, btn_x: i32, below_y: i32, snap: *i32, open: *bool, skip_close: bool) bool {
+    if (!open.*) return false;
+    var consumed = false;
+    var mw: i32 = 0;
+    var mh: i32 = 0;
+    var mx: i32 = 0;
+    var my: i32 = 0;
+    {
+        const n: i32 = @intCast(model.snap_denoms.len);
+        mw = 96;
+        mh = n * menu_item_h + 4;
+        mx = btn_x;
+        my = below_y;
+        ui.renderer.fillRect(mx, my, mw, mh, ui.theme.panel);
+        ui.renderer.strokeRect(mx, my, mw, mh, ui.theme.accent);
+        for (model.snap_denoms, 0..) |d, ii| {
+            const iy = my + 2 + @as(i32, @intCast(ii)) * menu_item_h;
+            const ih = inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, mw - 2, menu_item_h);
+            if (ih) ui.renderer.fillRect(mx + 1, iy, mw - 2, menu_item_h, ui.theme.item_hover);
+            var dbuf: [16]u8 = undefined;
+            const dt = std.fmt.bufPrint(&dbuf, "1/{d}", .{d}) catch "";
+            const sel = snap.* == @as(i32, @intCast(ii));
+            ui.labelClipped(dt, mx + 10, iy + 2, mw - 20, if (sel) ui.theme.accent else ui.theme.text);
+            if (ih) consumed = true;
+            if (ih and ui.mouse_pressed) {
+                snap.* = @intCast(ii);
+                open.* = false;
+            }
+        }
+        // 点外部关闭（跳过“刚点按钮打开菜单”那一帧）
+        if (!skip_close and ui.mouse_pressed and !inRect(ui.mouse_x, ui.mouse_y, mx, my, mw, mh)) {
+            open.* = false;
+        }
+    }
+    return consumed;
 }
 
 /// 滚轮增量 → 像素（24px/格）

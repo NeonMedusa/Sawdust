@@ -45,6 +45,15 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     };
     ui.panelTitled(x, y, w, h, title);
 
+    // 吸附网格选择器（标题栏内，**紧挨标题文字**；与钢琴卷帘**独立**）
+    const snap_menu_was_open = app.playlist.snap_menu_open;
+    const title_w: i32 = @intFromFloat(ui.font.measure(title));
+    const snap_btn_x: i32 = x + 6 + title_w + 12;
+    var snap_clicked = false;
+    if (snap_btn_x + 40 < x + w - 24) {
+        snap_clicked = util.snapSelectorButton(ui, snap_btn_x, y, util.title_h, &app.playlist.snap, &app.playlist.snap_menu_open);
+    }
+
     const header_w: i32 = 90; // 轨道名列宽
     const ruler_h: i32 = 20; // 标尺行高 = 滚动条厚度（横条高 = 纵条宽）
     const list_y = y + util.title_h;
@@ -192,6 +201,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                     @as(f32, @floatFromInt(bar_w)) / @as(f32, @floatFromInt(spb)), // 步宽（浮点：80/96≈0.833）
                     spb,
                     model.stepsPerBeat(app.time_den),
+                    model.snapSteps(app.playlist.snap), // 播放列表**独立**的吸附档位
                 );
                 // 行分隔线：必须在片段**之前**绘制——
                 // 否则它（画在 ty+track_h-1）会盖住片段底边的亮色描边（只有上/左/右亮、下不亮）。
@@ -296,11 +306,16 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
 
     // ── 鼠标交互（轨道内容区）──
     // 左键空位：放置样式；左键片段：拖动移动；片段右缘：拉伸长度；右键片段：删除
-    const in_lane = ui.hitRect(lane_x, tracks_y, view_w, tracks_h);
+    // 菜单展开时的点击只归菜单：屏蔽轨道交互一帧（含本帧点击选择器按钮）
+    const menu_click = (snap_menu_was_open or snap_clicked) and ui.mouse_pressed;
+    const in_lane = !menu_click and ui.hitRect(lane_x, tracks_y, view_w, tracks_h);
     const track_i = @divFloor(ui.mouse_y - tracks_y + app.playlist.scroll, track_h);
     // 鼠标 → 内容坐标（除以 zoom）→ **全局步**（U=96）
     const mouse_cx: f32 = @as(f32, @floatFromInt(app.playlist.scroll_x)) + @as(f32, @floatFromInt(ui.mouse_x - lane_x)) / zoom;
     const step_i: i32 = @max(0, @as(i32, @intFromFloat(mouse_cx / step_px)));
+    // 量化/吸附格（步）——片段移动/拉伸对齐到它
+    const snap_steps: i32 = model.snapSteps(app.playlist.snap);
+    const snap_step: i32 = @max(0, model.snapRound(step_i, snap_steps));
     const track_count: i32 = @intCast(app.track_items.len);
     const valid_track = track_i >= 0 and track_i < track_count;
 
@@ -367,6 +382,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         if (clip_hit) |hit| {
             const c = app.clips.items[hit.index];
             app.sel.pattern = c.pattern;
+            // 拖动/拉伸中的最短长度（步）：= 吸附格（**放行拉长、阻止收回**）
+            app.playlist.resize_min_len = @max(1, snap_steps);
             switch (hit.mode) {
                 .left => {
                     app.playlist.resize_clip = hit.index;
@@ -382,10 +399,10 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 },
             }
         } else {
-            // 默认片段长度 = 1 小节（步单位随拍号变化）
+            // 放置：位置吸附到网格；默认长度 = 1 小节（步单位随拍号）
             const new_len: i32 = spb;
-            if (!model.clipOverlaps(app.clips.items, app.clips.items.len, track_i, step_i, new_len)) {
-                app.addClip(.{ .track = track_i, .start = step_i, .len = new_len, .pattern = app.sel.pattern });
+            if (!model.clipOverlaps(app.clips.items, app.clips.items.len, track_i, snap_step, new_len)) {
+                app.addClip(.{ .track = track_i, .start = snap_step, .len = new_len, .pattern = app.sel.pattern });
             }
         }
     }
@@ -395,7 +412,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         if (app.playlist.drag_clip) |ci| {
             if (ci < app.clips.items.len) {
                 const c = &app.clips.items[ci];
-                const new_start = @max(0, step_i - app.playlist.drag_grab);
+                // **目标位置**吸附到网格（而非鼠标位置——抓取点不在格上时会脱格）
+                const target = @max(0, step_i - app.playlist.drag_grab);
+                const new_start = @max(0, model.snapRound(target, snap_steps));
                 const new_track = std.math.clamp(track_i, 0, track_count - 1);
                 if ((new_start != c.start or new_track != c.track) and !model.clipOverlaps(app.clips.items, ci, new_track, new_start, c.len)) {
                     c.track = new_track;
@@ -408,21 +427,21 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             if (ci < app.clips.items.len) {
                 const c = &app.clips.items[ci];
                 if (app.playlist.resize_left) {
-                    // 左缘：折叠/展开（不能超过自身第 1 步）
-                    if (model.clipTrimLeft(c.*, step_i)) |nc| {
+                    // 左缘：折叠/展开（吸附到网格；不能超过自身第 1 步；**最短 = 一格**）
+                    if (model.clipTrimLeft(c.*, snap_step, app.playlist.resize_min_len)) |nc| {
                         if (!model.clipOverlaps(app.clips.items, ci, nc.track, nc.start, nc.len)) {
                             c.* = nc;
                             app.dirty = true;
                         }
                     }
                 } else {
-                    // 右缘：加长/缩短（上限：同轨下一个片段之前）；最小 1 步
+                    // 右缘：加长/缩短（吸附到网格；上限：同轨下一个片段之前）；最小 1 步
                     var max_len: i32 = 1 << 20;
                     for (app.clips.items, 0..) |o, oi| {
                         if (oi == ci or o.track != c.track or o.start <= c.start) continue;
                         max_len = @min(max_len, o.start - c.start);
                     }
-                    const new_len = std.math.clamp(step_i - c.start + 1, 1, @max(1, max_len));
+                    const new_len = std.math.clamp(snap_step - c.start + 1, app.playlist.resize_min_len, @max(1, max_len));
                     if (new_len != c.len) {
                         c.len = new_len;
                         app.dirty = true;
@@ -459,5 +478,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         }
     }
     _ = ui.scrollbarV(9, sb_x, tracks_y, ruler_h, tracks_h, &app.playlist.scroll, content_h, tracks_h);
-    ui.renderer.vline(sb_x, tracks_y, tracks_h, ui.theme.panel_border); // 纵向滚动条左边界
+    // 吸附网格下拉（在**全部内容之后** → 绘制在最上层）
+    if (app.playlist.snap_menu_open and snap_btn_x + 40 < x + w - 24) {
+        _ = util.snapSelectorMenu(ui, snap_btn_x, y + util.title_h, &app.playlist.snap, &app.playlist.snap_menu_open, snap_clicked);
+    }
 }

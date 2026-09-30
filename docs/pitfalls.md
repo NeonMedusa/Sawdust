@@ -285,6 +285,18 @@ else if (ui.active_id == 6000) { /* 滑动换音 / 松开释音 */ }
 **同族**：推子（slider/knob）的正确写法——`hovered and mouse_pressed` 进入拖动、
 之后用 `active_id` 延续；与本次修琴键试听是同一模式。
 
+### 菜单开关：打开它的那次点击不能被自己的“点外部关闭”吃掉
+
+```zig
+// 帧内次序：先按钮后菜单（菜单在按钮下方）
+if (hovered and ui.mouse_pressed) open.* = !open.*;  // ① 点击按钮 → 打开
+// ...同帧稍后...
+if (ui.mouse_pressed and !inRect(mouse, 菜单区)) open.* = false;  // ② 鼠标在按钮上 → 立即关闭
+```
+**表现**：菜单展开后**闪一下消失**（只存活一帧）。
+**修法**：把“本帧是否点了按钮”传给菜单，那一帧**跳过外部关闭判断**：
+`if (!skip_close and ui.mouse_pressed and !inRect(...)) open.* = false;`
+
 ### 浮动窗口的“点击穿透”：输入分层必须在帧首决定
 
 立即式 UI 里**绘制顺序 = 事件处理顺序**：底层面板先绘制、先响应。
