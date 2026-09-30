@@ -32,7 +32,17 @@ pub fn patternColor(pattern: i32) r_mod.Color {
 }
 
 pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
-    ui.panelTitled(x, y, w, h, "播放列表 (Playlist)");
+    // 标题：`播放列表 (Playlist) — 工程名`（与钢琴卷帘的「钢琴卷帘 — 样式 N」同格式）；
+    // 新工程未命名 / 非法路径时不带后缀；脏标记 `*` 附在工程名后。
+    var title_buf: [192]u8 = undefined;
+    const title: []const u8 = blk: {
+        const name = app.projectName() orelse break :blk "播放列表 (Playlist)";
+        if (app.dirty) {
+            break :blk std.fmt.bufPrint(&title_buf, "播放列表 (Playlist) — {s}*", .{name}) catch "播放列表 (Playlist)";
+        }
+        break :blk std.fmt.bufPrint(&title_buf, "播放列表 (Playlist) — {s}", .{name}) catch "播放列表 (Playlist)";
+    };
+    ui.panelTitled(x, y, w, h, title);
 
     const bar_w: i32 = 80;
     const header_w: i32 = 90; // 轨道名列宽
@@ -343,6 +353,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             app.playlist.erase_drag = false;
         } else if (clip_hit) |hit| {
             _ = app.clips.orderedRemove(hit.index);
+            app.dirty = true;
             app.playlist.drag_clip = null;
             app.playlist.resize_clip = null;
         }
@@ -386,6 +397,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 if ((new_bar != c.bar or new_track != c.track) and !model.clipOverlaps(app.clips.items, ci, new_track, new_bar, c.len)) {
                     c.track = new_track;
                     c.bar = new_bar;
+                    app.dirty = true;
                 }
             }
         }
@@ -395,7 +407,10 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 if (app.playlist.resize_left) {
                     // 左缘：折叠/展开（不能超过自身第 1 小节）
                     if (model.clipTrimLeft(c.*, bar_i)) |nc| {
-                        if (!model.clipOverlaps(app.clips.items, ci, nc.track, nc.bar, nc.len)) c.* = nc;
+                        if (!model.clipOverlaps(app.clips.items, ci, nc.track, nc.bar, nc.len)) {
+                            c.* = nc;
+                            app.dirty = true;
+                        }
                     }
                 } else {
                     // 右缘：加长/缩短（上限：同轨下一个片段之前）
@@ -404,7 +419,11 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                         if (oi == ci or o.track != c.track or o.bar <= c.bar) continue;
                         max_len = @min(max_len, o.bar - c.bar);
                     }
-                    c.len = std.math.clamp(bar_i - c.bar + 1, 1, @max(1, max_len));
+                    const new_len = std.math.clamp(bar_i - c.bar + 1, 1, @max(1, max_len));
+                    if (new_len != c.len) {
+                        c.len = new_len;
+                        app.dirty = true;
+                    }
                 }
             }
         }

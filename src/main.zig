@@ -12,9 +12,12 @@ const r_mod = @import("render.zig");
 const Font = @import("font.zig").Font;
 const Ui = @import("ui.zig").Ui;
 const App = @import("app.zig").App;
+const QuitChoice = @import("app.zig").QuitChoice;
 const synth = @import("synth.zig");
 const sequencer = @import("sequencer.zig");
 const model = @import("model.zig");
+const persist = @import("persist.zig");
+const filedialog = @import("filedialog.zig");
 const util = @import("view_util.zig");
 const view_playlist = @import("view_playlist.zig");
 const view_pianoroll = @import("view_pianoroll.zig");
@@ -39,7 +42,7 @@ pub fn main(init: std.process.Init) !u8 {
     var app = App{ .allocator = allocator };
     defer app.clips.deinit(allocator);
     defer app.notes.deinit(allocator);
-    defer app.deinitInstruments();
+    defer app.deinitAll();
     // 初始片段（演示）：前 12 轨铺一些样式，每 16 小节重复（只铺 2 轮——
     // 避免演示内容把时间轴行程撑得过长，行程应贴合最右内容）
     {
@@ -60,6 +63,7 @@ pub fn main(init: std.process.Init) !u8 {
     // **必须在 engine.init 之前**：音频回调启动后会解引用参数/队列指针
     _ = app.addInstrument("减法合成器");
     _ = app.addInstrument("减法合成器");
+    app.dirty = false; // 演示数据不算“未保存的修改”
     app.params.events = &app.events;
     app.params.sched_events = &app.sched_events;
 
@@ -72,7 +76,64 @@ pub fn main(init: std.process.Init) !u8 {
     var ui_input = InputState{};
     var ui = Ui.init(r_mod.Renderer.init(&win.fb), &font);
 
-    while (!win.shouldQuit()) {
+    while (true) {
+        // ── 脏确认流程（自绘模态；**不用系统 MessageBox**——
+        // 系统弹窗会把鼠标吸到默认按钮上，实测体验差）──
+        // 两种场景共用：① 退出程序；② 打开其他工程（都会丢失未保存修改）
+        if (win.shouldQuit()) {
+            win.should_quit = false; // 拦截：先走确认流程
+            if (!app.dirty) break; // 无未保存修改 → 直接退出
+            app.dirty_flow = .confirming;
+            app.dirty_intent = .quit;
+            app.modal = .dirty_confirm;
+            app.modal_choice = null;
+        }
+        switch (app.dirty_flow) {
+            .none => {},
+            .confirming => {
+                // 等用户选择（鼠标在模态框中 / Enter / Esc）
+                if (app.modal_choice) |choice| {
+                    app.modal = null;
+                    app.modal_choice = null;
+                    switch (choice) {
+                        .save => {
+                            // 先保存，保存完成后再执行目标动作（见 save_then 分支）
+                            app.pending_file_action = .save;
+                            app.dirty_flow = .save_then;
+                        },
+                        .discard => {
+                            // 不保存：直接执行目标动作（退出 / 打开）
+                            app.dirty_flow = .none;
+                            if (app.dirty_intent == .quit) break;
+                        },
+                        .cancel => {
+                            // 取消：放弃目标动作（清掉待打开的工程）
+                            app.dirty_flow = .none;
+                            app.clearPendingOpen();
+                        },
+                    }
+                }
+            },
+            .save_then => {
+                // 保存已完成（pending 为空）：成功 → 继续目标动作；失败/取消 → 放弃
+                if (app.pending_file_action == null) {
+                    app.dirty_flow = .none;
+                    if (!app.dirty) {
+                        // 保存成功 → 执行目标动作
+                        if (app.dirty_intent == .quit) break;
+                        app.pending_file_action = .open; // 执行待定的打开
+                    } else {
+                        // 保存失败 / 用户在保存对话框里取消 → 放弃目标动作
+                        app.clearPendingOpen();
+                    }
+                }
+            },
+        }
+        // 脏确认已结束（且意图为打开）：执行待定的打开
+        if (app.dirty_flow == .none and app.pending_open_path != null and app.pending_file_action == null) {
+            app.pending_file_action = .open;
+        }
+
         ui_input.mouse_pressed = false;
         ui_input.mouse_released = false;
         ui_input.mouse_right_pressed = false;
@@ -126,13 +187,23 @@ pub fn main(init: std.process.Init) !u8 {
                     ui_input.mouse_y = m.y;
                 },
                 .key_down => |k| {
-                    if (k.code == 0x1B) { // Esc：钢琴卷帘中返回播放列表，否则退出
-                        if (app.piano.pattern != null) {
+                    // 模态确认框优先捕获键盘
+                    if (app.modal != null) {
+                        switch (k.code) {
+                            0x0D => app.modal_choice = .save, // Enter = 保存
+                            0x1B => app.modal_choice = .cancel, // Esc = 取消
+                            else => {},
+                        }
+                        continue;
+                    }
+                    if (k.code == 0x1B) { // Esc：关闭文件菜单 / 返回播放列表（**不退出程序**）
+                        if (app.file_menu_open) {
+                            app.file_menu_open = false;
+                        } else if (app.piano.pattern != null) {
                             app.closePiano();
                             if (ui.active_id == 6000) ui.active_id = 0; // 释放琴键试听拖动标记
-                        } else {
-                            win.should_quit = true;
                         }
+                        // 退出请用窗口关闭按钮（X / Alt+F4）
                     }
                     if (k.code == 0x20) { // Space：播放/暂停（从游标处开始，基于音频时钟）
                         app.playing = !app.playing;
@@ -150,6 +221,14 @@ pub fn main(init: std.process.Init) !u8 {
                             app.params.playing.store(false, .monotonic);
                         }
                     }
+                    // Ctrl+S：保存（无路径则弹对话框）；Ctrl+Shift+S：另存为；Ctrl+O：打开。
+                    // 注：只登记动作，不在事件迭代中弹对话框——事件数组可能被
+                    // 对话框泵入的消息 realloc，迭代中的 slice 会悬空（实测崩溃：
+                    // “switch on corrupt value”）。帧末统一执行。
+                    if (k.ctrl and (k.code == 'S' or k.code == 's')) {
+                        app.pending_file_action = if (k.shift) .save_as else .save;
+                    }
+                    if (k.ctrl and (k.code == 'O' or k.code == 'o')) app.pending_file_action = .open;
                 },
                 .resize => {},
                 else => {},
@@ -221,8 +300,16 @@ pub fn main(init: std.process.Init) !u8 {
         }
         ui.frozen_dy = win.frozenDeltaY();
 
+        // 每帧递减状态栏提示（保存/加载结果）
+        app.tickToast();
+
         ui.beginFrame();
         drawApp(&ui, &app, @intCast(win.fb.width), @intCast(win.fb.height));
+        // 文件菜单：在 UI 之后、endFrame **之前**（endFrame 会清 mouse_pressed——
+        // 放在之后则菜单永远收不到点击，实测“点菜单没反应”）
+        if (app.file_menu_open) drawFileMenu(&ui, &app);
+        // 模态确认框（最上层；自绘——避开系统 MessageBox 把鼠标吸到默认按钮）
+        if (app.modal != null) drawModal(&ui, &app);
         ui.endFrame();
 
         // 普通拖动（滚动条/片段/音符/分隔条）捕获鼠标：拖出窗口后仍能收到松开事件
@@ -238,6 +325,54 @@ pub fn main(init: std.process.Init) !u8 {
 
         // 4) 呈现
         win.present();
+
+        // 4.2) 帧末执行待定的文件操作（对话框在此弹出——不在事件迭代/绘制中，
+        // 避免 pushEvent realloc 使迭代中的 events slice 悬空）
+        if (app.pending_file_action) |act| {
+            app.pending_file_action = null;
+            ui.active_id = 0; // 对话框会抢走鼠标：清掉拖动状态
+            win.setDragCapture(false);
+            switch (act) {
+                .open => {
+                    // 已有待定路径（脏确认后继续打开）→ 直接加载；
+                    // 否则弹对话框选文件
+                    if (app.pending_open_path) |p| {
+                        defer app.clearPendingOpen();
+                        loadProjectFromPath(&app, io, p);
+                    } else {
+                        openProjectWithDialog(&app, &win, io);
+                    }
+                },
+                .save => saveProject(&app, &win, io, false),
+                .save_as => saveProject(&app, &win, io, true),
+            }
+        }
+
+        // 4.5) 同步窗口标题（脏标记 `*` + 工程名；仅在变化时刷 Win32）
+        const cur_name = app.projectName();
+        const name_changed = blk: {
+            const a = app.title_applied_name orelse break :blk (cur_name != null);
+            const b = cur_name orelse break :blk true;
+            break :blk !std.mem.eql(u8, a, b);
+        };
+        if (app.title_applied_dirty != app.dirty or name_changed) {
+            app.title_applied_dirty = app.dirty;
+            if (app.title_applied_name) |old| app.allocator.free(old);
+            app.title_applied_name = if (cur_name) |n| (app.allocator.dupe(u8, n) catch null) else null;
+
+            var title_buf: [192]u8 = undefined;
+            const base = "Sawdust — Simple Audio Workstation";
+            const title = if (cur_name) |n|
+                (std.fmt.bufPrint(&title_buf, "Sawdust — {s}", .{n}) catch base)
+            else
+                base;
+            var with_dirty: [208]u8 = undefined;
+            const final_title = if (app.dirty)
+                (std.fmt.bufPrint(&with_dirty, "* {s}", .{title}) catch title)
+            else
+                title;
+            win.setTitle(final_title);
+        }
 
         // 5) 帧率限制（约 60fps）
         std.Io.sleep(io, .fromMilliseconds(16), .awake) catch {};
@@ -274,6 +409,10 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
 
     ui.resetLayers();
     _ = ui.declare(.{ .prio = 0, .rect = .{ .x = 0, .y = 0, .w = w, .h = h } }); // 主界面
+    // 模态确认框（最高优先级，全屏屏蔽）：存在时所有低层不响应鼠标
+    if (app.modal != null) {
+        _ = ui.declare(.{ .prio = 10, .rect = .{ .x = 0, .y = 0, .w = w, .h = h }, .modal = true });
+    }
     if (rack_open) {
         _ = ui.declare(.{ .prio = 1, .rect = .{ .x = app.rack.x, .y = app.rack.y, .w = app.rack.w, .h = app.rack.h } });
     }
@@ -349,21 +488,31 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
     var x: i32 = 8;
     const by: i32 = 7;
     const bh: i32 = 26;
+    // “文件”按钮位置（菜单展开时用于判断点击是否在按钮上）
+    var file_menu_x: i32 = 8;
+    var file_menu_w: i32 = 140;
 
-    // 菜单（占位：只有文字按钮）；“乐器”按钮 = 开关通道机架
+    // 菜单：“文件”带下拉（打开/保存/另存为）；“乐器”开关通道机架
+    // 注：下拉项的**动作**由 main 循环处理（需要 window/io）；本函数只置状态
     const menus = [_][]const u8{ "文件", "选项", "视图", "乐器", "混音台" };
     for (menus, 0..) |m, i| {
         const mw: i32 = @as(i32, @intFromFloat(ui.font.measure(m))) + 16;
-        const active = (i == 3) and app.rack.open; // “乐器”当前开着 → 高亮
+        const active = (i == 3 and app.rack.open) or (i == 0 and app.file_menu_open);
         if (active) {
             if (ui.buttonEx(100 + @as(u64, i), m, x, by, mw, bh, true)) {
-                app.rack.open = false; // 点击关闭
+                if (i == 3) app.rack.open = false else if (i == 0) app.file_menu_open = false;
             }
         } else if (ui.button(100 + @as(u64, i), m, x, by, mw, bh)) {
-            if (i == 3) app.rack.open = true; // 点击打开通道机架
+            if (i == 3) app.rack.open = true else if (i == 0) app.file_menu_open = !app.file_menu_open;
+        }
+        if (i == 0) {
+            file_menu_x = x;
+            file_menu_w = @max(mw + 70, 140);
         }
         x += mw + 2;
     }
+    app.file_menu_x = file_menu_x;
+    app.file_menu_w = file_menu_w;
 
     // 视图切换：播放列表 / 钢琴卷帘（两段式，像 SONG/PAT）
     {
@@ -432,8 +581,12 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
     // BPM（按住上下拖：上滑增加 / 下滑减小；拖动时光标隐藏并冻结）
     ui.label("BPM", x, by + 4, ui.theme.text_dim);
     x += @as(i32, @intFromFloat(ui.font.measure("BPM"))) + 8;
-    _ = ui.dragNumber(350, x, by + 3, 56, 20, &app.bpm, 20, 999, 2);
-    x += 62;
+    {
+        const old_bpm = app.bpm;
+        _ = ui.dragNumber(350, x, by + 3, 56, 20, &app.bpm, 20, 999, 2);
+        if (app.bpm != old_bpm) app.dirty = true;
+        x += 62;
+    }
 
     // 拍号（分子/分母都可推；分母为 2 的幂：指数式推子——拖 1 单位 = 翻倍）
     {
@@ -445,6 +598,7 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
         const changed_den = ui.dragNumberEx(352, x + num_w + 15, by + 3, den_w, 20, &app.time_den, 0, 4, 4, 1, null);
         if (changed_num or changed_den) {
             app.steps_per_bar = model.stepsPerBarFor(app.time_num, app.time_den);
+            app.dirty = true;
             // 拍号变更 → 内容解释变了：播放中重置调度与传输
             if (app.playing) app.jumpPlaybackCursor(app.playback.cursorStep(app.sel.song_mode));
         }
@@ -462,6 +616,236 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
         app.params.volume.store(app.volume, .monotonic);
     }
     app.params.playing.store(app.playing, .monotonic);
+}
+
+// ── 保存 / 加载 ──
+
+/// 绘制并处理“文件”下拉菜单（在 UI 之后调用 = 视觉最上层）。
+/// 用**直接坐标**判定命中（不受 UI 层屏蔽影响）。
+/// 绘制并处理“文件”下拉菜单（在 `endFrame` **之前**调用：需要未清的 mouse_pressed）。
+/// 命中项只登记 `pending_file_action`（真正的对话框在帧末执行——见主循环）。
+fn drawFileMenu(ui: *Ui, app: *App) void {
+    const items = [_]struct { label: []const u8, shortcut: []const u8 }{
+        .{ .label = "打开...", .shortcut = "Ctrl+O" },
+        .{ .label = "保存", .shortcut = "Ctrl+S" },
+        .{ .label = "另存为...", .shortcut = "Ctrl+Shift+S" },
+    };
+    const item_h: i32 = 22;
+    const menu_x = app.file_menu_x;
+    const menu_w = app.file_menu_w;
+    const menu_y = util.toolbar_h;
+    const menu_h: i32 = @intCast(items.len * @as(usize, @intCast(item_h)) + 4);
+
+    ui.renderer.fillRect(menu_x, menu_y, menu_w, menu_h, ui.theme.panel);
+    ui.renderer.strokeRect(menu_x, menu_y, menu_w, menu_h, ui.theme.accent);
+
+    var activated: ?usize = null;
+    for (items, 0..) |it, ii| {
+        const iy = menu_y + 2 + @as(i32, @intCast(ii)) * item_h;
+        const hovered = util.inRect(ui.mouse_x, ui.mouse_y, menu_x + 1, iy, menu_w - 2, item_h);
+        if (hovered) {
+            ui.renderer.fillRect(menu_x + 1, iy, menu_w - 2, item_h, ui.theme.item_hover);
+            ui.cursor = .arrow;
+        }
+        ui.label(it.label, menu_x + 8, iy + 3, ui.theme.text);
+        if (it.shortcut.len > 0) {
+            const sw: i32 = @intFromFloat(ui.font.measure(it.shortcut));
+            ui.label(it.shortcut, menu_x + menu_w - sw - 8, iy + 3, ui.theme.text_dim);
+        }
+        if (hovered and ui.mouse_pressed) activated = ii;
+    }
+
+    // 点击外部关闭（落在“文件”按钮上时不关闭：按钮自己会切换）
+    if (ui.mouse_pressed and !util.inRect(ui.mouse_x, ui.mouse_y, menu_x, menu_y, menu_w, menu_h)) {
+        const on_button = util.inRect(ui.mouse_x, ui.mouse_y, menu_x, 7, menu_w, 26);
+        if (!on_button) app.file_menu_open = false;
+    }
+
+    if (activated) |ai| {
+        app.file_menu_open = false;
+        app.pending_file_action = switch (ai) {
+            0 => .open,
+            1 => .save,
+            2 => .save_as,
+            else => null,
+        };
+    }
+}
+
+/// 保存工程。
+/// - `force_dialog` = true（另存为）：总是弹对话框选路径；
+/// - 否则：有 `project_path` 直接存；无路径（新工程首次保存）→ 弹对话框；
+/// - 用户在对话框中取消 → 不保存（不是错误）。
+/// 成功后清除脏标记并刷新标题。
+fn saveProject(app: *App, win: *window.Window, io: std.Io, force_dialog: bool) void {
+    // 决定目标路径
+    var chosen: ?[]u8 = null;
+    defer if (chosen) |p| app.allocator.free(p);
+
+    const path: []const u8 = blk: {
+        if (!force_dialog) {
+            if (app.project_path) |p| break :blk p;
+        }
+        // 需要对话框（首次保存 / 另存为 / 无对话框平台回退到默认名）
+        const default_name = if (force_dialog)
+            (if (app.project_path) |p| std.fs.path.basename(p) else persist.default_file_name)
+        else
+            persist.default_file_name;
+        const picked = filedialog.save(app.allocator, win.hwnd, "保存工程", default_name, filedialog.project_filter) catch |e| {
+            app.setToastWith("保存失败：对话框出错（{s}）", .{@errorName(e)});
+            return;
+        };
+        if (picked) |p| {
+            chosen = p;
+            break :blk p;
+        }
+        // 取消（或平台不支持对话框）
+        if (filedialog.supported()) {
+            app.setToast("已取消保存");
+            return;
+        }
+        break :blk persist.default_file_name; // 无对话框平台的回退
+    };
+
+    // 导出 → 序列化 → 写文件 → 释放
+    const project = app.exportProject() catch |e| {
+        app.setToastWith("保存失败：导出失败（{s}）", .{@errorName(e)});
+        return;
+    };
+    defer app.freeProject(project);
+
+    const json = persist.toJson(app.allocator, project) catch |e| {
+        app.setToastWith("保存失败：序列化失败（{s}）", .{@errorName(e)});
+        return;
+    };
+    defer app.allocator.free(json);
+
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json }) catch |e| {
+        app.setToastWith("保存失败：写入失败（{s}）", .{@errorName(e)});
+        return;
+    };
+
+    // 记住路径（首次保存 / 另存为后）——**安全设置**：
+    // 普通保存时 path 正指向旧的 project_path，先 free 再读会 use-after-free
+    app.setProjectPath(path);
+    app.dirty = false;
+    app.setToastWith("已保存：{s}", .{path});
+}
+
+/// 弹对话框选文件并加载（替换当前工程）。取消/失败不影响当前工程。
+/// 弹对话框选文件并加载（替换当前工程）。
+/// **脏检查**：当前工程有未保存修改时，先弹自绘确认框（保存/不保存/取消），
+/// 用户确认后才真正替换（避免无提示丢修改——实测漏洞）。
+fn openProjectWithDialog(app: *App, win: *window.Window, io: std.Io) void {
+    const picked = filedialog.open(app.allocator, win.hwnd, "打开工程", filedialog.project_filter) catch |e| {
+        app.setToastWith("打开失败：对话框出错（{s}）", .{@errorName(e)});
+        return;
+    };
+    const path = picked orelse {
+        if (filedialog.supported()) app.setToast("已取消打开");
+        return;
+    };
+    defer app.allocator.free(path);
+
+    // 脏 → 先确认（确认框文案与退出场景共用）
+    if (app.dirty) {
+        app.setPendingOpen(path);
+        app.dirty_flow = .confirming;
+        app.dirty_intent = .open;
+        app.modal = .dirty_confirm;
+        app.modal_choice = null;
+        return;
+    }
+
+    loadProjectFromPath(app, io, path);
+}
+
+/// 从指定路径加载并替换当前工程（失败时保留当前工程不变）
+fn loadProjectFromPath(app: *App, io: std.Io, path: []const u8) void {
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, app.allocator, .unlimited) catch |e| {
+        app.setToastWith("打开失败：读取失败（{s}）", .{@errorName(e)});
+        return;
+    };
+    defer app.allocator.free(data);
+
+    const parsed = persist.fromJson(app.allocator, data) catch |e| {
+        app.setToastWith("打开失败：解析失败（{s}）", .{@errorName(e)});
+        return;
+    };
+    defer parsed.deinit();
+
+    app.importProject(parsed.value);
+
+    app.setProjectPath(path);
+    app.dirty = false;
+    app.setToastWith("已打开：{s}", .{path});
+}
+
+// ── 模态确认框（自绘）──
+
+/// 绘制退出确认框并处理鼠标点击（在 `endFrame` 前调用）。
+/// 用户选择写入 `app.modal_choice`，由主循环的退出流程消费。
+/// 不用系统 MessageBox：系统弹窗会把鼠标吸到默认按钮上（实测体验差，
+/// 且受系统设置 `SnapToDefaultButton` 影响）。
+fn drawModal(ui: *Ui, app: *App) void {
+    const kind = app.modal orelse return;
+    switch (kind) {
+        .dirty_confirm => {},
+    }
+
+    const w = @as(i32, @intCast(ui.renderer.fb.width));
+    const h = @as(i32, @intCast(ui.renderer.fb.height));
+
+    // 半透明遮罩（提亮对比）
+    ui.renderer.fillRect(0, 0, w, h, (@as(u32, 110) << 24) | 0x000000);
+
+    // 文案随场景变化（退出 vs 打开其他工程）
+    const line2 = if (app.dirty_intent == .open) "是否保存后再打开其他工程？" else "是否保存后再退出？";
+    const line1 = "当前工程有未保存的修改。";
+    const tw1: i32 = @intFromFloat(ui.font.measure(line1));
+    const tw2: i32 = @intFromFloat(ui.font.measure(line2));
+    const text_w = @max(tw1, tw2);
+    const btn_w: i32 = 84;
+    const btn_h: i32 = 26;
+    const gap: i32 = 10;
+    const dlg_w = @max(text_w + 48, btn_w * 3 + gap * 2 + 32);
+    const dlg_h: i32 = 110;
+    const dx = @divTrunc(w - dlg_w, 2);
+    const dy = @divTrunc(h - dlg_h, 2);
+
+    // 对话框背景 + 边框
+    ui.renderer.fillRect(dx + 4, dy + 4, dlg_w, dlg_h, r_mod.rgb(12, 13, 16)); // 阴影
+    ui.renderer.fillRect(dx, dy, dlg_w, dlg_h, ui.theme.panel);
+    ui.renderer.strokeRect(dx, dy, dlg_w, dlg_h, ui.theme.accent);
+
+    // 文字（两行）
+    ui.label(line1, dx + @divTrunc(dlg_w - tw1, 2), dy + 18, ui.theme.text);
+    ui.label(line2, dx + @divTrunc(dlg_w - tw2, 2), dy + 40, ui.theme.text_dim);
+
+    // 按钮：保存 / 不保存 / 取消
+    const labels = [_][]const u8{ "保存", "不保存", "取消" };
+    const choices = [_]QuitChoice{ .save, .discard, .cancel };
+    const total_w = btn_w * 3 + gap * 2;
+    const bx0 = dx + @divTrunc(dlg_w - total_w, 2);
+    const by = dy + dlg_h - btn_h - 16;
+
+    for (labels, 0..) |label, bi| {
+        const bx = bx0 + @as(i32, @intCast(bi)) * (btn_w + gap);
+        const hovered = util.inRect(ui.mouse_x, ui.mouse_y, bx, by, btn_w, btn_h);
+        const is_primary = (bi == 0); // “保存”为主按钮
+        const bg = if (hovered)
+            (if (is_primary) r_mod.rgb(70, 130, 200) else ui.theme.item_hover)
+        else if (is_primary)
+            ui.theme.accent
+        else
+            ui.theme.slider_track;
+        ui.renderer.fillRect(bx, by, btn_w, btn_h, bg);
+        ui.renderer.strokeRect(bx, by, btn_w, btn_h, ui.theme.panel_border);
+        const tw: i32 = @intFromFloat(ui.font.measure(label));
+        ui.label(label, bx + @divTrunc(btn_w - tw, 2), by + 4, ui.theme.text);
+
+        if (hovered and ui.mouse_pressed) app.modal_choice = choices[bi];
+    }
 }
 
 // ── 字体 ──
@@ -487,6 +871,7 @@ test {
     _ = @import("audio.zig");
     _ = @import("synth.zig");
     _ = @import("model.zig");
+    _ = @import("persist.zig");
     _ = @import("app.zig");
     _ = @import("view_util.zig");
     _ = @import("view_playlist.zig");

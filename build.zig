@@ -30,9 +30,9 @@ pub fn build(b: *std.Build) void {
         .flags = &.{"-std=c99"},
     });
 
-    // Windows 系统库（窗口 + GDI 软件渲染 + miniaudio 的 WASAPI 后端）
+    // Windows 系统库（窗口 + GDI 软件渲染 + 文件对话框 + miniaudio 的 WASAPI 后端）
     if (target.result.os.tag == .windows) {
-        for ([_][]const u8{ "user32", "gdi32", "kernel32", "ole32", "uuid", "winmm" }) |lib| {
+        for ([_][]const u8{ "user32", "gdi32", "kernel32", "ole32", "uuid", "winmm", "comdlg32" }) |lib| {
             exe.root_module.linkSystemLibrary(lib, .{});
         }
     }

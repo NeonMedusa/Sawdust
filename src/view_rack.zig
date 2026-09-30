@@ -214,14 +214,17 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, x: i32, y: i32, w: i32, clip_top: i32
     const mute_hovered = util.hitUI(ui, cx, cy, util.rack_mute_w, util.rack_mute_w);
     ui.renderer.fillRect(cx, cy, util.rack_mute_w, util.rack_mute_w, if (inst.muted) ui.theme.mute_on else ui.theme.slider_track);
     ui.renderer.strokeRect(cx, cy, util.rack_mute_w, util.rack_mute_w, ui.theme.panel_border);
-    if (mute_hovered and ui.mouse_pressed) inst.muted = !inst.muted;
+    if (mute_hovered and ui.mouse_pressed) {
+        inst.muted = !inst.muted;
+        app.dirty = true;
+    }
     cx += util.rack_mute_w + 8;
 
     // 声像旋钮 / 音量旋钮
     const ky = y + @divTrunc(util.rack_row_h - util.rack_knob_size, 2);
-    _ = ui.knob(4000 + @as(u64, idx) * 2, &inst.pan, cx, ky, util.rack_knob_size);
+    if (ui.knob(4000 + @as(u64, idx) * 2, &inst.pan, cx, ky, util.rack_knob_size)) app.dirty = true;
     cx += util.rack_knob_size + 6;
-    _ = ui.knob(4000 + @as(u64, idx) * 2 + 1, &inst.volume, cx, ky, util.rack_knob_size);
+    if (ui.knob(4000 + @as(u64, idx) * 2 + 1, &inst.volume, cx, ky, util.rack_knob_size)) app.dirty = true;
     cx += util.rack_knob_size + 10;
 
     // 混音通道

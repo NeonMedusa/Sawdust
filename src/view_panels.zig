@@ -86,9 +86,12 @@ pub fn drawStatusBar(ui: *Ui, app: *App, w: i32, h: i32) void {
     }) catch "";
     ui.label(left, 8, y + 4, ui.theme.text_dim);
 
-    if (app.piano.pattern != null) {
+    // 保存/加载提示优先；无提示时显示操作说明
+    if (app.toast) |t| {
+        ui.label(t, w - 620, y + 4, ui.theme.accent);
+    } else if (app.piano.pattern != null) {
         ui.label("左键放置/拖动音符 · 边缘拉伸 · 右键擦除 · Ctrl+滚轮 横向缩放", w - 620, y + 4, ui.theme.text_dim);
     } else {
-        ui.label("点击放置/拖动片段 · 边缘拉伸 · 右键擦除 · 双击进入钢琴卷帘 · Ctrl+滚轮 横向缩放", w - 620, y + 4, ui.theme.text_dim);
+        ui.label("点击放置/拖动片段 · 边缘拉伸 · 右键擦除 · 双击进入钢琴卷帘 · Ctrl+S 保存 / Ctrl+O 打开", w - 620, y + 4, ui.theme.text_dim);
     }
 }

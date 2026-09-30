@@ -2,5 +2,7 @@ zig-out/
 .zig-cache/
 zig-pkg/
 tmp/
+.firecrawl/
+*.saw
 *.pdb
 nul

@@ -110,7 +110,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         for (0..synth.osc_count) |oi| {
             const col: i32 = @intCast(oi % 2);
             const row: i32 = @intCast(oi / 2);
-            drawOscCell(ui, p, oi, x + 10 + col * (col_w + 10), ry + row * cell_h, col_w);
+            drawOscCell(ui, app, p, oi, x + 10 + col * (col_w + 10), ry + row * cell_h, col_w);
         }
         ry += cell_h * 2;
     }
@@ -131,6 +131,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
             var v = knobs[ki].load(.monotonic);
             if (ui.knob(5100 + @as(u64, ki), &v, kx + @divTrunc(kw - knob_size, 2), ky, knob_size)) {
                 knobs[ki].store(v, .monotonic);
+                app.dirty = true;
             }
             ui.label(lb, kx + @divTrunc(kw, 2) - 4, ky + knob_size + 2, ui.theme.text_dim);
         }
@@ -157,13 +158,17 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
             ui.renderer.fillRect(fx, ry, btn_w, btn_h, if (on) ui.theme.accent else if (hovered) ui.theme.item_hover else ui.theme.slider_track);
             ui.renderer.strokeRect(fx, ry, btn_w, btn_h, ui.theme.panel_border);
             ui.labelClipped(nm, fx + 8, ry + 3, btn_w - 12, ui.theme.text);
-            if (hovered and ui.mouse_pressed) filters[fi].enabled.store(!on, .monotonic);
+            if (hovered and ui.mouse_pressed) {
+                filters[fi].enabled.store(!on, .monotonic);
+                app.dirty = true;
+            }
 
             // 截止频率旋钮
             const kx = fx + btn_w + 16;
             var cv = filters[fi].cutoff.load(.monotonic);
             if (ui.knob(5200 + @as(u64, fi), &cv, kx, ry - 6, knob_size)) {
                 filters[fi].cutoff.store(cv, .monotonic);
+                app.dirty = true;
             }
             var hz_buf: [16]u8 = undefined;
             const hz = synth.cutoffHz(cv);
@@ -179,7 +184,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
 }
 
 /// 振荡器单元（2×2 网格的一格）：开关 / 波形按钮 / 音量旋钮
-fn drawOscCell(ui: *Ui, p: *synth.SynthParams, oi: usize, x: i32, y: i32, w: i32) void {
+fn drawOscCell(ui: *Ui, app: *App, p: *synth.SynthParams, oi: usize, x: i32, y: i32, w: i32) void {
     _ = w;
     const op = &p.osc[oi];
     const on = op.enabled.load(.monotonic);
@@ -191,7 +196,10 @@ fn drawOscCell(ui: *Ui, p: *synth.SynthParams, oi: usize, x: i32, y: i32, w: i32
     const sw_hovered = util.hitUI(ui, x, sw_y, sw_sz, sw_sz);
     ui.renderer.fillRect(x, sw_y, sw_sz, sw_sz, if (on) ui.theme.accent else if (sw_hovered) ui.theme.item_hover else ui.theme.slider_track);
     ui.renderer.strokeRect(x, sw_y, sw_sz, sw_sz, ui.theme.panel_border);
-    if (sw_hovered and ui.mouse_pressed) op.enabled.store(!on, .monotonic);
+    if (sw_hovered and ui.mouse_pressed) {
+        op.enabled.store(!on, .monotonic);
+        app.dirty = true;
+    }
 
     // 序号
     var nb: [8]u8 = undefined;
@@ -210,6 +218,7 @@ fn drawOscCell(ui: *Ui, p: *synth.SynthParams, oi: usize, x: i32, y: i32, w: i32
     ui.labelClipped(wf.name(), btn_x + 8, btn_y + 3, btn_w - 12, ui.theme.text);
     if (btn_hovered and ui.mouse_pressed) {
         op.waveform.store(@intFromEnum(wf.next()), .monotonic);
+        app.dirty = true;
     }
 
     // 音量旋钮
@@ -217,5 +226,6 @@ fn drawOscCell(ui: *Ui, p: *synth.SynthParams, oi: usize, x: i32, y: i32, w: i32
     const kx = btn_x + btn_w + 12;
     if (ui.knob(5300 + @as(u64, oi), &v, kx, cy - @divTrunc(knob_size, 2), knob_size)) {
         op.volume.store(v, .monotonic);
+        app.dirty = true;
     }
 }

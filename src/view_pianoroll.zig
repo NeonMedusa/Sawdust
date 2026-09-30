@@ -449,6 +449,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         } else if (note_hit) |hit| {
             _ = app.notes.orderedRemove(hit.index);
             app.piano.drag_note = null;
+            app.dirty = true;
         }
     }
 
@@ -493,12 +494,18 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                     .right => {
                         // 右缘：改长度（最小 1 步）
                         const new_len = @max(1, step_i - n.step + 1);
-                        if (!model.noteOverlaps(app.notes.items, ni, pattern, n.instrument, n.step, new_len, n.pitch)) n.len = new_len;
+                        if (!model.noteOverlaps(app.notes.items, ni, pattern, n.instrument, n.step, new_len, n.pitch)) {
+                            n.len = new_len;
+                            app.dirty = true;
+                        }
                     },
                     .left => {
                         // 左缘：改起点+长度（右端固定；不能撞出局部第 1 步）
                         if (model.noteTrimLeft(n.*, step_i, app.piano.drag_note_right)) |nn| {
-                            if (!model.noteOverlaps(app.notes.items, ni, pattern, nn.instrument, nn.step, nn.len, nn.pitch)) n.* = nn;
+                            if (!model.noteOverlaps(app.notes.items, ni, pattern, nn.instrument, nn.step, nn.len, nn.pitch)) {
+                                n.* = nn;
+                                app.dirty = true;
+                            }
                         }
                     },
                     .body => {
@@ -511,6 +518,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                             const pitch_changed = new_pitch != n.pitch;
                             n.step = new_step;
                             n.pitch = new_pitch;
+                            app.dirty = true;
                             // 拖动换音高 → 重触发试听（滑奏；行高亮/琴键高亮跟随）
                             if (pitch_changed) {
                                 if (app.piano.held_pitch) |hp| app.auditionOff(hp);

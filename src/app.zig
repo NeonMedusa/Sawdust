@@ -9,6 +9,7 @@ const audio = @import("audio.zig");
 const model = @import("model.zig");
 const synth = @import("synth.zig");
 const sequencer = @import("sequencer.zig");
+const persist = @import("persist.zig");
 
 pub const Clip = model.Clip;
 pub const Note = model.Note;
@@ -30,6 +31,34 @@ pub const Layout = struct {
         self.initialized = true;
     }
 };
+
+/// 文件菜单动作（帧末统一执行）
+pub const FileAction = enum { open, save, save_as };
+
+/// 脏确认流程的**目标动作**（确认框按钮相同，但“保存后”要执行不同的事）
+pub const PendingIntent = enum {
+    /// 保存后退出程序
+    quit,
+    /// 保存后打开另一个工程（用户已在系统对话框里选了文件）
+    open,
+};
+
+/// 脏确认流程状态（拦截动作 → 自绘模态确认 → 执行）
+/// 共用场景：退出程序 / 打开其他工程（都会丢失未保存修改）
+pub const DirtyFlow = enum {
+    /// 无流程
+    none,
+    /// 正在显示确认框
+    confirming,
+    /// 用户选了“保存后再继续”（等保存完成）
+    save_then,
+};
+
+/// 模态对话框种类（自绘；避开系统 MessageBox 的“鼠标跳默认按钮”）
+pub const ModalKind = enum { dirty_confirm };
+
+/// 脏确认框的用户选择
+pub const QuitChoice = enum { save, discard, cancel };
 
 /// 选择状态（三个视图共享的“当前编辑对象”）
 pub const Selection = struct {
@@ -212,6 +241,40 @@ pub const App = struct {
     /// 序列器调度状态（已调度到哪一步 + generation）
     scheduler: sequencer.Scheduler = .{},
 
+    // ── 保存 / 加载（工程文件）──
+    /// 当前工程路径（null = 尚未保存过）
+    project_path: ?[]u8 = null,
+    /// 脏标记（有未保存修改）——任何编辑操作置 true；保存/加载后置 false
+    dirty: bool = false,
+    /// 已应用到窗口标题的状态（脏标记 + 工程名；避免每帧刷 Win32）
+    title_applied_dirty: bool = false,
+    /// 已应用到窗口标题的工程名快照（null = 无）
+    title_applied_name: ?[]u8 = null,
+    /// 状态栏提示（短暂显示保存/加载结果；null = 无）
+    toast: ?[]u8 = null,
+    /// toast 剩余帧数（main 每帧递减；到 0 清除）——约 60fps，180 帧 ≈ 3 秒
+    toast_frames: i32 = 0,
+    /// “文件”菜单展开中
+    file_menu_open: bool = false,
+    /// 待定的文件操作（帧末执行——对话框不能在事件迭代/绘制中弹出）。
+    /// null = 无
+    pending_file_action: ?FileAction = null,
+    /// “文件”按钮位置（绘制时由工具栏写入；主循环用于菜单定位）
+    file_menu_x: i32 = 8,
+    file_menu_w: i32 = 140,
+
+    // ── 模态对话框与脏确认流程 ──
+    /// 当前模态框（null = 无）
+    modal: ?ModalKind = null,
+    /// 模态框的用户选择（鼠标点击 / 键盘 Enter/Esc 均写入这里）
+    modal_choice: ?QuitChoice = null,
+    /// 脏确认流程状态（拦截动作 → 确认 → 执行）
+    dirty_flow: DirtyFlow = .none,
+    /// 脏确认流程的目标动作（quit / open）
+    dirty_intent: ?PendingIntent = null,
+    /// 待打开的工程路径（用户已在系统对话框选好；等确认框决定后执行）
+    pending_open_path: ?[]u8 = null,
+
     // ── 音频 ──
     params: audio.Params = .{},
     engine: audio.Engine = .{ .params = undefined },
@@ -294,11 +357,13 @@ pub const App = struct {
     /// 放置一个样式片段（分配失败时静默忽略）
     pub fn addClip(self: *App, c: Clip) void {
         self.clips.append(self.allocator, c) catch {};
+        self.dirty = true;
     }
 
     /// 添加一个音符（分配失败时静默忽略）
     pub fn addNote(self: *App, n: Note) void {
         self.notes.append(self.allocator, n) catch {};
+        self.dirty = true;
     }
 
     /// 添加乐器（自动分配名字与合成器参数）；返回新槽位序号（失败 -1）
@@ -328,12 +393,14 @@ pub const App = struct {
             self.allocator.destroy(sp);
             return -1;
         };
+        self.dirty = true;
         return @intCast(self.instruments.items.len - 1);
     }
 
     /// 删除乐器槽位（同时删除其音符；合成器参数延迟释放；其余音符的槽位序号前移）
     pub fn removeInstrument(self: *App, idx: usize) void {
         if (idx >= self.instruments.items.len) return;
+        self.dirty = true;
         const inst = self.instruments.items[idx];
         self.allocator.free(inst.name); // 名字只被 UI 线程使用，可立即释放
         // 合成器参数：音频线程可能仍持有该指针（异步读取）→ 移入退役列表，进程退出时释放。
@@ -358,6 +425,31 @@ pub const App = struct {
         }
     }
 
+    /// 清除待打开工程的路径（取消流程时）
+    pub fn clearPendingOpen(self: *App) void {
+        if (self.pending_open_path) |p| self.allocator.free(p);
+        self.pending_open_path = null;
+    }
+
+    /// 设置待打开工程的路径（复制所有权）
+    pub fn setPendingOpen(self: *App, path: []const u8) void {
+        self.clearPendingOpen();
+        self.pending_open_path = self.allocator.dupe(u8, path) catch null;
+    }
+
+    /// 释放全部乐器（名字 + 合成器参数，含退役的）+ 保存相关字段——进程退出时调用
+    pub fn deinitAll(self: *App) void {
+        if (self.project_path) |p| self.allocator.free(p);
+        if (self.toast) |t| self.allocator.free(t);
+        if (self.title_applied_name) |n| self.allocator.free(n);
+        if (self.pending_open_path) |p| self.allocator.free(p);
+        self.project_path = null;
+        self.toast = null;
+        self.title_applied_name = null;
+        self.pending_open_path = null;
+        self.deinitInstruments();
+    }
+
     /// 释放全部乐器（名字 + 合成器参数，含退役的）——进程退出时调用
     pub fn deinitInstruments(self: *App) void {
         for (self.instruments.items) |inst| {
@@ -373,6 +465,157 @@ pub const App = struct {
     pub fn selectedSynth(self: *App) ?*synth.SynthParams {
         if (self.sel.instrument < 0 or self.sel.instrument >= @as(i32, @intCast(self.instruments.items.len))) return null;
         return self.instruments.items[@intCast(self.sel.instrument)].synth;
+    }
+
+    /// 标记脏（任何编辑操作调用）
+    pub fn markDirty(self: *App) void {
+        self.dirty = true;
+    }
+
+    /// 设置当前工程路径（**安全**：不依赖 path 与旧值的别名关系）。
+    /// 复制到临时缓冲后才释放旧值——即使 path 就是旧 project_path
+    /// （普通保存的场景）也不会读已释放内存（实测 use-after-free：
+    /// 路径变垃圾 → InvalidUtf8 / BadPathName）。
+    pub fn setProjectPath(self: *App, path: []const u8) void {
+        var buf: [1024]u8 = undefined;
+        const len = @min(path.len, buf.len);
+        @memcpy(buf[0..len], path[0..len]); // 先复制出别名区
+        if (self.project_path) |old| self.allocator.free(old);
+        self.project_path = self.allocator.dupe(u8, buf[0..len]) catch null;
+    }
+
+    /// 当前工程名（无路径或异常时 = null）
+    pub fn projectName(self: *const App) ?[]const u8 {
+        const p = self.project_path orelse return null;
+        if (p.len == 0 or std.mem.indexOfScalar(u8, p, 0) != null) return null; // 防御：非法路径
+        if (!std.unicode.utf8ValidateSlice(p)) return null; // 防御：非法 UTF-8
+        const base = std.fs.path.basename(p);
+        if (base.len == 0) return null;
+        return base;
+    }
+
+    /// 设置状态栏提示（覆盖旧的；默认显示约 3 秒）
+    pub fn setToast(self: *App, text: []const u8) void {
+        if (self.toast) |old| self.allocator.free(old);
+        self.toast = self.allocator.dupe(u8, text) catch null;
+        self.toast_frames = 180;
+    }
+
+    /// 格式化版提示（如含文件名/错误名）
+    pub fn setToastWith(self: *App, comptime fmt: []const u8, args: anytype) void {
+        var buf: [256]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, fmt, args) catch {
+            self.setToast("（提示文本过长）");
+            return;
+        };
+        self.setToast(text);
+    }
+
+    /// 取消提示（过期或手动）
+    pub fn clearToast(self: *App) void {
+        if (self.toast) |old| self.allocator.free(old);
+        self.toast = null;
+        self.toast_frames = 0;
+    }
+
+    /// 每帧递减 toast 计时（main 调用）
+    pub fn tickToast(self: *App) void {
+        if (self.toast_frames > 0) {
+            self.toast_frames -= 1;
+            if (self.toast_frames == 0) self.clearToast();
+        }
+    }
+
+    /// 导出当前工程为存档（不涉及 IO；纯数据转换）
+    pub fn exportProject(self: *App) !persist.Project {
+        const alloc = self.allocator;
+        const clips = try alloc.alloc(persist.SavedClip, self.clips.items.len);
+        errdefer alloc.free(clips);
+        for (self.clips.items, 0..) |c, i| {
+            clips[i] = .{ .track = c.track, .bar = c.bar, .len = c.len, .pattern = c.pattern, .offset = c.offset };
+        }
+        const notes = try alloc.alloc(persist.SavedNote, self.notes.items.len);
+        errdefer alloc.free(notes);
+        for (self.notes.items, 0..) |n, i| {
+            notes[i] = .{ .step = n.step, .len = n.len, .pitch = n.pitch, .pattern = n.pattern, .instrument = n.instrument };
+        }
+        const insts = try alloc.alloc(persist.SavedInstrument, self.instruments.items.len);
+        errdefer alloc.free(insts);
+        for (self.instruments.items, 0..) |inst, i| {
+            const name_copy = try alloc.dupe(u8, inst.name);
+            insts[i] = .{
+                .name = name_copy,
+                .volume = inst.volume,
+                .pan = inst.pan,
+                .muted = inst.muted,
+                .mixer = inst.mixer,
+                .synth = persist.exportSynth(inst.synth),
+            };
+        }
+        return .{
+            .bpm = self.bpm,
+            .time_num = self.time_num,
+            .time_den = self.time_den,
+            .steps_per_bar = self.steps_per_bar,
+            .clips = clips,
+            .notes = notes,
+            .instruments = insts,
+        };
+    }
+
+    /// 释放 `exportProject` 返回的存档（含内部字符串）
+    pub fn freeProject(self: *App, p: persist.Project) void {
+        for (p.instruments) |inst| self.allocator.free(inst.name);
+        self.allocator.free(p.clips);
+        self.allocator.free(p.notes);
+        self.allocator.free(p.instruments);
+    }
+
+    /// 用存档替换当前工程内容（先清空旧数据）
+    pub fn importProject(self: *App, p: persist.Project) void {
+        // 停止播放（避免调度器引用已被清空的数据）
+        self.stopPlayback();
+
+        // 清空旧数据
+        self.clips.clearRetainingCapacity();
+        self.notes.clearRetainingCapacity();
+        // 乐器：逐个删除（复用删除逻辑，原子字段/退役列表正确处理）
+        while (self.instruments.items.len > 0) {
+            self.removeInstrument(self.instruments.items.len - 1);
+        }
+
+        // 恢复
+        for (p.clips) |c| {
+            self.addClip(.{ .track = c.track, .bar = c.bar, .len = c.len, .pattern = c.pattern, .offset = c.offset });
+        }
+        for (p.notes) |n| {
+            self.addNote(.{ .step = n.step, .len = n.len, .pitch = n.pitch, .pattern = n.pattern, .instrument = n.instrument });
+        }
+        for (p.instruments) |inst| {
+            const idx = self.addInstrument(inst.name);
+            if (idx < 0) continue;
+            const target = &self.instruments.items[@intCast(idx)];
+            target.volume = inst.volume;
+            target.pan = inst.pan;
+            target.muted = inst.muted;
+            target.mixer = inst.mixer;
+            persist.importSynth(&inst.synth, target.synth);
+        }
+
+        // 全局设置
+        self.bpm = p.bpm;
+        self.time_num = p.time_num;
+        self.time_den = p.time_den;
+        self.steps_per_bar = p.steps_per_bar;
+
+        // 选择/clamp 回有效范围
+        self.sel.pattern = 0;
+        self.sel.track = 0;
+        self.sel.instrument = if (self.instruments.items.len > 0) 0 else -1;
+        self.playback.song_step = 0;
+        self.playback.piano_step = 0;
+        self.playback.start_step = 0;
+        self.piano.pattern = null;
     }
 
     /// 停止播放（停声 + 作废调度事件）
@@ -451,4 +694,48 @@ test "baseNameEquals: 识别基础名与 #N 后缀" {
     try std.testing.expect(baseNameEquals("减法合成器 #10", "减法合成器"));
     try std.testing.expect(!baseNameEquals("采样器", "减法合成器"));
     try std.testing.expect(!baseNameEquals("减法合成器X", "减法合成器"));
+}
+
+// ── 保存路径安全（回归：use-after-free）──
+
+test "app: setProjectPath 在 path 别名旧值时安全（修 InvalidUtf8/BadPathName）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.deinitAll();
+
+    // 首次设置
+    app.setProjectPath("C:\\proj\\first.saw");
+    try std.testing.expectEqualStrings("C:\\proj\\first.saw", app.project_path.?);
+    try std.testing.expectEqualStrings("first.saw", app.projectName().?);
+
+    // **关键场景**：path 就是当前 project_path 的切片（普通保存的路径：
+    // saveProject 里 path 指向 project_path 自身）。
+    // 旧实现「先 free 再 dupe」会读已释放内存 → 路径变垃圾。
+    const aliased: []const u8 = app.project_path.?;
+    app.setProjectPath(aliased);
+    try std.testing.expectEqualStrings("C:\\proj\\first.saw", app.project_path.?);
+    try std.testing.expectEqualStrings("first.saw", app.projectName().?);
+
+    // 另存为到新路径 → 工程名跟随（且不残留旧路径）
+    app.setProjectPath("D:\\other\\song2.saw");
+    try std.testing.expectEqualStrings("D:\\other\\song2.saw", app.project_path.?);
+    try std.testing.expectEqualStrings("song2.saw", app.projectName().?);
+
+    // 无路径 → 工程名为 null
+    std.testing.allocator.free(app.project_path.?);
+    app.project_path = null;
+    try std.testing.expect(app.projectName() == null);
+}
+
+test "app: projectName 对非法路径的防御（不崩溃）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.deinitAll();
+
+    // 非法 UTF-8 → null（而不是崩溃/乱码）
+    app.project_path = try std.testing.allocator.dupe(u8, &.{ 0xFF, 0xFE, 0x41 });
+    try std.testing.expect(app.projectName() == null);
+
+    // 空路径 → null
+    std.testing.allocator.free(app.project_path.?);
+    app.project_path = try std.testing.allocator.dupe(u8, "");
+    try std.testing.expect(app.projectName() == null);
 }

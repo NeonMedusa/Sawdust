@@ -26,7 +26,7 @@ pub const Event = union(enum) {
     mouse_double: struct { x: i32, y: i32 },
     /// 滚轮（delta > 0 = 向上/远离用户；ctrl = 按下 Ctrl，用于横向缩放）
     mouse_wheel: struct { x: i32, y: i32, delta: i32, ctrl: bool },
-    key_down: struct { code: u32, repeat: bool },
+    key_down: struct { code: u32, repeat: bool, ctrl: bool, shift: bool },
     key_up: struct { code: u32 },
     /// 已翻译的字符（含 IME 结果）
     char: u21,
@@ -195,6 +195,18 @@ const WindowsWindow = struct {
         self.fb.pixels = px[0 .. width * height];
         self.fb.width = width;
         self.fb.height = height;
+    }
+
+    /// 设置窗口标题（脏标记 `*` 用）
+    pub fn setTitle(self: *WindowsWindow, title: []const u8) void {
+        if (self.hwnd == null) return;
+        // UTF-8 → UTF-16（栈缓冲，标题不会太长）
+        var buf: [512]u16 = undefined;
+        const need = std.unicode.calcUtf16LeLen(title) catch return;
+        if (need >= buf.len) return;
+        _ = std.unicode.utf8ToUtf16Le(buf[0..need], title) catch return;
+        buf[need] = 0;
+        _ = SetWindowTextW(@ptrCast(self.hwnd), @ptrCast(&buf));
     }
 
     /// 切换系统光标（UI 每帧按需调用；仅在变化时真正切换，避免每帧刷 Win32）
@@ -426,7 +438,11 @@ const WindowsWindow = struct {
             WM_KEYDOWN, WM_SYSKEYDOWN => {
                 if (self) |s| {
                     const repeat = (lparam & (1 << 30)) != 0;
-                    s.pushEvent(.{ .key_down = .{ .code = @intCast(wparam), .repeat = repeat } });
+                    // Ctrl / Shift 状态（快捷键如 Ctrl+S / Ctrl+Shift+S）
+                    // 注：返回 i16，0x8000 需经 u16 位转换判断
+                    const ctrl = (@as(u16, @bitCast(GetKeyState(VK_CONTROL))) & 0x8000) != 0;
+                    const shift = (@as(u16, @bitCast(GetKeyState(VK_SHIFT))) & 0x8000) != 0;
+                    s.pushEvent(.{ .key_down = .{ .code = @intCast(wparam), .repeat = repeat, .ctrl = ctrl, .shift = shift } });
                 }
                 return 0;
             },
@@ -522,6 +538,8 @@ const IDC_SIZEALL: ?*anyopaque = @ptrFromInt(32646);
 /// 值越小缩放越细腻；2 兼顾“过滤硬件微抖”与“细粒度累积”。
 const mouse_deadzone: i32 = 2;
 const GCLP_HCURSOR: i32 = -12;
+const VK_CONTROL: i32 = 0x11;
+const VK_SHIFT: i32 = 0x10;
 const GWLP_USERDATA: i32 = -21;
 const PM_REMOVE: u32 = 0x0001;
 const WM_CLOSE: u32 = 0x0010;
@@ -567,7 +585,9 @@ extern "user32" fn SetCursor(?*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "user32" fn SetClassLongPtrW(*anyopaque, i32, isize) callconv(.winapi) isize;
 extern "user32" fn SetWindowLongPtrW(*anyopaque, i32, isize) callconv(.winapi) isize;
 extern "user32" fn GetWindowLongPtrW(*anyopaque, i32) callconv(.winapi) isize;
+extern "user32" fn SetWindowTextW(?*anyopaque, [*:0]const u16) callconv(.winapi) i32;
 extern "user32" fn ScreenToClient(*anyopaque, *POINT) callconv(.winapi) i32;
+extern "user32" fn GetKeyState(i32) callconv(.winapi) i16;
 extern "user32" fn ClientToScreen(?*anyopaque, *POINT) callconv(.winapi) i32;
 extern "user32" fn SetCursorPos(i32, i32) callconv(.winapi) i32;
 extern "user32" fn CreateCursor(?*anyopaque, i32, i32, i32, i32, *const anyopaque, *const anyopaque) ?*anyopaque;
@@ -616,6 +636,10 @@ const UnsupportedWindow = struct {
     pub fn setDragCapture(self: *UnsupportedWindow, on: bool) void {
         _ = self;
         _ = on;
+    }
+    pub fn setTitle(self: *UnsupportedWindow, title: []const u8) void {
+        _ = self;
+        _ = title;
     }
     pub fn pollEvents(self: *UnsupportedWindow) ![]const Event {
         _ = self;
