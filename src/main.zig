@@ -46,14 +46,15 @@ pub fn main(init: std.process.Init) !u8 {
     // 初始片段（演示）：前 12 轨铺一些样式，每 16 小节重复（只铺 2 轮——
     // 避免演示内容把时间轴行程撑得过长，行程应贴合最右内容）
     {
+        const B: i32 = model.units_per_whole; // 4/4 一小节 = 96 步
         var t: i32 = 0;
         while (t < 12) : (t += 1) {
             var rep: i32 = 0;
             while (rep < 2) : (rep += 1) {
                 app.addClip(.{
                     .track = t,
-                    .bar = 1 + @mod(t, 6) * 2 + rep * 16,
-                    .len = 2 + @mod(t, 3),
+                    .start = @mod(t, 6) * 2 * B + rep * 16 * B,
+                    .len = (2 + @mod(t, 3)) * B,
                     .pattern = @mod(t, 6),
                 });
             }
@@ -215,7 +216,7 @@ pub fn main(init: std.process.Init) !u8 {
                             app.params.start_step.store(from, .monotonic);
                             app.params.playing.store(true, .monotonic);
                             // 调度：作废旧事件 + 为跨起点长音符补发 on；重置调度窗口
-                            sequencer.reset(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, app.sel.song_mode, app.sel.pattern, from, app.steps_per_bar);
+                            sequencer.reset(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, app.sel.song_mode, app.sel.pattern, from);
                             app.params.sched_gen.store(app.scheduler.gen, .monotonic);
                         } else {
                             app.params.playing.store(false, .monotonic);
@@ -266,7 +267,7 @@ pub fn main(init: std.process.Init) !u8 {
             // 调度 lookahead：提前 4 小节（步单位随拍号/分辨率变化）
             const horizon = cur + app.steps_per_bar * 4;
             if (horizon > app.scheduler.scheduled_upto) {
-                sequencer.scheduleRange(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, app.sel.song_mode, app.sel.pattern, app.scheduler.scheduled_upto, horizon, app.steps_per_bar);
+                sequencer.scheduleRange(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, app.sel.song_mode, app.sel.pattern, app.scheduler.scheduled_upto, horizon);
             }
         }
         // 同步发声音高缓存（音频线程回传的位掩码 → 当前乐器的音高集合）
@@ -556,7 +557,7 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
             app.params.start_frame.store(app.playback.start_frame, .monotonic);
             app.params.start_step.store(from, .monotonic);
             app.params.playing.store(true, .monotonic);
-            sequencer.reset(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, app.sel.song_mode, app.sel.pattern, from, app.steps_per_bar);
+            sequencer.reset(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, app.sel.song_mode, app.sel.pattern, from);
             app.params.sched_gen.store(app.scheduler.gen, .monotonic);
         } else {
             app.params.playing.store(false, .monotonic);

@@ -9,9 +9,10 @@ const util = @import("view_util.zig");
 
 /// 片段在轨道内容区的绘制矩形（x / 宽；屏幕像素，含 zoom 换算）。
 /// **边缘与格子对齐**（不缩进）；起点/终点各自取整 → 并排片段严格相接、无 1px 缝。
-pub fn clipXW(c: model.Clip, lane_x: i32, bar_w: i32, scroll_x: i32, zoom: f32) struct { x: i32, w: i32 } {
-    const x0: f32 = @as(f32, @floatFromInt((c.bar - 1) * bar_w - scroll_x)) * zoom;
-    const x1: f32 = @as(f32, @floatFromInt((c.bar - 1 + c.len) * bar_w - scroll_x)) * zoom;
+/// `step_px`：一步的**内容像素宽**（浮点；U=96 下每步很小）。
+pub fn clipXW(c: model.Clip, lane_x: i32, step_px: f32, scroll_x: i32, zoom: f32) struct { x: i32, w: i32 } {
+    const x0: f32 = (@as(f32, @floatFromInt(c.start)) * step_px - @as(f32, @floatFromInt(scroll_x))) * zoom;
+    const x1: f32 = (@as(f32, @floatFromInt(c.start + c.len)) * step_px - @as(f32, @floatFromInt(scroll_x))) * zoom;
     const px0 = lane_x + @as(i32, @intFromFloat(@round(x0)));
     const px1 = lane_x + @as(i32, @intFromFloat(@round(x1)));
     return .{ .x = px0, .w = @max(1, px1 - px0) };
@@ -44,7 +45,6 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     };
     ui.panelTitled(x, y, w, h, title);
 
-    const bar_w: i32 = 80;
     const header_w: i32 = 90; // 轨道名列宽
     const ruler_h: i32 = 20; // 标尺行高 = 滚动条厚度（横条高 = 纵条宽）
     const list_y = y + util.title_h;
@@ -59,15 +59,20 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     const tracks_h = list_h - ruler_h * 2;
     const lane_x = main_x + header_w;
     const view_w = @max(1, main_w - header_w); // 轨道内容可视宽度
+    // 时间轴尺寸（与钢琴卷帘统一）：步 = U=96 单位；
+    // 每步内容像素宽固定（`piano_step_w`）→ 一小节的像素宽随拍号变化。
+    const spb: i32 = app.steps_per_bar;
+    const step_px: f32 = @floatFromInt(util.piano_step_w);
+    const bar_w: i32 = spb * util.piano_step_w; // 一小节的像素宽（未含 zoom）
 
     // ── 时间轴长度与缩放下限（**同一个值**，否则会出现“滑块有行程但拖不动”）──
     // 时间轴 = 内容右缘（保底 4 小节）+ 右侧 3 小节留白。
     // 缩放下限 = 视图恰好容纳整个时间轴 → 缩到底时滑块**满宽**（无假行程）。
-    var max_bar: i32 = 0;
+    var max_end: i32 = 0; // 最右片段的结束步
     for (app.clips.items) |c| {
-        max_bar = @max(max_bar, c.bar + c.len - 1);
+        max_end = @max(max_end, c.start + c.len);
     }
-    const bars_right = @max(4, max_bar);
+    const bars_right = @max(4, @divTrunc(max_end + spb - 1, spb)); // 向上取整到小节
     const timeline_w: i32 = (bars_right + 3) * bar_w;
     const min_content: i32 = @max(timeline_w, 1); // 滚动条时间轴下限
     const content_span: i32 = timeline_w; // 缩放拉回限制（同值）
@@ -90,11 +95,11 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         for (app.clips.items) |c| {
             if (nmini >= mini_buf.len) break;
             mini_buf[nmini] = .{
-                .pos = (c.bar - 1) * bar_w,
-                .len = c.len * bar_w,
+                // 步 → 内容像素（与时间轴同一尺度：step_px）
+                .pos = @as(i32, @intFromFloat(@as(f32, @floatFromInt(c.start)) * step_px)),
+                .len = @as(i32, @intFromFloat(@as(f32, @floatFromInt(c.len)) * step_px)),
                 .kind = .note,
-                // 纵向 = 轨道位置：**不反向**——播放列表是 track 0 在最上（与钢琴卷帘
-                // “高音在上”相反，那边才需要 1.0 - yOf）
+                // 纵向 = 轨道位置：**不反向**——播放列表是 track 0 在最上
                 .y = track_range.yOf(c.track),
                 .color = patternColor(c.pattern),
             };
@@ -172,25 +177,22 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 // 轨道内容区（背景 + 网格）
                 const lane_bg = if (i % 2 == 1) ui.theme.item_alt else ui.theme.panel;
                 ui.renderer.fillRect(lane_x, ty, view_w, track_h, lane_bg);
-                // 网格线（随横向滚动与缩放）：**小节线 / 拍线 / （无步线）** 三层
-                // 注：播放列表网格按小节步进（每小节一条），拍线按拍步进
-                var b: i32 = @divFloor(app.playlist.scroll_x, bar_w) + 1;
-                while (true) : (b += 1) {
-                    const gx = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(b)) * bar_ws - scroll_s));
-                    if (gx > lane_x + view_w) break;
-                    ui.renderer.fillRect(gx, ty, 2, track_h, ui.theme.panel_border); // 小节线（加粗 + 最亮）
-                    // 拍线（小节内，每拍一条）：这里小节宽固定 = bar_w 像素，
-                    // 拍位置按**比例**算（不能乘 piano_step_w——那是钢琴卷帘的尺度）
-                    const beat_steps = model.stepsPerBeat(app.time_den);
-                    const spb_f: f32 = @floatFromInt(app.steps_per_bar);
-                    var k: i32 = beat_steps;
-                    while (k < app.steps_per_bar) : (k += beat_steps) {
-                        const frac: f32 = @as(f32, @floatFromInt(k)) / spb_f; // 0-1（小节内）
-                        const gxb = lane_x + @as(i32, @intFromFloat((@as(f32, @floatFromInt(b)) * bar_ws) + frac * bar_ws * zoom - scroll_s));
-                        if (gxb > lane_x + view_w) break;
-                        ui.renderer.vline(gxb, ty, track_h, ui.theme.grid_beat);
-                    }
-                }
+                // 网格线（与钢琴卷帘共用 `util.drawTimelineGrid`：步线/拍线/小节线三层，
+                // U=96 对齐；`step_w` = 一小节宽/每小节步数）
+                util.drawTimelineGrid(
+                    &ui.renderer,
+                    &ui.theme,
+                    lane_x,
+                    view_w,
+                    ty,
+                    track_h,
+                    lane_x,
+                    app.playlist.scroll_x,
+                    zoom,
+                    @as(f32, @floatFromInt(bar_w)) / @as(f32, @floatFromInt(spb)), // 步宽（浮点：80/96≈0.833）
+                    spb,
+                    model.stepsPerBeat(app.time_den),
+                );
                 // 行分隔线：必须在片段**之前**绘制——
                 // 否则它（画在 ty+track_h-1）会盖住片段底边的亮色描边（只有上/左/右亮、下不亮）。
                 ui.renderer.hline(main_x, ty + track_h - 1, main_w, ui.theme.panel_border);
@@ -200,7 +202,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                     defer ui.renderer.popClip(saved_clips);
                     for (app.clips.items) |clip| {
                         if (clip.track != @as(i32, @intCast(i))) continue;
-                        const rect = clipXW(clip, lane_x, bar_w, app.playlist.scroll_x, zoom);
+                        const rect = clipXW(clip, lane_x, step_px, app.playlist.scroll_x, zoom);
                         const clip_x = rect.x;
                         const clip_w = rect.w;
                         if (clip_x + clip_w < lane_x or clip_x > lane_x + view_w) continue;
@@ -223,8 +225,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                             const pi: usize = @intCast(@min(clip.pattern, max_patterns - 1));
                             if (clip.pattern >= 0 and clip.pattern < max_patterns and pat_has_notes[pi]) {
                                 const range = model.rangeMap(pat_min_pitch[pi], pat_max_pitch[pi], 12);
-                                const win_lo = clip.offset * app.steps_per_bar;
-                                const win_steps = clip.len * app.steps_per_bar;
+                                const win_lo = clip.offset;
+                                const win_steps = clip.len;
                                 var drawn: usize = 0;
                                 for (app.notes.items) |n| {
                                     if (n.pattern != clip.pattern) continue;
@@ -270,7 +272,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         const saved_cursor = ui.renderer.pushClip(lane_x, ruler_y, view_w, ruler_h + tracks_h);
         defer ui.renderer.popClip(saved_cursor);
 
-        const bar_frac: f32 = @as(f32, @floatFromInt(app.playback.song_step)) / @as(f32, @floatFromInt(app.steps_per_bar));
+        const bar_frac: f32 = @as(f32, @floatFromInt(app.playback.song_step)) / @as(f32, @floatFromInt(spb));
         const cx = lane_x + @as(i32, @intFromFloat(bar_frac * bar_ws - scroll_s));
         util.drawCursor(ui, cx, ruler_y, ruler_h, tracks_y + tracks_h, app.playing);
 
@@ -284,8 +286,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 ui.active_id = 0;
             } else {
                 // 鼠标 → 全局步（吸附到步；范围 ≥ 0）
-                const content_px: i32 = app.playlist.scroll_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(ui.mouse_x - lane_x)) / zoom));
-                const step = @max(0, @divFloor(content_px * app.steps_per_bar, bar_w));
+                const content_px: f32 = @as(f32, @floatFromInt(app.playlist.scroll_x)) + @as(f32, @floatFromInt(ui.mouse_x - lane_x)) / zoom;
+                const step: i32 = @max(0, @as(i32, @intFromFloat(content_px / step_px)));
                 // 跳转（播放中会重置传输基准 + 作废旧调度事件）
                 app.jumpPlaybackCursor(step);
             }
@@ -296,9 +298,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 左键空位：放置样式；左键片段：拖动移动；片段右缘：拉伸长度；右键片段：删除
     const in_lane = ui.hitRect(lane_x, tracks_y, view_w, tracks_h);
     const track_i = @divFloor(ui.mouse_y - tracks_y + app.playlist.scroll, track_h);
-    // 鼠标 → 内容坐标（除以 zoom）→ 小节号
-    const mouse_cx: i32 = app.playlist.scroll_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(ui.mouse_x - lane_x)) / zoom));
-    const bar_i = @divFloor(mouse_cx, bar_w) + 1;
+    // 鼠标 → 内容坐标（除以 zoom）→ **全局步**（U=96）
+    const mouse_cx: f32 = @as(f32, @floatFromInt(app.playlist.scroll_x)) + @as(f32, @floatFromInt(ui.mouse_x - lane_x)) / zoom;
+    const step_i: i32 = @max(0, @as(i32, @intFromFloat(mouse_cx / step_px)));
     const track_count: i32 = @intCast(app.track_items.len);
     const valid_track = track_i >= 0 and track_i < track_count;
 
@@ -307,8 +309,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     if (in_lane and valid_track) {
         for (app.clips.items, 0..) |c, ci| {
             if (c.track != track_i) continue;
-            if (bar_i >= c.bar and bar_i < c.bar + c.len) {
-                const rect = clipXW(c, lane_x, bar_w, app.playlist.scroll_x, zoom);
+            if (step_i >= c.start and step_i < c.start + c.len) {
+                const rect = clipXW(c, lane_x, step_px, app.playlist.scroll_x, zoom);
                 const near_left = ui.mouse_x <= rect.x + 8;
                 const near_right = ui.mouse_x >= rect.x + rect.w - 8;
                 const mode: model.ClipHitMode = if (near_left and near_right)
@@ -376,13 +378,14 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 },
                 .body => {
                     app.playlist.drag_clip = hit.index;
-                    app.playlist.drag_grab = bar_i - c.bar;
+                    app.playlist.drag_grab = step_i - c.start;
                 },
             }
         } else {
-            const new_len: i32 = 4;
-            if (!model.clipOverlaps(app.clips.items, app.clips.items.len, track_i, bar_i, new_len)) {
-                app.addClip(.{ .track = track_i, .bar = bar_i, .len = new_len, .pattern = app.sel.pattern });
+            // 默认片段长度 = 1 小节（步单位随拍号变化）
+            const new_len: i32 = spb;
+            if (!model.clipOverlaps(app.clips.items, app.clips.items.len, track_i, step_i, new_len)) {
+                app.addClip(.{ .track = track_i, .start = step_i, .len = new_len, .pattern = app.sel.pattern });
             }
         }
     }
@@ -392,11 +395,11 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         if (app.playlist.drag_clip) |ci| {
             if (ci < app.clips.items.len) {
                 const c = &app.clips.items[ci];
-                const new_bar = @max(1, bar_i - app.playlist.drag_grab);
+                const new_start = @max(0, step_i - app.playlist.drag_grab);
                 const new_track = std.math.clamp(track_i, 0, track_count - 1);
-                if ((new_bar != c.bar or new_track != c.track) and !model.clipOverlaps(app.clips.items, ci, new_track, new_bar, c.len)) {
+                if ((new_start != c.start or new_track != c.track) and !model.clipOverlaps(app.clips.items, ci, new_track, new_start, c.len)) {
                     c.track = new_track;
-                    c.bar = new_bar;
+                    c.start = new_start;
                     app.dirty = true;
                 }
             }
@@ -405,21 +408,21 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             if (ci < app.clips.items.len) {
                 const c = &app.clips.items[ci];
                 if (app.playlist.resize_left) {
-                    // 左缘：折叠/展开（不能超过自身第 1 小节）
-                    if (model.clipTrimLeft(c.*, bar_i)) |nc| {
-                        if (!model.clipOverlaps(app.clips.items, ci, nc.track, nc.bar, nc.len)) {
+                    // 左缘：折叠/展开（不能超过自身第 1 步）
+                    if (model.clipTrimLeft(c.*, step_i)) |nc| {
+                        if (!model.clipOverlaps(app.clips.items, ci, nc.track, nc.start, nc.len)) {
                             c.* = nc;
                             app.dirty = true;
                         }
                     }
                 } else {
-                    // 右缘：加长/缩短（上限：同轨下一个片段之前）
-                    var max_len: i32 = 4096;
+                    // 右缘：加长/缩短（上限：同轨下一个片段之前）；最小 1 步
+                    var max_len: i32 = 1 << 20;
                     for (app.clips.items, 0..) |o, oi| {
-                        if (oi == ci or o.track != c.track or o.bar <= c.bar) continue;
-                        max_len = @min(max_len, o.bar - c.bar);
+                        if (oi == ci or o.track != c.track or o.start <= c.start) continue;
+                        max_len = @min(max_len, o.start - c.start);
                     }
-                    const new_len = std.math.clamp(bar_i - c.bar + 1, 1, @max(1, max_len));
+                    const new_len = std.math.clamp(step_i - c.start + 1, 1, @max(1, max_len));
                     if (new_len != c.len) {
                         c.len = new_len;
                         app.dirty = true;

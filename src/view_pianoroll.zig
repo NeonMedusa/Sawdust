@@ -200,43 +200,22 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         }
 
         // 步网格（竖线；每小节加强）。
-        // **必须裁剪到音符区**（lane_x 起）：外层裁剪含琴键列，而网格起点
-        // `(bar_i - 1)` 可能落在 scroll 左侧（bx < lane_x）→ 不裁就画到琴键上
-        // （实测：只在小节线模式下暴露，因为细网格模式用 st 不减 1）。
-        // **缩放很小时只画小节线**：细网格此时会变成“实心墙”（视觉无意义），
-        // 而且循环迭代量 = 视宽/步宽 会爆炸（step_ws=0.05px 时约 1.6 万次/帧）。
-        // 做法：直接按小节步进（每步 96 格），而非逐 step 遍历。
-        // 拍线数：靠分母算，不靠“÷4”。
-        {
-            const saved_grid = ui.renderer.pushClip(lane_x, lane_y, view_w, lane_h);
-            defer ui.renderer.popClip(saved_grid);
-            const draw_steps = step_ws >= 3.0;
-            if (draw_steps) {
-                var st: i32 = @divFloor(app.piano.scroll_x, util.piano_step_w) + 1;
-                while (true) : (st += 1) {
-                    const gx = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(st)) * step_ws - scroll_s));
-                    if (gx > lane_x + view_w) break;
-                    const is_bar = @mod(st, spb) == 0;
-                    // 拍线：按**分母**决定每拍步数（如 4/4 → 24 步/拍；3/4 → 24；6/8 → 12）
-                    const beat_steps = model.stepsPerBeat(app.time_den);
-                    const is_beat = @mod(st, beat_steps) == 0;
-                    if (is_bar) {
-                        // 小节线：**加粗**（2px）+ 最亮
-                        ui.renderer.fillRect(gx, lane_y, 2, lane_h, ui.theme.panel_border);
-                    } else {
-                        ui.renderer.vline(gx, lane_y, lane_h, if (is_beat) ui.theme.grid_beat else ui.theme.grid);
-                    }
-                }
-            } else {
-                // 只画小节线（按小节步进 → 迭代量 = 视宽/小节宽，有限）
-                var bar_i: i32 = @divFloor(app.piano.scroll_x, bar_w) + 1;
-                while (true) : (bar_i += 1) {
-                    const bx = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(bar_i - 1)) * bar_ws - scroll_s));
-                    if (bx > lane_x + view_w) break;
-                    ui.renderer.fillRect(bx, lane_y, 2, lane_h, ui.theme.panel_border); // 小节线加粗
-                }
-            }
-        }
+        // 时间轴网格（与播放列表共用 `util.drawTimelineGrid`；U=96 对齐）。
+        // 该函数内部自行裁剪到音符区（含细小缩放时只画小节线的降级）。
+        util.drawTimelineGrid(
+            &ui.renderer,
+            &ui.theme,
+            lane_x,
+            view_w,
+            lane_y,
+            lane_h,
+            lane_x,
+            app.piano.scroll_x,
+            zoom,
+            @floatFromInt(util.piano_step_w),
+            spb,
+            model.stepsPerBeat(app.time_den),
+        );
 
         // 试听/发声行高亮：**网格之上、音符之下**——否则行线/网格会“透”过高亮层，
         // 看起来像高亮在下层（实测观感：高亮时网格反而更明显）
@@ -306,7 +285,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         if (app.sel.song_mode) {
             // SONG：找当前样式最左片段 → 全局步换算为局部步；无片段/不在范围内不显示
             if (model.leftmostClipFor(app.clips.items, pattern)) |c| {
-                if (model.clipSongToLocal(c, app.playback.song_step, spb)) |local| {
+                if (model.clipSongToLocal(c, app.playback.song_step)) |local| {
                     util.drawCursor(ui, localStepX(local, lane_x, step_ws, scroll_s), ruler_y, ruler_h, lane_y + lane_h, app.playing);
                 }
                 // 设置：局部 → 全局（超出片段可见范围 → 归位到片段起点）
@@ -321,7 +300,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                         const content_px: i32 = app.piano.scroll_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(ui.mouse_x - lane_x)) / zoom));
                         const local = @max(0, @divFloor(content_px * spb, bar_w));
                         // 超出可见范围 → 归位到片段起点（局部 offset）；跳转（播放中重置传输）
-                        app.jumpPlaybackCursor(model.clipLocalToSong(c, local, spb) orelse (c.bar - 1) * spb);
+                        app.jumpPlaybackCursor(model.clipLocalToSong(c, local) orelse c.start);
                     }
                 }
             }

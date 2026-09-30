@@ -45,14 +45,14 @@ fn pushEv(evs: []synth.SchedEvent, n: *usize, ev: synth.SchedEvent) bool {
 /// SONG：需要片段上下文；PAT：局部步即全局步。
 const Mapped = struct { start: i32, end: i32 };
 
-fn mapSong(clip: model.Clip, nt: model.Note, spb: i32) ?Mapped {
+fn mapSong(clip: model.Clip, nt: model.Note) ?Mapped {
     if (nt.pitch < 0 or nt.pitch > 127) return null;
     if (nt.instrument < 0 or nt.instrument >= synth.max_instruments) return null;
     if (nt.len <= 0) return null;
-    const clip_start = (clip.bar - 1) * spb;
-    const win_steps = clip.len * spb;
-    const clip_end = clip_start + win_steps;
-    const local_lo = clip.offset * spb;
+    // 片段与音符同为 **U=96 步**坐标：无需再乘每小节步数
+    const clip_start = clip.start;
+    const clip_end = clip.start + clip.len;
+    const local_lo = clip.offset;
     const gs = clip_start + (nt.step - local_lo);
     const ge = gs + nt.len;
     if (ge <= clip_start or gs >= clip_end) return null; // 完全在片段窗口外
@@ -90,13 +90,12 @@ fn gatherRange(
     from: i32,
     to: i32,
     gen: u32,
-    spb: i32,
 ) void {
     if (song_mode) {
         for (clips) |clip| {
             for (notes) |nt| {
                 if (nt.pattern != clip.pattern) continue;
-                const m = mapSong(clip, nt, spb) orelse continue;
+                const m = mapSong(clip, nt) orelse continue;
                 if (m.start >= from and m.start < to) {
                     if (!pushEv(evs, n, makeEv(nt, .on, m.start, gen))) return;
                     max_step.* = @max(max_step.*, m.start);
@@ -134,13 +133,12 @@ fn gatherMidOns(
     pattern: i32,
     point: i32,
     gen: u32,
-    spb: i32,
 ) void {
     if (song_mode) {
         for (clips) |clip| {
             for (notes) |nt| {
                 if (nt.pattern != clip.pattern) continue;
-                const m = mapSong(clip, nt, spb) orelse continue;
+                const m = mapSong(clip, nt) orelse continue;
                 if (m.start < point and point < m.end) {
                     if (!pushEv(evs, n, makeEv(nt, .on, point, gen))) return;
                 }
@@ -167,14 +165,13 @@ pub fn reset(
     song_mode: bool,
     pattern: i32,
     from_step: i32,
-    spb: i32,
 ) void {
     sched.gen +%= 1;
     sched.scheduled_upto = from_step;
 
     var evs: [max_gather]synth.SchedEvent = undefined;
     var n: usize = 0;
-    gatherMidOns(&evs, &n, clips, notes, song_mode, pattern, from_step, sched.gen, spb);
+    gatherMidOns(&evs, &n, clips, notes, song_mode, pattern, from_step, sched.gen);
     std.mem.sort(synth.SchedEvent, evs[0..n], {}, evLess);
     for (evs[0..n]) |ev| queue.push(ev);
 }
@@ -190,14 +187,13 @@ pub fn scheduleRange(
     pattern: i32,
     from: i32,
     to: i32,
-    spb: i32,
 ) void {
     if (to <= from) return;
 
     var evs: [max_gather]synth.SchedEvent = undefined;
     var n: usize = 0;
     var max_step: i32 = from - 1;
-    gatherRange(&evs, &n, &max_step, clips, notes, song_mode, pattern, from, to, sched.gen, spb);
+    gatherRange(&evs, &n, &max_step, clips, notes, song_mode, pattern, from, to, sched.gen);
     std.mem.sort(synth.SchedEvent, evs[0..n], {}, evLess);
     for (evs[0..n]) |ev| queue.push(ev);
 
@@ -219,15 +215,15 @@ test "sequencer: SONG——同一样式的两个片段各播一次" {
     var q = synth.SchedQueue{};
     var s = Scheduler{};
     const clips = [_]model.Clip{
-        .{ .track = 0, .bar = 1, .len = 2, .pattern = 0 }, // 步 [0, 32)
-        .{ .track = 0, .bar = 3, .len = 2, .pattern = 0 }, // 步 [32, 64)
+        .{ .track = 0, .start = 0, .len = 32, .pattern = 0 }, // 步 [0, 32)
+        .{ .track = 0, .start = 32, .len = 32, .pattern = 0 }, // 步 [32, 64)
     };
     const notes = [_]model.Note{
         .{ .step = 0, .len = 4, .pitch = 60, .pattern = 0 },
     };
 
-    reset(&s, &q, &clips, &notes, true, 0, 0, 16);
-    scheduleRange(&s, &q, &clips, &notes, true, 0, 0, 64, 16);
+    reset(&s, &q, &clips, &notes, true, 0, 0);
+    scheduleRange(&s, &q, &clips, &notes, true, 0, 0, 64);
 
     var out: [16]synth.SchedEvent = undefined;
     const n = drainAll(&q, &out);
@@ -247,7 +243,7 @@ test "sequencer: SONG——折叠 offset 与窗口截断" {
     var s = Scheduler{};
     // 片段 [0,32)，可见局部 [16,48)：局部 16 → 全局 0
     const clips = [_]model.Clip{
-        .{ .track = 0, .bar = 1, .len = 2, .pattern = 0, .offset = 1 },
+        .{ .track = 0, .start = 0, .len = 32, .pattern = 0, .offset = 16 },
     };
     const notes = [_]model.Note{
         .{ .step = 16, .len = 4, .pitch = 60, .pattern = 0 }, // → 全局 [0,4)
@@ -255,8 +251,8 @@ test "sequencer: SONG——折叠 offset 与窗口截断" {
         .{ .step = 46, .len = 8, .pitch = 64, .pattern = 0 }, // → 全局 [30,38) 被截断到 [30,32)
     };
 
-    reset(&s, &q, &clips, &notes, true, 0, 0, 16);
-    scheduleRange(&s, &q, &clips, &notes, true, 0, 0, 64, 16);
+    reset(&s, &q, &clips, &notes, true, 0, 0);
+    scheduleRange(&s, &q, &clips, &notes, true, 0, 0, 64);
 
     var out: [16]synth.SchedEvent = undefined;
     const n = drainAll(&q, &out);
@@ -279,8 +275,8 @@ test "sequencer: PAT——局部步直接作为时间" {
         .{ .step = 5, .len = 3, .pitch = 67, .pattern = 3 }, // 不同样式 → 不发声
     };
 
-    reset(&s, &q, &clips, &notes, false, 2, 0, 16);
-    scheduleRange(&s, &q, &clips, &notes, false, 2, 0, 16, 16);
+    reset(&s, &q, &clips, &notes, false, 2, 0);
+    scheduleRange(&s, &q, &clips, &notes, false, 2, 0, 16);
 
     var out: [8]synth.SchedEvent = undefined;
     const n = drainAll(&q, &out);
@@ -298,9 +294,9 @@ test "sequencer: 窗口推进不重不漏" {
         .{ .step = 10, .len = 2, .pitch = 62, .pattern = 0 }, // on@10 off@12
     };
 
-    reset(&s, &q, &clips, &notes, false, 0, 0, 16);
-    scheduleRange(&s, &q, &clips, &notes, false, 0, 0, 8, 16); // 第一窗口
-    scheduleRange(&s, &q, &clips, &notes, false, 0, 8, 16, 16); // 第二窗口
+    reset(&s, &q, &clips, &notes, false, 0, 0);
+    scheduleRange(&s, &q, &clips, &notes, false, 0, 0, 8); // 第一窗口
+    scheduleRange(&s, &q, &clips, &notes, false, 0, 8, 16); // 第二窗口
 
     var out: [8]synth.SchedEvent = undefined;
     const n = drainAll(&q, &out);
@@ -319,8 +315,8 @@ test "sequencer: reset 为跨起点长音符补发 note-on" {
         .{ .step = 0, .len = 8, .pitch = 60, .pattern = 0 }, // 跨越点 2
     };
 
-    reset(&s, &q, &clips, &notes, false, 0, 2, 16);
-    scheduleRange(&s, &q, &clips, &notes, false, 0, 2, 16, 16);
+    reset(&s, &q, &clips, &notes, false, 0, 2);
+    scheduleRange(&s, &q, &clips, &notes, false, 0, 2, 16);
 
     var out: [8]synth.SchedEvent = undefined;
     const n = drainAll(&q, &out);
@@ -340,11 +336,11 @@ test "sequencer: gen 递增作废旧事件" {
         .{ .step = 0, .len = 4, .pitch = 60, .pattern = 0 },
     };
 
-    reset(&s, &q, &clips, &notes, false, 0, 0, 16);
+    reset(&s, &q, &clips, &notes, false, 0, 0);
     const gen1 = s.gen;
-    scheduleRange(&s, &q, &clips, &notes, false, 0, 0, 8, 16);
+    scheduleRange(&s, &q, &clips, &notes, false, 0, 0, 8);
 
-    reset(&s, &q, &clips, &notes, false, 0, 3, 16); // 跳转 → gen 递增
+    reset(&s, &q, &clips, &notes, false, 0, 3); // 跳转 → gen 递增
     try std.testing.expect(s.gen != gen1);
 
     var out: [8]synth.SchedEvent = undefined;

@@ -532,7 +532,7 @@ pub const App = struct {
         const clips = try alloc.alloc(persist.SavedClip, self.clips.items.len);
         errdefer alloc.free(clips);
         for (self.clips.items, 0..) |c, i| {
-            clips[i] = .{ .track = c.track, .bar = c.bar, .len = c.len, .pattern = c.pattern, .offset = c.offset };
+            clips[i] = .{ .track = c.track, .start = c.start, .len = c.len, .pattern = c.pattern, .offset = c.offset };
         }
         const notes = try alloc.alloc(persist.SavedNote, self.notes.items.len);
         errdefer alloc.free(notes);
@@ -586,7 +586,7 @@ pub const App = struct {
 
         // 恢复
         for (p.clips) |c| {
-            self.addClip(.{ .track = c.track, .bar = c.bar, .len = c.len, .pattern = c.pattern, .offset = c.offset });
+            self.addClip(.{ .track = c.track, .start = c.start, .len = c.len, .pattern = c.pattern, .offset = c.offset });
         }
         for (p.notes) |n| {
             self.addNote(.{ .step = n.step, .len = n.len, .pitch = n.pitch, .pattern = n.pattern, .instrument = n.instrument });
@@ -652,7 +652,7 @@ pub const App = struct {
         self.params.start_frame.store(self.playback.start_frame, .monotonic);
         self.params.start_step.store(step, .monotonic);
         if (self.playing) {
-            sequencer.reset(&self.scheduler, &self.sched_events, self.clips.items, self.notes.items, self.sel.song_mode, self.sel.pattern, step, self.steps_per_bar);
+            sequencer.reset(&self.scheduler, &self.sched_events, self.clips.items, self.notes.items, self.sel.song_mode, self.sel.pattern, step);
             self.params.sched_gen.store(self.scheduler.gen, .monotonic);
         }
     }

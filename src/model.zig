@@ -9,29 +9,30 @@ const synth = @import("synth.zig");
 /// 播放列表中的一个样式片段。
 ///
 /// **坐标系**（重要）：
-/// - 播放列表小节 = **全局坐标**：`bar`（起始，1 起）、`len`（可见长度）都用它；
-/// - 片段内部小节 = **局部坐标**：双击打开钢琴卷帘时，卷帘里的小节号；
-///   音符数据存在局部坐标里，左缘折叠只是改变“显示窗口”，不动内容。
-/// - 换算：局部 = 全局 − `bar` + `offset`；全局 = 局部 + `bar` − `offset`。
+/// - 播放列表 = **全局坐标**（单位 = `units_per_whole` 步；96 = 4/4 一小节）：
+///   `start`（起始步，0 起）、`len`（可见长度，步）、`offset`（左缘对应的局部步）；
+/// - 片段内部 = **局部坐标**（钢琴卷帘里的步）：音符数据在局部坐标，
+///   左缘折叠只是改变“显示窗口”，不动内容。
+/// - 换算：局部 = 全局 − `start` + `offset`；全局 = 局部 + `start` − `offset`。
 ///
 /// 约束（左缘拖动的语义）：
-/// - `offset >= 0`：不能展开到局部第 0 小节之前
+/// - `offset >= 0`：不能展开到局部第 0 步之前
 ///   （凭空往左 = 造出内容里不存在的音符位置，不对）；
 /// - 折叠右移 `offset` 增大、`len` 减小（右端不动）；展开反之。
 pub const Clip = struct {
-    track: i32, // 轨道序号（0 起，全局）
-    bar: i32, // 起始小节（全局坐标，1 起）
-    len: i32, // 可见长度（全局小节数）
+    track: i32, // 轨道序号（0 起）
+    start: i32, // 起始步（全局坐标，0 起；U=96 单位）
+    len: i32, // 可见长度（步，>= 1）
     pattern: i32, // 样式序号（0 起）
-    offset: i32 = 0, // 左缘对应的局部小节号（0 = 从片段自身第 1 小节开始）
+    offset: i32 = 0, // 左缘对应的局部步（0 = 从片段自身第 1 步开始）
 };
 
 /// 钢琴卷帘中的音符（**局部坐标**，按样式 + 乐器归属）。
-/// step：局部步（每小节 16 步，0 = 样式自身第 1 小节第 1 步）；
+/// step：局部步（U=96 单位，0 = 样式自身第 1 步）；
 /// pitch：MIDI 音高（0-127，越大越高）。
-/// 片段（Clip）只是样式的“窗口”（bar/len/offset 决定显示哪一段），音符本身归样式。
+/// 片段（Clip）只是样式的“窗口”（start/len/offset 决定显示哪一段），音符本身归样式。
 pub const Note = struct {
-    step: i32, // 局部起始步（每小节 16 步）
+    step: i32, // 局部起始步（U=96 单位）
     len: i32, // 长度（步，>= 1）
     pitch: i32, // MIDI 音高（0-127）
     pattern: i32, // 所属样式序号
@@ -52,7 +53,7 @@ pub const Instrument = struct {
 /// **每全音符的份数**（分辨率 `U`）：数据层的时间单位。
 /// `96 = 2⁵ × 3`——可精确表示的分母 = 96 的约数：
 /// {1,2,3,4,6,8,12,16,24,32,48,96}——涵盖二进制细分与三连音体系。
-/// `Note.step`、`Clip.bar`（小节）等均以它为单位。
+/// `Note.step`、`Clip.start/len/offset` 均以它为单位。
 pub const units_per_whole: i32 = 96;
 
 /// 默认每小节步数（4/4 → 96 步；实际用 `App.steps_per_bar`）
@@ -93,56 +94,53 @@ pub fn leftmostClipFor(clips: []const Clip, pattern: i32) ?Clip {
     var best: ?Clip = null;
     for (clips) |c| {
         if (c.pattern != pattern) continue;
-        if (best == null or c.bar < best.?.bar) best = c;
+        if (best == null or c.start < best.?.start) best = c;
     }
     return best;
 }
 
 /// 全局步 → 片段内的**局部**步（不在片段可见范围内 → null）。
-/// `spb`：每小节步数（拍号决定；默认 16 = 4/4）。
-pub fn clipSongToLocal(c: Clip, song_step: i32, spb: i32) ?i32 {
-    const start = (c.bar - 1) * spb;
-    const len_steps = c.len * spb;
-    if (song_step < start or song_step >= start + len_steps) return null;
-    return song_step - start + c.offset * spb;
+/// 注：片段与音符现已同为 **U=96 步**坐标，无需再乘每小节步数。
+pub fn clipSongToLocal(c: Clip, song_step: i32) ?i32 {
+    if (song_step < c.start or song_step >= c.start + c.len) return null;
+    return song_step - c.start + c.offset;
 }
 
 /// 局部步 → 全局步（不在片段可见范围内 → null）
-pub fn clipLocalToSong(c: Clip, local_step: i32, spb: i32) ?i32 {
-    const lo = c.offset * spb;
-    const hi = lo + c.len * spb;
+pub fn clipLocalToSong(c: Clip, local_step: i32) ?i32 {
+    const lo = c.offset;
+    const hi = lo + c.len;
     if (local_step < lo or local_step >= hi) return null;
-    return (c.bar - 1) * spb + (local_step - lo);
+    return c.start + (local_step - lo);
 }
 
 test "游标换算：最左片段 / 全局↔局部 / 折叠截断" {
+    const B: i32 = units_per_whole; // 一小节（4/4）= 96 步
     const clips = [_]Clip{
-        .{ .track = 0, .bar = 7, .len = 4, .pattern = 0 },
-        .{ .track = 1, .bar = 3, .len = 4, .pattern = 0 }, // 更靠左
-        .{ .track = 2, .bar = 2, .len = 2, .pattern = 1 },
+        .{ .track = 0, .start = 6 * B, .len = 4 * B, .pattern = 0 },
+        .{ .track = 1, .start = 2 * B, .len = 4 * B, .pattern = 0 }, // 更靠左
+        .{ .track = 2, .start = B, .len = 2 * B, .pattern = 1 },
     };
     const c = leftmostClipFor(&clips, 0).?;
-    try std.testing.expectEqual(@as(i32, 3), c.bar);
+    try std.testing.expectEqual(2 * B, c.start);
     try std.testing.expect(leftmostClipFor(&clips, 9) == null);
 
-    // 全局步 32（片段 bar3 的第 1 步）→ 局部 0
-    const c0 = Clip{ .track = 0, .bar = 3, .len = 4, .pattern = 0 };
-    try std.testing.expectEqual(@as(i32, 0), clipSongToLocal(c0, 32, 16).?);
-    try std.testing.expectEqual(@as(i32, 16), clipSongToLocal(c0, 48, 16).?); // bar4
-    try std.testing.expect(clipSongToLocal(c0, 31, 16) == null); // 片段左界外
-    try std.testing.expect(clipSongToLocal(c0, 96, 16) == null); // 片段右界外
-    try std.testing.expectEqual(@as(i32, 32), clipLocalToSong(c0, 0, 16).?);
-    try std.testing.expect(clipLocalToSong(c0, 64, 16) == null);
+    // 片段从第 3 小节（步 2B）开始：全局 2B → 局部 0
+    const c0 = Clip{ .track = 0, .start = 2 * B, .len = 4 * B, .pattern = 0 };
+    try std.testing.expectEqual(@as(i32, 0), clipSongToLocal(c0, 2 * B).?);
+    try std.testing.expectEqual(B, clipSongToLocal(c0, 3 * B).?);
+    try std.testing.expect(clipSongToLocal(c0, 2 * B - 1) == null); // 片段左界外
+    try std.testing.expect(clipSongToLocal(c0, 6 * B) == null); // 片段右界外
+    try std.testing.expectEqual(2 * B, clipLocalToSong(c0, 0).?);
+    try std.testing.expect(clipLocalToSong(c0, 4 * B) == null);
 
-    // 折叠：offset=1、len=3 → 可见局部 [16, 64)
-    const fold = Clip{ .track = 0, .bar = 5, .len = 3, .pattern = 0, .offset = 1 };
-    try std.testing.expect(clipLocalToSong(fold, 15, 16) == null); // 被折叠部分不可设置
-    try std.testing.expectEqual(@as(i32, 64), clipLocalToSong(fold, 16, 16).?);
-    try std.testing.expectEqual(@as(i32, 95), clipLocalToSong(fold, 47, 16).?);
-    try std.testing.expectEqual(@as(i32, 96), clipLocalToSong(fold, 48, 16).?); // 仍在可见范围内（3 小节 = 48 步）
-    try std.testing.expectEqual(@as(i32, 111), clipLocalToSong(fold, 63, 16).?); // 可见最后一步
-    try std.testing.expect(clipLocalToSong(fold, 64, 16) == null); // 超出可见末小节
-    try std.testing.expectEqual(@as(i32, 16), clipSongToLocal(fold, 64, 16).?);
+    // 折叠：offset = B（折叠 1 小节）、len = 3B → 可见局部 [B, 4B)
+    const fold = Clip{ .track = 0, .start = 4 * B, .len = 3 * B, .pattern = 0, .offset = B };
+    try std.testing.expect(clipLocalToSong(fold, B - 1) == null); // 被折叠部分不可设置
+    try std.testing.expectEqual(4 * B, clipLocalToSong(fold, B).?);
+    try std.testing.expectEqual(4 * B + 2 * B - 1, clipLocalToSong(fold, 3 * B - 1).?);
+    try std.testing.expect(clipLocalToSong(fold, 4 * B) == null); // 超出可见末小节
+    try std.testing.expectEqual(B, clipSongToLocal(fold, 4 * B).?);
 }
 
 /// 值域映射（minimap 的纵向压缩）：把 `[min_v, max_v]` 归一化到 `[0, 1]`。
@@ -223,26 +221,27 @@ pub fn isBlackKey(pitch: i32) bool {
     return pc == 1 or pc == 3 or pc == 6 or pc == 8 or pc == 10;
 }
 
-/// 片段是否与其它片段重叠（排除 exclude 下标；exclude == len 表示不排除任何）
-pub fn clipOverlaps(clips: []const Clip, exclude: usize, track: i32, bar: i32, len: i32) bool {
+/// 片段是否与其它片段重叠（排除 exclude 下标；exclude == len 表示不排除任何）。
+/// 坐标单位：步（U=96）——区间为 `[start, start+len)`。
+pub fn clipOverlaps(clips: []const Clip, exclude: usize, track: i32, start: i32, len: i32) bool {
     for (clips, 0..) |o, oi| {
         if (oi == exclude or o.track != track) continue;
-        if (bar < o.bar + o.len and o.bar < bar + len) return true;
+        if (start < o.start + o.len and o.start < start + len) return true;
     }
     return false;
 }
 
-/// 左缘裁剪/展开：`new_bar` 为鼠标所在小节（**全局坐标**）。
+/// 左缘裁剪/展开：`new_start` 为鼠标所在步（**全局坐标**）。
 /// 折叠 = offset 增大、len 减小（右端不动）；展开反之。
-/// 约束：offset >= 0（局部坐标不能为负——不能展开到自身第 1 小节之前）、len >= 1。
+/// 约束：offset >= 0（局部坐标不能为负——不能展开到自身第 1 步之前）、len >= 1（步）。
 /// 无效返回 null（调用方保持原样）。
-pub fn clipTrimLeft(c: Clip, new_bar: i32) ?Clip {
-    const delta = new_bar - c.bar;
+pub fn clipTrimLeft(c: Clip, new_start: i32) ?Clip {
+    const delta = new_start - c.start;
     const new_offset = c.offset + delta;
     const new_len = c.len - delta;
     if (new_offset < 0 or new_len < 1) return null;
     var r = c;
-    r.bar = new_bar;
+    r.start = new_start;
     r.offset = new_offset;
     r.len = new_len;
     return r;
@@ -291,39 +290,45 @@ test "pitchName / isBlackKey" {
 }
 
 test "clipOverlaps: 重叠检测、排除自身、不同轨道" {
+    const B: i32 = units_per_whole;
     const clips = [_]Clip{
-        .{ .track = 0, .bar = 5, .len = 4, .pattern = 0 }, // 占 5-8
+        .{ .track = 0, .start = 4 * B, .len = 4 * B, .pattern = 0 }, // 占 [4B, 8B)
     };
-    try std.testing.expect(clipOverlaps(&clips, clips.len, 0, 6, 2)); // 与首片段重叠
-    try std.testing.expect(clipOverlaps(&clips, clips.len, 0, 4, 2)); // 左缘相接处重叠（4-5 与 5-8）
-    try std.testing.expect(!clipOverlaps(&clips, clips.len, 0, 9, 2)); // 紧邻右侧不重叠
-    try std.testing.expect(!clipOverlaps(&clips, clips.len, 1, 5, 2)); // 不同轨道
-    try std.testing.expect(!clipOverlaps(&clips, 0, 0, 5, 4)); // 排除自身
+    try std.testing.expect(clipOverlaps(&clips, clips.len, 0, 5 * B, 2 * B)); // 重叠
+    try std.testing.expect(clipOverlaps(&clips, clips.len, 0, 3 * B, 2 * B)); // 左缘相接处重叠
+    try std.testing.expect(!clipOverlaps(&clips, clips.len, 0, 8 * B, 2 * B)); // 紧邻右侧不重叠
+    try std.testing.expect(!clipOverlaps(&clips, clips.len, 1, 5 * B, 2 * B)); // 不同轨道
+    try std.testing.expect(!clipOverlaps(&clips, 0, 0, 4 * B, 4 * B)); // 排除自身
 }
 
-test "clipTrimLeft: 左缘折叠/展开（不能超过自身第 1 小节）" {
-    const c0 = Clip{ .track = 0, .bar = 5, .len = 8, .pattern = 0 };
+test "clipTrimLeft: 左缘折叠/展开（不能超过自身第 1 步）" {
+    const B: i32 = units_per_whole;
+    const c0 = Clip{ .track = 0, .start = 4 * B, .len = 8 * B, .pattern = 0 };
 
-    // 向右折叠 2 小节：offset +2、len -2、右端（5+8=13）不动
-    const folded = clipTrimLeft(c0, 7).?;
-    try std.testing.expectEqual(@as(i32, 7), folded.bar);
-    try std.testing.expectEqual(@as(i32, 2), folded.offset);
-    try std.testing.expectEqual(@as(i32, 6), folded.len);
-    try std.testing.expectEqual(c0.bar + c0.len, folded.bar + folded.len);
+    // 向右折叠 2 小节：offset +2B、len -2B、右端（4B+8B=12B）不动
+    const folded = clipTrimLeft(c0, 6 * B).?;
+    try std.testing.expectEqual(6 * B, folded.start);
+    try std.testing.expectEqual(2 * B, folded.offset);
+    try std.testing.expectEqual(6 * B, folded.len);
+    try std.testing.expectEqual(c0.start + c0.len, folded.start + folded.len);
 
     // 再展开回来（offset 归 0、len 复原）
-    const unfolded = clipTrimLeft(folded, 5).?;
+    const unfolded = clipTrimLeft(folded, 4 * B).?;
     try std.testing.expectEqual(@as(i32, 0), unfolded.offset);
-    try std.testing.expectEqual(@as(i32, 8), unfolded.len);
+    try std.testing.expectEqual(8 * B, unfolded.len);
 
-    // 凭空向左超过自身第 1 小节 → 拒绝
-    try std.testing.expect(clipTrimLeft(c0, 4) == null);
-    // 折叠后最多展开回自身第 1 小节（anchor = 5）：到 5 可以、到 4 不行
-    try std.testing.expect(clipTrimLeft(folded, 5) != null);
-    try std.testing.expect(clipTrimLeft(folded, 4) == null);
-    // 折叠到不足 1 小节 → 拒绝（最多折到 bar 12）
-    try std.testing.expect(clipTrimLeft(c0, 12) != null);
-    try std.testing.expect(clipTrimLeft(c0, 13) == null);
+    // 凭空向左超过自身第 1 步 → 拒绝
+    try std.testing.expect(clipTrimLeft(c0, 4 * B - 1) == null);
+    // 折叠后最多展开回自身第 1 步（anchor = 4B）：到 4B 可以、更小不行
+    try std.testing.expect(clipTrimLeft(folded, 4 * B) != null);
+    try std.testing.expect(clipTrimLeft(folded, 4 * B - 1) == null);
+    // 步级折叠（U=96 精度）：右移 1 步也可以
+    const fine = clipTrimLeft(c0, 4 * B + 1).?;
+    try std.testing.expectEqual(@as(i32, 1), fine.offset);
+    try std.testing.expectEqual(8 * B - 1, fine.len);
+    // 折叠到不足 1 步 → 拒绝（最多折到 start = 12B - 1）
+    try std.testing.expect(clipTrimLeft(c0, 12 * B - 1) != null);
+    try std.testing.expect(clipTrimLeft(c0, 12 * B) == null);
 }
 
 test "noteTrimLeft: 左缘自由拖动（右端固定、不撞出第 1 步）" {
