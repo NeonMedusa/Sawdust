@@ -54,6 +54,11 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         snap_clicked = util.snapSelectorButton(ui, snap_btn_x, y, util.title_h, &app.playlist.snap, &app.playlist.snap_menu_open);
     }
 
+    // 视图切换按钮（标题栏最右）：⇄ 打开钢琴卷帘（当前样式）
+    if (util.viewSwitchButton(ui, x + w - 6, y, util.title_h)) {
+        app.openPiano(app.sel.pattern);
+    }
+
     const header_w: i32 = 90; // 轨道名列宽
     const ruler_h: i32 = 20; // 标尺行高 = 滚动条厚度（横条高 = 纵条宽）
     const list_y = y + util.title_h;
@@ -330,6 +335,10 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 // 鼠标 → 全局步（吸附到步；范围 ≥ 0）
                 const content_px: f32 = @as(f32, @floatFromInt(app.playlist.scroll_x)) + @as(f32, @floatFromInt(ui.mouse_x - lane_x)) / zoom;
                 const step: i32 = @max(0, @as(i32, @intFromFloat(content_px / step_px)));
+                // **点播放列表标尺 = 自动切 SONG**（本视图编辑的是全曲时间线；
+                // 符合直觉：在播放列表里定游标 → 就是要听全曲）。
+                // 切换后下面的 jumpPlaybackCursorDrag 会按 SONG 语义跳转。
+                app.sel.song_mode = true;
                 // 跳转（**去重**：按住期间只在目标步变化/按下帧才跳——
                 // 否则每帧 reset → 音符每帧重触发“响两下”，实测 bug）
                 app.jumpPlaybackCursorDrag(step, ui.mouse_pressed);
@@ -428,13 +437,15 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         }
     }
 
-    // 光标：拉伸中 / 悬停边缘 → ↔
-    if (app.playlist.resize_clip != null) {
+    // 光标：
+    // - 拖动中：边缘拉伸 → ↔（左右箭头）；移动/批量 → 十字箭头
+    // - 悬停：边缘 → ↔；**主体（可拖动）→ 十字箭头**（与边缘 hover 同一层次感）
+    if (app.playlist.batch_trim or app.playlist.resize_clip != null) {
         ui.cursor = .resize_h;
-    } else if (app.playlist.drag_clip == null) {
-        if (clip_hit) |hit| {
-            if (hit.mode != .body) ui.cursor = .resize_h;
-        }
+    } else if (app.playlist.drag_clip != null or app.playlist.drag_batch) {
+        ui.cursor = .size_all;
+    } else if (clip_hit) |hit| {
+        ui.cursor = if (hit.mode == .body) .size_all else .resize_h;
     }
 
     // 右键：按下处删除；按住拖动 = 擦除（划过即删；起点需在播放列表内）

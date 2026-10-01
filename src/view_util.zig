@@ -16,6 +16,34 @@ pub const splitter_w: i32 = 4; // 分隔条宽度
 pub const min_pane_w: i32 = 100; // 每栏最小宽度
 pub const title_h: i32 = 24; // 面板标题栏高度
 
+/// 视图切换按钮（标题栏**最右侧**）：播放列表 ⇄ 钢琴卷帘。
+/// `x` = 面板右缘；按钮右对齐。返回 true = 本帧被点击（调用方执行切换）。
+/// 图标用**自绘双向箭头**（不依赖字体字形——`⇄` 在常见 UI 字体里缺失）。
+pub fn viewSwitchButton(ui: *Ui, x: i32, y: i32, bar_h: i32) bool {
+    const bw: i32 = bar_h - 8;
+    const btn_x = x - bw - 4; // 右对齐
+    const btn_y = y + 4;
+    const hovered = ui.hitRect(btn_x, btn_y, bw, bw);
+    ui.renderer.fillRect(btn_x, btn_y, bw, bw, if (hovered) ui.theme.item_hover else ui.theme.toolbar);
+    // 双向箭头（上下两根带箭头的短横线；箭头头用斜线画）：
+    // 上行 → 右箭头；下行 → 左箭头
+    const col = ui.theme.text;
+    const cx = btn_x + @divTrunc(bw, 2);
+    const cy = btn_y + @divTrunc(bw, 2);
+    const half: i32 = 5;
+    const gap: i32 = 3;
+    const ah: i32 = 3; // 箭头头张开幅度
+    // 上行（y = cy-gap）：主体 + 右箭头头（向右张开的两条斜线）
+    ui.renderer.hline(cx - half, cy - gap, half * 2, col);
+    ui.renderer.line(cx + half, cy - gap, cx + half - ah, cy - gap - ah, col);
+    ui.renderer.line(cx + half, cy - gap, cx + half - ah, cy - gap + ah, col);
+    // 下行（y = cy+gap）：主体 + 左箭头头
+    ui.renderer.hline(cx - half, cy + gap, half * 2, col);
+    ui.renderer.line(cx - half, cy + gap, cx - half + ah, cy + gap - ah, col);
+    ui.renderer.line(cx - half, cy + gap, cx - half + ah, cy + gap + ah, col);
+    return hovered and ui.mouse_pressed;
+}
+
 // ── 钢琴卷帘常量 ──
 /// 每步宽（像素）——步的单位为 1/96 全音符（`model.units_per_whole`）。
 /// 4/4 时每小节 96 步；为保证视觉密度与手感，默认缩放下调到 5px/步
@@ -239,15 +267,17 @@ pub fn scrollDelta(ui: *Ui) i32 {
 
 /// 播放游标（倒三角 + 贯穿内容区的竖线）。
 /// `x`：游标位置（屏幕像素）；`ruler_y`/`ruler_h`：标尺行；`bottom_y`：竖线底端。
+/// 三角**矮小**（高 ≈ 标尺行一半、宽 11px）——与竖线是否相接不重要。
 pub fn drawCursor(ui: *Ui, x: i32, ruler_y: i32, ruler_h: i32, bottom_y: i32, playing: bool) void {
     const col = if (playing) ui.theme.cursor_play else ui.theme.cursor_idle;
     // 竖线（贯穿内容区，先画在线下）
     if (bottom_y > ruler_y) ui.renderer.vline(x, ruler_y + ruler_h, bottom_y - ruler_y - ruler_h, col);
-    // 倒三角（标尺顶部）
-    const tri_w: i32 = 11;
-    const tri_h: i32 = 9;
+    // 倒三角（标尺行内，矮小）：宽 14px、高 = 标尺行一半（最小 5px）
+    const tri_w: i32 = 14;
+    const tri_h: i32 = @max(5, @divTrunc(ruler_h, 2));
     var i: i32 = 0;
     while (i < tri_h) : (i += 1) {
+        // 线性收敛：i=0 最宽，i=tri_h-1 收为 1px（尖端）
         const half = @divTrunc(tri_w * (tri_h - 1 - i), tri_h * 2);
         ui.renderer.fillRect(x - half, ruler_y + i, half * 2 + 1, 1, col);
     }

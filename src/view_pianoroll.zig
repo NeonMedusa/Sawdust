@@ -45,6 +45,11 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         if (snap_clicked) app.piano.inst_menu_open = false;
     }
 
+    // 视图切换按钮（标题栏最右）：⇄ 返回播放列表
+    if (util.viewSwitchButton(ui, x + w - 6, y, util.title_h)) {
+        app.closePiano();
+    }
+
     const ruler_h: i32 = 20; // 标尺行高 = 滚动条厚度（与播放列表一致）
     const list_y = y + util.title_h;
     const list_h = h - util.title_h;
@@ -361,6 +366,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                     } else {
                         const content_px: i32 = app.piano.scroll_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(ui.mouse_x - lane_x)) / zoom));
                         const local = @max(0, @divFloor(content_px * spb, bar_w));
+                        // **点 SONG 标尺 = 切回 SONG**（与“点播放列表标尺 = 切 SONG”对称）
+                        app.sel.song_mode = true;
                         // 超出可见范围 → 归位到片段起点（局部 offset）；
                         // 跳转**去重**（按住期间只在目标步变化/按下帧才跳）
                         app.jumpPlaybackCursorDrag(model.clipLocalToSong(c, local) orelse c.start, ui.mouse_pressed);
@@ -379,6 +386,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                     ui.active_id = 0;
                 } else {
                     const content_px: i32 = app.piano.scroll_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(ui.mouse_x - lane_x)) / zoom));
+                    // **点 PAT 标尺 = 切回 PAT**（与“点 SONG 标尺 = 切 SONG”对称）
+                    app.sel.song_mode = false;
                     // 跳转**去重**（按住期间只在目标步变化/按下帧才跳）
                     app.jumpPlaybackCursorDrag(@max(0, @divFloor(content_px * spb, bar_w)), ui.mouse_pressed);
                 }
@@ -478,11 +487,19 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         }
     }
 
-    // 光标：拖动中 → 十字箭头（音符可横竖拖动）；悬停边缘 → ↔
-    if (app.piano.drag_note != null or app.piano.drag_batch or app.piano.batch_trim) {
+    // 光标：
+    // - 拖动中：边缘拉伸 → ↔（左右箭头）；移动/批量 → 十字箭头
+    // - 悬停：边缘 → ↔；**主体（可拖动）→ 十字箭头**（与边缘 hover 同一层次感）
+    // 注：拖边缘时 `drag_note` 也非 null——必须按 `drag_note_mode` 区分，
+    // 否则边缘拉伸会被归入“移动”分支（实测 bug：拖边缘变十字）。
+    if (app.piano.batch_trim) {
+        ui.cursor = .resize_h;
+    } else if (app.piano.drag_note != null) {
+        ui.cursor = if (app.piano.drag_note_mode == .body) .size_all else .resize_h;
+    } else if (app.piano.drag_batch) {
         ui.cursor = .size_all;
     } else if (note_hit) |hit| {
-        if (hit.mode != .body) ui.cursor = .resize_h;
+        ui.cursor = if (hit.mode == .body) .size_all else .resize_h;
     }
 
     // 放置音符时也试听一声（原型手感）：仅新放置（非拖动）

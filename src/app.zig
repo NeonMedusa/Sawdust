@@ -81,8 +81,9 @@ pub const Selection = struct {
     track: i32 = 0,
     /// 当前编辑的乐器（钢琴卷帘归属；0 起，-1 = 无）
     instrument: i32 = 0,
-    /// SONG（播放全曲）还是 PAT（播放当前样式）
-    song_mode: bool = true,
+    /// SONG（播放全曲）还是 PAT（播放当前样式）——默认 PAT（启动/打开工程时；
+    /// 点播放列表标尺会自动切回 SONG）
+    song_mode: bool = false,
 };
 
 /// 播放列表视图状态
@@ -1202,6 +1203,8 @@ pub const App = struct {
         self.playback.piano_step = 0;
         self.playback.start_step = 0;
         self.piano.pattern = null;
+        // 打开工程后回到 PAT（默认工作模式；点播放列表标尺会自动切 SONG）
+        self.sel.song_mode = false;
     }
 
     // ── MIDI 导入 / 导出（转换逻辑；文件 IO 在 main 接线）──

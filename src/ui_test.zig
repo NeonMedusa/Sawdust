@@ -6,12 +6,114 @@ const r_mod = @import("render.zig");
 const Ui = @import("ui.zig").Ui;
 const HBarMode = @import("ui.zig").HBarMode;
 const Font = @import("font.zig").Font;
+const view_util = @import("view_util.zig");
 
 /// 构造一个"假 UI"（无字体依赖的控件测试用；slider 不需要字体）
 fn makeUi(fb: *r_mod.Framebuffer) Ui {
     // slider 不读 font，但 Ui 结构要求非空指针 → 用 undefined 占位（测试不触碰）
     const fake_font: *Font = @ptrFromInt(@alignOf(Font));
     return Ui.init(r_mod.Renderer.init(fb), fake_font);
+}
+
+test "游标：三角的不变量（居中、1px 尖端、不越出标尺行）" {
+    // 注：三角宽度是**装饰性常量**（可随时微调）——本测试只验不变量，
+    // 不硬编码宽度（否则调外观就挂）。
+    var buf: [60 * 40]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 60, .height = 40 };
+    var ui = makeUi(&fb);
+    @memset(fb.pixels, ui.theme.bg);
+
+    const x: i32 = 30;
+    const ruler_y: i32 = 4;
+    const ruler_h: i32 = 20;
+    const bottom_y: i32 = 36;
+    view_util.drawCursor(&ui, x, ruler_y, ruler_h, bottom_y, false);
+
+    const col = ui.theme.cursor_idle;
+    const width = 60;
+
+    // 找出标尺行内所有含三角像素的行（顶行 = 最宽行）
+    var top_row: i32 = -1;
+    var tip_row: i32 = -1;
+    var row = ruler_y;
+    while (row < ruler_y + ruler_h) : (row += 1) {
+        var has = false;
+        var px: i32 = 0;
+        while (px < width) : (px += 1) {
+            if (buf[@as(usize, @intCast(row)) * width + @as(usize, @intCast(px))] == col) {
+                has = true;
+                break;
+            }
+        }
+        if (has) {
+            if (top_row < 0) top_row = row;
+            tip_row = row;
+        }
+    }
+    try std.testing.expect(top_row >= 0); // 三角已画出
+
+    // 不变量 1：顶行宽度为奇数且以 x 为中心（居中无 off-by-one）
+    var w_top: i32 = 0;
+    var px: i32 = 0;
+    while (px < width) : (px += 1) {
+        if (buf[@as(usize, @intCast(top_row)) * width + @as(usize, @intCast(px))] == col) w_top += 1;
+    }
+    try std.testing.expect(@mod(w_top, 2) == 1);
+    try std.testing.expectEqual(col, buf[@as(usize, @intCast(top_row)) * width + @as(usize, @intCast(x))]);
+    const half = @divTrunc(w_top - 1, 2);
+    try std.testing.expectEqual(col, buf[@as(usize, @intCast(top_row)) * width + @as(usize, @intCast(x - half))]);
+    try std.testing.expectEqual(col, buf[@as(usize, @intCast(top_row)) * width + @as(usize, @intCast(x + half))]);
+
+    // 不变量 2：尖端（最后一行）= 1px，居中于 x
+    var w_tip: i32 = 0;
+    px = 0;
+    while (px < width) : (px += 1) {
+        if (buf[@as(usize, @intCast(tip_row)) * width + @as(usize, @intCast(px))] == col) w_tip += 1;
+    }
+    try std.testing.expectEqual(@as(i32, 1), w_tip);
+    try std.testing.expectEqual(col, buf[@as(usize, @intCast(tip_row)) * width + @as(usize, @intCast(x))]);
+
+    // 不变量 3：三角矮小——不越出标尺行（尖端必须在标尺行内）
+    try std.testing.expect(tip_row < ruler_y + ruler_h);
+
+    // 不变量 4：竖线从标尺底边开始（x 处）
+    const first_line_row = ruler_y + ruler_h;
+    try std.testing.expectEqual(col, buf[@as(usize, @intCast(first_line_row)) * width + @as(usize, @intCast(x))]);
+}
+
+test "ui: 视图切换按钮（标题栏最右）——命中范围与点击" {
+    var buf: [300 * 40]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 300, .height = 40 };
+    var ui = makeUi(&fb);
+
+    const panel_x: i32 = 10;
+    const panel_w: i32 = 280;
+    const y: i32 = 8;
+    const bar_h: i32 = 24;
+    // 按钮右对齐：bw = 16、右缘 = panel_x + panel_w - 6 → [x+w-6-16-4, ...)
+    const bw: i32 = bar_h - 8;
+    const btn_x = panel_x + panel_w - 6 - bw - 4;
+
+    // 悬停命中（不点击）→ 返回 false
+    ui.mouse_x = btn_x + 2;
+    ui.mouse_y = y + 6;
+    try std.testing.expect(!view_util.viewSwitchButton(&ui, panel_x + panel_w - 6, y, bar_h));
+    // 点击 → 返回 true
+    ui.mouse_pressed = true;
+    try std.testing.expect(view_util.viewSwitchButton(&ui, panel_x + panel_w - 6, y, bar_h));
+    ui.mouse_pressed = false;
+    // 按钮左侧（网格选单区域）不命中
+    ui.mouse_x = btn_x - 10;
+    try std.testing.expect(!view_util.viewSwitchButton(&ui, panel_x + panel_w - 6, y, bar_h));
+    // 绘制：按钮区域应出现非背景像素（箭头已画出）
+    ui.mouse_x = btn_x + 2;
+    _ = view_util.viewSwitchButton(&ui, panel_x + panel_w - 6, y, bar_h);
+    var found = false;
+    var i: usize = 0;
+    while (i < buf.len) : (i += 1) {
+        if (buf[i] == ui.theme.text) found = true;
+    }
+    try std.testing.expect(found);
 }
 
 test "ui: 水平推子——按下并拖动应改变值" {
