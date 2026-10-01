@@ -238,6 +238,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                     ui.labelClipped(nm, keys_x + util.piano_header_w - 34, py - 2, 30, if (pressed) ui.theme.text else ui.theme.key_label);
                 }
             }
+            // 黑键行背景加深（音符区；与琴键列的黑白层次呼应——扫视时更容易对上行）。
+            // 半透明叠加（不会盖过行线/网格：它们在后面画）
+            if (black) ui.renderer.fillRect(lane_x, py, view_w, kh - 1, ui.theme.lane_black_key);
             // 行线（每八度加强）
             ui.renderer.hline(lane_x, py, view_w, if (@mod(p, 12) == 0) ui.theme.panel_border else ui.theme.grid);
         }
@@ -272,6 +275,23 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 // 白键行亮得多一点、黑键行少一点（保持“黑白键”的视觉层次）
                 const row_tint: u32 = if (model.isBlackKey(hp2)) 26 else 40;
                 ui.renderer.fillRect(lane_x, hy, view_w, app.piano.key_h - 1, (@as(u32, row_tint) << 24) | (ui.theme.accent & 0x00FFFFFF));
+            }
+        }
+
+        // 幽灵音符（**同样式、其它乐器**；灰色半透明——只读参考，无交互）：
+        // 画在主体音符**之前** → 真实音符压在上层。
+        // 交互（命中/框选/行选）的乐器筛选保留——幽灵不参与选择与拖动。
+        {
+            const saved_ghost = ui.renderer.pushClip(lane_x, lane_y, view_w, lane_h);
+            defer ui.renderer.popClip(saved_ghost);
+            for (app.notes.items) |n| {
+                if (n.pattern != pattern or n.instrument == app.sel.instrument) continue;
+                const gx = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(n.step)) * step_ws - scroll_s));
+                const gy = lane_y + (127 - n.pitch) * kh - app.piano.scroll;
+                const gw = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(n.len)) * step_ws)));
+                if (gx + gw < lane_x or gx > lane_x + view_w) continue;
+                if (gy + kh < lane_y or gy > lane_y + lane_h) continue;
+                ui.renderer.fillRect(gx, gy, gw, kh - 1, ui.theme.ghost_note);
             }
         }
 
@@ -522,9 +542,11 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     }
 
     // 左键按下：拖动/拉伸音符，或空位放置（4 步）
-    // 试听（单一真源 `held_pitch`）：
-    // - 放置/点击音符 → 发声（按住不放 = 持续发声）
-    // - 拖动中换音高 → 重触发（滑奏）
+    // 试听规则（按设计）：
+    // - 放置/点击**未选中**音符的主体 → 发声（按住不放 = 持续发声）
+    // - **已选中的音符**（框选选区）单击/拖动位置/长度 → 不发声
+    // - **拖边缘改长度**（任何音符）→ 不发声
+    // - 拖动中换音高 → 重触发（仅当按下时已开始试听）
     // 注：Ctrl 按下（框选手势）时**不放置**——否则框选启动当帧会先放一个音符
     if (ui.mouse_pressed and in_lane and !ui.mods_ctrl and step_i >= 0 and pitch_i >= 0 and pitch_i <= 127) {
         if (note_hit) |hit| {
@@ -552,8 +574,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 app.piano.drag_armed = false;
                 app.piano.drag_down_x = ui.mouse_x;
                 app.piano.drag_down_y = ui.mouse_y;
-                app.piano.held_pitch = n.pitch;
-                app.auditionOn(n.pitch);
+                // 注：选中音符拖动**不试听**（按设计）——旧实现会开一个固定音高的声部
             } else {
                 // 单选语义：点**未选中**的音符 → 清除旧选区（只操作当前这个）；
                 // 点已选中但选区 = 1 → 保留选中（单音符拖动）
@@ -577,9 +598,14 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 app.piano.drag_armed = false;
                 app.piano.drag_down_x = ui.mouse_x;
                 app.piano.drag_down_y = ui.mouse_y;
-                // 点击已有音符 → 试听（按住不放持续发声）
-                app.piano.held_pitch = n.pitch;
-                app.auditionOn(n.pitch);
+                // 点击已有音符 → 试听（按住不放持续发声）。
+                // **不发声的两种情况**（按设计）：
+                // - 音符已选中（框选选区）——单击/拖动均不发声；
+                // - 拖边缘改长度——任何音符都不发声。
+                if (!n.selected and hit.mode == .body) {
+                    app.piano.held_pitch = n.pitch;
+                    app.auditionOn(n.pitch);
+                }
             }
         } else {
             // 新音符长度：沿用**上一个被点击/编辑过的音符**（无参考时 = 当前吸附格）
@@ -696,8 +722,10 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                             n.step = new_step;
                             n.pitch = new_pitch;
                             app.dirty = true;
-                            // 拖动换音高 → 重触发试听（滑奏；行高亮/琴键高亮跟随）
-                            if (pitch_changed) {
+                            // 拖动换音高 → 重触发试听（滑奏；行高亮/琴键高亮跟随）。
+                            // 仅当按下时已开始试听（held_pitch 非空）——
+                            // 选中音符/边缘拖动不发声，拖中也不应冒出声音
+                            if (pitch_changed and app.piano.held_pitch != null) {
                                 if (app.piano.held_pitch) |hp| app.auditionOff(hp);
                                 app.piano.held_pitch = new_pitch;
                                 app.auditionOn(new_pitch);
@@ -777,7 +805,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 }
             },
             .select_all => {
-                const n = app.selectAllNotes(pattern);
+                const n = app.selectAllNotes(pattern, app.sel.instrument);
                 if (n > 0) app.setToastWith("已全选 {d} 个音符", .{n});
             },
         }
@@ -793,6 +821,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         var names: [synth.max_instruments][]const u8 = undefined;
         const n: usize = @min(app.instruments.items.len, synth.max_instruments);
         for (app.instruments.items[0..n], 0..) |inst2, ii| names[ii] = inst2.name;
+        const inst_before = app.sel.instrument;
         _ = util.titleSelectorMenu(ui, inst_btn_x, y + util.title_h, names[0..n], &app.sel.instrument, &app.piano.inst_menu_open, inst_clicked, 170);
+        // 切换乐器 → 清选区（防跨乐器孤儿选区；见 App.setInstrument）
+        if (app.sel.instrument != inst_before) app.clearNoteSelection();
     }
 }

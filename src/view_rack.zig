@@ -240,12 +240,12 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, x: i32, y: i32, w: i32, clip_top: i32
     const name_hovered = util.hitUI(ui, cx, y + 2, name_w, util.rack_row_h - 4);
     ui.labelClipped(inst.name, cx + 4, y + @divTrunc(util.rack_row_h - 10, 2), name_w - 8, if (selected) ui.theme.text else ui.theme.text_dim);
     if (name_hovered and ui.mouse_pressed) {
-        app.sel.instrument = @intCast(idx);
+        app.setInstrument(@intCast(idx)); // 切换清选区（防跨乐器孤儿选区）
         app.rack.ctx_instrument = null;
     }
     // 双击名称 → 打开合成器编辑器（编辑该乐器）
     if (ui.mouse_double and name_hovered) {
-        app.sel.instrument = @intCast(idx);
+        app.setInstrument(@intCast(idx));
         app.synth_win.instrument = @intCast(idx);
         app.synth_win.open = true;
     }

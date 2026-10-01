@@ -52,6 +52,10 @@ pub const Theme = struct {
     slider_fill: Color = r_mod.rgb(90, 170, 255),
     waveform: Color = r_mod.rgb(120, 210, 150),
     grid: Color = r_mod.rgb(44, 48, 56),
+    /// 钢琴卷帘音符区：黑键行背景加深色（半透明叠加；与琴键列的黑白层次呼应）
+    lane_black_key: Color = 0x1E000000,
+    /// 幽灵音符（同样式、其它乐器；灰色半透明——只读参考，无交互）
+    ghost_note: Color = 0x70808692,
     /// 量化网格线（= 所选吸附档位；最暗、1px）
     grid_snap: Color = r_mod.rgb(48, 52, 62),
     /// 拍线（比网格线亮一档；1px）

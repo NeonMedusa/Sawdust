@@ -496,11 +496,22 @@ pub const App = struct {
         for (self.notes.items) |*nt| nt.selected = false;
     }
 
-    /// 全选当前样式的全部音符（Ctrl+A；钢琴卷帘上下文）。返回选中数。
-    pub fn selectAllNotes(self: *App, pattern: i32) usize {
+    /// 切换当前乐器（**唯一的乐器切换入口**）：
+    /// 乐器变化时**清空音符选区**——选区是“当前样式 + 当前乐器”上下文里的，
+    /// 切走后旧选中的音符会变成不可见的“孤儿选区”，批量操作（拖动/Del/克隆）
+    /// 却仍会带上它们（实测 bug：切乐器后拖动，旧乐器音符跟着跑）。
+    pub fn setInstrument(self: *App, idx: i32) void {
+        if (self.sel.instrument == idx) return;
+        self.sel.instrument = idx;
+        self.clearNoteSelection();
+    }
+
+    /// 全选**当前样式 + 当前乐器**的全部音符（Ctrl+A；钢琴卷帘上下文）。
+    /// 返回选中数。注：幽灵音符（其它乐器）不参与。
+    pub fn selectAllNotes(self: *App, pattern: i32, instrument: i32) usize {
         var n: usize = 0;
         for (self.notes.items) |*nt| {
-            if (nt.pattern != pattern) continue;
+            if (nt.pattern != pattern or nt.instrument != instrument) continue;
             nt.selected = true;
             n += 1;
         }
@@ -2003,28 +2014,65 @@ test "app: 撤销——乐器/全局设置（BPM、拍号、乐器增删）也�
     try std.testing.expectEqual(@as(usize, 2), app.instruments.items.len);
 }
 
-test "app: 全选——音符（仅当前样式）/ 片段" {
+test "app: 切换乐器清选区（防跨乐器“孤儿选区”：拖动时旧乐器音符跟着跑）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    _ = app.addInstrument("减法合成器");
+    _ = app.addInstrument("减法合成器");
+
+    // 乐器 0 的音符被选中（模拟：选了几个乐器 1 的音符）
+    app.notes.append(app.allocator, .{ .step = 0, .len = 12, .pitch = 60, .pattern = 0, .instrument = 0, .selected = true }) catch {};
+    app.sel.instrument = 0;
+    try std.testing.expectEqual(@as(usize, 1), app.selectedNoteCount());
+
+    // 切到乐器 1 → **选区清空**（孤儿选区消除）
+    app.setInstrument(1);
+    try std.testing.expectEqual(@as(i32, 1), app.sel.instrument);
+    try std.testing.expectEqual(@as(usize, 0), app.selectedNoteCount());
+
+    // 切回乐器 0 → 选区仍空（不会“恢复”旧选区）
+    app.setInstrument(0);
+    try std.testing.expectEqual(@as(usize, 0), app.selectedNoteCount());
+
+    // 切到**同一**乐器 → 选区保留（不误清）
+    app.notes.items[0].selected = true;
+    app.setInstrument(0);
+    try std.testing.expectEqual(@as(usize, 1), app.selectedNoteCount());
+}
+
+test "app: 全选——音符（仅当前样式 + 当前乐器）/ 片段" {
     var app = App{ .allocator = std.testing.allocator };
     defer app.clips.deinit(app.allocator);
     defer app.notes.deinit(app.allocator);
     defer app.deinitAll();
 
-    // 音符：样式 0 两个、样式 1 一个
-    app.notes.append(app.allocator, .{ .step = 0, .len = 12, .pitch = 60, .pattern = 0 }) catch {};
-    app.notes.append(app.allocator, .{ .step = 24, .len = 12, .pitch = 62, .pattern = 0 }) catch {};
-    app.notes.append(app.allocator, .{ .step = 48, .len = 12, .pitch = 64, .pattern = 1 }) catch {};
+    // 音符：样式 0 乐器 0 两个、样式 0 乐器 1 一个（幽灵）、样式 1 乐器 0 一个
+    app.notes.append(app.allocator, .{ .step = 0, .len = 12, .pitch = 60, .pattern = 0, .instrument = 0 }) catch {};
+    app.notes.append(app.allocator, .{ .step = 24, .len = 12, .pitch = 62, .pattern = 0, .instrument = 0 }) catch {};
+    app.notes.append(app.allocator, .{ .step = 12, .len = 12, .pitch = 61, .pattern = 0, .instrument = 1 }) catch {};
+    app.notes.append(app.allocator, .{ .step = 48, .len = 12, .pitch = 64, .pattern = 1, .instrument = 0 }) catch {};
 
-    // Ctrl+A（钢琴卷帘上下文）：只选当前样式（0）的全部音符
-    try std.testing.expectEqual(@as(usize, 2), app.selectAllNotes(0));
+    // Ctrl+A（钢琴卷帘上下文）：只选当前样式（0）+ 当前乐器（0）的全部音符
+    // **回归**：旧实现只看样式——会把幽灵音符（其它乐器）也选中
+    try std.testing.expectEqual(@as(usize, 2), app.selectAllNotes(0, 0));
     try std.testing.expectEqual(@as(usize, 2), app.selectedNoteCount());
     try std.testing.expect(app.notes.items[0].selected);
     try std.testing.expect(app.notes.items[1].selected);
-    try std.testing.expect(!app.notes.items[2].selected); // 样式 1 不受影响
+    try std.testing.expect(!app.notes.items[2].selected); // 幽灵（乐器 1）不受影响
+    try std.testing.expect(!app.notes.items[3].selected); // 样式 1 不受影响
 
-    // 切样式全选：样式 1 一个
+    // 切乐器：样式 0 + 乐器 1 → 只选幽灵那个
     app.clearNoteSelection();
-    try std.testing.expectEqual(@as(usize, 1), app.selectAllNotes(1));
+    try std.testing.expectEqual(@as(usize, 1), app.selectAllNotes(0, 1));
     try std.testing.expect(app.notes.items[2].selected);
+
+    // 切样式全选：样式 1 + 乐器 0
+    app.clearNoteSelection();
+    try std.testing.expectEqual(@as(usize, 1), app.selectAllNotes(1, 0));
+    try std.testing.expect(app.notes.items[3].selected);
 
     // 片段全选
     app.clips.append(app.allocator, .{ .track = 0, .start = 0, .len = 96, .pattern = 0 }) catch {};
