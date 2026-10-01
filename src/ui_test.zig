@@ -268,6 +268,82 @@ test "ui: 横向时间轴滚动条——拖左缘 = 缩放（右端内容位置�
     ui.endFrame();
 }
 
+test "ui: 横向时间轴滚动条——拖出延长后（zoom 低于 zoom_min）拖左缘仍可扩宽视野" {
+    var buf: [400 * 40]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 400, .height = 40 };
+    var ui = makeUi(&fb);
+
+    const x: i32 = 10;
+    const y: i32 = 10;
+    const w: i32 = 380;
+    const h: i32 = 20;
+    const view: i32 = 200;
+    // 模拟“拖出延长”后的状态：content 远大于一屏；zoom = 1.0 但 zoom_min = 1.43
+    // （时间轴短于视口时的动态下限——**高于**当前 zoom，旧实现会把拖左缘钳死）
+    var scroll: i32 = 600; // 贴右端（max_scroll = 800 - 200）
+    var content: i32 = 800;
+    var zoom: f32 = 1.0;
+
+    // 滑块：thumb_w = 200/800×380 = 95；thumb_x = 10 + 1.0×(380-95) = 295 → [295, 390]
+    // 帧 1：按左缘（295 + 8 = 303 内）
+    ui.mouse_x = 297;
+    ui.mouse_y = y + 5;
+    ui.mouse_down = true;
+    ui.mouse_pressed = true;
+    _ = ui.scrollbarTimeline(7, x, y, w, h, &scroll, &content, &zoom, view, 0, 1.43, 8.0);
+    try std.testing.expectEqual(HBarMode.left, ui.drag_mode_h);
+    ui.endFrame();
+
+    // 帧 2：左拖到 200 → 新左缘 198 → 滑块宽 192 → view_cw = 192×800/380 = 404
+    // → zoom = 200/404 ≈ 0.495（视野扩宽；旧实现被 zoom_min 钳回 1.0 = 拖不动）
+    ui.mouse_x = 200;
+    ui.mouse_down = true;
+    ui.mouse_pressed = false;
+    try std.testing.expect(ui.scrollbarTimeline(7, x, y, w, h, &scroll, &content, &zoom, view, 0, 1.43, 8.0));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.495), zoom, 0.01);
+    // 右端内容位置守恒：scroll + view_cw = 600 + 200 = 800 → 新 scroll = 800 - 404 = 396
+    try std.testing.expectEqual(@as(i32, 396), scroll);
+    ui.endFrame();
+}
+
+test "ui: 横向时间轴滚动条——拖右缘到物理下限（滑块满宽后不再缩）" {
+    var buf: [400 * 40]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 400, .height = 40 };
+    var ui = makeUi(&fb);
+
+    const x: i32 = 10;
+    const y: i32 = 10;
+    const w: i32 = 380;
+    const h: i32 = 20;
+    const view: i32 = 200;
+    // 同场景：content 800、zoom 1.0、zoom_min 1.43（高于 zoom）
+    var scroll: i32 = 300;
+    var content: i32 = 800;
+    var zoom: f32 = 1.0;
+    // 滑块：thumb_w = 95、thumb_x = 10 + 0.5×285 = 152 → [152, 247]
+
+    // 帧 1：按右缘（247 - 8 = 239 起）
+    ui.mouse_x = 244;
+    ui.mouse_y = y + 5;
+    ui.mouse_down = true;
+    ui.mouse_pressed = true;
+    _ = ui.scrollbarTimeline(7, x, y, w, h, &scroll, &content, &zoom, view, 0, 1.43, 8.0);
+    try std.testing.expectEqual(HBarMode.right, ui.drag_mode_h);
+    ui.endFrame();
+
+    // 帧 2：右拖到 600（远超轨道右缘 390）→ 左缘固定 152，滑块最多到轨道右缘
+    // → 宽 = 238（不是满宽）→ view_cw = 238×800/380 = 501 → zoom = 200/501 ≈ 0.399
+    // （物理下限 0.25 未被触及——右缘拖动受“左缘固定”几何限制，行为正确）
+    ui.mouse_x = 600;
+    ui.mouse_down = true;
+    ui.mouse_pressed = false;
+    _ = ui.scrollbarTimeline(7, x, y, w, h, &scroll, &content, &zoom, view, 0, 1.43, 8.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.399), zoom, 0.01);
+    // 视野变宽 → 右缘内容位置不变时 scroll 被钳到 content_w - vcw = 800 - 501 = 299
+    try std.testing.expectEqual(@as(i32, 299), scroll);
+    ui.endFrame();
+}
+
 test "ui: zoomSquareState——冻结位移驱动、松开帧不丢位移" {
     var buf: [40 * 40]u32 = undefined;
     var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 40, .height = 40 };

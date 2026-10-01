@@ -835,7 +835,9 @@ pub const Ui = struct {
     /// - **拖主体**：滑块 1:1 跟手（标准拖动）；
     /// - **拖到右端继续右拖**：**滑块左边缘 1:1 跟随鼠标**（右缘固定 → 滑块被压缩）
     ///   → 由滑块宽反推时间轴长度（延长）；左端继续左拖则回缩（下限 = 内容右缘）；
-    /// - **拖左/右缘（≤8px）**：横向缩放（右/左端固定，像拉音符）。
+    /// - **拖左/右缘（≤8px）**：横向缩放（右/左端固定，像拉音符）；
+    ///   缩放下限 = min(zoom_min, **物理下限** = view_w / content_w)——
+    ///   拖出的延长让 content_w > timeline_w 时，仍可缩到“装下全部内容”（否则拖不动）。
     ///
     /// **时间轴长度**（每帧钳制）：
     /// - 下限 = `max(内容右缘 + 余量, 一屏)`——行程与最右内容强相关；
@@ -889,7 +891,8 @@ pub const Ui = struct {
         // **只钳上限，不被动抬高 zoom**：内容缩短（如删除最右音符）时，调用方传入的
         // zoom_min 会变大——若每帧在此强制命中，视口会被自动放大、右边缘回缩
         // （实测困扰：画面频繁变动）。缩放下限只在**用户主动缩放**时生效：
-        // 滚轮 → 视图侧钳制；拖边缘 → 下方 new_zoom 的 min(zoom_min, zoom.*)。
+        // 滚轮 → 视图侧钳制；拖边缘 → 下方 new_zoom 的 zoom_floor
+        // （= min(zoom_min, view_w/content_w)——物理下限：装下全部内容）。
         if (zoom.* < 0.001) zoom.* = 0.001;
         if (zoom.* > zoom_max) zoom.* = zoom_max;
         const view_cw = @max(1, viewCw(view_w, zoom.*));
@@ -1008,8 +1011,15 @@ pub const Ui = struct {
                         const new_left = std.math.clamp(self.mouse_x - self.drag_start, x, right_x - min_w);
                         const new_thumb_w = right_x - new_left;
                         const new_view_cw = @max(1, @as(i32, @intCast(@divTrunc(@as(i64, new_thumb_w) * content_w.*, w))));
-                        // 下限取 min(zoom_min, 当前)：不因内容缩短后的下限抬高而突然放大
-                        const new_zoom = std.math.clamp(@as(f32, @floatFromInt(view_w)) / @as(f32, @floatFromInt(new_view_cw)), @min(zoom_min, zoom.*), zoom_max);
+                        // 缩放下限 = min(zoom_min, **物理下限**)。
+                        // 物理下限 = view_w / content_w：视野最多扩到装下全部内容（= 滑块满宽）。
+                        // 为何需要它：zoom_min 锚在 timeline_w 上，而**拖出的延长**让
+                        // content_w > timeline_w——若 zoom 已低于 zoom_min（初始 1.0、时间轴短于视口），
+                        // 旧式 min(zoom_min, zoom.*) = zoom → 想继续缩（扩宽视野）被钳死
+                        // （实测 bug：拖出延长后拖左缘“拖不动”，左边空一段可用行程却拉不动）。
+                        // min(..., zoom.*) 保留“下限不高于当前 zoom”（防内容缩短后突然放大）。
+                        const zoom_floor = @min(zoom.*, @min(zoom_min, @as(f32, @floatFromInt(view_w)) / @as(f32, @floatFromInt(@max(1, content_w.*)))));
+                        const new_zoom = std.math.clamp(@as(f32, @floatFromInt(view_w)) / @as(f32, @floatFromInt(new_view_cw)), zoom_floor, zoom_max);
                         if (new_zoom != zoom.*) {
                             zoom.* = new_zoom;
                             changed = true;
@@ -1025,8 +1035,9 @@ pub const Ui = struct {
                         // 拖右缘：缩放（左缘固定）
                         const new_thumb_w = @min(x + w - self.drag_anchor_x, @max(min_w, self.mouse_x - self.drag_anchor_x));
                         const new_view_cw = @max(1, @as(i32, @intCast(@divTrunc(@as(i64, new_thumb_w) * content_w.*, w))));
-                        // 下限取 min(zoom_min, 当前)：不因内容缩短后的下限抬高而突然放大
-                        const new_zoom = std.math.clamp(@as(f32, @floatFromInt(view_w)) / @as(f32, @floatFromInt(new_view_cw)), @min(zoom_min, zoom.*), zoom_max);
+                        // 缩放下限同上（物理下限：装下全部内容 = 滑块满宽）
+                        const zoom_floor = @min(zoom.*, @min(zoom_min, @as(f32, @floatFromInt(view_w)) / @as(f32, @floatFromInt(@max(1, content_w.*)))));
+                        const new_zoom = std.math.clamp(@as(f32, @floatFromInt(view_w)) / @as(f32, @floatFromInt(new_view_cw)), zoom_floor, zoom_max);
                         if (new_zoom != zoom.*) {
                             zoom.* = new_zoom;
                             changed = true;

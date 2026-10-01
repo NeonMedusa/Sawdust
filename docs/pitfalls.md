@@ -533,6 +533,27 @@ drawLayer(... steps_per_bar, 3.0, ...); // 小节线
 **教训**：画多层同类元素时，**亮度梯度要拉开**（相邻差 ≥ 20-30），
 不能假设用户能分辨 5-10 的亮度差。
 
+### 时间轴滚动条：缩放下限要含“物理下限”（拖不动事故）
+
+症状：拖主体向右延长行程（滑块被压缩、贴右端）后，拖滑块**左缘**往左
+（想扩宽视野）拖不动。
+
+机制：拖边缘的 zoom 下限是 `min(zoom_min, zoom.*)`，而 `zoom_min` 锚在
+`timeline_w` 上。当**时间轴短于视口**时 `zoom_min > 1`，而初始 `zoom = 1.0`
+本来就低于它 → 下限 = zoom → 想继续缩（扩宽视野）被钳死。
+拖出的延长又让 `content_w > timeline_w`——此时真正的下限是
+“装下全部内容”（物理下限），比 zoom_min 更宽松。
+
+```zig
+// ✗ 下限 = min(zoom_min, zoom.*)——zoom_min 锚在 timeline_w 上，拖出延长后钳死
+const new_zoom = clamp(vw / new_view_cw, @min(zoom_min, zoom.*), zoom_max);
+// ✓ 加物理下限：view_w / content_w（视野最多扩到装下全部内容 = 滑块满宽）
+const zoom_floor = @min(zoom.*, @min(zoom_min, view_w / content_w));
+```
+**教训**：多个“下限”取**最松的那个**（min）——物理约束（装下全部内容）
+永远是真极限；参数约束（zoom_min）若比物理约束更严，说明它漏了场景
+（这里漏了“拖出的延长”）。
+
 ## 音频
 
 ### 实时回调的约束

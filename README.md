@@ -48,6 +48,9 @@ zig build -Doptimize=ReleaseFast
 | `src/ui.zig` | UI 层：立即式控件（自绘） |
 | `src/main.zig` | 应用：状态 + 主循环 + 界面布局 |
 
+**文档**：踩坑记录见 `docs/pitfalls.md`；复杂控件设计见 `docs/timeline-scrollbar.md`
+（横向时间轴滚动条：minimap 语义的手势/不变量/快照语义）。
+
 **线程模型**：UI 在主线程，音频回调在 miniaudio 的实时线程；
 参数（音量/频率/播放状态）用 `std.atomic.Value` 传递（无锁，实时安全）。
 
