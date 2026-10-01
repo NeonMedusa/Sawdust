@@ -146,6 +146,8 @@ pub const PianoState = struct {
     snap: i32 = 2, // 默认 1/4
     /// 吸附网格下拉选单：展开中
     snap_menu_open: bool = false,
+    /// 乐器选择下拉选单：展开中（标题栏、网格选单右侧；与机架窗口的选单独立）
+    inst_menu_open: bool = false,
 
     /// 拖动死区（像素）：按下后位移超过 3px 才真正编辑——
     /// 否则**单击音符**会在按下当帧被吸附（实测 bug：位置/长度跳变）
@@ -181,17 +183,10 @@ pub const RackState = struct {
     ctx_y: i32 = 0,
 
     // ── 下拉菜单 ──
-    /// 乐器选择下拉菜单：展开中
-    inst_menu_open: bool = false,
     /// 添加乐器的下拉菜单：展开中
     add_menu_open: bool = false,
     /// 右键菜单中的乐器（删除用；null = 未展开）
     ctx_instrument: ?usize = null,
-    /// 乐器选择器按钮矩形（标尺行左端空位；由视图绘制时写入，下拉菜单用）
-    inst_btn_x: i32 = 0,
-    inst_btn_y: i32 = 0,
-    inst_btn_w: i32 = 0,
-    inst_btn_h: i32 = 0,
 };
 
 /// 播放状态（游标 + 传输）——设计原则：
@@ -868,6 +863,8 @@ pub const App = struct {
     pub fn closePiano(self: *App) void {
         self.piano.pattern = null;
         self.piano.drag_note = null;
+        self.piano.snap_menu_open = false; // 关闭视图时收起标题栏选单
+        self.piano.inst_menu_open = false;
         self.events.push(.{ .kind = .all_off });
         self.piano.held_pitch = null;
     }
@@ -875,6 +872,8 @@ pub const App = struct {
     /// 打开钢琴卷帘（编辑指定样式的音符）
     pub fn openPiano(self: *App, pattern: i32) void {
         self.piano.pattern = pattern;
+        self.piano.snap_menu_open = false; // 打开时收起上次残留的选单
+        self.piano.inst_menu_open = false;
         self.playlist.drag_clip = null;
         self.playlist.resize_clip = null;
         self.playlist.erase_drag = false;

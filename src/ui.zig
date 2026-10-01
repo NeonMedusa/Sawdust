@@ -52,10 +52,12 @@ pub const Theme = struct {
     slider_fill: Color = r_mod.rgb(90, 170, 255),
     waveform: Color = r_mod.rgb(120, 210, 150),
     grid: Color = r_mod.rgb(44, 48, 56),
-    /// 拍线（比步线亮、比小节线暗）
-    grid_beat: Color = r_mod.rgb(62, 67, 78),
-    /// 吸附格线（量化网格；介于步线与拍线之间）
-    grid_snap: Color = r_mod.rgb(54, 59, 70),
+    /// 量化网格线（= 所选吸附档位；最暗、1px）
+    grid_snap: Color = r_mod.rgb(48, 52, 62),
+    /// 拍线（比网格线亮一档；1px）
+    grid_beat: Color = r_mod.rgb(76, 82, 96),
+    /// 小节线（最亮、2px——与拍/网格拉开明暗+粗细双层差异）
+    grid_bar: Color = r_mod.rgb(108, 115, 132),
     /// 列表项：悬停 / 选中 / 交替行
     item_hover: Color = r_mod.rgb(52, 58, 68),
     item_selected: Color = r_mod.rgb(58, 84, 120),

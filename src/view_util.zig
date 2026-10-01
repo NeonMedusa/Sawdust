@@ -59,24 +59,25 @@ pub fn hitUI(ui: *Ui, x: i32, y: i32, w: i32, h: i32) bool {
 
 // ── 时间轴网格（播放列表与钢琴卷帘共用）──
 
-/// 网格分层：步线 / 拍线 / 小节线（用于着色与粗细）
-pub const GridLevel = enum { step, beat, bar };
-
-/// 计算某**步**对应的网格层级（U=96 对齐；拍线由分母决定）
-pub fn gridLevel(step: i32, steps_per_bar: i32, beat_steps: i32) GridLevel {
-    if (steps_per_bar > 0 and @mod(step, steps_per_bar) == 0) return .bar;
-    if (beat_steps > 0 and @mod(step, beat_steps) == 0) return .beat;
-    return .step;
-}
-
 /// 通用时间轴网格绘制（播放列表/钢琴卷帘共用）。
+///
+/// **分层**（各自独立判断是否太密，绘制顺序 = **细 → 粗**，后画覆盖先画）：
+/// 1. 网格层：当前量化档位（`snap_steps`；最暗、1px）；
+/// 2. 拍线（`beat_steps`；亮一档、1px）；
+/// 3. 小节线（`steps_per_bar`；最亮、常显）。
+/// 当前三层都是 1px，纯靠明暗区分；若想加回粗线，把 `drawLayer` 的
+/// `thick` 参数（第 3 层现在是 1）改成 2 即可。
+///
+/// **为什么不“网格线遇拍/小节位置就跳过”**：那样当拍线层因太密被隐藏时，
+/// 拍位置上的网格线也没人画——会出现“洞”。覆盖式顺序则天然正确：
+/// 哪层画了就以哪层为准，哪层隐藏也不留空缺。
+///
 /// - `scroll_x`/`zoom`：与各自视图一致的内容坐标与缩放；
 /// - `step_w`：一步的**内容像素宽**（**浮点**——如播放列表 80/96≈0.833，
 ///   整数会被截断为 0 导致网格与内容错位）；
 /// - `steps_per_bar`/`beat_steps`：U=96 下的每小节/拍步数；
-/// - `snap_steps`：量化/吸附网格的格子大小（步）；> 1 时额外画一层“吸附格线”
-///   （比步线亮、比拍线暗）——让用户看到吸附位置；
-/// - 细小缩放（步宽 < 3px）时只画小节线（避免“实心墙”且限制迭代量）；
+/// - `snap_steps`：量化/吸附网格的格子大小（步；1 = 1/96 最细档——照常显示，受密度门槛约束）；
+/// - 密度门槛（屏上间距，低于则跳过该层）：网格 4px、拍线 6px、小节线 3px；
 /// - 自动裁剪到 [clip_x, clip_x+clip_w]（网格不会画到琴键列/轨道名列上）。
 pub fn drawTimelineGrid(
     ren: *r_mod.Renderer,
@@ -96,69 +97,71 @@ pub fn drawTimelineGrid(
     if (steps_per_bar <= 0 or step_w <= 0) return;
     const view_w = clip_w;
     const step_ws: f32 = step_w * zoom; // 屏幕上的步宽
-    const bar_steps: i32 = steps_per_bar;
     const scroll_s: f32 = @as(f32, @floatFromInt(scroll_x)) * zoom;
+    // 已滚过的步数（**内容**单位：内容滚动量 / 内容步宽——两者同为内容坐标）
+    const scroll_steps: i32 = @intFromFloat(@as(f32, @floatFromInt(scroll_x)) / step_w);
 
     const saved = ren.pushClip(clip_x, y, clip_w, h);
     defer ren.popClip(saved);
 
-    if (step_ws >= 3.0) {
-        // 全网格：逐 step（迭代量 = 视宽/步宽 ≤ 视宽/3）
-        var st: i32 = @as(i32, @intFromFloat(@as(f32, @floatFromInt(scroll_x)) / step_w));
-        st += 1;
-        while (true) : (st += 1) {
-            const gx = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(st)) * step_ws - scroll_s));
-            if (gx > clip_x + view_w) break;
-            switch (gridLevel(st, bar_steps, beat_steps)) {
-                .bar => ren.fillRect(gx, y, 2, h, theme.panel_border),
-                .beat => ren.vline(gx, y, h, theme.grid_beat),
-                .step => ren.vline(gx, y, h, theme.grid),
-            }
-        }
-    } else {
-        // 细小缩放：只画小节线（按小节步进 → 迭代量 = 视宽/小节宽）
-        const bar_ws: f32 = step_w * @as(f32, @floatFromInt(bar_steps)) * zoom;
-        if (bar_ws <= 0) return;
-        var bar_i: i32 = @as(i32, @intFromFloat(@as(f32, @floatFromInt(scroll_x)) / (step_w * @as(f32, @floatFromInt(bar_steps)))));
-        bar_i += 1;
-        while (true) : (bar_i += 1) {
-            const bx = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(bar_i - 1)) * bar_ws - scroll_s));
-            if (bx > clip_x + view_w) break;
-            ren.fillRect(bx, y, 2, h, theme.panel_border);
-        }
-    }
-
-    // 吸附格线（比步线亮、比拍线暗；仅在格宽 ≥ 6px 时画，太密就没意义）
-    if (snap_steps > 1) {
-        const snap_ws: f32 = step_w * @as(f32, @floatFromInt(snap_steps)) * zoom;
-        if (snap_ws >= 6.0) {
-            var k: i32 = @as(i32, @intFromFloat(@as(f32, @floatFromInt(scroll_x)) / (step_w * @as(f32, @floatFromInt(snap_steps)))));
-            k += 1;
+    // 画某一层：`every` = 每几步一条线（<=0 = 不画）；
+    // `min_px` = 密度门槛（屏上间距低于它 → 该层整体跳过）；
+    // `thick`/`col` = 线宽与颜色。从滚动位置之后的第一条线开始（迭代量 ≤ 视宽/间距）。
+    const drawLayer = struct {
+        fn f(
+            r: *r_mod.Renderer,
+            clip_x_: i32,
+            view_w_: i32,
+            lane_x_: i32,
+            scroll_s_: f32,
+            scroll_steps_: i32,
+            step_ws_: f32,
+            y_: i32,
+            h_: i32,
+            every: i32,
+            min_px: f32,
+            thick: i32,
+            col: r_mod.Color,
+        ) void {
+            if (every <= 0) return;
+            const ws = step_ws_ * @as(f32, @floatFromInt(every)); // 屏上间距
+            if (ws < min_px) return;
+            var k: i32 = @divFloor(@max(0, scroll_steps_), every) + 1;
             while (true) : (k += 1) {
-                const gx = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(k)) * snap_ws - scroll_s));
-                if (gx > clip_x + view_w) break;
-                // 只画小节/拍线之外的位置（避免叠色）
-                const step_pos = k * snap_steps;
-                if (gridLevel(step_pos, bar_steps, beat_steps) == .step) {
-                    ren.vline(gx, y, h, theme.grid_snap);
-                }
+                const gx = lane_x_ + @as(i32, @intFromFloat(@as(f32, @floatFromInt(k)) * ws - scroll_s_));
+                if (gx > clip_x_ + view_w_) break;
+                if (gx >= clip_x_ - thick + 1) r.fillRect(gx, y_, thick, h_, col);
             }
         }
-    }
+    }.f;
+
+    // 1) 网格层（= 当前量化档位；最暗、1px——1/96 时即“步线”）
+    drawLayer(ren, clip_x, view_w, lane_x, scroll_s, scroll_steps, step_ws, y, h, snap_steps, 4.0, 1, theme.grid_snap);
+    // 2) 拍线（亮一档、1px）
+    drawLayer(ren, clip_x, view_w, lane_x, scroll_s, scroll_steps, step_ws, y, h, beat_steps, 6.0, 1, theme.grid_beat);
+    // 3) 小节线（最亮、常显；当前 1px——纯靠明暗与拍/网格区分）
+    drawLayer(ren, clip_x, view_w, lane_x, scroll_s, scroll_steps, step_ws, y, h, steps_per_bar, 3.0, 1, theme.grid_bar);
 }
 
-/// 吸附网格选择器（标题栏内，紧挨标题文字；模仿乐器选单交互）。
-/// - `btn_x`：按钮左端（由调用方放在标题后面）；`y`/`h`：标题栏范围；
-/// - `snap`/`open`：调用方的状态字段（两视图各自独立）；
-/// - 返回 true = 本帧点击了按钮（调用方可用它屏蔽同帧的其它交互）。
-/// **本函数只绘制按钮与下拉；下拉内容在后（应确保绘制在最上层）**。
-pub fn snapSelectorButton(ui: *Ui, btn_x: i32, y: i32, bar_h: i32, snap: *i32, open: *bool) bool {
+/// 网格选择器按钮文本（"网格 1/4 ▾"；`buf` 由调用方提供——栈上格式化）。
+pub fn snapLabel(buf: []u8, snap: i32) []const u8 {
+    const idx = std.math.clamp(snap, 0, @as(i32, @intCast(model.snap_denoms.len - 1)));
+    return std.fmt.bufPrint(buf, "网格 1/{d} ▾", .{model.snap_denoms[@intCast(idx)]}) catch "网格 ▾";
+}
+
+/// 标题栏选择器按钮宽度（文本宽 + 内边距；供调用方定位相邻控件/可见性判断）
+pub fn titleSelectorButtonWidth(ui: *Ui, label: []const u8) i32 {
+    return @as(i32, @intFromFloat(ui.font.measure(label))) + 16;
+}
+
+/// 标题栏下拉选择器——按钮（网格/乐器共用：交互与视觉一致）。
+/// `label`：按钮文本（由调用方生成）；`open`：展开状态（点击切换）。
+/// 返回 true = 本帧点击了按钮（调用方用于屏蔽同帧交互 / 互斥关闭另一选单）。
+/// **下拉内容由 `titleSelectorMenu` 绘制（在全部内容之后 → 最上层）**。
+pub fn titleSelectorButton(ui: *Ui, btn_x: i32, y: i32, bar_h: i32, label: []const u8, open: *bool) bool {
     const btn_h: i32 = bar_h - 8;
     const btn_y = y + 4;
-    var sbuf: [24]u8 = undefined;
-    const idx = std.math.clamp(snap.*, 0, @as(i32, @intCast(model.snap_denoms.len - 1)));
-    const label = std.fmt.bufPrint(&sbuf, "网格 1/{d} ▾", .{model.snap_denoms[@intCast(idx)]}) catch "网格 ▾";
-    const bw: i32 = @as(i32, @intFromFloat(ui.font.measure(label))) + 16;
+    const bw = titleSelectorButtonWidth(ui, label);
     const hovered = ui.hitRect(btn_x, btn_y, bw, btn_h);
     ui.renderer.fillRect(btn_x, btn_y, bw, btn_h, if (open.*) ui.theme.accent else if (hovered) ui.theme.item_hover else ui.theme.toolbar);
     ui.labelClipped(label, btn_x + 8, btn_y, bw - 12, ui.theme.text);
@@ -166,46 +169,67 @@ pub fn snapSelectorButton(ui: *Ui, btn_x: i32, y: i32, bar_h: i32, snap: *i32, o
     return hovered and ui.mouse_pressed;
 }
 
-/// 吸附网格下拉列表（在**内容之后**调用 → 绘制在最上层）。
-/// `btn_x`/`btn_w`：与按钮对齐；`below_y`：展开位置（按钮下沿）；
-/// `skip_close`：本帧刚点击了按钮（用于打开菜单）——此时**跳过“点外部关闭”判断**，
+/// 吸附网格选择器按钮（= `titleSelectorButton` + 网格档位文本）
+pub fn snapSelectorButton(ui: *Ui, btn_x: i32, y: i32, bar_h: i32, snap: *i32, open: *bool) bool {
+    var buf: [24]u8 = undefined;
+    return titleSelectorButton(ui, btn_x, y, bar_h, snapLabel(&buf, snap.*), open);
+}
+
+/// 标题栏下拉选择器——菜单（在**全部内容之后**调用 → 绘制在最上层）。
+/// `items`：条目文本（空列表显示占位提示）；`selected`：选中下标（点击条目写入）；
+/// `min_w`：最小宽度（如网格 96、乐器 170）；实际宽度还会按最长条目放宽；
+/// `skip_close`：本帧刚点击了按钮（用于打开菜单）——**跳过“点外部关闭”判断**，
 /// 否则同帧的点击会立刻把菜单关掉（实测 bug：菜单闪一下消失）。
 /// 返回 true = 本帧点击了列表（调用方用它屏蔽同帧的其它交互）。
-pub fn snapSelectorMenu(ui: *Ui, btn_x: i32, below_y: i32, snap: *i32, open: *bool, skip_close: bool) bool {
+pub fn titleSelectorMenu(
+    ui: *Ui,
+    btn_x: i32,
+    below_y: i32,
+    items: []const []const u8,
+    selected: *i32,
+    open: *bool,
+    skip_close: bool,
+    min_w: i32,
+) bool {
     if (!open.*) return false;
+    var mw = min_w;
+    for (items) |it| mw = @max(mw, titleSelectorButtonWidth(ui, it));
+    const n: i32 = @intCast(items.len);
+    const mh: i32 = @max(1, n) * menu_item_h + 4;
+    const mx = btn_x;
+    const my = below_y;
+    ui.renderer.fillRect(mx, my, mw, mh, ui.theme.panel);
+    ui.renderer.strokeRect(mx, my, mw, mh, ui.theme.accent);
+    if (n == 0) ui.label("（空）", mx + 10, my + 4, ui.theme.text_dim);
     var consumed = false;
-    var mw: i32 = 0;
-    var mh: i32 = 0;
-    var mx: i32 = 0;
-    var my: i32 = 0;
-    {
-        const n: i32 = @intCast(model.snap_denoms.len);
-        mw = 96;
-        mh = n * menu_item_h + 4;
-        mx = btn_x;
-        my = below_y;
-        ui.renderer.fillRect(mx, my, mw, mh, ui.theme.panel);
-        ui.renderer.strokeRect(mx, my, mw, mh, ui.theme.accent);
-        for (model.snap_denoms, 0..) |d, ii| {
-            const iy = my + 2 + @as(i32, @intCast(ii)) * menu_item_h;
-            const ih = inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, mw - 2, menu_item_h);
-            if (ih) ui.renderer.fillRect(mx + 1, iy, mw - 2, menu_item_h, ui.theme.item_hover);
-            var dbuf: [16]u8 = undefined;
-            const dt = std.fmt.bufPrint(&dbuf, "1/{d}", .{d}) catch "";
-            const sel = snap.* == @as(i32, @intCast(ii));
-            ui.labelClipped(dt, mx + 10, iy + 2, mw - 20, if (sel) ui.theme.accent else ui.theme.text);
-            if (ih) consumed = true;
-            if (ih and ui.mouse_pressed) {
-                snap.* = @intCast(ii);
-                open.* = false;
-            }
-        }
-        // 点外部关闭（跳过“刚点按钮打开菜单”那一帧）
-        if (!skip_close and ui.mouse_pressed and !inRect(ui.mouse_x, ui.mouse_y, mx, my, mw, mh)) {
+    for (items, 0..) |it, ii| {
+        const iy = my + 2 + @as(i32, @intCast(ii)) * menu_item_h;
+        const ih = inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, mw - 2, menu_item_h);
+        if (ih) ui.renderer.fillRect(mx + 1, iy, mw - 2, menu_item_h, ui.theme.item_hover);
+        const sel = selected.* == @as(i32, @intCast(ii));
+        ui.labelClipped(it, mx + 10, iy + 2, mw - 20, if (sel) ui.theme.accent else ui.theme.text);
+        if (ih) consumed = true;
+        if (ih and ui.mouse_pressed) {
+            selected.* = @intCast(ii);
             open.* = false;
         }
     }
+    // 点外部关闭（跳过“刚点按钮打开菜单”那一帧）
+    if (!skip_close and ui.mouse_pressed and !inRect(ui.mouse_x, ui.mouse_y, mx, my, mw, mh)) {
+        open.* = false;
+    }
     return consumed;
+}
+
+/// 吸附网格下拉（= `titleSelectorMenu` + 网格档位条目 "1/N"）
+pub fn snapSelectorMenu(ui: *Ui, btn_x: i32, below_y: i32, snap: *i32, open: *bool, skip_close: bool) bool {
+    if (!open.*) return false;
+    var bufs: [model.snap_denoms.len][16]u8 = undefined;
+    var items: [model.snap_denoms.len][]const u8 = undefined;
+    for (model.snap_denoms, 0..) |d, i| {
+        items[i] = std.fmt.bufPrint(&bufs[i], "1/{d}", .{d}) catch "";
+    }
+    return titleSelectorMenu(ui, btn_x, below_y, &items, snap, open, skip_close, 96);
 }
 
 /// 滚轮增量 → 像素（24px/格）
@@ -227,4 +251,59 @@ pub fn drawCursor(ui: *Ui, x: i32, ruler_y: i32, ruler_h: i32, bottom_y: i32, pl
         const half = @divTrunc(tri_w * (tri_h - 1 - i), tri_h * 2);
         ui.renderer.fillRect(x - half, ruler_y + i, half * 2 + 1, 1, col);
     }
+}
+
+// ── 测试 ──
+
+/// 测试辅助：网格绘制到干净画布（4/4：每小节 96 步、每拍 24 步；lane_x = 0）。
+fn gridTestRow(fb: *r_mod.Framebuffer, theme: *const Theme, snap_steps: i32, step_w: f32, zoom: f32) void {
+    var ren = r_mod.Renderer.init(fb);
+    @memset(fb.pixels, theme.bg);
+    drawTimelineGrid(&ren, theme, 0, @intCast(fb.width), 0, @intCast(fb.height), 0, 0, zoom, step_w, 96, 24, snap_steps);
+}
+
+test "网格：只画所选档位（不再常显步线）；拍线/小节线常显" {
+    var buf: [200 * 4]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 200, .height = 4 };
+    const theme = Theme{};
+
+    // 每步 1px；网格 1/96（每步）间距 1px < 4 → 网格层整层跳过
+    gridTestRow(&fb, &theme, 1, 1.0, 1.0);
+    try std.testing.expectEqual(theme.bg, buf[1]); // 步位置：无网格线（旧行为会常显）
+    try std.testing.expectEqual(theme.grid_beat, buf[24]); // 拍线常显
+    try std.testing.expectEqual(theme.grid_bar, buf[96]); // 小节线常显
+
+    // 放大到每步 24px：网格 1/96 间距 24px ≥ 4 → 网格层画出（此时它 = 步线）
+    gridTestRow(&fb, &theme, 1, 1.0, 24.0);
+    try std.testing.expectEqual(theme.grid_snap, buf[24]); // step 1 → x=24
+}
+
+test "网格：与拍/小节线重合时显示粗层（覆盖式，无洞）" {
+    var buf: [100 * 4]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 100, .height = 4 };
+    const theme = Theme{};
+
+    // 每步 0.5px；网格 1/4（24 步）与拍线完全重合
+    gridTestRow(&fb, &theme, 24, 1.0, 0.5);
+    try std.testing.expectEqual(theme.grid_beat, buf[12]); // step 24：拍线覆盖网格
+    try std.testing.expectEqual(theme.grid_bar, buf[48]); // step 96：小节线覆盖
+    try std.testing.expectEqual(theme.bg, buf[6]); // step 12：非网格点
+
+    // 网格 1/8（12 步）：非拍位置也有网格线
+    gridTestRow(&fb, &theme, 12, 1.0, 0.5);
+    try std.testing.expectEqual(theme.grid_snap, buf[6]); // step 12：网格点（非拍）
+    try std.testing.expectEqual(theme.grid_beat, buf[12]); // step 24：拍线覆盖
+}
+
+test "网格：拍线因太密隐藏时，拍位置上的网格线仍画（不留洞）" {
+    var buf: [40 * 4]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 40, .height = 4 };
+    const theme = Theme{};
+
+    // 每步 0.1px：网格 1/2（48 步）间距 4.8px ≥ 4 → 画；
+    // 拍线间距 2.4px < 6 → 整层跳过；小节线 9.6px ≥ 3 → 画。
+    // step 48 是拍位置（拍线层没画）——网格线必须补上（若用“跳过”逻辑会是洞）。
+    gridTestRow(&fb, &theme, 48, 1.0, 0.1);
+    try std.testing.expectEqual(theme.grid_snap, buf[4]); // step 48 → x=4.8→4：网格线补上
+    try std.testing.expectEqual(theme.grid_bar, buf[9]); // step 96 → x=9.6→9：小节线
 }

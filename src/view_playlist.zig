@@ -132,7 +132,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         while (true) : (bar += 1) {
             const bx = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(bar - 1)) * bar_ws - scroll_s));
             if (bx > main_x + main_w) break;
-            ui.renderer.vline(bx, ruler_y, ruler_h, ui.theme.panel_border);
+            // 只画数字标记（小节线在内容区已有，标尺行保持干净）。
+            // 若将来想加回刻度线，在此处加：
+            //   ui.renderer.fillRect(bx, ruler_y, 1, ruler_h, ui.theme.grid_bar);
             var buf: [8]u8 = undefined;
             const t = std.fmt.bufPrint(&buf, "{d}", .{bar}) catch "";
             ui.label(t, bx + 3, ruler_y + 1, ui.theme.text_dim);
@@ -187,8 +189,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 // 轨道内容区（背景 + 网格）
                 const lane_bg = if (i % 2 == 1) ui.theme.item_alt else ui.theme.panel;
                 ui.renderer.fillRect(lane_x, ty, view_w, track_h, lane_bg);
-                // 网格线（与钢琴卷帘共用 `util.drawTimelineGrid`：步线/拍线/小节线三层，
-                // U=96 对齐；`step_w` = 一小节宽/每小节步数）
+                // 网格线（与钢琴卷帘共用 `util.drawTimelineGrid`：网格层（= 当前量化档位）/
+                // 拍线/小节线，各自按密度门槛独立显隐；U=96 对齐）
                 util.drawTimelineGrid(
                     &ui.renderer,
                     &ui.theme,

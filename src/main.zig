@@ -410,7 +410,11 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     // 优先级：菜单(3) > 合成器窗口(2) > 机架窗口(1) > 主界面(0)。
     const rack_open = app.rack.open;
     const synth_open = app.synth_win.open;
-    const menu_open = app.rack.inst_menu_open or app.rack.add_menu_open or app.rack.ctx_instrument != null;
+    // 机架的下拉/右键菜单 = 模态层（全屏屏蔽）。
+    // 注：钢琴卷帘的两个标题栏选单**不在此列**——它们保持轻量语义
+    // （同帧 menu_click 门控本视图交互；点击穿透给其它视图后自行关闭），
+    // 这样两个选单可以单击直接互切（进模态层会让选择器按钮自身被屏蔽）。
+    const menu_open = app.rack.add_menu_open or app.rack.ctx_instrument != null;
 
     ui.resetLayers();
     _ = ui.declare(.{ .prio = 0, .rect = .{ .x = 0, .y = 0, .w = w, .h = h } }); // 主界面

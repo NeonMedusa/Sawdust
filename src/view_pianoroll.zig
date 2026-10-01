@@ -5,6 +5,7 @@ const r_mod = @import("render.zig");
 const Ui = @import("ui.zig").Ui;
 const App = @import("app.zig").App;
 const model = @import("model.zig");
+const synth = @import("synth.zig");
 const util = @import("view_util.zig");
 
 pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
@@ -13,16 +14,35 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     const title = std.fmt.bufPrint(&title_buf, "钢琴卷帘 — 样式 {d}", .{pattern + 1}) catch "钢琴卷帘";
     ui.panelTitled(x, y, w, h, title);
 
-    // 吸附网格选择器（标题栏内，**紧挨标题文字**）——
+    // 吸附网格选择器 + 乐器选择器（标题栏内，**紧挨标题文字**；两者交互/视觉一致）——
     // 按钮在此绘制（在标题后面）；下拉在内容之后绘制（最上层，见函数末尾）。
     const snap_menu_was_open = app.piano.snap_menu_open;
+    const inst_menu_was_open = app.piano.inst_menu_open;
     const title_w: i32 = @intFromFloat(ui.font.measure(title));
     const snap_btn_x: i32 = x + 6 + title_w + 12;
-    const snap_btn_w: i32 = 96; // 与 helper 内的 mw 一致（下拉左对齐用）
-    _ = snap_btn_w;
     var snap_clicked = false;
     if (snap_btn_x + 40 < x + w - 24) {
         snap_clicked = util.snapSelectorButton(ui, snap_btn_x, y, util.title_h, &app.piano.snap, &app.piano.snap_menu_open);
+    }
+    // 乐器选择器（网格选单**右侧**；标签 = 当前乐器名）
+    var inst_buf: [48]u8 = undefined;
+    const inst_label: []const u8 = blk: {
+        const iname: []const u8 = if (app.sel.instrument >= 0 and app.sel.instrument < @as(i32, @intCast(app.instruments.items.len)))
+            app.instruments.items[@intCast(app.sel.instrument)].name
+        else
+            "无乐器";
+        break :blk std.fmt.bufPrint(&inst_buf, "{s} ▾", .{iname}) catch iname;
+    };
+    const inst_btn_x: i32 = blk: {
+        var sbuf: [24]u8 = undefined;
+        break :blk snap_btn_x + util.titleSelectorButtonWidth(ui, util.snapLabel(&sbuf, app.piano.snap)) + 6;
+    };
+    var inst_clicked = false;
+    if (inst_btn_x + 40 < x + w - 24) {
+        inst_clicked = util.titleSelectorButton(ui, inst_btn_x, y, util.title_h, inst_label, &app.piano.inst_menu_open);
+        // 互斥：打开一个选单时关闭另一个
+        if (inst_clicked) app.piano.snap_menu_open = false;
+        if (snap_clicked) app.piano.inst_menu_open = false;
     }
 
     const ruler_h: i32 = 20; // 标尺行高 = 滚动条厚度（与播放列表一致）
@@ -112,7 +132,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         while (true) : (bar += 1) {
             const bx = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(bar - 1)) * bar_ws - scroll_s));
             if (bx > main_x + main_w) break;
-            ui.renderer.vline(bx, ruler_y, ruler_h, ui.theme.panel_border);
+            // 只画数字标记（小节线在内容区已有，标尺行保持干净）。
+            // 若将来想加回刻度线，在此处加：
+            //   ui.renderer.fillRect(bx, ruler_y, 1, ruler_h, ui.theme.grid_bar);
             var buf: [8]u8 = undefined;
             const t = std.fmt.bufPrint(&buf, "{d}", .{bar}) catch "";
             ui.label(t, bx + 3, ruler_y + 1, ui.theme.text_dim);
@@ -138,7 +160,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // - **菜单展开中 / 帧首菜单开着** 时忽略鼠标 → 修“点菜单击穿到琴键发声”（实测 bug）
     {
         const kh = app.piano.key_h;
-        const menu_blocks = app.rack.inst_menu_open or app.rack.add_menu_open or app.rack.ctx_instrument != null;
+        // 菜单展开中 → 琴键不响应（机架的下拉/右键菜单，以及卷帘自己的两个选单）
+        const menu_blocks = app.rack.add_menu_open or app.rack.ctx_instrument != null or
+            app.piano.inst_menu_open or app.piano.snap_menu_open;
         const in_keys = !menu_blocks and ui.hitRect(keys_x, lane_y, util.piano_header_w, lane_h);
         const over_other_drag = ui.active_id != 0 and ui.active_id != 6000;
         const pitch_at_mouse: i32 = 127 - @divFloor(ui.mouse_y - lane_y + app.piano.scroll, kh);
@@ -213,9 +237,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             ui.renderer.hline(lane_x, py, view_w, if (@mod(p, 12) == 0) ui.theme.panel_border else ui.theme.grid);
         }
 
-        // 步网格（竖线；每小节加强）。
         // 时间轴网格（与播放列表共用 `util.drawTimelineGrid`；U=96 对齐）。
-        // 该函数内部自行裁剪到音符区（含细小缩放时只画小节线的降级）。
+        // 该函数内部自行裁剪到音符区；网格层 = 当前量化档位（非固定步线），
+        // 拍线/小节线常显（各自按密度门槛降级）。
         util.drawTimelineGrid(
             &ui.renderer,
             &ui.theme,
@@ -339,59 +363,11 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         }
     }
 
-    // ── 乐器选择器（标尺行左端空位：琴键列上方）──
-    const menu_was_open = app.rack.inst_menu_open;
-    {
-        const btn_x = main_x + 1;
-        const btn_y = ruler_y;
-        const btn_w = util.piano_header_w - 1;
-        const btn_h = ruler_h;
-        app.rack.inst_btn_x = btn_x;
-        app.rack.inst_btn_y = btn_y;
-        app.rack.inst_btn_w = btn_w;
-        app.rack.inst_btn_h = btn_h;
-        const hovered = ui.hitRect(btn_x, btn_y, btn_w, btn_h);
-        ui.renderer.fillRect(btn_x, btn_y, btn_w, btn_h, if (app.rack.inst_menu_open) ui.theme.accent else if (hovered) ui.theme.item_hover else ui.theme.toolbar);
-        var ibuf: [48]u8 = undefined;
-        const iname: []const u8 = if (app.sel.instrument >= 0 and app.sel.instrument < @as(i32, @intCast(app.instruments.items.len)))
-            app.instruments.items[@intCast(app.sel.instrument)].name
-        else
-            "无乐器";
-        const it = std.fmt.bufPrint(&ibuf, "{s} ▾", .{iname}) catch iname;
-        ui.labelClipped(it, btn_x + 4, btn_y + 1, btn_w - 8, ui.theme.text);
-        if (hovered and ui.mouse_pressed) {
-            app.rack.inst_menu_open = !app.rack.inst_menu_open;
-            app.rack.add_menu_open = false;
-            app.rack.ctx_instrument = null;
-        }
-        if (app.rack.inst_menu_open) {
-            const n: i32 = @intCast(app.instruments.items.len);
-            const mw: i32 = @max(btn_w + 60, 170);
-            const mh: i32 = @max(1, n) * util.menu_item_h + 4;
-            const mx = btn_x;
-            const my = btn_y + btn_h;
-            ui.renderer.fillRect(mx, my, mw, mh, ui.theme.panel);
-            ui.renderer.strokeRect(mx, my, mw, mh, ui.theme.accent);
-            if (n == 0) {
-                ui.label("（通道机架为空）", mx + 8, my + 4, ui.theme.text_dim);
-            }
-            for (app.instruments.items, 0..) |inst2, ii| {
-                const iy = my + 2 + @as(i32, @intCast(ii)) * util.menu_item_h;
-                const ih = util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, mw - 2, util.menu_item_h);
-                if (ih) ui.renderer.fillRect(mx + 1, iy, mw - 2, util.menu_item_h, ui.theme.item_hover);
-                const sel = app.sel.instrument == @as(i32, @intCast(ii));
-                ui.labelClipped(inst2.name, mx + 8, iy + 2, mw - 16, if (sel) ui.theme.accent else ui.theme.text);
-                if (ih and ui.mouse_pressed) {
-                    app.sel.instrument = @intCast(ii);
-                    app.rack.inst_menu_open = false;
-                }
-            }
-            if (ui.mouse_pressed and !util.inRect(ui.mouse_x, ui.mouse_y, mx, my, mw, mh) and !hovered) app.rack.inst_menu_open = false;
-        }
-    }
+    // ── 乐器选择器已移至标题栏（网格选单右侧；见函数顶部）——
+    // 标尺行左端保持为空（不再占用琴键列上方）。
     // 菜单展开时的点击只归菜单：屏蔽音符交互一帧
     // （乐器选单、吸附网格选单、以及本帧点击选择器按钮本身）
-    const menu_click = (menu_was_open or snap_menu_was_open or snap_clicked) and ui.mouse_pressed;
+    const menu_click = (inst_menu_was_open or snap_menu_was_open or snap_clicked or inst_clicked) and ui.mouse_pressed;
 
     // 量化/吸附格（步）——音符移动/拉伸对齐到它；网格也按它加一层（已在函数顶部声明）。
 
@@ -604,5 +580,12 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 吸附网格下拉（在**全部内容之后** → 绘制在最上层，不会被标尺/音符区盖住）
     if (app.piano.snap_menu_open and snap_btn_x + 40 < x + w - 24) {
         _ = util.snapSelectorMenu(ui, snap_btn_x, y + util.title_h, &app.piano.snap, &app.piano.snap_menu_open, snap_clicked);
+    }
+    // 乐器下拉（同样在最上层；与网格选单互斥——同时只会开一个）
+    if (app.piano.inst_menu_open and inst_btn_x + 40 < x + w - 24) {
+        var names: [synth.max_instruments][]const u8 = undefined;
+        const n: usize = @min(app.instruments.items.len, synth.max_instruments);
+        for (app.instruments.items[0..n], 0..) |inst2, ii| names[ii] = inst2.name;
+        _ = util.titleSelectorMenu(ui, inst_btn_x, y + util.title_h, names[0..n], &app.sel.instrument, &app.piano.inst_menu_open, inst_clicked, 170);
     }
 }

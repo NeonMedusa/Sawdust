@@ -39,7 +39,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
     // （否则菜单项点击会穿透到下面的行/按钮）。
     // 注意：**不覆盖**“被上层窗口屏蔽”的状态（那是 beginLayer 算的；
     // 上面用 or 合幷而不直接赋值）。
-    const menu_modal = menu_was_open or app.rack.inst_menu_open or app.rack.add_menu_open or app.rack.ctx_instrument != null;
+    const menu_modal = menu_was_open or app.rack.add_menu_open or app.rack.ctx_instrument != null;
     if (menu_modal) ui.input_blocked = true;
 
     // 窗口阴影 + 背景 + 边框
@@ -57,7 +57,6 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
     ui.label("×", close_x + 6, title_y + 4, ui.theme.text);
     if (close_hovered and ui.mouse_pressed) {
         rk.open = false;
-        app.rack.inst_menu_open = false;
         app.rack.add_menu_open = false;
         app.rack.ctx_instrument = null;
         return true;
@@ -132,7 +131,6 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
     ui.label("+ 添加乐器", add_x + 8, add_y + 3, ui.theme.text_dim);
     if (add_hovered and ui.mouse_pressed) {
         app.rack.add_menu_open = !app.rack.add_menu_open;
-        app.rack.inst_menu_open = false;
         app.rack.ctx_instrument = null;
     }
 
