@@ -183,7 +183,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             if (ty + track_h > tracks_y and ty < tracks_y + tracks_h) {
                 const selected = app.sel.track == @as(i32, @intCast(i));
                 // 轨道名（左列；底色加深与内容区区分）
-                if (ui.listItem(3000 + i, app.track_items[i], main_x, ty, header_w, track_h, selected, i % 2 == 1, ui.theme.bg)) {
+                // 注：Ctrl 按下时不响应（让位给“按行框选”——起点在轨道名列的手势）
+                if (ui.listItem(3000 + i, app.track_items[i], main_x, ty, header_w, track_h, selected, i % 2 == 1, ui.theme.bg) and !ui.mods_ctrl) {
                     app.sel.track = @intCast(i);
                 }
                 // 轨道内容区（背景 + 网格）
@@ -220,9 +221,14 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                         const clip_w = rect.w;
                         if (clip_x + clip_w < lane_x or clip_x > lane_x + view_w) continue;
                         const base = patternColor(clip.pattern);
-                        // 底色 = 样式色（32% 不透明）+ 描边 = 样式色全亮
+                        // 底色 = 样式色（32% 不透明）+ 描边 = 样式色全亮；
+                        // 选中片段：额外叠加橙色高亮（框选/批量操作的视觉反馈）
                         const fill = (@as(u32, 80) << 24) | (base & 0x00FFFFFF);
                         ui.renderer.fillRect(clip_x, ty, clip_w, track_h, fill);
+                        if (clip.selected) {
+                            const sel_fill = (@as(u32, 60) << 24) | (ui.theme.note_selected & 0x00FFFFFF);
+                            ui.renderer.fillRect(clip_x, ty, clip_w, track_h, sel_fill);
+                        }
 
                         // ── 片段内音符预览（minimap 风格）──
                         // 只画“片段可见窗口”（offset..offset+len）内的音符；
@@ -261,6 +267,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                         // 描边只在“不会被填充满”时才画（与钢琴卷帘音符同一规则）：
                         // 极窄的片段描边会把填充完全包成灰色。
                         if (clip_w > 2) ui.renderer.strokeRect(clip_x, ty, clip_w, track_h, base);
+                        if (clip.selected and clip_w > 2) ui.renderer.strokeRect(clip_x, ty, clip_w, track_h, ui.theme.note_selected);
                         if (label_h > 0) {
                             var buf: [24]u8 = undefined;
                             const label_text = std.fmt.bufPrint(&buf, "样式 {d}", .{clip.pattern + 1}) catch "";
@@ -271,6 +278,28 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             }
             ty += track_h;
             if (ty > tracks_y + tracks_h) break;
+        }
+
+        // 框选矩形（半透明填充 + 描边；画在片段之上；裁剪到轨道内容区）
+        if (app.playlist.marquee_active) {
+            const mx0 = @min(app.playlist.marquee_x0, ui.mouse_x);
+            const mx1 = @max(app.playlist.marquee_x0, ui.mouse_x);
+            const my0 = @min(app.playlist.marquee_y0, ui.mouse_y);
+            const my1 = @max(app.playlist.marquee_y0, ui.mouse_y);
+            const fill = (@as(u32, 40) << 24) | (ui.theme.accent & 0x00FFFFFF);
+            if (app.playlist.row_marquee) {
+                // 按行框选：**横跨整个内容区**的行带（轨道行范围；当前行 = 鼠标所在行）
+                const cur_track: i32 = @divFloor(ui.mouse_y - tracks_y + app.playlist.scroll, track_h);
+                const t0 = @min(app.playlist.row_marquee_track0, cur_track);
+                const t1 = @max(app.playlist.row_marquee_track0, cur_track);
+                const ry0 = tracks_y + t0 * track_h - app.playlist.scroll;
+                const rh = (t1 - t0 + 1) * track_h;
+                ui.renderer.fillRect(lane_x, ry0, view_w, rh, fill);
+                ui.renderer.strokeRect(lane_x, ry0, view_w, rh, ui.theme.accent);
+            } else {
+                ui.renderer.fillRect(mx0, my0, mx1 - mx0, my1 - my0, fill);
+                ui.renderer.strokeRect(mx0, my0, mx1 - mx0, my1 - my0, ui.theme.accent);
+            }
         }
     }
 
@@ -323,9 +352,52 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     const track_count: i32 = @intCast(app.track_items.len);
     const valid_track = track_i >= 0 and track_i < track_count;
 
+    // ── 框选（Ctrl+左键拖；Ctrl+Shift = 追加）——片段──
+    // **按行框选**：起点在**轨道名列**时切换成“整行选择”（垂直拖选轨道行、水平不限）
+    if (ui.mods_ctrl and ui.mouse_pressed and ui.active_id == 0) {
+        const in_header = ui.hitRect(main_x, tracks_y, header_w, tracks_h);
+        if (in_lane or in_header) {
+            app.playlist.marquee_active = true;
+            app.playlist.marquee_add = ui.mods_shift;
+            app.playlist.marquee_x0 = ui.mouse_x;
+            app.playlist.marquee_y0 = ui.mouse_y;
+            app.playlist.row_marquee = in_header;
+            app.playlist.row_marquee_track0 = track_i;
+            ui.active_id = 7400; // 片段框选手势
+            if (!app.playlist.marquee_add) app.clearClipSelection();
+        }
+    }
+    if (ui.active_id == 7400 and !ui.mouse_down) {
+        ui.active_id = 0;
+        app.playlist.marquee_active = false;
+        app.playlist.row_marquee = false;
+    }
+    if (app.playlist.marquee_active) {
+        const mx0 = @min(app.playlist.marquee_x0, ui.mouse_x);
+        const mx1 = @max(app.playlist.marquee_x0, ui.mouse_x);
+        const my0 = @min(app.playlist.marquee_y0, ui.mouse_y);
+        const my1 = @max(app.playlist.marquee_y0, ui.mouse_y);
+        if (!app.playlist.marquee_add) app.clearClipSelection();
+        for (app.clips.items) |*c| {
+            if (app.playlist.row_marquee) {
+                // 按行：轨道在起始/当前行之间 → 选中（**水平不限**）
+                const t0 = @min(app.playlist.row_marquee_track0, track_i);
+                const t1 = @max(app.playlist.row_marquee_track0, track_i);
+                if (c.track >= t0 and c.track <= t1) c.selected = true;
+                continue;
+            }
+            const rect = clipXW(c.*, lane_x, step_px, app.playlist.scroll_x, zoom);
+            const cy = tracks_y + @as(i32, @intCast(c.track)) * track_h - app.playlist.scroll;
+            if (rect.x + rect.w >= mx0 and rect.x <= mx1 and cy + track_h >= my0 and cy <= my1) {
+                c.selected = true;
+            }
+        }
+    }
+
     // 命中：鼠标下的片段 + 命中模式（中部 / 左缘 / 右缘，边缘区 8px）
+    // 注：框选手势期间不命中（框选优先）
     var clip_hit: ?struct { index: usize, mode: model.ClipHitMode } = null;
-    if (in_lane and valid_track) {
+    if (in_lane and valid_track and !app.playlist.marquee_active and !ui.mods_ctrl) {
         for (app.clips.items, 0..) |c, ci| {
             if (c.track != track_i) continue;
             if (step_i >= c.start and step_i < c.start + c.len) {
@@ -381,7 +453,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     }
 
     // 左键按下：选中 / 开始拖动或拉伸 / 空位放置
-    if (ui.mouse_pressed and in_lane and valid_track) {
+    // 注：Ctrl 按下（框选手势）时不放置/拖动——否则框选启动当帧会先放一个片段
+    if (ui.mouse_pressed and in_lane and !ui.mods_ctrl and valid_track) {
         app.sel.track = track_i;
         if (clip_hit) |hit| {
             const c = app.clips.items[hit.index];
@@ -394,22 +467,42 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             app.playlist.drag_armed = false;
             app.playlist.drag_down_x = ui.mouse_x;
             app.playlist.drag_down_y = ui.mouse_y;
-            switch (hit.mode) {
-                .left => {
-                    app.playlist.resize_clip = hit.index;
-                    app.playlist.resize_left = true;
-                },
-                .right => {
-                    app.playlist.resize_clip = hit.index;
-                    app.playlist.resize_left = false;
-                },
-                .body => {
-                    app.playlist.drag_clip = hit.index;
-                    app.playlist.drag_grab = step_i - c.start;
-                },
+            // 命中**已选中的片段** + 选区 ≥ 2：
+            // - 中部 → 批量拖动；边缘 → 批量拉伸（全组同步，与音符一致）
+            const batch_sel = c.selected and app.selectedClipCount() >= 2;
+            if (batch_sel and hit.mode == .body) {
+                app.beginClipBatchSnap();
+                app.playlist.drag_batch = true;
+                app.playlist.batch_down_step = step_i;
+                app.playlist.batch_down_track = track_i;
+            } else if (batch_sel) {
+                app.beginClipBatchSnap();
+                app.playlist.batch_trim = true;
+                app.playlist.batch_trim_down_step = step_i;
+                app.playlist.batch_trim_grid = @max(1, snap_steps);
+                app.playlist.resize_left = hit.mode == .left;
+            } else {
+                // 单选语义：点未选中片段 → 清除旧选区（只操作当前这个）
+                if (!c.selected) app.clearClipSelection();
+                switch (hit.mode) {
+                    .left => {
+                        app.playlist.resize_clip = hit.index;
+                        app.playlist.resize_left = true;
+                    },
+                    .right => {
+                        app.playlist.resize_clip = hit.index;
+                        app.playlist.resize_left = false;
+                    },
+                    .body => {
+                        app.playlist.drag_clip = hit.index;
+                        app.playlist.drag_grab = step_i - c.start;
+                    },
+                }
             }
         } else {
             // 放置：位置吸附到网格；默认长度 = 1 小节（步单位随拍号）
+            // 注：放置新片段时**取消选区**（符合直觉：新建 = 新焦点）
+            app.clearClipSelection();
             const new_len: i32 = spb;
             if (!model.clipOverlaps(app.clips.items, app.clips.items.len, track_i, snap_step, new_len)) {
                 app.addClip(.{ .track = track_i, .start = snap_step, .len = new_len, .pattern = app.sel.pattern });
@@ -419,6 +512,37 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
 
     // 拖动 / 拉伸更新（鼠标可移出区域；位置 clamp 到有效范围）
     if (ui.mouse_down) {
+        // ── 批量拖动（选区 ≥ 2）──
+        if (app.playlist.drag_batch) {
+            if (!app.playlist.drag_armed) {
+                const dx = ui.mouse_x - app.playlist.drag_down_x;
+                const dy = ui.mouse_y - app.playlist.drag_down_y;
+                if (dx * dx + dy * dy >= 3 * 3) app.playlist.drag_armed = true;
+            }
+            if (app.playlist.drag_armed) {
+                const d_step = model.snapRound(step_i - app.playlist.batch_down_step, snap_steps);
+                const d_track = track_i - app.playlist.batch_down_track;
+                _ = app.moveSelectedClips(d_step, d_track, track_count);
+            }
+        }
+        // ── 批量拉伸（选区 ≥ 2 边缘拖动；全组同步，与音符一致）──
+        if (app.playlist.batch_trim) {
+            if (!app.playlist.drag_armed) {
+                const dx = ui.mouse_x - app.playlist.drag_down_x;
+                const dy = ui.mouse_y - app.playlist.drag_down_y;
+                if (dx * dx + dy * dy >= 3 * 3) app.playlist.drag_armed = true;
+            }
+            if (app.playlist.drag_armed) {
+                const g = app.playlist.batch_trim_grid;
+                // 位移 → 格数（左缘：左移为正、右缘：右移为正；与单片段增量式一致）
+                const delta = if (app.playlist.resize_left)
+                    app.playlist.batch_trim_down_step - step_i // 左缘：左移为正（加长）
+                else
+                    step_i - app.playlist.batch_trim_down_step; // 右缘：右移为正（加长）
+                const k = model.gridSteps(delta, g);
+                _ = app.applyClipBatchTrim(k, g, app.playlist.resize_left);
+            }
+        }
         // 死区：位移超过 3px 才真正开始编辑（防单击片段被吸附）
         if (app.playlist.drag_clip != null or app.playlist.resize_clip != null) {
             if (!app.playlist.drag_armed) {
@@ -482,6 +606,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         app.playlist.drag_clip = null;
         app.playlist.resize_clip = null;
         app.playlist.drag_armed = false; // 下次按下重新评估死区
+        app.playlist.drag_batch = false;
+        app.playlist.batch_trim = false;
     }
 
     // 纵向滚动：滚轮（主区）+ 右侧纵向滚动条
@@ -508,6 +634,37 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         }
     }
     _ = ui.scrollbarV(9, sb_x, tracks_y, ruler_h, tracks_h, &app.playlist.scroll, content_h, tracks_h);
+
+    // ── 编辑快捷键执行（框选/批量；本视图处理片段相关）──
+    // Del：删除选中片段；Ctrl+A：全选片段；Ctrl+B：铺瓷砖克隆（选区转移到克隆体）；
+    // Ctrl+C/V：片段剪贴板（粘贴到**鼠标位置**：步 + 轨道）。
+    if (app.pending_edit_op) |op| {
+        switch (op) {
+            .delete_selected => {
+                const n = app.deleteSelectedClips();
+                if (n > 0) app.setToastWith("已删除 {d} 个片段", .{n});
+            },
+            .select_all => {
+                const n = app.selectAllClips();
+                if (n > 0) app.setToastWith("已全选 {d} 个片段", .{n});
+            },
+            .clone_right => {
+                const n = app.cloneSelectedClipsRight();
+                if (n > 0) app.setToastWith("已克隆 {d} 个片段（选区已移至克隆体）", .{n});
+            },
+            .copy => {
+                const n = app.copySelectedClips();
+                if (n > 0) app.setToastWith("已复制 {d} 个片段", .{n});
+            },
+            .paste => {
+                // 粘贴到**鼠标位置**（步吸附网格；**轨道不变**——回原轨道）
+                const n = app.pasteClips(snap_step, track_count);
+                if (n > 0) app.setToastWith("已粘贴 {d} 个片段", .{n});
+            },
+        }
+        app.pending_edit_op = null;
+    }
+
     // 吸附网格下拉（在**全部内容之后** → 绘制在最上层）
     if (app.playlist.snap_menu_open and snap_btn_x + 40 < x + w - 24) {
         _ = util.snapSelectorMenu(ui, snap_btn_x, y + util.title_h, &app.playlist.snap, &app.playlist.snap_menu_open, snap_clicked);

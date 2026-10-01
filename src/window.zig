@@ -36,6 +36,12 @@ pub const Event = union(enum) {
 
 pub const MouseButton = enum { left, right, middle };
 
+/// 修饰键状态（每帧由 main 从窗口读取；框选/批量操作用）
+pub const Modifiers = struct {
+    ctrl: bool = false,
+    shift: bool = false,
+};
+
 /// 帧缓冲：BGRA 像素（与 Win32 的 32 位 DIB 格式一致，可直接 blit）
 pub const Framebuffer = struct {
     pixels: []u32,
@@ -226,6 +232,15 @@ const WindowsWindow = struct {
             // 立即生效：向窗口发 WM_SETCURSOR 由系统重取类光标
             _ = SetCursor(@ptrCast(h));
         }
+    }
+
+    /// 当前修饰键状态（Ctrl/Shift；每帧由 main 读取——
+    /// 键盘事件里只带按下瞬间的状态，而框选等手势需要“当前”状态）
+    pub fn modifiers(self: *WindowsWindow) Modifiers {
+        _ = self;
+        const ctrl = (@as(u16, @bitCast(GetKeyState(VK_CONTROL))) & 0x8000) != 0;
+        const shift = (@as(u16, @bitCast(GetKeyState(VK_SHIFT))) & 0x8000) != 0;
+        return .{ .ctrl = ctrl, .shift = shift };
     }
 
     /// 空白光标（1×1 全透明；懒创建一次）
@@ -632,6 +647,10 @@ const UnsupportedWindow = struct {
     pub fn frozenDeltaY(self: *UnsupportedWindow) i32 {
         _ = self;
         return 0;
+    }
+    pub fn modifiers(self: *UnsupportedWindow) Modifiers {
+        _ = self;
+        return .{};
     }
     pub fn setDragCapture(self: *UnsupportedWindow, on: bool) void {
         _ = self;

@@ -58,6 +58,8 @@ pub const Theme = struct {
     grid_beat: Color = r_mod.rgb(76, 82, 96),
     /// 小节线（最亮、2px——与拍/网格拉开明暗+粗细双层差异）
     grid_bar: Color = r_mod.rgb(108, 115, 132),
+    /// 选中音符（框选/批量操作的视觉反馈；与普通音符、拖动中音符都区分）
+    note_selected: Color = r_mod.rgb(255, 186, 80),
     /// 列表项：悬停 / 选中 / 交替行
     item_hover: Color = r_mod.rgb(52, 58, 68),
     item_selected: Color = r_mod.rgb(58, 84, 120),
@@ -97,6 +99,9 @@ pub const Ui = struct {
     wheel: i32 = 0,
     /// 本帧滚轮是否按着 Ctrl（横向缩放）
     wheel_ctrl: bool = false,
+    /// 本帧修饰键状态（每帧由 main 从窗口读取；框选/批量操作用）
+    mods_ctrl: bool = false,
+    mods_shift: bool = false,
 
     // ── 拖动状态（跨帧保持）──
     active_id: u64 = 0,

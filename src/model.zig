@@ -25,6 +25,8 @@ pub const Clip = struct {
     len: i32, // 可见长度（步，>= 1）
     pattern: i32, // 样式序号（0 起）
     offset: i32 = 0, // 左缘对应的局部步（0 = 从片段自身第 1 步开始）
+    /// 框选/批量操作选中（**瞬态**：不存档）
+    selected: bool = false,
 };
 
 /// 钢琴卷帘中的音符（**局部坐标**，按样式 + 乐器归属）。
@@ -37,6 +39,8 @@ pub const Note = struct {
     pitch: i32, // MIDI 音高（0-127）
     pattern: i32, // 所属样式序号
     instrument: i32 = 0, // 所属乐器（通道机架槽位，0 起）
+    /// 框选/批量操作选中（**瞬态**：不存档）
+    selected: bool = false,
 };
 
 /// 乐器（通道机架中的一个槽位）。
@@ -206,6 +210,29 @@ pub fn trimLenByGrid(orig_len: i32, delta_steps: i32, grid: i32) i32 {
     return @max(trimMinGridLen(orig_len, g), orig_len + k * g);
 }
 
+/// 批量缩短：长 `len` 的音符在网格 `g` 下**最多能缩短几格**。
+/// 规则（与单音符一致：缩短后长度 = 原长 − k×格，且 >= “原长减去整数格后的最小正余”）：
+/// `m = floor((len-1)/g)`——若 `len <= g` 则 m = 0（不能缩短）。
+/// 批量操作取所有选中音符的 **min(m)**（有一个不够就整体不能缩）。
+pub fn batchShortenMax(len: i32, grid: i32) i32 {
+    const g = @max(1, grid);
+    return @divFloor(@max(1, len) - 1, g);
+}
+
+/// 批量拉伸的**格数钳制**：
+/// - `requested`：鼠标位移换算的格数（正 = 加长、负 = 缩短）；
+/// - `shorten_cap`：全组最多能缩几格（= min over 组内 `batchShortenMax`，>= 0）；
+/// - `extend_cap`：全组最多能延几格（>= 0；右缘拉伸传大值，左缘传
+///   `min(step/g)`——不能越过样式开头）；
+/// 返回钳制后的格数（保持符号）。
+pub fn clampBatchK(requested: i32, shorten_cap: i32, extend_cap: i32) i32 {
+    // 注：不能用 `@max(0, x)`——Zig 会把非负结果收窄成 u31，无法取负。
+    const sc: i32 = if (shorten_cap > 0) shorten_cap else 0;
+    const ec: i32 = if (extend_cap > 0) extend_cap else 0;
+    if (requested < 0) return @max(requested, -sc);
+    return @min(requested, ec);
+}
+
 test "snapSteps / snapFloor / snapRound（U=96）" {
     // 档位 → 步数：1/1 = 96、1/4 = 24、1/8 = 12、1/3 = 32、1/12 = 8、1/96 = 1
     try std.testing.expectEqual(@as(i32, 96), snapSteps(0)); // 1/1
@@ -253,6 +280,30 @@ test "gridSteps / trimMinGridLen / trimLenByGrid：增量式拉伸（网格 = �
     // 自由精度（网格 = 1 步）：跟随位移、下限 1
     try std.testing.expectEqual(@as(i32, 37), trimLenByGrid(12, 25, 1));
     try std.testing.expectEqual(@as(i32, 1), trimLenByGrid(12, -999, 1));
+}
+
+test "batchShortenMax / clampBatchK：批量缩短的“全组同步”规则" {
+    const g = 12; // 1/8 网格 = 12 步
+    // 四分音符（24）：最多缩 1 格（24−12=12；再缩 24−24=0 不行）
+    try std.testing.expectEqual(@as(i32, 1), batchShortenMax(24, g));
+    // 八分音符（12）：不能缩（= 一格）
+    try std.testing.expectEqual(@as(i32, 0), batchShortenMax(12, g));
+    // 更短（6）：不能缩
+    try std.testing.expectEqual(@as(i32, 0), batchShortenMax(6, g));
+    // 二分音符（48）：3 格（48→36→24→12，到一格为止）
+    try std.testing.expectEqual(@as(i32, 3), batchShortenMax(48, g));
+    // 非整格（30）：floor(29/12) = 2
+    try std.testing.expectEqual(@as(i32, 2), batchShortenMax(30, g));
+
+    // 钳制：全组 cap = min（有一个不够就整体不能缩）
+    const cap = @min(batchShortenMax(24, g), batchShortenMax(24, g));
+    try std.testing.expectEqual(@as(i32, -1), clampBatchK(-1, cap, 0));
+    try std.testing.expectEqual(@as(i32, -1), clampBatchK(-5, cap, 0)); // 超缩 → 钳到 -1
+    const cap2 = @min(batchShortenMax(24, g), batchShortenMax(12, g)); // 有一个 = 一格
+    try std.testing.expectEqual(@as(i32, 0), clampBatchK(-1, cap2, 0)); // 全组不能缩
+    // 加长：受 extend_cap（左缘“不能越过 0”）
+    try std.testing.expectEqual(@as(i32, 3), clampBatchK(10, 0, 3));
+    try std.testing.expectEqual(@as(i32, 10), clampBatchK(10, 0, 999));
 }
 
 /// 值域映射（minimap 的纵向压缩）：把 `[min_v, max_v]` 归一化到 `[0, 1]`。

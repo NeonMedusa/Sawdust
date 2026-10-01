@@ -146,6 +146,13 @@ pub fn main(init: std.process.Init) !u8 {
 
         // 1) 输入
         const events = try win.pollEvents();
+        // 修饰键（每帧读“当前”状态——框选手势需要实时状态，
+        // 而键盘事件里只有按下瞬间的状态）
+        {
+            const m = win.modifiers();
+            ui_input.mods_ctrl = m.ctrl;
+            ui_input.mods_shift = m.shift;
+        }
         for (events) |ev| {
             switch (ev) {
                 .quit => {},
@@ -232,6 +239,13 @@ pub fn main(init: std.process.Init) !u8 {
                         app.pending_file_action = if (k.shift) .save_as else .save;
                     }
                     if (k.ctrl and (k.code == 'O' or k.code == 'o')) app.pending_file_action = .open;
+                    // ── 编辑快捷键（框选/批量操作；只登记，由当前视图按上下文执行）──
+                    // Del（VK_DELETE = 0x2E）：删除选中
+                    if (k.code == 0x2E) app.pending_edit_op = .delete_selected;
+                    if (k.ctrl and (k.code == 'B' or k.code == 'b')) app.pending_edit_op = .clone_right;
+                    if (k.ctrl and (k.code == 'C' or k.code == 'c')) app.pending_edit_op = .copy;
+                    if (k.ctrl and (k.code == 'V' or k.code == 'v')) app.pending_edit_op = .paste;
+                    if (k.ctrl and (k.code == 'A' or k.code == 'a')) app.pending_edit_op = .select_all;
                 },
                 .resize => {},
                 else => {},
@@ -293,6 +307,8 @@ pub fn main(init: std.process.Init) !u8 {
         ui.mouse_double = ui_input.mouse_double;
         ui.wheel = ui_input.wheel;
         ui.wheel_ctrl = ui_input.wheel_ctrl;
+        ui.mods_ctrl = ui_input.mods_ctrl;
+        ui.mods_shift = ui_input.mods_shift;
 
         // □ 缩放拖动：鼠标冻结（光标隐藏 + 锚定不动，位移经 frozen_dy 传入）
         if (ui.mouse_capture) {
@@ -396,6 +412,8 @@ const InputState = struct {
     mouse_double: bool = false,
     wheel: i32 = 0,
     wheel_ctrl: bool = false,
+    mods_ctrl: bool = false,
+    mods_shift: bool = false,
 };
 
 // ── 主界面组装 ──

@@ -36,6 +36,18 @@ pub const Layout = struct {
 /// 文件菜单动作（帧末统一执行）
 pub const FileAction = enum { open, save, save_as, import_midi, export_midi };
 
+/// 编辑操作（框选/批量操作快捷键 → 由**当前视图**在帧内按上下文执行）
+pub const EditOp = enum { delete_selected, clone_right, copy, paste, select_all };
+
+/// 剪贴板音符（step 存为**相对**最左音符的偏移；粘贴时加到锚点）
+pub const ClipboardNote = struct { step: i32, len: i32, pitch: i32 };
+
+/// 批量拉伸快照项（拖选中音符期间；按音符数组顺序对应）
+/// 批量操作快照项（拖选中音符/片段期间；按数组顺序对应）
+/// - 音符：`step`=起点、`len`=长度、`pitch`=音高；
+/// - 片段：`step`=start、`len`=len、`pitch`=track、`offset`=左缘局部步（左缘拉伸用）。
+pub const BatchSnap = struct { step: i32, len: i32, pitch: i32, offset: i32 = 0 };
+
 /// 脏确认流程的**目标动作**（确认框按钮相同，但“保存后”要执行不同的事）
 pub const PendingIntent = enum {
     /// 保存后退出程序
@@ -86,7 +98,7 @@ pub const PlaylistState = struct {
     /// 横向缩放（屏幕像素 / 内容像素）
     zoom: f32 = 1.0,
     /// 量化/吸附网格档位（`model.snap_denoms` 下标；**与钢琴卷帘独立**）
-    snap: i32 = 2, // 默认 1/4
+    snap: i32 = 3, // 默认 1/8（`snap_denoms` 下标 3）
     /// 吸附网格下拉选单：展开中
     snap_menu_open: bool = false,
 
@@ -110,14 +122,37 @@ pub const PlaylistState = struct {
     drag_down_y: i32 = 0,
     /// 右键擦除拖动中（按住右键划过片段即删）
     erase_drag: bool = false,
+
+    // ── 框选 / 批量操作（片段）──
+    /// 框选拖动中（Ctrl+左键拖）
+    marquee_active: bool = false,
+    /// 框选起点（屏幕坐标）
+    marquee_x0: i32 = 0,
+    marquee_y0: i32 = 0,
+    /// 框选追加（Ctrl+Shift）：按下时不取消旧选区
+    marquee_add: bool = false,
+    /// 批量拖动选中片段（拖动中）
+    drag_batch: bool = false,
+    /// 批量拖动按下时的鼠标步 / 轨道（快照基准）
+    batch_down_step: i32 = 0,
+    batch_down_track: i32 = 0,
+    /// 批量拉伸中（拖选中片段的边缘；全组同步，与音符一致）
+    batch_trim: bool = false,
+    /// 批量拉伸的基准：按下时的鼠标步 + 网格格宽（步）
+    batch_trim_down_step: i32 = 0,
+    batch_trim_grid: i32 = 1,
+    /// **按行框选**（Ctrl+左键起点在轨道名列）：垂直拖选轨道行；水平不限（整条时间轴）
+    row_marquee: bool = false,
+    /// 行框选起始轨道（按下时）
+    row_marquee_track0: i32 = 0,
 };
 
 /// 钢琴卷帘视图状态
 pub const PianoState = struct {
     /// 当前编辑的样式序号（null = 在播放列表视图）
     pattern: ?i32 = null,
-    /// 音高行高（像素；□ 缺口缩放）
-    key_h: i32 = 12,
+    /// 音高行高（像素；□ 缺口缩放）——默认 16：视口内行数较少、内容更大
+    key_h: i32 = 16,
     /// 纵向滚动（像素）
     scroll: i32 = 0,
     /// 横向滚动（内容像素）
@@ -143,7 +178,7 @@ pub const PianoState = struct {
     last_note_len: i32 = 0,
 
     /// 量化/吸附网格档位（`model.snap_denoms` 下标；控制音符移动/拉伸对齐）
-    snap: i32 = 2, // 默认 1/4
+    snap: i32 = 3, // 默认 1/8（`snap_denoms` 下标 3）
     /// 吸附网格下拉选单：展开中
     snap_menu_open: bool = false,
     /// 乐器选择下拉选单：展开中（标题栏、网格选单右侧；与机架窗口的选单独立）
@@ -154,6 +189,29 @@ pub const PianoState = struct {
     drag_armed: bool = false,
     drag_down_x: i32 = 0,
     drag_down_y: i32 = 0,
+
+    // ── 框选 / 批量操作 ──
+    /// 框选拖动中（Ctrl+左键拖）
+    marquee_active: bool = false,
+    /// 框选起点（屏幕坐标）
+    marquee_x0: i32 = 0,
+    marquee_y0: i32 = 0,
+    /// 框选追加（Ctrl+Shift）：按下时不取消旧选区
+    marquee_add: bool = false,
+    /// 批量拖动选中音符（拖动中；`drag_note` 为 null 时看这个）
+    drag_batch: bool = false,
+    /// 批量拖动按下时的鼠标内容步 / 音高（快照基准）
+    batch_down_step: i32 = 0,
+    batch_down_pitch: i32 = 0,
+    /// 批量拉伸中（拖选中音符的边缘；左右同单音符规则）
+    batch_trim: bool = false,
+    /// 批量拉伸的基准：按下时的鼠标步 + 网格格宽（步）
+    batch_trim_down_step: i32 = 0,
+    batch_trim_grid: i32 = 1,
+    /// **按行框选**（Ctrl+左键起点在琴键列）：垂直拖选音高行；水平不限（整条时间轴）
+    row_marquee: bool = false,
+    /// 行框选起始音高（按下时）
+    row_marquee_pitch0: i32 = 0,
 
     /// 正在试听的音高（null = 无）——**单一真源**：
     /// 琴键点击、音符放置、音符拖动换音都写它；行高亮/琴键高亮/发声都由它派生。
@@ -271,6 +329,16 @@ pub const App = struct {
     sched_events: synth.SchedQueue = .{},
     /// 序列器调度状态（已调度到哪一步 + generation）
     scheduler: sequencer.Scheduler = .{},
+
+    // ── 选区与批量操作（框选/剪贴板；瞬态，不存档）──
+    /// 待执行的编辑操作（键盘快捷键只登记；由当前视图按上下文执行并清除）
+    pending_edit_op: ?EditOp = null,
+    /// 音符剪贴板（step 为相对最左音符的偏移）
+    clipboard_notes: std.ArrayListUnmanaged(ClipboardNote) = .{ .items = &.{}, .capacity = 0 },
+    /// 片段剪贴板（绝对坐标；粘贴时整体平移）
+    clipboard_clips: std.ArrayListUnmanaged(Clip) = .{ .items = &.{}, .capacity = 0 },
+    /// 批量拉伸快照（拖选中音符边缘期间；顺序 = 音符数组顺序）
+    batch_snap: std.ArrayListUnmanaged(BatchSnap) = .{ .items = &.{}, .capacity = 0 },
 
     // ── 保存 / 加载（工程文件）──
     /// 当前工程路径（null = 尚未保存过）
@@ -392,6 +460,450 @@ pub const App = struct {
         self.dirty = true;
     }
 
+    // ── 选区 / 批量操作（框选、批量删除/克隆/复制/粘贴）──
+
+    /// 选中音符数
+    pub fn selectedNoteCount(self: *const App) usize {
+        var n: usize = 0;
+        for (self.notes.items) |nt| {
+            if (nt.selected) n += 1;
+        }
+        return n;
+    }
+
+    /// 清空音符选区（不碰片段选区）
+    pub fn clearNoteSelection(self: *App) void {
+        for (self.notes.items) |*nt| nt.selected = false;
+    }
+
+    /// 全选当前样式的全部音符（Ctrl+A；钢琴卷帘上下文）。返回选中数。
+    pub fn selectAllNotes(self: *App, pattern: i32) usize {
+        var n: usize = 0;
+        for (self.notes.items) |*nt| {
+            if (nt.pattern != pattern) continue;
+            nt.selected = true;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// 全选全部片段（Ctrl+A；播放列表上下文）。返回选中数。
+    pub fn selectAllClips(self: *App) usize {
+        for (self.clips.items) |*c| c.selected = true;
+        return self.clips.items.len;
+    }
+
+    /// 选中片段数
+    pub fn selectedClipCount(self: *const App) usize {
+        var n: usize = 0;
+        for (self.clips.items) |c| {
+            if (c.selected) n += 1;
+        }
+        return n;
+    }
+
+    /// 清空片段选区
+    pub fn clearClipSelection(self: *App) void {
+        for (self.clips.items) |*c| c.selected = false;
+    }
+
+    /// 删除全部选中片段（返回删除数）
+    pub fn deleteSelectedClips(self: *App) usize {
+        var removed: usize = 0;
+        var i: usize = 0;
+        while (i < self.clips.items.len) {
+            if (self.clips.items[i].selected) {
+                _ = self.clips.swapRemove(i);
+                removed += 1;
+            } else {
+                i += 1;
+            }
+        }
+        if (removed > 0) self.dirty = true;
+        return removed;
+    }
+
+    /// 批量移动选中片段：`d_step`/`d_track` = 相对**按下时快照**的位移（幂等）。
+    /// 注：与单个片段拖动不同，**不拦重叠**（批量移动时允许交叠——与音符一致）。
+    /// **钳制作用于整个选区**（同 `moveSelectedNotes`）：先算组内最小 step / 最小轨道
+    /// → 全组统一下限，保持相对间距（撞墙时全组停，而非逐个压扁）。
+    pub fn moveSelectedClips(self: *App, d_step: i32, d_track: i32, track_count: i32) bool {
+        if (self.batch_snap.items.len == 0) return false;
+        // 组级钳制（step >= 0、track ∈ [0, track_count-1]）
+        var min_step: i32 = std.math.maxInt(i32);
+        var min_track: i32 = std.math.maxInt(i32);
+        var max_track: i32 = std.math.minInt(i32);
+        for (self.batch_snap.items) |snap| {
+            min_step = @min(min_step, snap.step);
+            min_track = @min(min_track, snap.pitch);
+            max_track = @max(max_track, snap.pitch);
+        }
+        const d_step_c = @max(d_step, -min_step);
+        const d_track_c = std.math.clamp(d_track, -min_track, @max(0, track_count - 1) - max_track);
+        var changed = false;
+        var si: usize = 0;
+        for (self.clips.items) |*c| {
+            if (!c.selected) continue;
+            if (si >= self.batch_snap.items.len) break;
+            const snap = self.batch_snap.items[si];
+            si += 1;
+            const ns = snap.step + d_step_c;
+            const ntr = snap.pitch + d_track_c;
+            if (ns != c.start or ntr != c.track) {
+                c.start = ns;
+                c.track = ntr;
+                changed = true;
+            }
+        }
+        if (changed) self.dirty = true;
+        return changed;
+    }
+
+    /// 开始片段批量操作快照（顺序 = 数组顺序；含 `offset`——左缘拉伸需要）
+    pub fn beginClipBatchSnap(self: *App) void {
+        self.batch_snap.clearRetainingCapacity();
+        for (self.clips.items) |c| {
+            if (!c.selected) continue;
+            self.batch_snap.append(self.allocator, .{ .step = c.start, .len = c.len, .pitch = c.track, .offset = c.offset }) catch {};
+        }
+    }
+
+    /// 批量拉伸（片段；增量式，单位 = **网格格数** `k`；以快照为锚，幂等）：
+    /// - `k > 0`：加长 k 格（右缘不限；左缘受“不能展开到局部第 1 步之前”
+    ///   （offset >= 0）与“不能越过时间轴起点”（start >= 0）限制）；
+    /// - `k < 0`：缩短 |k| 格，受**全组同步**约束——全组最多能缩
+    ///   `min over 片段 batchShortenMax(len, grid)` 格
+    ///   （任一片段 ≤ 一格 → 全组不能缩）；
+    /// - `k = 0`：**还原到快照状态**（往回拖经过 0 时必须写回）。
+    /// `left_edge`：拖左缘（右端固定；改 start/len/offset）还是右缘（起点固定；改 len）。
+    /// 不考虑重叠（与批量移动/音符批量一致）。返回实际应用的格数。
+    pub fn applyClipBatchTrim(self: *App, k: i32, grid: i32, left_edge: bool) i32 {
+        if (self.batch_snap.items.len == 0) return 0;
+        const g = @max(1, grid);
+        var applied = k;
+        if (k < 0) {
+            // 缩短：全组取最小（有一个不够就整体不能缩）
+            var cap: i32 = std.math.maxInt(i32);
+            for (self.batch_snap.items) |snap| {
+                cap = @min(cap, model.batchShortenMax(snap.len, g));
+            }
+            if (cap < 0) cap = 0;
+            applied = @max(k, -cap);
+        } else if (k > 0 and left_edge) {
+            // 左缘加长：不能展开到局部第 1 步之前（offset >= 0）、
+            // 也不能越过时间轴起点（start >= 0）——两个约束取最小
+            var cap: i32 = std.math.maxInt(i32);
+            for (self.batch_snap.items) |snap| {
+                cap = @min(cap, @min(@divFloor(snap.step, g), @divFloor(snap.offset, g)));
+            }
+            if (cap < 0) cap = 0;
+            applied = @min(k, cap);
+        }
+        // **总是写回**（即使 applied == 0）：k 从非零变回 0 时要还原到快照状态
+        var si: usize = 0;
+        var changed = false;
+        for (self.clips.items) |*c| {
+            if (!c.selected) continue;
+            if (si >= self.batch_snap.items.len) break;
+            const snap = self.batch_snap.items[si];
+            si += 1;
+            const new_len = @max(1, snap.len + applied * g);
+            if (left_edge) {
+                const right = snap.step + snap.len; // 右端固定
+                const ns = @max(0, right - new_len);
+                const nl = right - ns;
+                // offset 同步平移（clipTrimLeft 的规则：offset += delta）
+                const no = snap.offset + (ns - snap.step);
+                if (ns != c.start or nl != c.len or no != c.offset) {
+                    c.start = ns;
+                    c.len = nl;
+                    c.offset = no;
+                    changed = true;
+                }
+            } else {
+                if (new_len != c.len) {
+                    c.len = new_len;
+                    changed = true;
+                }
+            }
+        }
+        if (changed) self.dirty = true;
+        return applied;
+    }
+
+    /// 快速克隆（Ctrl+B，片段）：把选中片段整体右移**选区跨度**（= 最右缘 − 最左缘）
+    /// 并复制一份；复制后**选区转移到克隆体**（连按 = 铺瓷砖）。
+    /// 不考虑重叠（允许交叠）。返回克隆数（0 = 无选区）。
+    pub fn cloneSelectedClipsRight(self: *App) usize {
+        var min_start: i32 = std.math.maxInt(i32);
+        var max_end: i32 = 0;
+        for (self.clips.items) |c| {
+            if (!c.selected) continue;
+            min_start = @min(min_start, c.start);
+            max_end = @max(max_end, c.start + c.len);
+        }
+        if (min_start == std.math.maxInt(i32)) return 0;
+        const span = @max(1, max_end - min_start);
+
+        // 先收集到临时表（append 可能 realloc——不能边迭代原数组边 append）
+        var to_clone: std.ArrayListUnmanaged(Clip) = .{ .items = &.{}, .capacity = 0 };
+        defer to_clone.deinit(self.allocator);
+        for (self.clips.items) |c| {
+            if (!c.selected) continue;
+            to_clone.append(self.allocator, c) catch {};
+        }
+        self.clearClipSelection();
+        for (to_clone.items) |c| {
+            var copy = c;
+            copy.start = c.start + span;
+            copy.selected = true;
+            self.clips.append(self.allocator, copy) catch {};
+        }
+        const cloned = to_clone.items.len;
+        if (cloned > 0) self.dirty = true;
+        return cloned;
+    }
+
+    /// 删除全部选中音符（返回删除数）
+    pub fn deleteSelectedNotes(self: *App) usize {
+        var removed: usize = 0;
+        var i: usize = 0;
+        while (i < self.notes.items.len) {
+            if (self.notes.items[i].selected) {
+                _ = self.notes.swapRemove(i);
+                removed += 1;
+            } else {
+                i += 1;
+            }
+        }
+        if (removed > 0) self.dirty = true;
+        return removed;
+    }
+
+    /// 复制选中音符到剪贴板（step 归一为相对最左音符的偏移；返回复制数）
+    pub fn copySelectedNotes(self: *App) usize {
+        self.clipboard_notes.clearRetainingCapacity();
+        var min_step: i32 = std.math.maxInt(i32);
+        for (self.notes.items) |nt| {
+            if (nt.selected) min_step = @min(min_step, nt.step);
+        }
+        if (min_step == std.math.maxInt(i32)) return 0;
+        for (self.notes.items) |nt| {
+            if (!nt.selected) continue;
+            self.clipboard_notes.append(self.allocator, .{
+                .step = nt.step - min_step,
+                .len = nt.len,
+                .pitch = nt.pitch,
+            }) catch {};
+        }
+        return self.clipboard_notes.items.len;
+    }
+
+    /// 快速克隆（Ctrl+B）：把选中音符整体右移**选区跨度**（= 最右缘 − 最左缘）
+    /// 并复制一份；复制后**选区转移到克隆体**（连按 = 铺瓷砖）。
+    /// 不考虑重叠（允许重叠）。返回克隆数（0 = 无选区）。
+    pub fn cloneSelectedNotesRight(self: *App) usize {
+        var min_step: i32 = std.math.maxInt(i32);
+        var max_end: i32 = 0;
+        for (self.notes.items) |nt| {
+            if (!nt.selected) continue;
+            min_step = @min(min_step, nt.step);
+            max_end = @max(max_end, nt.step + nt.len);
+        }
+        if (min_step == std.math.maxInt(i32)) return 0;
+        const span = @max(1, max_end - min_step);
+
+        // 先把待克隆的音符收集到临时表（数组 append 可能 realloc——
+        // 直接迭代原数组再 append 会悬空），再清空选区、追加克隆体。
+        var to_clone: std.ArrayListUnmanaged(model.Note) = .{ .items = &.{}, .capacity = 0 };
+        defer to_clone.deinit(self.allocator);
+        for (self.notes.items) |nt| {
+            if (!nt.selected) continue;
+            to_clone.append(self.allocator, nt) catch {};
+        }
+        self.clearNoteSelection();
+        for (to_clone.items) |nt| {
+            var copy = nt;
+            copy.step = nt.step + span;
+            copy.selected = true;
+            self.notes.append(self.allocator, copy) catch {};
+        }
+        const cloned = to_clone.items.len;
+        if (cloned > 0) self.dirty = true;
+        return cloned;
+    }
+
+    /// 粘贴音符（Ctrl+V）：把剪贴板内容粘贴到 `anchor_step`（相对偏移 + 锚点）；
+    /// 音高不变；**选区转移到新粘贴的音符**。返回粘贴数。
+    pub fn pasteNotes(self: *App, pattern: i32, instrument: i32, anchor_step: i32) usize {
+        if (self.clipboard_notes.items.len == 0) return 0;
+        self.clearNoteSelection();
+        for (self.clipboard_notes.items) |cn| {
+            self.notes.append(self.allocator, .{
+                .step = @max(0, anchor_step + cn.step),
+                .len = cn.len,
+                .pitch = cn.pitch,
+                .pattern = pattern,
+                .instrument = instrument,
+                .selected = true,
+            }) catch {};
+        }
+        const n = self.clipboard_notes.items.len;
+        if (n > 0) self.dirty = true;
+        return n;
+    }
+
+    /// 复制选中片段到剪贴板（start 归一为相对最左片段的偏移；track 存原值；
+    /// 返回复制数）
+    pub fn copySelectedClips(self: *App) usize {
+        self.clipboard_clips.clearRetainingCapacity();
+        var min_start: i32 = std.math.maxInt(i32);
+        for (self.clips.items) |c| {
+            if (c.selected) min_start = @min(min_start, c.start);
+        }
+        if (min_start == std.math.maxInt(i32)) return 0;
+        for (self.clips.items) |c| {
+            if (!c.selected) continue;
+            var copy = c;
+            copy.start = c.start - min_start; // 相对偏移（粘贴时加锚点）
+            copy.selected = false;
+            self.clipboard_clips.append(self.allocator, copy) catch {};
+        }
+        return self.clipboard_clips.items.len;
+    }
+
+    /// 粘贴片段（Ctrl+V）：把剪贴板内容粘贴到 `anchor_start`（相对偏移 + 锚点）；
+    /// **轨道不变**（每个片段回原轨道——用户只关心横向落点）；
+    /// **选区转移到新粘贴的片段**。返回粘贴数。不考虑重叠（与克隆/批量一致）。
+    pub fn pasteClips(self: *App, anchor_start: i32, track_count: i32) usize {
+        if (self.clipboard_clips.items.len == 0) return 0;
+        self.clearClipSelection();
+        for (self.clipboard_clips.items) |c| {
+            const tr = std.math.clamp(c.track, 0, @max(0, track_count - 1));
+            self.clips.append(self.allocator, .{
+                .track = tr,
+                .start = @max(0, anchor_start + c.start),
+                .len = c.len,
+                .pattern = c.pattern,
+                .offset = c.offset,
+                .selected = true,
+            }) catch {};
+        }
+        const n = self.clipboard_clips.items.len;
+        if (n > 0) self.dirty = true;
+        return n;
+    }
+
+    /// 批量移动选中音符（钢琴卷帘拖动）：`d_step`/`d_pitch` = 相对**按下时快照**的位移。
+    /// 每帧从快照重算（幂等、可逆——不会因钳制而漂移）。
+    ///
+    /// **钳制必须作用于整个选区**（而非逐音符）：逐音符 `@max(0, step+d)` 会在
+    /// 撞左墙时把左边的音符一个个压到 step 0（实测 bug：斜排四音符被“压扁”成
+    /// 一列）。正确做法 = 先算组内最小 step → 全组统一的位移下限，
+    /// 保持相对间距不变（最左的音符碰到 0 时全组停住）。
+    /// 音高同理：`d_pitch` 也按组统一钳制（撞 0/127 时全组停）。
+    /// 返回是否变化。
+    pub fn moveSelectedNotes(self: *App, d_step: i32, d_pitch: i32) bool {
+        if (self.batch_snap.items.len == 0) return false;
+        // 组级钳制：算出全组允许的位移范围（保持相对间距）
+        var min_step: i32 = std.math.maxInt(i32);
+        var min_pitch: i32 = std.math.maxInt(i32);
+        var max_pitch: i32 = std.math.minInt(i32);
+        for (self.batch_snap.items) |snap| {
+            min_step = @min(min_step, snap.step);
+            min_pitch = @min(min_pitch, snap.pitch);
+            max_pitch = @max(max_pitch, snap.pitch);
+        }
+        const d_step_c = @max(d_step, -min_step); // 最左碰到 0 → 全组停
+        const d_pitch_c = std.math.clamp(d_pitch, -min_pitch, 127 - max_pitch); // 撞上下限 → 全组停
+        var changed = false;
+        var si: usize = 0;
+        for (self.notes.items) |*nt| {
+            if (!nt.selected) continue;
+            if (si >= self.batch_snap.items.len) break;
+            const snap = self.batch_snap.items[si];
+            si += 1;
+            const ns = snap.step + d_step_c; // 不再逐音符 @max(0, ...)
+            const np = snap.pitch + d_pitch_c;
+            if (ns != nt.step or np != nt.pitch) {
+                nt.step = ns;
+                nt.pitch = np;
+                changed = true;
+            }
+        }
+        if (changed) self.dirty = true;
+        return changed;
+    }
+
+    /// 开始批量操作快照（拖选中音符/拉伸前调用；顺序 = 音符数组顺序）
+    pub fn beginBatchSnap(self: *App) void {
+        self.batch_snap.clearRetainingCapacity();
+        for (self.notes.items) |nt| {
+            if (!nt.selected) continue;
+            self.batch_snap.append(self.allocator, .{ .step = nt.step, .len = nt.len, .pitch = nt.pitch }) catch {};
+        }
+    }
+
+    /// 批量拉伸（增量式，单位 = **网格格数** `k`；以快照为锚，幂等）：
+    /// - `k > 0`：加长 k 格（右缘不限；左缘受“不能越过样式开头”限制）；
+    /// - `k < 0`：缩短 |k| 格，受**全组同步**约束——全组最多能缩
+    ///   `min over 音符 batchShortenMax(len, grid)` 格
+    ///   （任一音符 ≤ 一格 → 全组不能缩）；
+    /// - `k = 0`：**还原到快照状态**（往回拖经过 0 时必须写回——否则音符
+    ///   卡在上一次非零 k 的长度；实测 bug：拉长后往回拖卡在二分音符）。
+    /// `left_edge`：拖左缘（右端固定）还是右缘（起点固定）。
+    /// 返回实际应用的格数。
+    pub fn applyBatchTrim(self: *App, k: i32, grid: i32, left_edge: bool) i32 {
+        if (self.batch_snap.items.len == 0) return 0;
+        const g = @max(1, grid);
+        var applied = k;
+        if (k < 0) {
+            // 缩短：全组取最小（有一个不够就整体不能缩）
+            var cap: i32 = std.math.maxInt(i32);
+            for (self.batch_snap.items) |snap| {
+                cap = @min(cap, model.batchShortenMax(snap.len, g));
+            }
+            if (cap < 0) cap = 0;
+            applied = @max(k, -cap);
+        } else if (k > 0 and left_edge) {
+            // 左缘加长：不能越过样式开头（step >= 0）
+            var cap: i32 = std.math.maxInt(i32);
+            for (self.batch_snap.items) |snap| {
+                cap = @min(cap, @divFloor(snap.step, g));
+            }
+            if (cap < 0) cap = 0;
+            applied = @min(k, cap);
+        }
+        // **总是写回**（即使 applied == 0）：k 从非零变回 0 时要还原到快照状态——
+        // 早退会让音符卡在上一次的非零长度（实测 bug：拉长后往回拖卡在二分音符）。
+        var si: usize = 0;
+        var changed = false;
+        for (self.notes.items) |*nt| {
+            if (!nt.selected) continue;
+            if (si >= self.batch_snap.items.len) break;
+            const snap = self.batch_snap.items[si];
+            si += 1;
+            const new_len = @max(1, snap.len + applied * g);
+            if (left_edge) {
+                const right = snap.step + snap.len; // 右端固定
+                const ns = @max(0, right - new_len);
+                const nl = right - ns;
+                if (ns != nt.step or nl != nt.len) {
+                    nt.step = ns;
+                    nt.len = nl;
+                    changed = true;
+                }
+            } else {
+                if (new_len != nt.len) {
+                    nt.len = new_len;
+                    changed = true;
+                }
+            }
+        }
+        if (changed) self.dirty = true;
+        return applied;
+    }
+
     /// 添加乐器（自动分配名字与合成器参数）；返回新槽位序号（失败 -1）
     /// `base_name`：基础名（如 "减法合成器"）；同名自动追加 #2、#3…
     pub fn addInstrument(self: *App, base_name: []const u8) i32 {
@@ -473,6 +985,9 @@ pub const App = struct {
         self.toast = null;
         self.title_applied_name = null;
         self.pending_open_path = null;
+        self.clipboard_notes.deinit(self.allocator);
+        self.clipboard_clips.deinit(self.allocator);
+        self.batch_snap.deinit(self.allocator);
         self.deinitPatterns();
         self.deinitInstruments();
     }
@@ -943,4 +1458,407 @@ test "app: projectName 对非法路径的防御（不崩溃）" {
     std.testing.allocator.free(app.project_path.?);
     app.project_path = try std.testing.allocator.dupe(u8, "");
     try std.testing.expect(app.projectName() == null);
+}
+
+// ── 选区 / 批量操作（框选、批量删除/克隆/复制/粘贴/拉伸）──
+
+test "app: 批量操作——删除/复制/粘贴/克隆（选区转移、相对偏移、铺瓷砖）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+
+    // 三个音符：两个选中（0..24、24..48），一个未选（96..120）
+    app.notes.append(app.allocator, .{ .step = 0, .len = 24, .pitch = 60, .pattern = 0, .selected = true }) catch {};
+    app.notes.append(app.allocator, .{ .step = 24, .len = 24, .pitch = 62, .pattern = 0, .selected = true }) catch {};
+    app.notes.append(app.allocator, .{ .step = 96, .len = 24, .pitch = 64, .pattern = 0 }) catch {};
+
+    // 复制：相对偏移 = step - 最左（0/24）
+    try std.testing.expectEqual(@as(usize, 2), app.copySelectedNotes());
+    try std.testing.expectEqual(@as(i32, 0), app.clipboard_notes.items[0].step);
+    try std.testing.expectEqual(@as(i32, 24), app.clipboard_notes.items[1].step);
+
+    // 克隆（Ctrl+B）：选区跨度 = 48 - 0 = 48 → 克隆体 48..72、72..96；选区转移到克隆体
+    try std.testing.expectEqual(@as(usize, 2), app.cloneSelectedNotesRight());
+    try std.testing.expectEqual(@as(usize, 5), app.notes.items.len);
+    try std.testing.expectEqual(@as(usize, 2), app.selectedNoteCount());
+    // 原选区已取消
+    try std.testing.expect(!app.notes.items[0].selected);
+    try std.testing.expect(!app.notes.items[1].selected);
+    // 克隆体成为新选区（48..72、72..96）
+    var found_clone_a = false;
+    var found_clone_b = false;
+    for (app.notes.items) |n| {
+        if (n.selected and n.step == 48 and n.pitch == 60) found_clone_a = true;
+        if (n.selected and n.step == 72 and n.pitch == 62) found_clone_b = true;
+    }
+    try std.testing.expect(found_clone_a and found_clone_b);
+
+    // **铺瓷砖**：再按一次 → 跨度还是 48（48..96）→ 克隆体 96..144、120..168
+    try std.testing.expectEqual(@as(usize, 2), app.cloneSelectedNotesRight());
+    try std.testing.expectEqual(@as(usize, 7), app.notes.items.len);
+    var found_tile = false;
+    for (app.notes.items) |n| {
+        if (n.selected and n.step == 96 and n.pitch == 60) found_tile = true;
+    }
+    try std.testing.expect(found_tile);
+
+    // 粘贴：锚点 240 → 相对偏移加上去（240、264）；音高不变；选区转移到粘贴体
+    try std.testing.expectEqual(@as(usize, 2), app.pasteNotes(0, 0, 240));
+    try std.testing.expectEqual(@as(usize, 9), app.notes.items.len);
+    var pasted_a = false;
+    var pasted_b = false;
+    for (app.notes.items) |n| {
+        if (n.selected and n.step == 240 and n.pitch == 60) pasted_a = true;
+        if (n.selected and n.step == 264 and n.pitch == 62) pasted_b = true;
+    }
+    try std.testing.expect(pasted_a and pasted_b);
+    try std.testing.expectEqual(@as(usize, 2), app.selectedNoteCount());
+
+    // 删除选中（粘贴体）→ 剩 7 个
+    try std.testing.expectEqual(@as(usize, 2), app.deleteSelectedNotes());
+    try std.testing.expectEqual(@as(usize, 7), app.notes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.selectedNoteCount());
+}
+
+test "app: 批量拉伸——全组同步缩短（任一 ≤ 一格则全组不能缩）、加长不限" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+
+    // 两个四分音符（24 步）+ 1/8 网格（12 步）
+    app.notes.append(app.allocator, .{ .step = 0, .len = 24, .pitch = 60, .pattern = 0, .selected = true }) catch {};
+    app.notes.append(app.allocator, .{ .step = 48, .len = 24, .pitch = 62, .pattern = 0, .selected = true }) catch {};
+    app.beginBatchSnap();
+
+    // 缩 1 格（-1）：24 → 12 ✓
+    try std.testing.expectEqual(@as(i32, -1), app.applyBatchTrim(-1, 12, false));
+    try std.testing.expectEqual(@as(i32, 12), app.notes.items[0].len);
+    try std.testing.expectEqual(@as(i32, 12), app.notes.items[1].len);
+    // 继续往左拖（-2）：快照 24 最多缩 1 格（floor(23/12)）→ clamp 到 -1（仍 12，幂等）
+    try std.testing.expectEqual(@as(i32, -1), app.applyBatchTrim(-2, 12, false));
+    try std.testing.expectEqual(@as(i32, 12), app.notes.items[0].len);
+
+    // 加长（+2）：24 + 24 = 48（从**快照 24** 起算；幂等）
+    try std.testing.expectEqual(@as(i32, 2), app.applyBatchTrim(2, 12, false));
+    try std.testing.expectEqual(@as(i32, 48), app.notes.items[0].len);
+    try std.testing.expectEqual(@as(i32, 48), app.notes.items[1].len);
+    // 再应用同一值（+2）→ 仍是 48（幂等：从快照重算）
+    try std.testing.expectEqual(@as(i32, 2), app.applyBatchTrim(2, 12, false));
+    try std.testing.expectEqual(@as(i32, 48), app.notes.items[0].len);
+
+    // 左缘拉伸（加长）：重建快照（当前长 48）——第 1 个音符快照 step = 0
+    // → 全组 cap = floor(0/12) = 0（左缘加长不能把**任何**音符推到负起点）
+    // → applied = 0 → **写回快照状态**（新语义：状态永远 = 快照 + applied×格）
+    app.beginBatchSnap();
+    try std.testing.expectEqual(@as(i32, 0), app.applyBatchTrim(1, 12, true));
+    try std.testing.expectEqual(@as(i32, 48), app.notes.items[1].len); // 保持快照值
+
+    // 把第 1 个音符往右挪（快照 step = 24）后，左缘可加 2 格（cap = floor(24/12) = 2）
+    app.notes.items[0].step = 24;
+    app.notes.items[1].step = 60;
+    app.beginBatchSnap();
+    try std.testing.expectEqual(@as(i32, 2), app.applyBatchTrim(2, 12, true));
+    // 第 1 个：右端 = 24+48 = 72 → 新 len = 48+24 = 72 → 新 step = 0
+    try std.testing.expectEqual(@as(i32, 0), app.notes.items[0].step);
+    try std.testing.expectEqual(@as(i32, 72), app.notes.items[0].len);
+    // 第 2 个：右端 = 60+48 = 108 → 新 len = 72 → 新 step = 36
+    try std.testing.expectEqual(@as(i32, 36), app.notes.items[1].step);
+    try std.testing.expectEqual(@as(i32, 72), app.notes.items[1].len);
+    try std.testing.expectEqual(@as(i32, 108), app.notes.items[1].step + app.notes.items[1].len);
+
+    // 组内有一个短的 → 全组不能缩
+    app.clearNoteSelection();
+    app.notes.items[0].selected = true;
+    app.notes.items[1].selected = true;
+    app.notes.items[1].len = 12; // 一个 = 一格
+    app.beginBatchSnap();
+    try std.testing.expectEqual(@as(i32, 0), app.applyBatchTrim(-1, 12, false));
+    try std.testing.expectEqual(@as(i32, 72), app.notes.items[0].len); // 未被缩短
+}
+
+test "app: 批量拉伸——往回拖经过 0 格必须还原（修“卡在二分音符”）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+
+    // 1/4 网格（24 步）、两个四分音符（24 步）——实测场景
+    app.notes.append(app.allocator, .{ .step = 0, .len = 24, .pitch = 60, .pattern = 0, .selected = true }) catch {};
+    app.notes.append(app.allocator, .{ .step = 48, .len = 24, .pitch = 62, .pattern = 0, .selected = true }) catch {};
+    app.beginBatchSnap();
+
+    // 拉长 1 格 → 48（二分音符）
+    try std.testing.expectEqual(@as(i32, 1), app.applyBatchTrim(1, 24, false));
+    try std.testing.expectEqual(@as(i32, 48), app.notes.items[0].len);
+
+    // **关键回归**：往回拖经过 0 格 → 必须还原为 24
+    // （旧实现在 applied == 0 时早退 → 卡在 48，再也缩不回）
+    try std.testing.expectEqual(@as(i32, 0), app.applyBatchTrim(0, 24, false));
+    try std.testing.expectEqual(@as(i32, 24), app.notes.items[0].len);
+    try std.testing.expectEqual(@as(i32, 24), app.notes.items[1].len);
+
+    // 单调不跳变：+2 → 72；回 1 格 → 48；回 0 格 → 24（旧实现会从 72 直接跳）
+    try std.testing.expectEqual(@as(i32, 2), app.applyBatchTrim(2, 24, false));
+    try std.testing.expectEqual(@as(i32, 72), app.notes.items[0].len);
+    try std.testing.expectEqual(@as(i32, 1), app.applyBatchTrim(1, 24, false));
+    try std.testing.expectEqual(@as(i32, 48), app.notes.items[0].len);
+    try std.testing.expectEqual(@as(i32, 0), app.applyBatchTrim(0, 24, false));
+    try std.testing.expectEqual(@as(i32, 24), app.notes.items[0].len);
+
+    // 继续往左（-1）：1/4 网格下 24 = 一格 → 全组不能缩（保持 24）
+    try std.testing.expectEqual(@as(i32, 0), app.applyBatchTrim(-1, 24, false));
+    try std.testing.expectEqual(@as(i32, 24), app.notes.items[0].len);
+}
+
+test "app: 全选——音符（仅当前样式）/ 片段" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+
+    // 音符：样式 0 两个、样式 1 一个
+    app.notes.append(app.allocator, .{ .step = 0, .len = 12, .pitch = 60, .pattern = 0 }) catch {};
+    app.notes.append(app.allocator, .{ .step = 24, .len = 12, .pitch = 62, .pattern = 0 }) catch {};
+    app.notes.append(app.allocator, .{ .step = 48, .len = 12, .pitch = 64, .pattern = 1 }) catch {};
+
+    // Ctrl+A（钢琴卷帘上下文）：只选当前样式（0）的全部音符
+    try std.testing.expectEqual(@as(usize, 2), app.selectAllNotes(0));
+    try std.testing.expectEqual(@as(usize, 2), app.selectedNoteCount());
+    try std.testing.expect(app.notes.items[0].selected);
+    try std.testing.expect(app.notes.items[1].selected);
+    try std.testing.expect(!app.notes.items[2].selected); // 样式 1 不受影响
+
+    // 切样式全选：样式 1 一个
+    app.clearNoteSelection();
+    try std.testing.expectEqual(@as(usize, 1), app.selectAllNotes(1));
+    try std.testing.expect(app.notes.items[2].selected);
+
+    // 片段全选
+    app.clips.append(app.allocator, .{ .track = 0, .start = 0, .len = 96, .pattern = 0 }) catch {};
+    app.clips.append(app.allocator, .{ .track = 1, .start = 96, .len = 96, .pattern = 1 }) catch {};
+    try std.testing.expectEqual(@as(usize, 2), app.selectAllClips());
+    try std.testing.expectEqual(@as(usize, 2), app.selectedClipCount());
+}
+
+test "app: 批量移动——组级钳制（斜排撞左墙不压扁，保持相对间距）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+
+    // 实测场景：xxx1 / xx2x / x3xx / 4xxx（step 3/2/1/0，音高 60/61/62/63）
+    app.notes.append(app.allocator, .{ .step = 3, .len = 1, .pitch = 60, .pattern = 0, .selected = true }) catch {};
+    app.notes.append(app.allocator, .{ .step = 2, .len = 1, .pitch = 61, .pattern = 0, .selected = true }) catch {};
+    app.notes.append(app.allocator, .{ .step = 1, .len = 1, .pitch = 62, .pattern = 0, .selected = true }) catch {};
+    app.notes.append(app.allocator, .{ .step = 0, .len = 1, .pitch = 63, .pattern = 0, .selected = true }) catch {};
+    app.beginBatchSnap();
+
+    // 大幅左拖（-10）：最左的（step 0）碰到 0 → **全组停**，不压扁
+    // （旧实现：逐音符 @max(0, step+d) → 四个全挤到 step 0）
+    try std.testing.expect(!app.moveSelectedNotes(-10, 0)); // 无变化（组级下限 = 0）
+    try std.testing.expectEqual(@as(i32, 3), app.notes.items[0].step); // 保持相对间距
+    try std.testing.expectEqual(@as(i32, 2), app.notes.items[1].step);
+    try std.testing.expectEqual(@as(i32, 1), app.notes.items[2].step);
+    try std.testing.expectEqual(@as(i32, 0), app.notes.items[3].step);
+
+    // 部分左移场景：组内最小 step = 2 → 可整体左移最多 2（保持间距）
+    app.clearNoteSelection();
+    for (app.notes.items, 0..) |*nt, i| {
+        nt.selected = true;
+        nt.step = @as(i32, @intCast(5 - i)); // 5/4/3/2
+    }
+    app.beginBatchSnap();
+    try std.testing.expect(app.moveSelectedNotes(-10, 0)); // 钳到 -2
+    try std.testing.expectEqual(@as(i32, 3), app.notes.items[0].step); // 5-2
+    try std.testing.expectEqual(@as(i32, 2), app.notes.items[1].step);
+    try std.testing.expectEqual(@as(i32, 1), app.notes.items[2].step);
+    try std.testing.expectEqual(@as(i32, 0), app.notes.items[3].step); // 2-2
+    // 再左拖 → 全组停（最左已到 0）
+    try std.testing.expect(!app.moveSelectedNotes(-11, 0));
+    // 回拖到 -1：从快照重算（幂等）
+    try std.testing.expect(app.moveSelectedNotes(-1, 0));
+    try std.testing.expectEqual(@as(i32, 4), app.notes.items[0].step);
+    try std.testing.expectEqual(@as(i32, 1), app.notes.items[3].step);
+
+    // 音高组级钳制：往上撞 127 → 全组停（保持间距 126/127 不变）
+    app.clearNoteSelection();
+    app.notes.items[0].selected = true;
+    app.notes.items[0].pitch = 126;
+    app.notes.items[1].selected = true;
+    app.notes.items[1].pitch = 127;
+    app.beginBatchSnap();
+    try std.testing.expect(!app.moveSelectedNotes(0, 5)); // 组级上限 = 127-127 = 0 → 无变化
+    try std.testing.expectEqual(@as(i32, 126), app.notes.items[0].pitch); // 保持间距
+    try std.testing.expectEqual(@as(i32, 127), app.notes.items[1].pitch);
+
+    // 片段组级钳制：轨道 0/1/2 整体下移 -10 → 全组停（最上已在轨道 0）
+    app.clearNoteSelection();
+    app.clips.append(app.allocator, .{ .track = 0, .start = 0, .len = 96, .pattern = 0, .selected = true }) catch {};
+    app.clips.append(app.allocator, .{ .track = 1, .start = 96, .len = 96, .pattern = 1, .selected = true }) catch {};
+    app.clips.append(app.allocator, .{ .track = 2, .start = 192, .len = 96, .pattern = 2, .selected = true }) catch {};
+    app.beginClipBatchSnap();
+    try std.testing.expect(!app.moveSelectedClips(0, -10, 8)); // 无变化（组级下限 = 0）
+    try std.testing.expectEqual(@as(i32, 0), app.clips.items[0].track);
+    try std.testing.expectEqual(@as(i32, 1), app.clips.items[1].track); // 保持间距
+    try std.testing.expectEqual(@as(i32, 2), app.clips.items[2].track);
+    // 从轨道 1 起的三片段可整体上移 1（保持间距）
+    app.clearClipSelection();
+    app.clips.items[0].selected = true;
+    app.clips.items[0].track = 1;
+    app.clips.items[1].selected = true;
+    app.clips.items[2].selected = true;
+    app.beginClipBatchSnap();
+    try std.testing.expect(app.moveSelectedClips(0, -1, 8));
+    try std.testing.expectEqual(@as(i32, 0), app.clips.items[0].track);
+    try std.testing.expectEqual(@as(i32, 0), app.clips.items[1].track);
+    try std.testing.expectEqual(@as(i32, 1), app.clips.items[2].track);
+}
+
+test "app: 片段剪贴板——复制（相对偏移）+ 粘贴（鼠标位置：步/轨道）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+
+    // 三个片段：两个选中（轨 1/2、步 96/192）
+    app.clips.append(app.allocator, .{ .track = 1, .start = 96, .len = 48, .pattern = 0, .selected = true }) catch {};
+    app.clips.append(app.allocator, .{ .track = 2, .start = 192, .len = 48, .pattern = 1, .selected = true }) catch {};
+    app.clips.append(app.allocator, .{ .track = 3, .start = 0, .len = 48, .pattern = 2 }) catch {};
+
+    // 复制：start 归一为相对偏移（0/96）；轨道存原值（1/2）
+    try std.testing.expectEqual(@as(usize, 2), app.copySelectedClips());
+    try std.testing.expectEqual(@as(i32, 0), app.clipboard_clips.items[0].start);
+    try std.testing.expectEqual(@as(i32, 96), app.clipboard_clips.items[1].start);
+    try std.testing.expectEqual(@as(i32, 1), app.clipboard_clips.items[0].track);
+
+    // 粘贴到鼠标位置（步 480；**轨道不变**——回原轨道 1/2）
+    try std.testing.expectEqual(@as(usize, 2), app.pasteClips(480, 8));
+    try std.testing.expectEqual(@as(usize, 5), app.clips.items.len);
+    try std.testing.expectEqual(@as(i32, 480), app.clips.items[3].start);
+    try std.testing.expectEqual(@as(i32, 1), app.clips.items[3].track); // 原轨道
+    try std.testing.expectEqual(@as(i32, 576), app.clips.items[4].start); // 相对偏移 96 保留
+    try std.testing.expectEqual(@as(i32, 2), app.clips.items[4].track); // 原轨道
+    try std.testing.expect(app.clips.items[3].selected);
+    try std.testing.expect(!app.clips.items[0].selected); // 原选区取消
+    try std.testing.expectEqual(@as(usize, 2), app.selectedClipCount());
+
+    // 轨道钳制：把剪贴板里的轨道改成超上限（99）→ 粘贴时钳到 7（8 轨）
+    app.clipboard_clips.items[0].track = 99;
+    app.clipboard_clips.items[1].track = 99;
+    try std.testing.expectEqual(@as(usize, 2), app.pasteClips(0, 8));
+    try std.testing.expectEqual(@as(i32, 7), app.clips.items[5].track);
+    try std.testing.expectEqual(@as(i32, 7), app.clips.items[6].track);
+    // 步钳制：负锚点 → 起点钳到 0（相对偏移保留，超出部分被钳）
+    app.clipboard_clips.items[0].track = 0;
+    app.clipboard_clips.items[1].track = 1;
+    try std.testing.expectEqual(@as(usize, 2), app.pasteClips(-50, 8));
+    try std.testing.expectEqual(@as(i32, 0), app.clips.items[7].start); // max(0, -50+0)
+    try std.testing.expectEqual(@as(i32, 46), app.clips.items[8].start); // max(0, -50+96)
+
+    // 无选区 → 复制 0（不污染剪贴板？——清空后为空）
+    app.clearClipSelection();
+    try std.testing.expectEqual(@as(usize, 0), app.copySelectedClips());
+    try std.testing.expectEqual(@as(usize, 0), app.clipboard_clips.items.len);
+}
+
+test "app: 片段批量拉伸——全组同步（任一 ≤ 一格则全组不能缩）+ 铺瓷砖克隆" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+
+    // 两个片段：各 24 步（1/4 音符量级）；快照后 1/8 网格（12 步）
+    app.clips.append(app.allocator, .{ .track = 0, .start = 0, .len = 24, .pattern = 0, .selected = true }) catch {};
+    app.clips.append(app.allocator, .{ .track = 1, .start = 48, .len = 24, .pattern = 1, .selected = true }) catch {};
+    app.beginClipBatchSnap();
+
+    // 缩 1 格（-1）：24 → 12 ✓
+    try std.testing.expectEqual(@as(i32, -1), app.applyClipBatchTrim(-1, 12, false));
+    try std.testing.expectEqual(@as(i32, 12), app.clips.items[0].len);
+    try std.testing.expectEqual(@as(i32, 12), app.clips.items[1].len);
+    // 继续缩：快照 24 最多 1 格 → 钳到 -1（幂等，仍 12）
+    try std.testing.expectEqual(@as(i32, -1), app.applyClipBatchTrim(-2, 12, false));
+    // 回 0 格 → **还原快照**（24）——修“卡住”同一原则
+    try std.testing.expectEqual(@as(i32, 0), app.applyClipBatchTrim(0, 12, false));
+    try std.testing.expectEqual(@as(i32, 24), app.clips.items[0].len);
+    // 加长 +2：24 + 24 = 48（从快照重算）
+    try std.testing.expectEqual(@as(i32, 2), app.applyClipBatchTrim(2, 12, false));
+    try std.testing.expectEqual(@as(i32, 48), app.clips.items[0].len);
+
+    // 全组同步：有一个 = 一格 → 全组不能缩
+    app.clips.items[1].len = 12;
+    app.beginClipBatchSnap();
+    try std.testing.expectEqual(@as(i32, 0), app.applyClipBatchTrim(-1, 12, false));
+    try std.testing.expectEqual(@as(i32, 48), app.clips.items[0].len); // 未被缩短
+
+    // 左缘拉伸：右端固定、offset 同步；片段 1 start=0 → 左缘不能加长（cap = min(0/g, 0/g) = 0）
+    app.beginClipBatchSnap();
+    try std.testing.expectEqual(@as(i32, 0), app.applyClipBatchTrim(1, 12, true));
+
+    // 铺瓷砖克隆：跨度 = 最右缘(0+48 或 48+12) − 最左(0) = 60 → 克隆体 60/108
+    const cloned = app.cloneSelectedClipsRight();
+    try std.testing.expectEqual(@as(usize, 2), cloned);
+    try std.testing.expectEqual(@as(usize, 4), app.clips.items.len);
+    try std.testing.expectEqual(@as(i32, 60), app.clips.items[2].start);
+    try std.testing.expectEqual(@as(i32, 108), app.clips.items[3].start);
+    // 选区转移到克隆体（原选区取消）
+    try std.testing.expect(!app.clips.items[0].selected);
+    try std.testing.expect(app.clips.items[2].selected);
+    // 再按一次 → 铺下一段（跨度 60：60→120、108→168）
+    try std.testing.expectEqual(@as(usize, 2), app.cloneSelectedClipsRight());
+    try std.testing.expectEqual(@as(i32, 120), app.clips.items[4].start);
+    try std.testing.expectEqual(@as(i32, 168), app.clips.items[5].start);
+}
+
+test "app: 片段批量操作——框选删除 + 批量移动（幂等、轨道钳制）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+
+    app.clips.append(app.allocator, .{ .track = 0, .start = 0, .len = 96, .pattern = 0, .selected = true }) catch {};
+    app.clips.append(app.allocator, .{ .track = 1, .start = 96, .len = 96, .pattern = 1, .selected = true }) catch {};
+    app.clips.append(app.allocator, .{ .track = 2, .start = 192, .len = 96, .pattern = 2 }) catch {};
+
+    try std.testing.expectEqual(@as(usize, 2), app.selectedClipCount());
+
+    // 批量移动：+48 步、+1 轨（从快照重算；幂等）
+    app.beginClipBatchSnap();
+    try std.testing.expect(app.moveSelectedClips(48, 1, 8));
+    try std.testing.expectEqual(@as(i32, 48), app.clips.items[0].start);
+    try std.testing.expectEqual(@as(i32, 1), app.clips.items[0].track);
+    try std.testing.expectEqual(@as(i32, 144), app.clips.items[1].start);
+    try std.testing.expectEqual(@as(i32, 2), app.clips.items[1].track);
+    // 未选中片段不动
+    try std.testing.expectEqual(@as(i32, 192), app.clips.items[2].start);
+    // 再应用同一位移 → 结果不变（幂等）——返回值 false（无变化）
+    try std.testing.expect(!app.moveSelectedClips(48, 1, 8));
+    try std.testing.expectEqual(@as(i32, 48), app.clips.items[0].start);
+
+    // 轨道钳制（**组级**）：摆到轨道 1/2 后快照 → 下移 -999 只能移 -1（保持间距）
+    app.clips.items[0].track = 1;
+    app.clips.items[1].track = 2;
+    app.beginClipBatchSnap();
+    try std.testing.expect(app.moveSelectedClips(0, -999, 8));
+    try std.testing.expectEqual(@as(i32, 0), app.clips.items[0].track); // 1-1
+    try std.testing.expectEqual(@as(i32, 1), app.clips.items[1].track); // 2-1（保持间距）
+    // 更大位移 → 结果不变（组级下限 = 0；幂等）
+    try std.testing.expect(!app.moveSelectedClips(0, -9999, 8));
+
+    // 步钳制（**组级**）：快照 step 48/144 → 左移 -999 被钳到 -48（保持间距）
+    app.clips.items[0].start = 48;
+    app.clips.items[1].start = 144;
+    app.beginClipBatchSnap();
+    try std.testing.expect(app.moveSelectedClips(-999, 0, 8));
+    try std.testing.expectEqual(@as(i32, 0), app.clips.items[0].start); // 48-48
+    try std.testing.expectEqual(@as(i32, 96), app.clips.items[1].start); // 144-48（保持间距）
+    // 更大位移 → 结果不变（幂等）
+    try std.testing.expect(!app.moveSelectedClips(-9999, 0, 8));
+
+    // 删除选中 → 剩 1 个
+    try std.testing.expectEqual(@as(usize, 2), app.deleteSelectedClips());
+    try std.testing.expectEqual(@as(usize, 1), app.clips.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.selectedClipCount());
 }

@@ -167,7 +167,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         const over_other_drag = ui.active_id != 0 and ui.active_id != 6000;
         const pitch_at_mouse: i32 = 127 - @divFloor(ui.mouse_y - lane_y + app.piano.scroll, kh);
 
-        if (in_keys and ui.mouse_pressed and !over_other_drag) {
+        if (in_keys and ui.mouse_pressed and !over_other_drag and !ui.mods_ctrl) {
             if (pitch_at_mouse >= 0 and pitch_at_mouse <= 127) {
                 ui.active_id = 6000; // 标记“琴键试听拖动”（归本控件）
                 app.piano.held_pitch = pitch_at_mouse;
@@ -283,7 +283,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 if (nx + nw < lane_x or nx > lane_x + view_w) continue;
                 if (ny + kh < lane_y or ny > lane_y + lane_h) continue;
                 const active = if (app.piano.drag_note) |dn| dn == ni else false;
-                const note_color = if (active) ui.theme.accent else ui.theme.waveform;
+                // 颜色层级：拖动中（accent）> 选中（橙）> 普通（波形绿）
+                const note_color = if (active) ui.theme.accent else if (n.selected) ui.theme.note_selected else ui.theme.waveform;
                 ui.renderer.fillRect(nx, ny, nw, kh - 1, note_color);
                 // 描边只在“不会被填充满”时才画：宽/高 ≤ 2px 时描边会完全
                 // 覆盖填充（1px 音符被灰色描边包成灰线——实测 bug）。
@@ -303,6 +304,28 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                         ui.label(pname, tx, ty, if (active) ui.theme.bg else r_mod.rgb(16, 18, 22));
                     }
                 }
+            }
+        }
+
+        // 框选矩形（半透明填充 + 描边；画在音符之上）
+        if (app.piano.marquee_active) {
+            const mx0 = @min(app.piano.marquee_x0, ui.mouse_x);
+            const mx1 = @max(app.piano.marquee_x0, ui.mouse_x);
+            const my0 = @min(app.piano.marquee_y0, ui.mouse_y);
+            const my1 = @max(app.piano.marquee_y0, ui.mouse_y);
+            const fill = (@as(u32, 40) << 24) | (ui.theme.accent & 0x00FFFFFF);
+            if (app.piano.row_marquee) {
+                // 按行框选：**横跨整个音符区**的行带（音高行范围；当前行 = 鼠标所在行）
+                const cur_pitch: i32 = 127 - @divFloor(ui.mouse_y - lane_y + app.piano.scroll, app.piano.key_h);
+                const p0 = @min(app.piano.row_marquee_pitch0, cur_pitch);
+                const p1 = @max(app.piano.row_marquee_pitch0, cur_pitch);
+                const ry0 = lane_y + (127 - p1) * app.piano.key_h - app.piano.scroll;
+                const rh = (p1 - p0 + 1) * app.piano.key_h;
+                ui.renderer.fillRect(lane_x, ry0, view_w, rh, fill);
+                ui.renderer.strokeRect(lane_x, ry0, view_w, rh, ui.theme.accent);
+            } else {
+                ui.renderer.fillRect(mx0, my0, mx1 - mx0, my1 - my0, fill);
+                ui.renderer.strokeRect(mx0, my0, mx1 - mx0, my1 - my0, ui.theme.accent);
             }
         }
     }
@@ -380,9 +403,58 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     const snap_step: i32 = @max(0, model.snapRound(step_i, snap_steps));
     const pitch_i = 127 - @divFloor(ui.mouse_y - lane_y + app.piano.scroll, app.piano.key_h);
 
+    // ── 框选（Ctrl+左键拖；Ctrl+Shift = 追加）──
+    // 判定：本帧在音符区按下 + Ctrl（不要求命中音符——命中音符时也优先框选，
+    // 否则“从音符上开始拖框”会变成拖动该音符）
+    // **按行框选**：起点在**琴键列**时切换成“整行选择”（垂直拖选音高行、水平不限）
+    if (ui.mods_ctrl and ui.mouse_pressed and ui.active_id == 0) {
+        const in_keys = ui.hitRect(keys_x, lane_y, util.piano_header_w, lane_h);
+        if (in_lane or in_keys) {
+            app.piano.marquee_active = true;
+            app.piano.marquee_add = ui.mods_shift;
+            app.piano.marquee_x0 = ui.mouse_x;
+            app.piano.marquee_y0 = ui.mouse_y;
+            app.piano.row_marquee = in_keys;
+            app.piano.row_marquee_pitch0 = pitch_i;
+            ui.active_id = 7300; // 框选手势（归本视图）
+            if (!app.piano.marquee_add) app.clearNoteSelection();
+        }
+    }
+    if (ui.active_id == 7300 and !ui.mouse_down) {
+        ui.active_id = 0;
+        app.piano.marquee_active = false;
+        app.piano.row_marquee = false;
+    }
+    if (app.piano.marquee_active) {
+        // 实时更新选区（每帧重算：框内 = 选中）
+        const mx0 = @min(app.piano.marquee_x0, ui.mouse_x);
+        const mx1 = @max(app.piano.marquee_x0, ui.mouse_x);
+        const my0 = @min(app.piano.marquee_y0, ui.mouse_y);
+        const my1 = @max(app.piano.marquee_y0, ui.mouse_y);
+        if (!app.piano.marquee_add) app.clearNoteSelection();
+        for (app.notes.items) |*n| {
+            if (n.pattern != pattern or n.instrument != app.sel.instrument) continue;
+            if (app.piano.row_marquee) {
+                // 按行：音高在起始/当前行之间 → 选中（**水平不限**）
+                const p0 = @min(app.piano.row_marquee_pitch0, pitch_i);
+                const p1 = @max(app.piano.row_marquee_pitch0, pitch_i);
+                if (n.pitch >= p0 and n.pitch <= p1) n.selected = true;
+                continue;
+            }
+            const nx = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(n.step)) * step_ws - scroll_s));
+            const ny = lane_y + (127 - n.pitch) * app.piano.key_h - app.piano.scroll;
+            const nw = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(n.len)) * step_ws)));
+            // 矩形相交（半开区间；含边界）
+            if (nx + nw >= mx0 and nx <= mx1 and ny + app.piano.key_h >= my0 and ny <= my1) {
+                n.selected = true;
+            }
+        }
+    }
+
     // 命中音符（下标 + 命中模式：中部 / 左缘 / 右缘，边缘区 8px）
+    // 注：框选手势期间不命中（框选优先）
     var note_hit: ?struct { index: usize, mode: model.NoteHitMode } = null;
-    if (in_lane) {
+    if (in_lane and !app.piano.marquee_active and !ui.mods_ctrl) {
         for (app.notes.items, 0..) |n, ni| {
             if (n.pattern != pattern or n.instrument != app.sel.instrument) continue;
             const nx = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(n.step)) * step_ws - scroll_s));
@@ -407,7 +479,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     }
 
     // 光标：拖动中 → 十字箭头（音符可横竖拖动）；悬停边缘 → ↔
-    if (app.piano.drag_note != null) {
+    if (app.piano.drag_note != null or app.piano.drag_batch or app.piano.batch_trim) {
         ui.cursor = .size_all;
     } else if (note_hit) |hit| {
         if (hit.mode != .body) ui.cursor = .resize_h;
@@ -434,29 +506,60 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 试听（单一真源 `held_pitch`）：
     // - 放置/点击音符 → 发声（按住不放 = 持续发声）
     // - 拖动中换音高 → 重触发（滑奏）
-    if (ui.mouse_pressed and in_lane and step_i >= 0 and pitch_i >= 0 and pitch_i <= 127) {
+    // 注：Ctrl 按下（框选手势）时**不放置**——否则框选启动当帧会先放一个音符
+    if (ui.mouse_pressed and in_lane and !ui.mods_ctrl and step_i >= 0 and pitch_i >= 0 and pitch_i <= 127) {
         if (note_hit) |hit| {
             const n = app.notes.items[hit.index];
-            app.piano.drag_note = hit.index;
-            app.piano.drag_note_mode = hit.mode;
-            // 拉伸基准（**按下时快照**）：原起点/原长/按下步——
-            // 增量式拉伸全程以它为锚（长度 = 原长 + k×格），避免“每帧以自身为基准”漂移
-            app.piano.drag_orig_step = n.step;
-            app.piano.drag_orig_len = n.len;
-            app.piano.drag_down_step = step_i;
-            app.piano.last_note_len = n.len; // 记住：新音符放置沿用此长度
-            app.piano.drag_grab_step = step_i - n.step;
-            app.piano.drag_grab_pitch = pitch_i - n.pitch;
-            // 拖动死区：先记录按下位置；超过阈值才真正编辑（防单击吸附）
-            app.piano.drag_armed = false;
-            app.piano.drag_down_x = ui.mouse_x;
-            app.piano.drag_down_y = ui.mouse_y;
-            // 点击已有音符 → 试听（按住不放持续发声）
-            app.piano.held_pitch = n.pitch;
-            app.auditionOn(n.pitch);
+            // 命中**已选中的音符** + 选区 ≥ 2 → 批量拖动/拉伸（选区整体）
+            // （单击单个未选中音符 → 单选 + 单音符拖动；点已选中但选区 = 1 也走单音符）
+            const batch_mode = n.selected and app.selectedNoteCount() >= 2 and hit.mode != .body;
+            if (batch_mode) {
+                app.beginBatchSnap();
+                app.piano.batch_trim = true;
+                app.piano.batch_trim_down_step = step_i;
+                app.piano.batch_trim_grid = @max(1, snap_steps);
+                app.piano.drag_note_mode = hit.mode;
+                app.piano.drag_armed = false;
+                app.piano.drag_down_x = ui.mouse_x;
+                app.piano.drag_down_y = ui.mouse_y;
+            } else if (n.selected and app.selectedNoteCount() >= 2) {
+                // 批量拖动（选区 ≥ 2）：快照 + 记录按下基准
+                app.beginBatchSnap();
+                app.piano.drag_batch = true;
+                app.piano.batch_down_step = step_i;
+                app.piano.batch_down_pitch = pitch_i;
+                app.piano.drag_armed = false;
+                app.piano.drag_down_x = ui.mouse_x;
+                app.piano.drag_down_y = ui.mouse_y;
+                app.piano.held_pitch = n.pitch;
+                app.auditionOn(n.pitch);
+            } else {
+                // 单选语义：点**未选中**的音符 → 清除旧选区（只操作当前这个）；
+                // 点已选中但选区 = 1 → 保留选中（单音符拖动）
+                if (!n.selected) app.clearNoteSelection();
+                app.piano.drag_note = hit.index;
+                app.piano.drag_note_mode = hit.mode;
+                // 拉伸基准（**按下时快照**）：原起点/原长/按下步——
+                // 增量式拉伸全程以它为锚（长度 = 原长 + k×格），避免“每帧以自身为基准”漂移
+                app.piano.drag_orig_step = n.step;
+                app.piano.drag_orig_len = n.len;
+                app.piano.drag_down_step = step_i;
+                app.piano.last_note_len = n.len; // 记住：新音符放置沿用此长度
+                app.piano.drag_grab_step = step_i - n.step;
+                app.piano.drag_grab_pitch = pitch_i - n.pitch;
+                // 拖动死区：先记录按下位置；超过阈值才真正编辑（防单击吸附）
+                app.piano.drag_armed = false;
+                app.piano.drag_down_x = ui.mouse_x;
+                app.piano.drag_down_y = ui.mouse_y;
+                // 点击已有音符 → 试听（按住不放持续发声）
+                app.piano.held_pitch = n.pitch;
+                app.auditionOn(n.pitch);
+            }
         } else {
             // 新音符长度：沿用**上一个被点击/编辑过的音符**（无参考时 = 当前吸附格）
-            // 注：**允许重叠**（与 MIDI 一致）——不再拦截
+            // 注：**允许重叠**（与 MIDI 一致）——不再拦截；
+            // 放置新音符时**取消选区**（符合直觉：新建 = 新焦点）
+            app.clearNoteSelection();
             const new_len: i32 = if (app.piano.last_note_len > 0) app.piano.last_note_len else @max(1, snap_steps);
             {
                 app.addNote(.{ .step = snap_step, .len = new_len, .pitch = pitch_i, .pattern = pattern, .instrument = app.sel.instrument });
@@ -483,6 +586,40 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 拖动 / 拉伸更新（带**死区**：位移超过 3px 才真正编辑——
     // 否则单击音符会在按下当帧被吸附，位置/长度跳变）
     if (ui.mouse_down) {
+        // ── 批量拖动（选区 ≥ 2 中部拖动）──
+        if (app.piano.drag_batch) {
+            if (!app.piano.drag_armed) {
+                const dx = ui.mouse_x - app.piano.drag_down_x;
+                const dy = ui.mouse_y - app.piano.drag_down_y;
+                if (dx * dx + dy * dy >= 3 * 3) app.piano.drag_armed = true;
+            }
+            if (app.piano.drag_armed) {
+                // 位移吸附到网格（与单音符一致：以**最左选中音符**的起点吸附）
+                const d_step_raw = step_i - app.piano.batch_down_step;
+                const d_pitch = pitch_i - app.piano.batch_down_pitch;
+                // 吸附：位移 = 网格格数 × 格宽（round）
+                const d_step = model.snapRound(d_step_raw, snap_steps);
+                _ = app.moveSelectedNotes(d_step, d_pitch);
+            }
+        }
+        // ── 批量拉伸（选区 ≥ 2 边缘拖动）──
+        if (app.piano.batch_trim) {
+            if (!app.piano.drag_armed) {
+                const dx = ui.mouse_x - app.piano.drag_down_x;
+                const dy = ui.mouse_y - app.piano.drag_down_y;
+                if (dx * dx + dy * dy >= 3 * 3) app.piano.drag_armed = true;
+            }
+            if (app.piano.drag_armed) {
+                const g = app.piano.batch_trim_grid;
+                // 位移 → 格数（左缘：左移为正、右缘：右移为正；与单音符增量式一致）
+                const delta = if (app.piano.drag_note_mode == .left)
+                    app.piano.batch_trim_down_step - step_i // 左缘：左移为正（加长）
+                else
+                    step_i - app.piano.batch_trim_down_step; // 右缘：右移为正（加长）
+                const k = model.gridSteps(delta, g);
+                _ = app.applyBatchTrim(k, g, app.piano.drag_note_mode == .left);
+            }
+        }
         if (app.piano.drag_note) |ni| {
             if (!app.piano.drag_armed) {
                 const dx = ui.mouse_x - app.piano.drag_down_x;
@@ -544,6 +681,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     } else {
         app.piano.drag_note = null;
         app.piano.drag_armed = false; // 下次按下重新评估死区
+        app.piano.drag_batch = false;
+        app.piano.batch_trim = false;
         // 松开：停止试听（仅当不是琴键试听拖动时——琴键有自己的生命周期）
         if (ui.active_id != 6000 and app.piano.held_pitch != null) {
             if (app.piano.held_pitch) |hp| app.auditionOff(hp);
@@ -576,6 +715,36 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     }
     _ = ui.scrollbarV(11, sb_x, lane_y, ruler_h, lane_h, &app.piano.scroll, content_h, lane_h);
     ui.renderer.vline(sb_x, lane_y, lane_h, ui.theme.panel_border);
+
+    // ── 编辑快捷键执行（框选/批量；按当前视图上下文）──
+    // 由 main 的键盘处理登记（`pending_edit_op`）；本视图消费后清除。
+    if (app.pending_edit_op) |op| {
+        switch (op) {
+            .delete_selected => {
+                const n = app.deleteSelectedNotes();
+                if (n > 0) app.setToastWith("已删除 {d} 个音符", .{n});
+            },
+            .clone_right => {
+                const n = app.cloneSelectedNotesRight();
+                if (n > 0) app.setToastWith("已克隆 {d} 个音符（选区已移至克隆体）", .{n});
+            },
+            .copy => {
+                const n = app.copySelectedNotes();
+                if (n > 0) app.setToastWith("已复制 {d} 个音符", .{n});
+            },
+            .paste => {
+                // 粘贴到**鼠标位置**（音高不变；step = 鼠标所在步）
+                const anchor = @max(0, snap_step);
+                const n = app.pasteNotes(pattern, app.sel.instrument, anchor);
+                if (n > 0) app.setToastWith("已粘贴 {d} 个音符", .{n});
+            },
+            .select_all => {
+                const n = app.selectAllNotes(pattern);
+                if (n > 0) app.setToastWith("已全选 {d} 个音符", .{n});
+            },
+        }
+        app.pending_edit_op = null;
+    }
 
     // 吸附网格下拉（在**全部内容之后** → 绘制在最上层，不会被标尺/音符区盖住）
     if (app.piano.snap_menu_open and snap_btn_x + 40 < x + w - 24) {
