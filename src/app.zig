@@ -48,6 +48,24 @@ pub const ClipboardNote = struct { step: i32, len: i32, pitch: i32 };
 /// - 片段：`step`=start、`len`=len、`pitch`=track、`offset`=左缘局部步（左缘拉伸用）。
 pub const BatchSnap = struct { step: i32, len: i32, pitch: i32, offset: i32 = 0 };
 
+/// 撤销/重做历史的一个**完整快照**（快照式撤销：恢复 = 整块回写）。
+/// 存音符/片段/乐器/样式数/全局设置。
+/// 乐器恢复的指针安全：数量相同 → **原位更新**（指针身份不变，音频线程安全）；
+/// 数量不同 → 重建（旧指针进退役列表——**不释放**，防音频线程 use-after-free）。
+pub const HistoryState = struct {
+    /// 操作名（如“放置音符”；堆分配，由 App 管理生命周期）
+    label: []u8,
+    notes: []model.Note,
+    clips: []model.Clip,
+    /// 乐器快照（name 为堆分配副本；synth 为值快照）
+    instruments: []persist.SavedInstrument,
+    pattern_count: i32 = model.default_pattern_count,
+    bpm: i32 = 120,
+    time_num: i32 = 4,
+    time_den: i32 = 4,
+    steps_per_bar: i32 = model.units_per_whole,
+};
+
 /// 脏确认流程的**目标动作**（确认框按钮相同，但“保存后”要执行不同的事）
 pub const PendingIntent = enum {
     /// 保存后退出程序
@@ -292,6 +310,8 @@ pub const SoundingPitches = struct {
 pub const PanelsState = struct {
     history_scroll: i32 = 0,
     pattern_scroll: i32 = 0,
+    /// 历史栏：上次跟随的当前条目（**变化时才自动滚动**——否则用户无法手动滚动查看）
+    history_follow: usize = 0,
 };
 
 /// 合成器编辑器（浮动窗口）状态
@@ -340,6 +360,17 @@ pub const App = struct {
     clipboard_clips: std.ArrayListUnmanaged(Clip) = .{ .items = &.{}, .capacity = 0 },
     /// 批量拉伸快照（拖选中音符边缘期间；顺序 = 音符数组顺序）
     batch_snap: std.ArrayListUnmanaged(BatchSnap) = .{ .items = &.{}, .capacity = 0 },
+
+    // ── 撤销/重做（快照式；见 `commitHistory`）──
+    /// 历史快照栈（[0] = 初始/打开工程时的状态；current = 当前所在快照）
+    history: std.ArrayListUnmanaged(HistoryState) = .{ .items = &.{}, .capacity = 0 },
+    /// 当前状态在 `history` 中的下标
+    history_current: usize = 0,
+    /// 最后一次保存时对应的历史下标（脏标记 = 当前 != 此处）
+    history_saved_index: usize = 0,
+    /// 待提交的操作名（**拖动类操作**在拖动中每帧设置，帧末鼠标松开后才真正提交——
+    /// 实现 coalesce：一次拖动 = 一条历史，而不是每帧一条）
+    history_pending: ?[]const u8 = null,
 
     // ── 保存 / 加载（工程文件）──
     /// 当前工程路径（null = 尚未保存过）
@@ -403,18 +434,6 @@ pub const App = struct {
     synth_win: SynthWindow = .{},
 
     // ── 占位数据 ──
-    history_items: []const []const u8 = &.{
-        "创建项目",
-        "添加样式 1",
-        "绘制音符",
-        "调整 BPM",
-        "添加样式 2",
-        "复制样式 1 → 3",
-        "调整音量",
-        "添加样式 4",
-        "删除样式 5",
-        "调整音符力度",
-    },
     /// 样式列表（**动态**；名字由 App 管理生命周期，如 "样式 7"）。
     /// 数量 = `pattern_items.items.len`；上限 `max_patterns`（播放列表预览数组等按此设限）。
     pattern_items: std.ArrayListUnmanaged([]u8) = .{ .items = &.{}, .capacity = 0 },
@@ -989,6 +1008,7 @@ pub const App = struct {
         self.clipboard_notes.deinit(self.allocator);
         self.clipboard_clips.deinit(self.allocator);
         self.batch_snap.deinit(self.allocator);
+        self.deinitHistory();
         self.deinitPatterns();
         self.deinitInstruments();
     }
@@ -1013,6 +1033,241 @@ pub const App = struct {
     /// 标记脏（任何编辑操作调用）
     pub fn markDirty(self: *App) void {
         self.dirty = true;
+    }
+
+    // ── 撤销/重做（快照式）──
+
+    /// 历史容量上限（超出后丢弃最旧的快照）
+    pub const history_limit: usize = 128;
+
+    /// 标记“已保存”（脏标记清零 + 记住当前历史位置）
+    pub fn markSaved(self: *App) void {
+        self.dirty = false;
+        self.history_saved_index = self.history_current;
+    }
+
+    /// 当前历史条目的操作名（供 toast/历史栏；无历史时返回 ""）
+    pub fn historyLabel(self: *const App) []const u8 {
+        if (self.history.items.len == 0) return "";
+        return self.history.items[self.history_current].label;
+    }
+
+    fn freeHistoryState(self: *App, st: *const HistoryState) void {
+        self.allocator.free(st.label);
+        self.allocator.free(st.notes);
+        self.allocator.free(st.clips);
+        for (st.instruments) |si| self.allocator.free(si.name);
+        self.allocator.free(st.instruments);
+    }
+
+    /// 捕获当前状态为快照（调用方负责释放；失败返回 error）
+    fn captureHistory(self: *App, label: []const u8) !HistoryState {
+        const label_copy = try self.allocator.dupe(u8, label);
+        errdefer self.allocator.free(label_copy);
+        const notes = try self.allocator.dupe(model.Note, self.notes.items);
+        errdefer self.allocator.free(notes);
+        const clips = try self.allocator.dupe(model.Clip, self.clips.items);
+        errdefer self.allocator.free(clips);
+        const insts = try self.allocator.alloc(persist.SavedInstrument, self.instruments.items.len);
+        var n: usize = 0;
+        errdefer {
+            for (insts[0..n]) |si| self.allocator.free(si.name);
+            self.allocator.free(insts);
+        }
+        for (self.instruments.items, 0..) |inst, i| {
+            insts[i] = .{
+                .name = try self.allocator.dupe(u8, inst.name),
+                .volume = inst.volume,
+                .pan = inst.pan,
+                .muted = inst.muted,
+                .mixer = inst.mixer,
+                .midi_channel = inst.midi_channel,
+                .synth = persist.exportSynth(inst.synth),
+            };
+            n += 1;
+        }
+        return .{
+            .label = label_copy,
+            .notes = notes,
+            .clips = clips,
+            .instruments = insts,
+            .pattern_count = self.patternCount(),
+            .bpm = self.bpm,
+            .time_num = self.time_num,
+            .time_den = self.time_den,
+            .steps_per_bar = self.steps_per_bar,
+        };
+    }
+
+    /// 当前状态是否与 `history[history_current]` 等价（**忽略选区**——
+    /// 选区是瞬态，不应产生历史条目/脏标记）
+    fn stateEqualsCurrent(self: *const App) bool {
+        if (self.history.items.len == 0) return false;
+        const st = self.history.items[self.history_current];
+        if (st.notes.len != self.notes.items.len or st.clips.len != self.clips.items.len) return false;
+        for (st.notes, self.notes.items) |a, b| {
+            if (a.step != b.step or a.len != b.len or a.pitch != b.pitch or
+                a.pattern != b.pattern or a.instrument != b.instrument) return false;
+        }
+        for (st.clips, self.clips.items) |a, b| {
+            if (a.track != b.track or a.start != b.start or a.len != b.len or
+                a.pattern != b.pattern or a.offset != b.offset) return false;
+        }
+        if (st.instruments.len != self.instruments.items.len) return false;
+        for (st.instruments, self.instruments.items) |a, b| {
+            if (a.volume != b.volume or a.pan != b.pan or a.muted != b.muted or
+                a.mixer != b.mixer or a.midi_channel != b.midi_channel) return false;
+            if (!std.mem.eql(u8, a.name, b.name)) return false;
+            // **合成器参数也要比较**——否则 ADSR/滤波等改动会被判为“无变化”，
+            // 静默丢弃历史条目（实测 bug：调 ADSR 不产生历史）
+            const cur = persist.exportSynth(b.synth);
+            if (!std.meta.eql(a.synth, cur)) return false;
+        }
+        if (st.bpm != self.bpm or st.time_num != self.time_num or st.time_den != self.time_den) return false;
+        if (st.pattern_count != self.patternCount()) return false;
+        return true;
+    }
+
+    /// 提交一次历史快照（**操作完成后**调用；`label` 会被复制）。
+    /// 若当前状态与所在快照等价（忽略选区）→ 不产生新条目（防“点了没动”噪音）。
+    pub fn commitHistory(self: *App, label: []const u8) void {
+        if (self.history.items.len > 0 and self.stateEqualsCurrent()) return;
+        // 截断 redo 尾巴（新操作发生在撤销之后）
+        while (self.history.items.len > self.history_current + 1) {
+            var st = self.history.pop().?;
+            self.freeHistoryState(&st);
+        }
+        const st = self.captureHistory(label) catch return;
+        self.history.append(self.allocator, st) catch {
+            self.freeHistoryState(&st);
+            return;
+        };
+        self.history_current = self.history.items.len - 1;
+        // 超限：丢最旧
+        while (self.history.items.len > history_limit) {
+            var old = self.history.orderedRemove(0);
+            self.freeHistoryState(&old);
+            if (self.history_current > 0) self.history_current -= 1;
+            if (self.history_saved_index > 0) self.history_saved_index -= 1;
+        }
+    }
+
+    /// 应用历史快照（恢复 = 整块回写；顺带钳制选择/乐器索引）
+    fn applyHistoryState(self: *App, st: *const HistoryState) void {
+        self.stopPlayback(); // 调度器引用旧数据：先停
+        self.history_pending = null; // 拖动中的 coalesce 标记作废
+        // 拖动状态全部清空：撤销/重做后数据已换，旧拖动（及其快照/下标）
+        // 会指向错误内容（下标可能越界）；用户需重新按下才能继续拖
+        self.piano.drag_note = null;
+        self.piano.drag_batch = false;
+        self.piano.batch_trim = false;
+        self.piano.marquee_active = false;
+        self.playlist.drag_clip = null;
+        self.playlist.resize_clip = null;
+        self.playlist.drag_batch = false;
+        self.playlist.batch_trim = false;
+        self.playlist.erase_drag = false;
+        self.playlist.marquee_active = false;
+        // 乐器：数量相同 → **原位更新**（指针身份不变——音频线程安全）；
+        // 数量不同 → 重建（removeInstrument 会把旧指针送入退役列表，不释放）
+        if (st.instruments.len == self.instruments.items.len) {
+            for (st.instruments, 0..) |si, i| {
+                const target = &self.instruments.items[i];
+                if (!std.mem.eql(u8, target.name, si.name)) {
+                    const dup = self.allocator.dupe(u8, si.name) catch continue;
+                    self.allocator.free(target.name);
+                    target.name = dup;
+                }
+                target.volume = si.volume;
+                target.pan = si.pan;
+                target.muted = si.muted;
+                target.mixer = si.mixer;
+                target.midi_channel = si.midi_channel;
+                persist.importSynth(&si.synth, target.synth);
+            }
+        } else {
+            while (self.instruments.items.len > 0) {
+                self.removeInstrument(self.instruments.items.len - 1);
+            }
+            for (st.instruments) |si| {
+                const idx = self.addInstrument(si.name);
+                if (idx < 0) continue;
+                const target = &self.instruments.items[@intCast(idx)];
+                target.volume = si.volume;
+                target.pan = si.pan;
+                target.muted = si.muted;
+                target.mixer = si.mixer;
+                target.midi_channel = si.midi_channel;
+                persist.importSynth(&si.synth, target.synth);
+            }
+        }
+        // 音符/片段
+        self.notes.clearRetainingCapacity();
+        for (st.notes) |n| {
+            var copy = n;
+            if (self.instruments.items.len > 0) {
+                copy.instrument = std.math.clamp(copy.instrument, 0, @as(i32, @intCast(self.instruments.items.len)) - 1);
+            }
+            self.notes.append(self.allocator, copy) catch {};
+        }
+        self.clips.clearRetainingCapacity();
+        for (st.clips) |c| self.clips.append(self.allocator, c) catch {};
+        if (st.pattern_count > 0 and st.pattern_count != self.patternCount()) {
+            const was_dirty = self.dirty;
+            self.resetPatterns(st.pattern_count);
+            self.dirty = was_dirty;
+        }
+        self.bpm = st.bpm;
+        self.time_num = st.time_num;
+        self.time_den = st.time_den;
+        self.steps_per_bar = st.steps_per_bar;
+        // 选择钳制
+        if (self.sel.pattern >= self.patternCount()) self.sel.pattern = self.patternCount() - 1;
+    }
+
+    /// 撤销（Ctrl+Z）。返回是否成功。
+    pub fn undo(self: *App) bool {
+        if (self.history.items.len == 0 or self.history_current == 0) return false;
+        self.history_current -= 1;
+        self.applyHistoryState(&self.history.items[self.history_current]);
+        self.dirty = self.history_current != self.history_saved_index;
+        return true;
+    }
+
+    /// 重做（Ctrl+Alt+Z）。返回是否成功。
+    pub fn redo(self: *App) bool {
+        if (self.history.items.len == 0 or self.history_current + 1 >= self.history.items.len) return false;
+        self.history_current += 1;
+        self.applyHistoryState(&self.history.items[self.history_current]);
+        self.dirty = self.history_current != self.history_saved_index;
+        return true;
+    }
+
+    /// 跳转到指定历史条目（历史栏点击）。返回是否成功。
+    pub fn jumpHistory(self: *App, index: usize) bool {
+        if (self.history.items.len == 0 or index >= self.history.items.len or index == self.history_current) return false;
+        self.history_current = index;
+        self.applyHistoryState(&self.history.items[index]);
+        self.dirty = self.history_current != self.history_saved_index;
+        return true;
+    }
+
+    /// 重置历史（启动/打开工程时）：以当前状态为基线（`label` 如“初始状态”）。
+    pub fn resetHistory(self: *App, label: []const u8) void {
+        for (self.history.items) |*st| self.freeHistoryState(st);
+        self.history.clearRetainingCapacity();
+        self.history_pending = null;
+        if (self.captureHistory(label)) |st| {
+            self.history.append(self.allocator, st) catch self.freeHistoryState(&st);
+        } else |_| {}
+        self.history_current = 0;
+        self.history_saved_index = 0;
+    }
+
+    /// 释放历史（进程退出）
+    pub fn deinitHistory(self: *App) void {
+        for (self.history.items) |*st| self.freeHistoryState(st);
+        self.history.deinit(self.allocator);
     }
 
     /// 当前样式数量
@@ -1613,6 +1868,139 @@ test "app: 批量拉伸——往回拖经过 0 格必须还原（修“卡在二
     // 继续往左（-1）：1/4 网格下 24 = 一格 → 全组不能缩（保持 24）
     try std.testing.expectEqual(@as(i32, 0), app.applyBatchTrim(-1, 24, false));
     try std.testing.expectEqual(@as(i32, 24), app.notes.items[0].len);
+}
+
+test "app: 撤销——合成器参数（ADSR）也恢复（修“调 ADSR 不产生历史”）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    // 修改 ADSR（attack 0.05 → 0.8）→ 提交
+    const old_attack = app.instruments.items[0].synth.attack.load(.monotonic);
+    app.instruments.items[0].synth.attack.store(0.8, .monotonic);
+    app.commitHistory("调整 ADSR");
+    // **关键回归**：stateEqualsCurrent 必须比较合成器参数——
+    // 旧实现漏了 → 判为“无变化” → 历史条目被静默丢弃
+    try std.testing.expectEqual(@as(usize, 2), app.history.items.len);
+
+    // 撤销 → attack 恢复
+    try std.testing.expect(app.undo());
+    try std.testing.expectApproxEqAbs(old_attack, app.instruments.items[0].synth.attack.load(.monotonic), 0.0001);
+    // 重做 → 回到 0.8
+    try std.testing.expect(app.redo());
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), app.instruments.items[0].synth.attack.load(.monotonic), 0.0001);
+}
+
+test "app: 撤销/重做——快照式（放置/删除/修改 + redo 截断 + 选区无关）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    // ① 放置音符 → 提交历史
+    app.addNote(.{ .step = 0, .len = 24, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.commitHistory("放置音符");
+    try std.testing.expectEqual(@as(usize, 2), app.history.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.history_current);
+
+    // ② 再放一个 → 第三条
+    app.addNote(.{ .step = 48, .len = 24, .pitch = 62, .pattern = 0, .instrument = 0 });
+    app.commitHistory("放置音符");
+    try std.testing.expectEqual(@as(usize, 3), app.history.items.len);
+    try std.testing.expectEqual(@as(usize, 2), app.notes.items.len);
+
+    // ③ 撤销 → 回到 1 个音符
+    try std.testing.expect(app.undo());
+    try std.testing.expectEqual(@as(usize, 1), app.notes.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.history_current);
+    try std.testing.expectEqualStrings("放置音符", app.historyLabel());
+
+    // ④ 再撤销 → 回到 0 个
+    try std.testing.expect(app.undo());
+    try std.testing.expectEqual(@as(usize, 0), app.notes.items.len);
+    // 到底了 → 再撤销失败
+    try std.testing.expect(!app.undo());
+
+    // ⑤ 重做 → 回到 1 个；再重做 → 2 个；到头失败
+    try std.testing.expect(app.redo());
+    try std.testing.expectEqual(@as(usize, 1), app.notes.items.len);
+    try std.testing.expect(app.redo());
+    try std.testing.expectEqual(@as(usize, 2), app.notes.items.len);
+    try std.testing.expect(!app.redo());
+
+    // ⑥ 撤销后新操作 → **截断 redo 尾巴**
+    try std.testing.expect(app.undo()); // 回到 1 个（current = 1）
+    try std.testing.expectEqual(@as(usize, 3), app.history.items.len);
+    app.addNote(.{ .step = 96, .len = 24, .pitch = 64, .pattern = 0, .instrument = 0 });
+    app.commitHistory("放置音符"); // 新分支
+    try std.testing.expectEqual(@as(usize, 3), app.history.items.len); // 尾巴被截断（回到 3 条）
+    try std.testing.expectEqual(@as(usize, 2), app.notes.items.len); // 1 + 新 1
+    try std.testing.expect(!app.redo()); // redo 已不可用
+
+    // ⑦ **选区变化不产生历史**（瞬态）：
+    const before = app.history.items.len;
+    app.notes.items[0].selected = true;
+    app.commitHistory("选中"); // 状态等价 → 不提交
+    try std.testing.expectEqual(before, app.history.items.len);
+
+    // ⑧ 脏标记与保存点：markSaved 后撤销 → 变脏；重做回来 → 不脏
+    app.markSaved();
+    try std.testing.expect(!app.dirty);
+    _ = app.undo();
+    try std.testing.expect(app.dirty);
+    _ = app.redo();
+    try std.testing.expect(!app.dirty);
+
+    // ⑨ 跳转历史（历史栏点击）：跳回第 0 条
+    try std.testing.expect(app.jumpHistory(0));
+    try std.testing.expectEqual(@as(usize, 0), app.notes.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.history_current);
+}
+
+test "app: 撤销——乐器/全局设置（BPM、拍号、乐器增删）也恢复" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    // BPM 修改
+    app.bpm = 150;
+    app.commitHistory("调整 BPM");
+    // 拍号修改
+    app.time_num = 3;
+    app.steps_per_bar = model.stepsPerBarFor(3, 4);
+    app.commitHistory("调整拍号");
+    // 添加乐器
+    _ = app.addInstrument("减法合成器");
+    app.commitHistory("添加乐器");
+    try std.testing.expectEqual(@as(usize, 2), app.instruments.items.len);
+
+    // 撤销三次：乐器数、拍号、BPM 逐项恢复
+    try std.testing.expect(app.undo());
+    try std.testing.expectEqual(@as(usize, 1), app.instruments.items.len);
+    try std.testing.expectEqual(@as(i32, 3), app.time_num); // 拍号还是 3（只撤销了乐器）
+    try std.testing.expect(app.undo());
+    try std.testing.expectEqual(@as(i32, 4), app.time_num); // 拍号恢复
+    try std.testing.expectEqual(@as(i32, 150), app.bpm); // BPM 还是 150
+    try std.testing.expect(app.undo());
+    try std.testing.expectEqual(@as(i32, 120), app.bpm); // BPM 恢复
+    // 重做三次回到最新
+    try std.testing.expect(app.redo());
+    try std.testing.expectEqual(@as(i32, 150), app.bpm);
+    try std.testing.expect(app.redo());
+    try std.testing.expectEqual(@as(i32, 3), app.time_num);
+    try std.testing.expect(app.redo());
+    try std.testing.expectEqual(@as(usize, 2), app.instruments.items.len);
 }
 
 test "app: 全选——音符（仅当前样式）/ 片段" {

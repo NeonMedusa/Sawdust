@@ -516,6 +516,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             _ = app.notes.orderedRemove(hit.index);
             app.piano.drag_note = null;
             app.dirty = true;
+            // 历史：右键擦除（含拖动划过多个）→ 松开右键时 coalesce 提交一次
+            app.history_pending = "擦除音符";
         }
     }
 
@@ -533,6 +535,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             if (batch_mode) {
                 app.beginBatchSnap();
                 app.piano.batch_trim = true;
+                app.history_pending = "批量拉伸音符"; // 松手时 coalesce 提交
                 app.piano.batch_trim_down_step = step_i;
                 app.piano.batch_trim_grid = @max(1, snap_steps);
                 app.piano.drag_note_mode = hit.mode;
@@ -543,6 +546,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 // 批量拖动（选区 ≥ 2）：快照 + 记录按下基准
                 app.beginBatchSnap();
                 app.piano.drag_batch = true;
+                app.history_pending = "批量移动音符"; // 松手时 coalesce 提交
                 app.piano.batch_down_step = step_i;
                 app.piano.batch_down_pitch = pitch_i;
                 app.piano.drag_armed = false;
@@ -556,6 +560,11 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 if (!n.selected) app.clearNoteSelection();
                 app.piano.drag_note = hit.index;
                 app.piano.drag_note_mode = hit.mode;
+                // 历史：拖动结束（松手）时 coalesce 提交
+                app.history_pending = switch (hit.mode) {
+                    .body => "移动音符",
+                    .left, .right => "拉伸音符",
+                };
                 // 拉伸基准（**按下时快照**）：原起点/原长/按下步——
                 // 增量式拉伸全程以它为锚（长度 = 原长 + k×格），避免“每帧以自身为基准”漂移
                 app.piano.drag_orig_step = n.step;
@@ -581,6 +590,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             {
                 app.addNote(.{ .step = snap_step, .len = new_len, .pitch = pitch_i, .pattern = pattern, .instrument = app.sel.instrument });
                 app.piano.last_note_len = new_len; // 放置的音符本身也成为“上一个”
+                // **放置即拖拽**：新音符立即进入拖动状态（按住左键可直接拖着跑）；
+                // 历史：拖动结束时 coalesce 提交（放置+拖动 = 一条“放置音符”）
+                app.history_pending = "放置音符";
                 // **放置即拖拽**：新音符立即进入拖动状态（按住左键可直接拖着跑）
                 app.piano.drag_note = app.notes.items.len - 1;
                 app.piano.drag_note_mode = .body;
@@ -739,11 +751,17 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         switch (op) {
             .delete_selected => {
                 const n = app.deleteSelectedNotes();
-                if (n > 0) app.setToastWith("已删除 {d} 个音符", .{n});
+                if (n > 0) {
+                    app.setToastWith("已删除 {d} 个音符", .{n});
+                    app.commitHistory("删除音符");
+                }
             },
             .clone_right => {
                 const n = app.cloneSelectedNotesRight();
-                if (n > 0) app.setToastWith("已克隆 {d} 个音符（选区已移至克隆体）", .{n});
+                if (n > 0) {
+                    app.setToastWith("已克隆 {d} 个音符（选区已移至克隆体）", .{n});
+                    app.commitHistory("克隆音符");
+                }
             },
             .copy => {
                 const n = app.copySelectedNotes();
@@ -753,7 +771,10 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 // 粘贴到**鼠标位置**（音高不变；step = 鼠标所在步）
                 const anchor = @max(0, snap_step);
                 const n = app.pasteNotes(pattern, app.sel.instrument, anchor);
-                if (n > 0) app.setToastWith("已粘贴 {d} 个音符", .{n});
+                if (n > 0) {
+                    app.setToastWith("已粘贴 {d} 个音符", .{n});
+                    app.commitHistory("粘贴音符");
+                }
             },
             .select_all => {
                 const n = app.selectAllNotes(pattern);

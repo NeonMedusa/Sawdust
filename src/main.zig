@@ -66,6 +66,7 @@ pub fn main(init: std.process.Init) !u8 {
     // **必须在 engine.init 之前**：音频回调启动后会解引用参数/队列指针
     _ = app.addInstrument("减法合成器");
     _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态"); // 演示数据 = 历史基线
     app.dirty = false; // 演示数据不算“未保存的修改”
     app.params.events = &app.events;
     app.params.sched_events = &app.sched_events;
@@ -246,6 +247,18 @@ pub fn main(init: std.process.Init) !u8 {
                     if (k.ctrl and (k.code == 'C' or k.code == 'c')) app.pending_edit_op = .copy;
                     if (k.ctrl and (k.code == 'V' or k.code == 'v')) app.pending_edit_op = .paste;
                     if (k.ctrl and (k.code == 'A' or k.code == 'a')) app.pending_edit_op = .select_all;
+                    // ── 撤销/重做 ──
+                    // Ctrl+Z 撤销；Ctrl+Alt+Z（或 Ctrl+Shift+Z）重做
+                    if (k.ctrl and (k.code == 'Z' or k.code == 'z')) {
+                        if (k.alt or k.shift) {
+                            if (app.redo()) app.setToastWith("重做：{s}", .{app.historyLabel()});
+                        } else {
+                            // 提示用**被撤销的操作名**——undo 之前先读当前状态标签
+                            // （undo 后 history_current 已指向到达的状态）
+                            const undone: []const u8 = app.historyLabel();
+                            if (app.undo()) app.setToastWith("撤销：{s}", .{undone});
+                        }
+                    }
                 },
                 .resize => {},
                 else => {},
@@ -344,6 +357,15 @@ pub fn main(init: std.process.Init) !u8 {
 
         // 4) 呈现
         win.present();
+
+        // 4.1) 历史提交（拖动类操作 **coalesce**：鼠标松开才提交一次——
+        // 一次拖动 = 一条历史，而不是每帧一条；左右键都算）
+        if (app.history_pending) |label| {
+            if (!ui_input.mouse_down and !ui_input.mouse_right_down) {
+                app.commitHistory(label);
+                app.history_pending = null;
+            }
+        }
 
         // 4.2) 帧末执行待定的文件操作（对话框在此弹出——不在事件迭代/绘制中，
         // 避免 pushEvent realloc 使迭代中的 events slice 悬空）
@@ -611,7 +633,7 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
     {
         const old_bpm = app.bpm;
         _ = ui.dragNumber(350, x, by + 3, 56, 20, &app.bpm, 20, 999, 2);
-        if (app.bpm != old_bpm) app.dirty = true;
+        if (app.bpm != old_bpm) app.history_pending = "调整 BPM"; // 松手时 coalesce 提交
         x += 62;
     }
 
@@ -625,7 +647,7 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
         const changed_den = ui.dragNumberEx(352, x + num_w + 15, by + 3, den_w, 20, &app.time_den, 0, 4, 4, 1, null);
         if (changed_num or changed_den) {
             app.steps_per_bar = model.stepsPerBarFor(app.time_num, app.time_den);
-            app.dirty = true;
+            app.history_pending = "调整拍号"; // 松手时 coalesce 提交
             // 拍号变更 → 内容解释变了：播放中重置调度与传输
             if (app.playing) app.jumpPlaybackCursor(app.playback.cursorStep(app.sel.song_mode));
         }
@@ -759,7 +781,7 @@ fn saveProject(app: *App, win: *window.Window, io: std.Io, force_dialog: bool) v
     // 记住路径（首次保存 / 另存为后）——**安全设置**：
     // 普通保存时 path 正指向旧的 project_path，先 free 再读会 use-after-free
     app.setProjectPath(path);
-    app.dirty = false;
+    app.markSaved();
     app.setToastWith("已保存：{s}", .{path});
 }
 
@@ -808,7 +830,8 @@ fn loadProjectFromPath(app: *App, io: std.Io, path: []const u8) void {
     app.importProject(parsed.value);
 
     app.setProjectPath(path);
-    app.dirty = false;
+    app.resetHistory("打开工程"); // 打开 = 新基线（旧历史作废）
+    app.markSaved();
     app.setToastWith("已打开：{s}", .{path});
 }
 
@@ -845,6 +868,7 @@ fn importMidiWithDialog(app: *App, win: *window.Window, io: std.Io) void {
         app.setToastWith("导入失败：{s}", .{@errorName(e)});
         return;
     };
+    app.commitHistory("导入 MIDI"); // 一次性提交（导入是原子操作）
 
     if (r.skipped > 0) {
         app.setToastWith("已导入 {d} 个音符（{d} 个乐器，跳过 {d}）；样式 {d}", .{ r.notes, r.instruments, r.skipped, r.pattern + 1 });

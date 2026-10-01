@@ -12,27 +12,56 @@ pub fn drawHistory(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     const item_h: i32 = @as(i32, @intFromFloat(ui.font.lineHeight())) + 8;
     const list_y = y + util.title_h;
     const list_h = h - util.title_h;
+    const n: usize = app.history.items.len;
 
     // 裁剪（列表滚动时不画出边界）
-    const saved_clip = ui.renderer.pushClip(x + 1, list_y, w - 2, list_h);
-    defer ui.renderer.popClip(saved_clip);
+    {
+        const saved_clip = ui.renderer.pushClip(x + 1, list_y, w - 2, list_h);
+        defer ui.renderer.popClip(saved_clip);
 
-    var i: usize = 0;
-    var iy = list_y - app.panels.history_scroll;
-    while (i < app.history_items.len) : (i += 1) {
-        if (iy + item_h > list_y and iy < list_y + list_h) {
-            _ = ui.listItem(1000 + i, app.history_items[i], x + 1, iy, w - 2, item_h, false, i % 2 == 1, null);
+        var i: usize = 0;
+        var iy = list_y - app.panels.history_scroll;
+        while (i < n) : (i += 1) {
+            if (iy + item_h > list_y and iy < list_y + list_h) {
+                const is_current = i == app.history_current;
+                const is_saved = i == app.history_saved_index;
+                // 条目文本：`<序号>. <操作名>`（保存点加 `*` 前缀；当前条目高亮）
+                var buf: [96]u8 = undefined;
+                const label = std.fmt.bufPrint(&buf, "{s}{d}. {s}", .{
+                    if (is_saved) "*" else "",
+                    i + 1,
+                    app.history.items[i].label,
+                }) catch app.history.items[i].label;
+                if (ui.listItem(1000 + i, label, x + 1, iy, w - 2, item_h, is_current, i % 2 == 1, null)) {
+                    // 点击条目 = 跳转到该状态（等价于连续撤销/重做）
+                    if (app.jumpHistory(i)) {
+                        app.setToastWith("历史：{s}", .{app.historyLabel()});
+                    }
+                }
+            }
+            iy += item_h;
+            if (iy > list_y + list_h) break;
         }
-        iy += item_h;
-        if (iy > list_y + list_h) break;
+
+        // 滚动（滚轮）
+        const content_h: i32 = @intCast(n * @as(usize, @intCast(item_h)));
+        if (ui.hitRect(x, list_y, w, list_h)) {
+            app.panels.history_scroll = std.math.clamp(app.panels.history_scroll - util.scrollDelta(ui), 0, @max(0, content_h - list_h));
+        }
+        ui.drawScrollbar(x + w - 6, list_y, 5, list_h, app.panels.history_scroll, content_h, list_h);
     }
 
-    // 滚动
-    const content_h: i32 = @intCast(app.history_items.len * @as(usize, @intCast(item_h)));
-    if (ui.hitRect(x, list_y, w, list_h)) {
-        app.panels.history_scroll = std.math.clamp(app.panels.history_scroll - util.scrollDelta(ui), 0, @max(0, content_h - list_h));
+    // 自动跟随：**当前条目变化时**滚到它（新操作/撤销后立即可见）。
+    // 注：不能每帧跟随——否则用户手动滚动查看时会被强制拉回。
+    if (n > 0 and app.history_current != app.panels.history_follow) {
+        app.panels.history_follow = app.history_current;
+        const cur_y: i32 = @as(i32, @intCast(app.history_current)) * item_h;
+        if (cur_y < app.panels.history_scroll) {
+            app.panels.history_scroll = cur_y;
+        } else if (cur_y + item_h > app.panels.history_scroll + list_h) {
+            app.panels.history_scroll = cur_y + item_h - list_h;
+        }
     }
-    ui.drawScrollbar(x + w - 6, list_y, 5, list_h, app.panels.history_scroll, content_h, list_h);
 }
 
 pub fn drawPatterns(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
@@ -88,6 +117,7 @@ pub fn drawPatterns(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             if (ni >= 0) {
                 app.sel.pattern = ni;
                 if (app.piano.pattern != null) app.piano.pattern = ni;
+                app.commitHistory("添加样式"); // 原子操作：立即提交
             }
         }
     } else {
@@ -113,8 +143,8 @@ pub fn drawStatusBar(ui: *Ui, app: *App, w: i32, h: i32) void {
     if (app.toast) |t| {
         ui.label(t, w - 620, y + 4, ui.theme.accent);
     } else if (app.piano.pattern != null) {
-        ui.label("左键放置/拖动音符 · Ctrl+拖 框选（琴键列起=按行）· Del 删除 · Ctrl+A 全选 · Ctrl+B 克隆 · Ctrl+C/V 复制粘贴", w - 620, y + 4, ui.theme.text_dim);
+        ui.label("左键放置/拖动 · Ctrl+拖 框选 · Del 删除 · Ctrl+A 全选 · Ctrl+B 克隆 · Ctrl+C/V · Ctrl+Z 撤销", w - 620, y + 4, ui.theme.text_dim);
     } else {
-        ui.label("点击放置/拖动片段 · Ctrl+拖 框选（轨道名起=按行）· Del 删除 · Ctrl+A 全选 · Ctrl+B 克隆 · Ctrl+C/V 复制粘贴", w - 620, y + 4, ui.theme.text_dim);
+        ui.label("左键放置/拖动 · Ctrl+拖 框选 · Del 删除 · Ctrl+A 全选 · Ctrl+B 克隆 · Ctrl+C/V · Ctrl+Z 撤销", w - 620, y + 4, ui.theme.text_dim);
     }
 }

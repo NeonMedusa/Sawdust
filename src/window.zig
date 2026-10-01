@@ -26,7 +26,7 @@ pub const Event = union(enum) {
     mouse_double: struct { x: i32, y: i32 },
     /// 滚轮（delta > 0 = 向上/远离用户；ctrl = 按下 Ctrl，用于横向缩放）
     mouse_wheel: struct { x: i32, y: i32, delta: i32, ctrl: bool },
-    key_down: struct { code: u32, repeat: bool, ctrl: bool, shift: bool },
+    key_down: struct { code: u32, repeat: bool, ctrl: bool, shift: bool, alt: bool },
     key_up: struct { code: u32 },
     /// 已翻译的字符（含 IME 结果）
     char: u21,
@@ -457,7 +457,8 @@ const WindowsWindow = struct {
                     // 注：返回 i16，0x8000 需经 u16 位转换判断
                     const ctrl = (@as(u16, @bitCast(GetKeyState(VK_CONTROL))) & 0x8000) != 0;
                     const shift = (@as(u16, @bitCast(GetKeyState(VK_SHIFT))) & 0x8000) != 0;
-                    s.pushEvent(.{ .key_down = .{ .code = @intCast(wparam), .repeat = repeat, .ctrl = ctrl, .shift = shift } });
+                    const alt = (@as(u16, @bitCast(GetKeyState(VK_MENU))) & 0x8000) != 0;
+                    s.pushEvent(.{ .key_down = .{ .code = @intCast(wparam), .repeat = repeat, .ctrl = ctrl, .shift = shift, .alt = alt } });
                 }
                 return 0;
             },
@@ -555,6 +556,7 @@ const mouse_deadzone: i32 = 2;
 const GCLP_HCURSOR: i32 = -12;
 const VK_CONTROL: i32 = 0x11;
 const VK_SHIFT: i32 = 0x10;
+const VK_MENU: i32 = 0x12; // Alt
 const GWLP_USERDATA: i32 = -21;
 const PM_REMOVE: u32 = 0x0001;
 const WM_CLOSE: u32 = 0x0010;

@@ -155,6 +155,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
             if (ih and ui.mouse_pressed) {
                 _ = app.addInstrument("减法合成器");
                 app.rack.add_menu_open = false;
+                app.commitHistory("添加乐器"); // 原子操作：立即提交
             }
         }
         // 点菜单外关闭（直接坐标；add_hovered 被屏蔽时无效）
@@ -178,6 +179,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
             if (ih and ui.mouse_pressed) {
                 app.removeInstrument(ci);
                 app.rack.ctx_instrument = null;
+                app.commitHistory("删除乐器"); // 原子操作：立即提交
             } else if (ui.mouse_pressed and !ih) {
                 app.rack.ctx_instrument = null;
             }
@@ -214,15 +216,15 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, x: i32, y: i32, w: i32, clip_top: i32
     ui.renderer.strokeRect(cx, cy, util.rack_mute_w, util.rack_mute_w, ui.theme.panel_border);
     if (mute_hovered and ui.mouse_pressed) {
         inst.muted = !inst.muted;
-        app.dirty = true;
+        app.commitHistory("切换静音"); // 开关：原子提交
     }
     cx += util.rack_mute_w + 8;
 
-    // 声像旋钮 / 音量旋钮
+    // 声像旋钮 / 音量旋钮（拖动中 coalesce，松手时提交）
     const ky = y + @divTrunc(util.rack_row_h - util.rack_knob_size, 2);
-    if (ui.knob(4000 + @as(u64, idx) * 2, &inst.pan, cx, ky, util.rack_knob_size)) app.dirty = true;
+    if (ui.knob(4000 + @as(u64, idx) * 2, &inst.pan, cx, ky, util.rack_knob_size)) app.history_pending = "调整声像";
     cx += util.rack_knob_size + 6;
-    if (ui.knob(4000 + @as(u64, idx) * 2 + 1, &inst.volume, cx, ky, util.rack_knob_size)) app.dirty = true;
+    if (ui.knob(4000 + @as(u64, idx) * 2 + 1, &inst.volume, cx, ky, util.rack_knob_size)) app.history_pending = "调整乐器音量";
     cx += util.rack_knob_size + 10;
 
     // 混音通道

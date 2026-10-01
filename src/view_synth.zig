@@ -131,7 +131,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
             var v = knobs[ki].load(.monotonic);
             if (ui.knob(5100 + @as(u64, ki), &v, kx + @divTrunc(kw - knob_size, 2), ky, knob_size)) {
                 knobs[ki].store(v, .monotonic);
-                app.dirty = true;
+                app.history_pending = "调整 ADSR"; // 松手时 coalesce 提交
             }
             ui.label(lb, kx + @divTrunc(kw, 2) - 4, ky + knob_size + 2, ui.theme.text_dim);
         }
@@ -160,7 +160,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
             ui.labelClipped(nm, fx + 8, ry + 3, btn_w - 12, ui.theme.text);
             if (hovered and ui.mouse_pressed) {
                 filters[fi].enabled.store(!on, .monotonic);
-                app.dirty = true;
+                app.commitHistory("切换滤波器"); // 开关：原子提交
             }
 
             // 截止频率旋钮
@@ -168,7 +168,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
             var cv = filters[fi].cutoff.load(.monotonic);
             if (ui.knob(5200 + @as(u64, fi), &cv, kx, ry - 6, knob_size)) {
                 filters[fi].cutoff.store(cv, .monotonic);
-                app.dirty = true;
+                app.history_pending = "调整滤波截止"; // 松手时 coalesce
             }
             var hz_buf: [16]u8 = undefined;
             const hz = synth.cutoffHz(cv);
@@ -198,7 +198,7 @@ fn drawOscCell(ui: *Ui, app: *App, p: *synth.SynthParams, oi: usize, x: i32, y: 
     ui.renderer.strokeRect(x, sw_y, sw_sz, sw_sz, ui.theme.panel_border);
     if (sw_hovered and ui.mouse_pressed) {
         op.enabled.store(!on, .monotonic);
-        app.dirty = true;
+        app.commitHistory("切换振荡器"); // 开关：原子提交
     }
 
     // 序号
@@ -218,7 +218,7 @@ fn drawOscCell(ui: *Ui, app: *App, p: *synth.SynthParams, oi: usize, x: i32, y: 
     ui.labelClipped(wf.name(), btn_x + 8, btn_y + 3, btn_w - 12, ui.theme.text);
     if (btn_hovered and ui.mouse_pressed) {
         op.waveform.store(@intFromEnum(wf.next()), .monotonic);
-        app.dirty = true;
+        app.commitHistory("切换波形"); // 按钮：原子提交
     }
 
     // 音量旋钮
@@ -226,6 +226,6 @@ fn drawOscCell(ui: *Ui, app: *App, p: *synth.SynthParams, oi: usize, x: i32, y: 
     const kx = btn_x + btn_w + 12;
     if (ui.knob(5300 + @as(u64, oi), &v, kx, cy - @divTrunc(knob_size, 2), knob_size)) {
         op.volume.store(v, .monotonic);
-        app.dirty = true;
+        app.history_pending = "调整振荡器音量"; // 松手时 coalesce
     }
 }

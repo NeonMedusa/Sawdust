@@ -460,6 +460,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             app.dirty = true;
             app.playlist.drag_clip = null;
             app.playlist.resize_clip = null;
+            // 历史：右键擦除（含拖动划过多个）→ 松开右键时 coalesce 提交一次
+            app.history_pending = "擦除片段";
         }
     }
 
@@ -486,15 +488,21 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 app.playlist.drag_batch = true;
                 app.playlist.batch_down_step = step_i;
                 app.playlist.batch_down_track = track_i;
+                app.history_pending = "批量移动片段"; // 松手时 coalesce 提交
             } else if (batch_sel) {
                 app.beginClipBatchSnap();
                 app.playlist.batch_trim = true;
                 app.playlist.batch_trim_down_step = step_i;
                 app.playlist.batch_trim_grid = @max(1, snap_steps);
                 app.playlist.resize_left = hit.mode == .left;
+                app.history_pending = "批量拉伸片段";
             } else {
                 // 单选语义：点未选中片段 → 清除旧选区（只操作当前这个）
                 if (!c.selected) app.clearClipSelection();
+                app.history_pending = switch (hit.mode) {
+                    .body => "移动片段",
+                    .left, .right => "拉伸片段",
+                };
                 switch (hit.mode) {
                     .left => {
                         app.playlist.resize_clip = hit.index;
@@ -517,6 +525,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             const new_len: i32 = spb;
             if (!model.clipOverlaps(app.clips.items, app.clips.items.len, track_i, snap_step, new_len)) {
                 app.addClip(.{ .track = track_i, .start = snap_step, .len = new_len, .pattern = app.sel.pattern });
+                app.commitHistory("放置片段"); // 原子操作：立即提交
             }
         }
     }
@@ -653,7 +662,10 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         switch (op) {
             .delete_selected => {
                 const n = app.deleteSelectedClips();
-                if (n > 0) app.setToastWith("已删除 {d} 个片段", .{n});
+                if (n > 0) {
+                    app.setToastWith("已删除 {d} 个片段", .{n});
+                    app.commitHistory("删除片段");
+                }
             },
             .select_all => {
                 const n = app.selectAllClips();
@@ -661,7 +673,10 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             },
             .clone_right => {
                 const n = app.cloneSelectedClipsRight();
-                if (n > 0) app.setToastWith("已克隆 {d} 个片段（选区已移至克隆体）", .{n});
+                if (n > 0) {
+                    app.setToastWith("已克隆 {d} 个片段（选区已移至克隆体）", .{n});
+                    app.commitHistory("克隆片段");
+                }
             },
             .copy => {
                 const n = app.copySelectedClips();
@@ -670,7 +685,10 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             .paste => {
                 // 粘贴到**鼠标位置**（步吸附网格；**轨道不变**——回原轨道）
                 const n = app.pasteClips(snap_step, track_count);
-                if (n > 0) app.setToastWith("已粘贴 {d} 个片段", .{n});
+                if (n > 0) {
+                    app.setToastWith("已粘贴 {d} 个片段", .{n});
+                    app.commitHistory("粘贴片段");
+                }
             },
         }
         app.pending_edit_op = null;
