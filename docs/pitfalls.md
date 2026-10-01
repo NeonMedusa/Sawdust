@@ -400,6 +400,107 @@ const min_len = model.trimMinGridLen(drag_orig_len, snap_steps);
   以原值为锚、网格作**步长**）——后者手感稳定且允许非格点长度；
 - 下限要写成“只剩不足一格不能再减”，而不是“最短 = 一格”（后者会把短音符拉长）。
 
+### 按住期间每帧跳转 = 每帧重触发（标尺游标“响两下”事故）
+
+症状：播放中单击标尺定位，音符快速响两下（按住更久则更多）。
+
+三处标尺拖动都是“按住期间每帧调用 `jumpPlaybackCursor`”——
+每帧跳转 = 每帧 `reset`（gen++）→ 音频线程每帧作废 stash + 全声部释音
++ 重新补发“跨位置”音符的 note-on → **每帧一个新音头**；
+且每帧重置传输基准让游标视觉上“回弹”（“游标又往左移了一小格”）。
+
+```zig
+// ✗ 按住期间每帧跳（重置传输 + gen++ + 重触发）
+if (ui.active_id == 7000 and ui.mouse_down) app.jumpPlaybackCursor(step);
+// ✓ 去重：只有目标步变化（或按下那一帧 force）才真跳
+pub fn jumpPlaybackCursorDrag(self: *App, step: i32, force: bool) void {
+    if (!force and step == self.playback.ruler_drag_step) return;
+    self.playback.ruler_drag_step = step;
+    self.jumpPlaybackCursor(step);
+}
+```
+**教训**：带副作用的“设置”操作在拖动路径上必须**按值去重**（同值重复调用
+不能重复产生副作用）；重置传输/作废事件这类重操作尤其如此。
+
+### `defer popClip` 挂到函数末尾 = 裁掉后续绘制
+
+症状：样式列表底部的“＋ 添加样式”按钮看不见。
+
+`defer` 是**函数级**作用域：在函数中部 `pushClip` + `defer popClip`，
+裁剪区一直到**函数返回**才恢复——后面画的控件只要不在裁剪区内就全部被裁掉。
+更阴的是：**`ui.hit()` 命中判定不检查裁剪区**——于是成了“看不见但可点击”的隐形按钮。
+
+```zig
+// ✗ defer 挂到函数末尾：按钮（在裁剪区外）被裁
+const saved = ui.renderer.pushClip(x, list_y, w, list_h);
+defer ui.renderer.popClip(saved);
+...列表...
+ui.button(2100, "＋ 添加样式", ..., btn_y, ...); // ← 画不出来
+
+// ✓ 用作用域块：块结束即恢复裁剪（参照 view_rack.zig）
+{
+    const saved = ui.renderer.pushClip(x, list_y, w, list_h);
+    defer ui.renderer.popClip(saved);
+    ...列表...
+}
+...按钮（在块外，正常绘制）...
+```
+
+### 传输跳转必须释放已发声的声部（否则音符悬挂）
+
+症状：游标扫到音符一半时拖走，该音符一直响到暂停/停止。
+
+机制：note-off 早已被 lookahead 调度进音频线程的 stash；跳转时 gen 递增
+把 stash 整批作废（**正确**——旧事件的时间戳相对新位置全错），
+但**漏了释放已经起音的声部**——它永远收不到 off，停在 sustain。
+
+```zig
+// ✗ 只作废事件
+if (gen != engine.stash_gen) { engine.stash_n = 0; engine.stash_gen = gen; }
+// ✓ 播放中的 gen 变化（跳转）还要释放全部声部（进入 release）
+fn handleGenChange(engine: *Engine, gen: u32, was_playing: bool) void {
+    engine.stash_n = 0;
+    engine.stash_gen = gen;
+    if (was_playing) for (engine.synths) |*s| synth.allOff(s);
+}
+```
+**教训**：
+- “作废未来事件”与“释放已发声声部”是两件事——跳转/切模式/改 BPM
+  这类传输变化两者都要做（暂停路径已有 transportEdge，别漏跳转）；
+- 修复放在**音频线程内**（与事件触发同线程）——UI 推 all_off 与 gen 存储
+  之间有窗口，音频线程可能先消费 all_off、再按新参数误触发旧 gen 事件，
+  新声部的 off 随后被作废 → 又悬挂；
+- 语义选“进入 release”（同暂停/停止）而非“播完剩余时值”：
+  剩余时值的终点在旧时间线上，跳走后没有明确终点。
+
+### 同音高重叠：合成器的 note-off 必须 FIFO
+
+数据层改为**允许重叠**（与 MIDI 一致）后，合成器的 noteOff 若释放**所有**
+同音高声部，重叠时第一个 note-off 会把后一个音也掉（实测断音）。
+
+```zig
+// ✗ 释放全部同音高声部（重叠时误杀）
+for (state.voices) |*v| {
+    if (v.pitch == pitch and ...) v.env_stage = .release;
+}
+// ✓ 只释放**最早分配**的（start_seq 最小）——MIDI 接收端的标准语义
+//   note-off 匹配最早的未释放 note-on（FIFO）
+```
+**教训**：允许重叠 = 同一音高可同时存在多个声部，“哪个声部响应 off”
+必须有明确规则（FIFO）；解析端配对、合成器释放端要用**同一条规则**。
+
+### MIDI 解析：三个必须处理的细节
+
+写 SMF 解析器时最易踩的三个坑（实际文件里全都常见）：
+
+1. **running status**：事件可省略状态字节（沿用上一个）——不处理会解析崩溃；
+2. **vel=0 的 note-on = note-off**（导出器省字节的常见写法）；
+3. **tick → 步必须逐事件独立换算**（`tick × 24 / tpq`，就近取整）——
+   若先算总长再累加，整除误差会累积漂移。
+
+另外：**每个文件自带头块声明分辨率**（tpq，常见 96/192/384/480/960），
+没有“统一值”——不能写死 480。SMPTE 时基（division 高位 1）先明确报错。
+
 ## 音频
 
 ### 实时回调的约束

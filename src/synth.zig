@@ -259,14 +259,21 @@ pub fn noteOn(state: *Synth, pitch: u8) void {
     v.rng = 0x9E3779B9 ^ @as(u32, @truncate(state.note_counter *% 2654435761));
 }
 
-/// 音符关（该音高的声部进入释音）
+/// 音符关（该音高的声部进入释音）——**FIFO**：只释放**最早分配**的声部。
+///
+/// 动机（重叠音符支持）：同音高允许重叠（与 MIDI 一致）。若这里释放**所有**
+/// 同音高声部，第一个 note-off 会把后一个音也掉（实测：重叠时断音）。
+/// MIDI 接收端的标准语义：note-off 匹配最早的未释放 note-on。
 pub fn noteOff(state: *Synth, pitch: u8) void {
-    for (state.voices, 0..) |_, vi| {
-        const v = &state.voices[vi];
-        if (v.pitch == pitch and v.env_stage != .idle and v.env_stage != .release) {
-            v.env_stage = .release;
-            v.release_from = v.env_level;
-        }
+    var best: ?usize = null;
+    for (state.voices, 0..) |v, vi| {
+        if (v.pitch != pitch or v.env_stage == .idle or v.env_stage == .release) continue;
+        if (best == null or v.start_seq < state.voices[best.?].start_seq) best = vi;
+    }
+    if (best) |bi| {
+        const v = &state.voices[bi];
+        v.env_stage = .release;
+        v.release_from = v.env_level;
     }
 }
 
@@ -512,6 +519,34 @@ test "synth: 复音（和弦 = 多声部同时发声）" {
     q.push(.{ .kind = .off, .pitch = 64 });
     pump(&p, &st, &q, &buf, 4800, test_sr, 1.0);
     try std.testing.expectEqual(@as(usize, 2), activeCount(&st));
+}
+
+test "synth: 同音高重叠——note-off FIFO（只释放最早分配的声部）" {
+    var p = SynthParams{};
+    p.attack.store(0.0, .monotonic);
+    p.sustain.store(1.0, .monotonic);
+    p.release.store(0.0, .monotonic); // 1ms 释音：很快归零，便于断言
+
+    var st = Synth{};
+    var q = EventQueue{};
+    var buf: [4800 * 2]f32 = undefined;
+
+    // 同一音高连按两次（重叠）→ 两个声部
+    q.push(.{ .kind = .on, .pitch = 60 });
+    pump(&p, &st, &q, &buf, 4, test_sr, 1.0);
+    q.push(.{ .kind = .on, .pitch = 60 });
+    pump(&p, &st, &q, &buf, 4, test_sr, 1.0);
+    try std.testing.expectEqual(@as(usize, 2), activeCount(&st));
+
+    // 第一个 note-off → 只释放**最早**的声部（另一个仍在响）
+    q.push(.{ .kind = .off, .pitch = 60 });
+    pump(&p, &st, &q, &buf, 4800, test_sr, 1.0);
+    try std.testing.expectEqual(@as(usize, 1), activeCount(&st));
+
+    // 第二个 note-off → 全部释放
+    q.push(.{ .kind = .off, .pitch = 60 });
+    pump(&p, &st, &q, &buf, 4800, test_sr, 1.0);
+    try std.testing.expectEqual(@as(usize, 0), activeCount(&st));
 }
 
 test "synth: 快速连点 = 新声部重触发（不吞音）" {

@@ -314,8 +314,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                     } else {
                         const content_px: i32 = app.piano.scroll_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(ui.mouse_x - lane_x)) / zoom));
                         const local = @max(0, @divFloor(content_px * spb, bar_w));
-                        // 超出可见范围 → 归位到片段起点（局部 offset）；跳转（播放中重置传输）
-                        app.jumpPlaybackCursor(model.clipLocalToSong(c, local) orelse c.start);
+                        // 超出可见范围 → 归位到片段起点（局部 offset）；
+                        // 跳转**去重**（按住期间只在目标步变化/按下帧才跳）
+                        app.jumpPlaybackCursorDrag(model.clipLocalToSong(c, local) orelse c.start, ui.mouse_pressed);
                     }
                 }
             }
@@ -331,7 +332,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                     ui.active_id = 0;
                 } else {
                     const content_px: i32 = app.piano.scroll_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(ui.mouse_x - lane_x)) / zoom));
-                    app.jumpPlaybackCursor(@max(0, @divFloor(content_px * spb, bar_w)));
+                    // 跳转**去重**（按住期间只在目标步变化/按下帧才跳）
+                    app.jumpPlaybackCursorDrag(@max(0, @divFloor(content_px * spb, bar_w)), ui.mouse_pressed);
                 }
             }
         }
@@ -478,8 +480,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             app.auditionOn(n.pitch);
         } else {
             // 新音符长度：沿用**上一个被点击/编辑过的音符**（无参考时 = 当前吸附格）
+            // 注：**允许重叠**（与 MIDI 一致）——不再拦截
             const new_len: i32 = if (app.piano.last_note_len > 0) app.piano.last_note_len else @max(1, snap_steps);
-            if (!model.noteOverlaps(app.notes.items, app.notes.items.len, pattern, app.sel.instrument, snap_step, new_len, pitch_i)) {
+            {
                 app.addNote(.{ .step = snap_step, .len = new_len, .pitch = pitch_i, .pattern = pattern, .instrument = app.sel.instrument });
                 app.piano.last_note_len = new_len; // 放置的音符本身也成为“上一个”
                 // **放置即拖拽**：新音符立即进入拖动状态（按住左键可直接拖着跑）
@@ -516,9 +519,10 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                     .right => {
                         // 右缘：长度 = **原长 + k×格**（网格决定增减步长：
                         // 鼠标过半格即 ±一格，往回拖按格递减，不会跳到无关格线）
+                        // 注：允许重叠——不再拦截
                         const delta = step_i - app.piano.drag_down_step;
                         const new_len = model.trimLenByGrid(app.piano.drag_orig_len, delta, snap_steps);
-                        if (new_len != n.len and !model.noteOverlaps(app.notes.items, ni, pattern, n.instrument, n.step, new_len, n.pitch)) {
+                        if (new_len != n.len) {
                             n.len = new_len;
                             app.piano.last_note_len = new_len; // 记住编辑后的长度
                             app.dirty = true;
@@ -527,16 +531,15 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                     .left => {
                         // 左缘：右端固定；长度同增量式（鼠标左移 = 拉长、右移 = 缩短），
                         // 且不能展开到样式第 1 步之前（new_step >= 0）
+                        // 注：允许重叠——不再拦截
                         const right = app.piano.drag_orig_step + app.piano.drag_orig_len;
                         const min_len = model.trimMinGridLen(app.piano.drag_orig_len, snap_steps);
                         const delta = app.piano.drag_down_step - step_i; // 左移为正（拉长方向）
                         const len = @min(model.trimLenByGrid(app.piano.drag_orig_len, delta, snap_steps), right);
                         if (model.noteTrimLeft(n.*, right - len, right, min_len)) |nn| {
-                            if (!model.noteOverlaps(app.notes.items, ni, pattern, nn.instrument, nn.step, nn.len, nn.pitch)) {
-                                n.* = nn;
-                                app.piano.last_note_len = nn.len; // 记住编辑后的长度
-                                app.dirty = true;
-                            }
+                            n.* = nn;
+                            app.piano.last_note_len = nn.len; // 记住编辑后的长度
+                            app.dirty = true;
                         }
                     },
                     .body => {
@@ -545,9 +548,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                         const target = @max(0, step_i - app.piano.drag_grab_step);
                         const new_step = @max(0, model.snapRound(target, snap_steps));
                         const new_pitch = std.math.clamp(pitch_i - app.piano.drag_grab_pitch, 0, 127);
-                        if ((new_step != n.step or new_pitch != n.pitch) and
-                            !model.noteOverlaps(app.notes.items, ni, pattern, n.instrument, new_step, n.len, new_pitch))
-                        {
+                        // 注：允许重叠——不再拦截
+                        if (new_step != n.step or new_pitch != n.pitch) {
                             const pitch_changed = new_pitch != n.pitch;
                             n.step = new_step;
                             n.pitch = new_pitch;

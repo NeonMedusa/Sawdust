@@ -128,6 +128,26 @@ pub fn transportEdge(engine: *Engine, playing: bool) void {
     engine.was_playing = playing;
 }
 
+/// 传输跳变（generation 变化）：作废 stash；**播放中**的跳变（`was_playing`）
+/// 还要释放全部声部。
+///
+/// 为什么必须释放：跳转时音符的 note-off 可能早已在 stash 里排队，
+/// gen 递增整批作废后它被丢弃 → 已起音的声部永远收不到 off，
+/// 停在 sustain 一直响（实测 bug：游标拖走后音符响到暂停/停止）。
+/// 释放 = 进入 release（与暂停/停止同语义；不播剩余时值）。
+///
+/// 为什么放在音频线程（而不是 UI 的 jumpPlaybackCursor 里推 all_off）：
+/// UI 推事件与 gen 存储之间有窗口（中间还有 reset 的 gather）——音频线程
+/// 可能先消费 all_off、再按**新传输参数**误触发旧 gen 的事件（新声部，
+/// 其 off 随后被作废 → 又悬挂）。这里与事件触发同线程，无窗口。
+fn handleGenChange(engine: *Engine, gen: u32, was_playing: bool) void {
+    engine.stash_n = 0;
+    engine.stash_gen = gen;
+    if (was_playing) {
+        for (engine.synths) |*s| synth.allOff(s);
+    }
+}
+
 /// 回传“正在发声的音高”（位掩码；UI 用于播放/试听高亮）
 fn publishSounding(engine: *Engine, params: *Params) void {
     for (0..synth.max_instruments) |i| {
@@ -205,6 +225,9 @@ fn dataCallback(
     const master = params.volume.load(.monotonic);
     const playing = params.playing.load(.monotonic);
     const gen = params.sched_gen.load(.monotonic);
+    // 本块之前的播放状态：区分“起播”与“播放中跳转”（两者都会让 gen 变化，
+    // 但只有跳转需要释放正在发声的旧声部——见 handleGenChange）
+    const was_playing = engine.was_playing;
 
     // 暂停边沿：释放全部声部（否则音符永远停在 sustain，实测 bug）
     transportEdge(engine, playing);
@@ -218,11 +241,7 @@ fn dataCallback(
     }
 
     // 4) 播放：stash 管理 + 样本级事件触发
-    if (gen != engine.stash_gen) {
-        // generation 变化（开始/跳转/停止）：整批作废
-        engine.stash_n = 0;
-        engine.stash_gen = gen;
-    }
+    if (gen != engine.stash_gen) handleGenChange(engine, gen, was_playing);
     // 尽量多取新事件（stash 有空位时）
     if (engine.stash_n < engine.stash.len) {
         const space = engine.stash.len - engine.stash_n;
@@ -280,6 +299,39 @@ fn dataCallback(
     publishSounding(engine, params);
 
     _ = params.frames_played.fetchAdd(frames, .monotonic);
+}
+
+test "audio: 播放中 gen 变化（跳转）释放全部声部（修“跳走后音符悬挂”）" {
+    var params = Params{};
+    var engine = Engine{ .params = &params };
+    engine.synths = try std.testing.allocator.alloc(synth.Synth, 1);
+    defer std.testing.allocator.free(engine.synths);
+    for (engine.synths) |*s| s.* = .{};
+
+    var p = synth.SynthParams{}; // 默认：release ≈ 10ms、sustain 0.7
+    var buf: [4800 * 2]f32 = undefined; // 0.1s @ 48k
+
+    // 声部正在发声（模拟播放中扫到了音符）
+    synth.noteOn(&engine.synths[0], 60);
+    synth.render(&p, &engine.synths[0], &buf, 4800, 48000, 1.0, false); // 进入 sustain
+    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(&engine.synths[0]));
+    engine.stash_n = 3;
+    engine.stash_gen = 7;
+
+    // 播放中跳转（gen 变化）→ stash 作废 + 声部进入 release
+    handleGenChange(&engine, 8, true);
+    try std.testing.expectEqual(@as(u32, 8), engine.stash_gen);
+    try std.testing.expectEqual(@as(usize, 0), engine.stash_n);
+    // 再渲染 0.1s：release（≈10ms）已走完 → 归零
+    // （若仍停在 sustain，activeCount 会一直是 1——正是实测 bug）
+    synth.render(&p, &engine.synths[0], &buf, 4800, 48000, 1.0, false);
+    try std.testing.expectEqual(@as(usize, 0), synth.activeCount(&engine.synths[0]));
+
+    // 起播（上一块未播放）→ **不释放**（不误杀试听/释音尾音）
+    synth.noteOn(&engine.synths[0], 64);
+    handleGenChange(&engine, 9, false);
+    synth.render(&p, &engine.synths[0], &buf, 4800, 48000, 1.0, false);
+    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(&engine.synths[0])); // 仍在响
 }
 
 test "audio: Params 默认值" {

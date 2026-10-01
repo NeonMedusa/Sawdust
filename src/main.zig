@@ -17,6 +17,7 @@ const synth = @import("synth.zig");
 const sequencer = @import("sequencer.zig");
 const model = @import("model.zig");
 const persist = @import("persist.zig");
+const midi = @import("midi.zig");
 const filedialog = @import("filedialog.zig");
 const util = @import("view_util.zig");
 const view_playlist = @import("view_playlist.zig");
@@ -43,6 +44,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer app.clips.deinit(allocator);
     defer app.notes.deinit(allocator);
     defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count); // 默认样式 1..6
     // 初始片段（演示）：前 12 轨铺一些样式，每 16 小节重复（只铺 2 轮——
     // 避免演示内容把时间轴行程撑得过长，行程应贴合最右内容）
     {
@@ -346,6 +348,8 @@ pub fn main(init: std.process.Init) !u8 {
                 },
                 .save => saveProject(&app, &win, io, false),
                 .save_as => saveProject(&app, &win, io, true),
+                .import_midi => importMidiWithDialog(&app, &win, io),
+                .export_midi => exportMidiWithDialog(&app, &win, io),
             }
         }
 
@@ -630,6 +634,8 @@ fn drawFileMenu(ui: *Ui, app: *App) void {
         .{ .label = "打开...", .shortcut = "Ctrl+O" },
         .{ .label = "保存", .shortcut = "Ctrl+S" },
         .{ .label = "另存为...", .shortcut = "Ctrl+Shift+S" },
+        .{ .label = "导入 MIDI...", .shortcut = "" },
+        .{ .label = "导出 MIDI...", .shortcut = "" },
     };
     const item_h: i32 = 22;
     const menu_x = app.file_menu_x;
@@ -668,6 +674,8 @@ fn drawFileMenu(ui: *Ui, app: *App) void {
             0 => .open,
             1 => .save,
             2 => .save_as,
+            3 => .import_midi,
+            4 => .export_midi,
             else => null,
         };
     }
@@ -782,6 +790,84 @@ fn loadProjectFromPath(app: *App, io: std.Io, path: []const u8) void {
     app.setToastWith("已打开：{s}", .{path});
 }
 
+/// MIDI 过滤器（描述\0通配\0…；与 project_filter 同格式）
+pub const midi_filter = "MIDI 文件 (*.mid;*.midi)\x00*.mid;*.midi\x00所有文件 (*.*)\x00*.*\x00";
+
+/// 导入 MIDI：选文件 → 解析 → 每个用到的通道建一个乐器 + 音符进新样式。
+/// 导入**不替换**当前工程（追加）；有脏修改时提示先保存？——不拦截：
+/// 导入是增量操作，不会丢数据。
+fn importMidiWithDialog(app: *App, win: *window.Window, io: std.Io) void {
+    const picked = filedialog.open(app.allocator, win.hwnd, "导入 MIDI", midi_filter) catch |e| {
+        app.setToastWith("导入失败：对话框出错（{s}）", .{@errorName(e)});
+        return;
+    };
+    const path = picked orelse {
+        if (filedialog.supported()) app.setToast("已取消导入");
+        return;
+    };
+    defer app.allocator.free(path);
+
+    const data = std.Io.Dir.cwd().readFileAlloc(io, path, app.allocator, .unlimited) catch |e| {
+        app.setToastWith("导入失败：读取失败（{s}）", .{@errorName(e)});
+        return;
+    };
+    defer app.allocator.free(data);
+
+    var parsed = midi.parse(app.allocator, data) catch |e| {
+        app.setToastWith("导入失败：解析失败（{s}）", .{@errorName(e)});
+        return;
+    };
+    defer parsed.deinit(app.allocator);
+
+    const r = app.importMidi(&parsed) catch |e| {
+        app.setToastWith("导入失败：{s}", .{@errorName(e)});
+        return;
+    };
+
+    if (r.skipped > 0) {
+        app.setToastWith("已导入 {d} 个音符（{d} 个乐器，跳过 {d}）；样式 {d}", .{ r.notes, r.instruments, r.skipped, r.pattern + 1 });
+    } else {
+        app.setToastWith("已导入 {d} 个音符（{d} 个乐器）；样式 {d}", .{ r.notes, r.instruments, r.pattern + 1 });
+    }
+}
+
+/// 导出 MIDI：全部片段按全局时间展开 → 写出文件。
+fn exportMidiWithDialog(app: *App, win: *window.Window, io: std.Io) void {
+    const default_name = "song.mid";
+    const picked = filedialog.save(app.allocator, win.hwnd, "导出 MIDI", default_name, midi_filter) catch |e| {
+        app.setToastWith("导出失败：对话框出错（{s}）", .{@errorName(e)});
+        return;
+    };
+    const path = picked orelse {
+        if (filedialog.supported()) app.setToast("已取消导出");
+        return;
+    };
+    defer app.allocator.free(path);
+
+    const notes = app.exportMidiNotes(app.allocator) catch |e| {
+        app.setToastWith("导出失败：收集音符失败（{s}）", .{@errorName(e)});
+        return;
+    };
+    defer app.allocator.free(notes);
+
+    const bytes = midi.write(app.allocator, .{
+        .bpm = app.bpm,
+        .time_num = @intCast(std.math.clamp(app.time_num, 1, 255)),
+        .time_den = @intCast(std.math.clamp(app.time_den, 1, 64)),
+        .notes = notes,
+    }) catch |e| {
+        app.setToastWith("导出失败：生成失败（{s}）", .{@errorName(e)});
+        return;
+    };
+    defer app.allocator.free(bytes);
+
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes }) catch |e| {
+        app.setToastWith("导出失败：写入失败（{s}）", .{@errorName(e)});
+        return;
+    };
+    app.setToastWith("已导出 {d} 个音符：{s}", .{ notes.len, path });
+}
+
 // ── 模态确认框（自绘）──
 
 /// 绘制退出确认框并处理鼠标点击（在 `endFrame` 前调用）。
@@ -873,6 +959,7 @@ test {
     _ = @import("synth.zig");
     _ = @import("model.zig");
     _ = @import("persist.zig");
+    _ = @import("midi.zig");
     _ = @import("app.zig");
     _ = @import("view_util.zig");
     _ = @import("view_playlist.zig");

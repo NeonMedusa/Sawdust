@@ -92,6 +92,8 @@ pub const SavedInstrument = struct {
     pan: f32 = 0.5,
     muted: bool = false,
     mixer: i32 = 1,
+    /// MIDI 通道（0-15；-1 = 无；旧存档缺失 → -1）
+    midi_channel: i32 = -1,
     synth: SavedSynth = .{},
 };
 
@@ -103,6 +105,8 @@ pub const Project = struct {
     time_den: i32 = 4,
     /// 每小节步数（冗余存储：拍号换算规则若变更仍能正确还原）
     steps_per_bar: i32 = model.units_per_whole,
+    /// 样式数量（旧存档缺失 → 默认 6；加载时重建样式列表）
+    pattern_count: i32 = model.default_pattern_count,
     /// 兼容用：v1 存档的时长单位（小节）。加载 v1 时把 `bar/len` 乘此值转成步。
     legacy_units_per_bar: i32 = model.units_per_whole,
     clips: []SavedClip = &.{},

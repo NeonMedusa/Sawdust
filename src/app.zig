@@ -10,6 +10,7 @@ const model = @import("model.zig");
 const synth = @import("synth.zig");
 const sequencer = @import("sequencer.zig");
 const persist = @import("persist.zig");
+const midi = @import("midi.zig");
 
 pub const Clip = model.Clip;
 pub const Note = model.Note;
@@ -33,7 +34,7 @@ pub const Layout = struct {
 };
 
 /// 文件菜单动作（帧末统一执行）
-pub const FileAction = enum { open, save, save_as };
+pub const FileAction = enum { open, save, save_as, import_midi, export_midi };
 
 /// 脏确认流程的**目标动作**（确认框按钮相同，但“保存后”要执行不同的事）
 pub const PendingIntent = enum {
@@ -207,6 +208,9 @@ pub const Playback = struct {
     start_frame: u64 = 0,
     /// 游玩时的起始步（暂停/恢复用）
     start_step: i32 = 0,
+    /// 标尺拖动的上次目标步（去重；负数 = 无——步非负）——
+    /// 见 `App.jumpPlaybackCursorDrag`
+    ruler_drag_step: i32 = -1,
 
     /// 当前显示的游标位置（步）
     pub fn cursorStep(self: *const Playback, song_mode: bool) i32 {
@@ -347,14 +351,9 @@ pub const App = struct {
         "删除样式 5",
         "调整音符力度",
     },
-    pattern_items: []const []const u8 = &.{
-        "样式 1",
-        "样式 2",
-        "样式 3",
-        "样式 4",
-        "样式 5",
-        "样式 6",
-    },
+    /// 样式列表（**动态**；名字由 App 管理生命周期，如 "样式 7"）。
+    /// 数量 = `pattern_items.items.len`；上限 `max_patterns`（播放列表预览数组等按此设限）。
+    pattern_items: std.ArrayListUnmanaged([]u8) = .{ .items = &.{}, .capacity = 0 },
     track_items: []const []const u8 = &.{
         "Track 1",   "Track 2",   "Track 3",   "Track 4",   "Track 5",
         "Track 6",   "Track 7",   "Track 8",   "Track 9",   "Track 10",
@@ -479,6 +478,7 @@ pub const App = struct {
         self.toast = null;
         self.title_applied_name = null;
         self.pending_open_path = null;
+        self.deinitPatterns();
         self.deinitInstruments();
     }
 
@@ -502,6 +502,45 @@ pub const App = struct {
     /// 标记脏（任何编辑操作调用）
     pub fn markDirty(self: *App) void {
         self.dirty = true;
+    }
+
+    /// 当前样式数量
+    pub fn patternCount(self: *const App) i32 {
+        return @intCast(self.pattern_items.items.len);
+    }
+
+    /// 添加样式（名字 = “样式 N”；上限 `model.max_patterns`）。
+    /// 返回新样式序号（0 起；已达上限返回 -1）。
+    pub fn addPattern(self: *App) i32 {
+        if (self.pattern_items.items.len >= model.max_patterns) return -1;
+        const n = self.pattern_items.items.len + 1;
+        var buf: [32]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "样式 {d}", .{n}) catch return -1;
+        const name = self.allocator.dupe(u8, text) catch return -1;
+        self.pattern_items.append(self.allocator, name) catch {
+            self.allocator.free(name);
+            return -1;
+        };
+        self.dirty = true;
+        return @intCast(self.pattern_items.items.len - 1);
+    }
+
+    /// 清空样式列表并重建为默认数量（新建/加载工程时用；释放旧名字）
+    pub fn resetPatterns(self: *App, count: i32) void {
+        for (self.pattern_items.items) |name| self.allocator.free(name);
+        self.pattern_items.clearRetainingCapacity();
+        const n = std.math.clamp(count, 1, model.max_patterns);
+        var i: i32 = 0;
+        while (i < n) : (i += 1) {
+            _ = self.addPattern();
+        }
+        self.dirty = false; // 重置本身不算编辑（调用方决定脏标记）
+    }
+
+    /// 释放样式列表（进程退出时调用）
+    pub fn deinitPatterns(self: *App) void {
+        for (self.pattern_items.items) |name| self.allocator.free(name);
+        self.pattern_items.deinit(self.allocator);
     }
 
     /// 设置当前工程路径（**安全**：不依赖 path 与旧值的别名关系）。
@@ -581,6 +620,7 @@ pub const App = struct {
                 .pan = inst.pan,
                 .muted = inst.muted,
                 .mixer = inst.mixer,
+                .midi_channel = inst.midi_channel,
                 .synth = persist.exportSynth(inst.synth),
             };
         }
@@ -589,6 +629,7 @@ pub const App = struct {
             .time_num = self.time_num,
             .time_den = self.time_den,
             .steps_per_bar = self.steps_per_bar,
+            .pattern_count = self.patternCount(),
             .clips = clips,
             .notes = notes,
             .instruments = insts,
@@ -631,6 +672,7 @@ pub const App = struct {
             target.pan = inst.pan;
             target.muted = inst.muted;
             target.mixer = inst.mixer;
+            target.midi_channel = inst.midi_channel;
             persist.importSynth(&inst.synth, target.synth);
         }
 
@@ -639,6 +681,8 @@ pub const App = struct {
         self.time_num = p.time_num;
         self.time_den = p.time_den;
         self.steps_per_bar = p.steps_per_bar;
+        // 样式列表：恢复到存档数量（旧存档无此字段 → 默认 6）
+        self.resetPatterns(if (p.pattern_count > 0) p.pattern_count else model.default_pattern_count);
 
         // 选择/clamp 回有效范围
         self.sel.pattern = 0;
@@ -648,6 +692,123 @@ pub const App = struct {
         self.playback.piano_step = 0;
         self.playback.start_step = 0;
         self.piano.pattern = null;
+    }
+
+    // ── MIDI 导入 / 导出（转换逻辑；文件 IO 在 main 接线）──
+
+    /// MIDI 导入结果
+    pub const MidiImportResult = struct {
+        /// 新样式序号（音符全部放进它）
+        pattern: i32,
+        /// 导入的音符数
+        notes: usize,
+        /// 新建的乐器数（= 文件里用到的通道数）
+        instruments: usize,
+        /// 被跳过的音符数（乐器上限、非法音高等）
+        skipped: usize,
+    };
+
+    /// 导入 MIDI：每个用到的通道 → 一个新乐器（默认减法合成器参数）；
+    /// 音符全部写进**一个新建样式**（不自动放片段——由用户自己放置）。
+    /// 失败返回错误；成功返回统计信息。
+    pub fn importMidi(self: *App, parsed: *const midi.Parsed) !MidiImportResult {
+        // 1) 收集用到的通道（升序稳定）
+        var ch_used = [_]bool{false} ** 16;
+        for (parsed.notes) |n| ch_used[n.channel & 0x0F] = true;
+
+        // 2) 新建样式（达到上限 → 报错，不做半途导入）
+        const new_pat = self.addPattern();
+        if (new_pat < 0) return error.TooManyPatterns;
+
+        // 3) 通道 → 乐器（顺序建立，保持通道升序）
+        var ch_to_inst = [_]i32{-1} ** 16;
+        var inst_count: usize = 0;
+        for (ch_used, 0..) |u, ch| {
+            if (!u) continue;
+            const idx = self.addInstrument("MIDI 通道");
+            if (idx < 0) continue; // 乐器已达上限：该通道音符将被跳过
+            self.instruments.items[@intCast(idx)].midi_channel = @intCast(ch); // 记住来源通道
+            ch_to_inst[ch] = idx;
+            inst_count += 1;
+        }
+
+        // 4) 音符：tick → 步（每事件独立换算）；时值至少 1 步
+        var imported: usize = 0;
+        var skipped: usize = 0;
+        for (parsed.notes) |pn| {
+            const inst = ch_to_inst[pn.channel & 0x0F];
+            if (inst < 0) {
+                skipped += 1;
+                continue;
+            }
+            if (pn.pitch > 127) {
+                skipped += 1;
+                continue;
+            }
+            const start = midi.tickToStep(pn.start_tick, parsed.ticks_per_quarter);
+            const end = midi.tickToStep(pn.end_tick, parsed.ticks_per_quarter);
+            const len = @max(1, end - start);
+            self.addNote(.{
+                .step = @max(0, start),
+                .len = len,
+                .pitch = pn.pitch,
+                .pattern = new_pat,
+                .instrument = inst,
+            });
+            imported += 1;
+        }
+
+        // 选中新样式（用户一眼能看到）；乐器选中第一个新建的
+        self.sel.pattern = new_pat;
+        if (self.piano.pattern != null) self.piano.pattern = new_pat;
+        if (inst_count > 0) {
+            for (ch_to_inst) |idx| {
+                if (idx >= 0) {
+                    self.sel.instrument = idx;
+                    break;
+                }
+            }
+        }
+
+        return .{ .pattern = new_pat, .notes = imported, .instruments = inst_count, .skipped = skipped };
+    }
+
+    /// 导出 MIDI：把**全部片段**里的音符按全局时间展开（同音符被多个片段引用
+    /// 会导出多次——与播放听到的一致）；乐器号 mod 16 → 通道。
+    /// 返回的切片归调用方释放（`allocator.free`）。
+    pub fn exportMidiNotes(self: *App, allocator: std.mem.Allocator) ![]midi.ExportNote {
+        var out: std.ArrayListUnmanaged(midi.ExportNote) = .{ .items = &.{}, .capacity = 0 };
+        errdefer out.deinit(allocator);
+
+        for (self.clips.items) |clip| {
+            for (self.notes.items) |n| {
+                if (n.pattern != clip.pattern) continue;
+                if (n.pitch < 0 or n.pitch > 127 or n.len <= 0) continue;
+                if (n.instrument < 0) continue;
+                // 通道：优先乐器记录的来源通道（MIDI 导入往返稳定）；否则乐器号 mod 16
+                const ch: i32 = blk: {
+                    const ii = @as(usize, @intCast(n.instrument));
+                    if (ii < self.instruments.items.len) {
+                        const mc = self.instruments.items[ii].midi_channel;
+                        if (mc >= 0) break :blk @mod(mc, 16);
+                    }
+                    break :blk @mod(n.instrument, 16);
+                };
+                // 全局步 = 局部步 + 片段起点 − 片段左缘偏移（与序列器同一公式）
+                const gs = clip.start + (n.step - clip.offset);
+                const ge = gs + n.len;
+                if (ge <= clip.start or gs >= clip.start + clip.len) continue; // 窗口外
+                const s = @max(gs, clip.start);
+                const e = @min(ge, clip.start + clip.len);
+                try out.append(allocator, .{
+                    .start_step = s,
+                    .len_steps = @max(1, e - s),
+                    .pitch = @intCast(n.pitch),
+                    .channel = @intCast(ch),
+                });
+            }
+        }
+        return out.toOwnedSlice(allocator);
     }
 
     /// 停止播放（停声 + 作废调度事件）
@@ -687,6 +848,19 @@ pub const App = struct {
             sequencer.reset(&self.scheduler, &self.sched_events, self.clips.items, self.notes.items, self.sel.song_mode, self.sel.pattern, step);
             self.params.sched_gen.store(self.scheduler.gen, .monotonic);
         }
+    }
+
+    /// 标尺拖动跳转（**去重**）：按住鼠标时 UI 每帧都调用，
+    /// 但只有目标步**变化**（或按下那一帧 `force`）才真正跳转。
+    ///
+    /// 为什么：每帧跳转 = 每帧 `reset`（gen++）→ 音频线程每帧作废 stash +
+    /// 全声部释音 + 重新补发“跨位置”音符的 note-on → **每帧一次重触发**
+    /// （实测 bug：播放中单击定位，音符“响两下”/连环重触发）；
+    /// 且每帧重置传输基准让游标视觉上“回弹”（“游标又往左移了一小格”）。
+    pub fn jumpPlaybackCursorDrag(self: *App, step: i32, force: bool) void {
+        if (!force and step == self.playback.ruler_drag_step) return;
+        self.playback.ruler_drag_step = step;
+        self.jumpPlaybackCursor(step);
     }
 
     /// 关闭钢琴卷帘（返回播放列表）：同时释音——

@@ -43,6 +43,8 @@ zig build -Doptimize=ReleaseFast
 | `src/render.zig` | 渲染层：软件光栅化图元（矩形/线/alpha blit），**可独立单测** |
 | `src/font.zig` | 字体层：stb_truetype 光栅化 + 字形缓存 + UTF-8 迭代 |
 | `src/audio.zig` | 音频层：miniaudio 设备 + 实时回调 + 原子参数 |
+| `src/midi.zig` | MIDI 导入/导出（SMF 解析 + 写出；纯逻辑可单测） |
+| `src/persist.zig` | 工程保存/加载（JSON `.saw`；版本迁移） |
 | `src/ui.zig` | UI 层：立即式控件（自绘） |
 | `src/main.zig` | 应用：状态 + 主循环 + 界面布局 |
 

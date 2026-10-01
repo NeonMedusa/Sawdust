@@ -3,6 +3,7 @@
 const std = @import("std");
 const Ui = @import("ui.zig").Ui;
 const App = @import("app.zig").App;
+const model = @import("model.zig");
 const util = @import("view_util.zig");
 
 pub fn drawHistory(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
@@ -39,37 +40,59 @@ pub fn drawPatterns(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
 
     const item_h: i32 = @as(i32, @intFromFloat(ui.font.lineHeight())) + 10;
     const list_y = y + util.title_h;
-    const list_h = h - util.title_h;
+    // 列表下方预留“添加样式”按钮行
+    const add_row_h: i32 = item_h + 4;
+    const list_h = h - util.title_h - add_row_h;
+    const pat_count: usize = app.pattern_items.items.len;
 
-    // 裁剪（列表滚动时不画出边界）
-    const saved_clip = ui.renderer.pushClip(x + 1, list_y, w - 2, list_h);
-    defer ui.renderer.popClip(saved_clip);
+    // 列表 + 滚动条：**作用域块内** pushClip/popClip——
+    // defer 是函数级作用域，若挂到函数末尾会把“添加样式”按钮也裁掉（实测 bug：按钮不可见，
+    // 且命中判定不受裁剪影响 → 隐形可点）。参照 view_rack.zig 的写法。
+    {
+        const saved_clip = ui.renderer.pushClip(x + 1, list_y, w - 2, list_h);
+        defer ui.renderer.popClip(saved_clip);
 
-    var i: usize = 0;
-    var iy = list_y - app.panels.pattern_scroll;
-    while (i < app.pattern_items.len) : (i += 1) {
-        if (iy + item_h > list_y and iy < list_y + list_h) {
-            const selected = app.sel.pattern == @as(i32, @intCast(i));
-            if (ui.listItem(2000 + i, app.pattern_items[i], x + 1, iy, w - 2, item_h, selected, i % 2 == 1, null)) {
-                app.sel.pattern = @intCast(i);
-                // 钢琴卷帘开着时，点击样式 = 切换编辑对象（与“点片段→选样式”闭环）
-                if (app.piano.pattern != null) app.piano.pattern = @intCast(i);
+        var i: usize = 0;
+        var iy = list_y - app.panels.pattern_scroll;
+        while (i < pat_count) : (i += 1) {
+            if (iy + item_h > list_y and iy < list_y + list_h) {
+                const selected = app.sel.pattern == @as(i32, @intCast(i));
+                if (ui.listItem(2000 + i, app.pattern_items.items[i], x + 1, iy, w - 2, item_h, selected, i % 2 == 1, null)) {
+                    app.sel.pattern = @intCast(i);
+                    // 钢琴卷帘开着时，点击样式 = 切换编辑对象（与“点片段→选样式”闭环）
+                    if (app.piano.pattern != null) app.piano.pattern = @intCast(i);
+                }
+                // 双击样式 → 打开钢琴卷帘
+                if (ui.mouse_double and ui.hitRect(x + 1, iy, w - 2, item_h)) {
+                    app.sel.pattern = @intCast(i);
+                    app.openPiano(@intCast(i));
+                }
             }
-            // 双击样式 → 打开钢琴卷帘
-            if (ui.mouse_double and ui.hitRect(x + 1, iy, w - 2, item_h)) {
-                app.sel.pattern = @intCast(i);
-                app.openPiano(@intCast(i));
+            iy += item_h;
+            if (iy > list_y + list_h) break;
+        }
+
+        const content_h: i32 = @intCast(pat_count * @as(usize, @intCast(item_h)));
+        if (ui.hitRect(x, list_y, w, list_h)) {
+            app.panels.pattern_scroll = std.math.clamp(app.panels.pattern_scroll - util.scrollDelta(ui), 0, @max(0, content_h - list_h));
+        }
+        ui.drawScrollbar(x + w - 6, list_y, 5, list_h, app.panels.pattern_scroll, content_h, list_h);
+    }
+
+    // 底部：“＋ 添加样式”按钮（列表满时显示提示文本）
+    const btn_y = y + h - add_row_h + 2;
+    const btn_w = w - 10;
+    if (pat_count < model.max_patterns) {
+        if (ui.button(2100, "＋ 添加样式", x + 5, btn_y, btn_w, item_h)) {
+            const ni = app.addPattern();
+            if (ni >= 0) {
+                app.sel.pattern = ni;
+                if (app.piano.pattern != null) app.piano.pattern = ni;
             }
         }
-        iy += item_h;
-        if (iy > list_y + list_h) break;
+    } else {
+        ui.label("样式已达上限", x + 8, btn_y + 4, ui.theme.text_dim);
     }
-
-    const content_h: i32 = @intCast(app.pattern_items.len * @as(usize, @intCast(item_h)));
-    if (ui.hitRect(x, list_y, w, list_h)) {
-        app.panels.pattern_scroll = std.math.clamp(app.panels.pattern_scroll - util.scrollDelta(ui), 0, @max(0, content_h - list_h));
-    }
-    ui.drawScrollbar(x + w - 6, list_y, 5, list_h, app.panels.pattern_scroll, content_h, list_h);
 }
 
 pub fn drawStatusBar(ui: *Ui, app: *App, w: i32, h: i32) void {

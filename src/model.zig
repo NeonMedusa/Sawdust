@@ -47,6 +47,9 @@ pub const Instrument = struct {
     pan: f32 = 0.5, // 0-1（0.5 = 居中）
     muted: bool = false,
     mixer: i32 = 1, // 混音通道（占位）
+    /// MIDI 通道（0-15；-1 = 无）——MIDI 导入时记住来源通道，
+    /// 导出时优先按它写通道号（保证往返稳定）；手动建的乐器 = -1（导出用序号 mod 16）
+    midi_channel: i32 = -1,
     synth: *synth.SynthParams, // 每乐器独立的合成器参数
 };
 
@@ -58,6 +61,14 @@ pub const units_per_whole: i32 = 96;
 
 /// 默认每小节步数（4/4 → 96 步；实际用 `App.steps_per_bar`）
 pub const steps_per_bar: i32 = units_per_whole;
+
+/// 样式数量上限（样式列表动态增长，但不超过此值）。
+/// 播放列表预览（音域统计数组）等固定缓冲按此设限。
+/// 注：无类型常量（comptime_int）——既可作数组长度，也可参与 i32 运算。
+pub const max_patterns = 32;
+
+/// 新工程的默认样式数（“样式 1”…“样式 N”）。
+pub const default_pattern_count = 6;
 
 /// 拍号 → 每小节步数（`units_per_whole` 单位）。
 /// `steps = num × (U / den)`；当 `den` 不整除 `U` 时会截断（UI 只允许 2 的幂分母，故不会发生）。
@@ -351,6 +362,9 @@ pub fn clipTrimLeft(c: Clip, new_start: i32, min_len: i32) ?Clip {
 }
 
 /// 音符是否与同样式、同乐器、同音高的其它音符重叠（排除 exclude 下标）
+///
+/// **注意**：数据层允许重叠（与 MIDI 一致）；本函数仅用于需要“找重叠”的场景
+/// （如擦除、诊断），**放置/拖动不再拦截**。
 pub fn noteOverlaps(notes: []const Note, exclude: usize, pattern: i32, instrument: i32, step: i32, len: i32, pitch: i32) bool {
     for (notes, 0..) |o, oi| {
         if (oi == exclude or o.pattern != pattern or o.instrument != instrument or o.pitch != pitch) continue;

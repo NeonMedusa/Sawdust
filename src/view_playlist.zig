@@ -157,7 +157,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     const track_h: i32 = app.playlist.track_h;
 
     // 样式音域统计（每帧一次）：片段预览的纵向映射用（避免片段循环里重复扫全量音符）
-    const max_patterns = 32;
+    // 样式数量上限（播放列表预览的音域统计数组按此设限）
+    const max_patterns: i32 = model.max_patterns;
     var pat_min_pitch: [max_patterns]i32 = [_]i32{127} ** max_patterns;
     var pat_max_pitch: [max_patterns]i32 = [_]i32{0} ** max_patterns;
     var pat_has_notes: [max_patterns]bool = [_]bool{false} ** max_patterns;
@@ -298,8 +299,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 // 鼠标 → 全局步（吸附到步；范围 ≥ 0）
                 const content_px: f32 = @as(f32, @floatFromInt(app.playlist.scroll_x)) + @as(f32, @floatFromInt(ui.mouse_x - lane_x)) / zoom;
                 const step: i32 = @max(0, @as(i32, @intFromFloat(content_px / step_px)));
-                // 跳转（播放中会重置传输基准 + 作废旧调度事件）
-                app.jumpPlaybackCursor(step);
+                // 跳转（**去重**：按住期间只在目标步变化/按下帧才跳——
+                // 否则每帧 reset → 音符每帧重触发“响两下”，实测 bug）
+                app.jumpPlaybackCursorDrag(step, ui.mouse_pressed);
             }
         }
     }
