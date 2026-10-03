@@ -24,7 +24,11 @@ const view_playlist = @import("view_playlist.zig");
 const view_pianoroll = @import("view_pianoroll.zig");
 const view_rack = @import("view_rack.zig");
 const view_synth = @import("view_synth.zig");
+const view_mixer = @import("view_mixer.zig");
+const view_effect = @import("view_effect.zig");
 const view_panels = @import("view_panels.zig");
+const eq = @import("eq.zig");
+const audio = @import("audio.zig");
 
 pub fn main(init: std.process.Init) !u8 {
     const allocator = init.gpa;
@@ -45,6 +49,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer app.notes.deinit(allocator);
     defer app.deinitAll();
     app.resetPatterns(model.default_pattern_count); // 默认样式 1..6
+    app.resetMixerChannels(@import("app.zig").default_mixer_channels); // 默认调音台通道（主通道 + 通道#1）
     // 初始片段（演示）：前 12 轨铺一些样式，每 16 小节重复（只铺 2 轮——
     // 避免演示内容把时间轴行程撑得过长，行程应贴合最右内容）
     {
@@ -275,6 +280,71 @@ pub fn main(init: std.process.Init) !u8 {
             else
                 0.0;
             app.params.instrument_gain[i].store(g, .monotonic);
+            // 混音通道路由（`mixer` 已是 0 起；**按实际通道数**钳制——
+            // 否则通道数减少后旧值会指向不存在的通道，实测 bug）
+            const n_ch: u32 = @intCast(app.mixer_channels_state.items.len);
+            const ch: u32 = if (i < app.instruments.items.len and n_ch > 0)
+                @intCast(std.math.clamp(app.instruments.items[i].mixer, 0, @as(i32, @intCast(n_ch)) - 1))
+            else
+                0;
+            app.params.instrument_channel[i].store(ch, .monotonic);
+        }
+
+        // 同步调音台通道参数（增益/声像/静音/效果链）到音频线程
+        const n_mixer: usize = @min(app.mixer_channels_state.items.len, audio.mixer_channels);
+        app.params.channel_count.store(@intCast(n_mixer), .monotonic);
+        for (0..n_mixer) |ci| {
+            const mc = app.mixer_channels_state.items[ci];
+            app.params.channel_gain[ci].store(mc.volume, .monotonic);
+            app.params.channel_pan[ci].store(mc.pan, .monotonic);
+            app.params.channel_muted[ci].store(mc.muted, .monotonic);
+            // 效果链长度 + 元数据（kind/enabled/mix）：逐槽对比才写
+            const eff_n: usize = @min(mc.effects.items.len, audio.effect_slots);
+            app.params.effect_count[ci].store(@intCast(eff_n), .monotonic);
+            var chain_changed = false;
+            for (0..eff_n) |slot| {
+                const es = mc.effects.items[slot];
+                const k: u32 = @intFromEnum(es.kind);
+                if (app.params.effect_kind[ci][slot].load(.monotonic) != k) {
+                    app.params.effect_kind[ci][slot].store(k, .monotonic);
+                    chain_changed = true;
+                }
+                if (app.params.effect_enabled[ci][slot].load(.monotonic) != es.enabled) {
+                    app.params.effect_enabled[ci][slot].store(es.enabled, .monotonic);
+                    chain_changed = true;
+                }
+                if (app.params.effect_mix[ci][slot].load(.monotonic) != es.mix) {
+                    app.params.effect_mix[ci][slot].store(es.mix, .monotonic);
+                    chain_changed = true;
+                }
+            }
+            if (chain_changed) {
+                const v = app.params.effect_chain_version[ci].load(.monotonic);
+                app.params.effect_chain_version[ci].store(v +% 1, .monotonic);
+            }
+            // EQ 参数（取**首个 EQ** 的参数——当前 EQ 参数由链上 EQ 共享）
+            var eq_bands: ?[eq.band_count]eq.BandParams = null;
+            for (mc.effects.items) |es| {
+                if (es.kind == .eq) {
+                    eq_bands = es.bands;
+                    break;
+                }
+            }
+            if (eq_bands) |bands| {
+                var ch_changed = false;
+                for (0..eq.band_count) |b| {
+                    const old = app.params.channel_eq[ci][b];
+                    const new = bands[b];
+                    if (old.freq != new.freq or old.gain_db != new.gain_db or old.q != new.q) {
+                        app.params.channel_eq[ci][b] = new;
+                        ch_changed = true;
+                    }
+                }
+                if (ch_changed) {
+                    const v = app.params.channel_eq_version[ci].load(.monotonic);
+                    app.params.channel_eq_version[ci].store(v +% 1, .monotonic);
+                }
+            }
         }
 
         // 播放推进 + 序列器调度：**由音频采样时钟驱动**（frames_played），不由渲染驱动。
@@ -360,12 +430,15 @@ pub fn main(init: std.process.Init) !u8 {
 
         // 4.1) 历史提交（拖动类操作 **coalesce**：鼠标松开才提交一次——
         // 一次拖动 = 一条历史，而不是每帧一条；左右键都算）
+        // 注：**滚轮类** pending 不走这里（无“松开”事件）——它用静默间隔，
+        // 见 `pollWheelHistory`
         if (app.history_pending) |label| {
-            if (!ui_input.mouse_down and !ui_input.mouse_right_down) {
+            if (!app.history_pending_wheel and !ui_input.mouse_down and !ui_input.mouse_right_down) {
                 app.commitHistory(label);
                 app.history_pending = null;
             }
         }
+        app.pollWheelHistory();
 
         // 4.2) 帧末执行待定的文件操作（对话框在此弹出——不在事件迭代/绘制中，
         // 避免 pushEvent realloc 使迭代中的 events slice 悬空）
@@ -445,32 +518,72 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
 
     // ── 层声明（帧首）──
     // 立即式 UI 里“绘制顺序 = 事件处理顺序”；层系统把“谁接收鼠标”
-    // 从手写组合逻辑（rack_blocks or synth_blocks...）变成**声明式**：
-    // 各层声明优先级 + 矩形，beginLayer 自动判定是否被上层屏蔽。
-    // 优先级：菜单(3) > 合成器窗口(2) > 机架窗口(1) > 主界面(0)。
+    // 从手写组合逻辑变成**声明式**：各层声明矩形，beginLayer 自动判定是否被上层屏蔽。
+    //
+    // **浮动窗口按 z 排序**（点谁谁置顶）：每个窗口持有自己的 z，
+    // 按 z 升序声明层 + 绘制（后声明/后绘制 = 在上）。
+    // 注：早期版本给窗口写死 prio（合成器/调音台都是 2）——而 `ui.declare`
+    // 对**同 prio 是覆盖**，后声明的把先声明的层顶掉 → 被顶那层点击穿透（实测 bug）。
     const rack_open = app.rack.open;
     const synth_open = app.synth_win.open;
+    const mixer_open = app.mixer_win.open;
+    // 效果器面板（依赖调音台的 panel 选择；通道/槽位有效才显示）
+    const effect_open = app.mixer_win.panel != null;
     // 机架的下拉/右键菜单 = 模态层（全屏屏蔽）。
-    // 注：钢琴卷帘的两个标题栏选单**不在此列**——它们保持轻量语义
-    // （同帧 menu_click 门控本视图交互；点击穿透给其它视图后自行关闭），
+    // 注：钢琴卷帘的两个标题栏选单**不在此列**——它们保持轻量语义，
     // 这样两个选单可以单击直接互切（进模态层会让选择器按钮自身被屏蔽）。
-    const menu_open = app.rack.add_menu_open or app.rack.ctx_instrument != null;
+    const menu_open = app.rack.menu_open or app.rack.ctx_instrument != null;
+
+    // 浮动窗口列表（按 z 升序 = 从下到上）；排序用插入排序（只有 4 个元素）
+    var wins: [4]struct { z: i32, draw: enum { rack, synth, mixer, effect } } = undefined;
+    var nwin: usize = 0;
+    if (rack_open) {
+        wins[nwin] = .{ .z = app.rack.z, .draw = .rack };
+        nwin += 1;
+    }
+    if (synth_open) {
+        wins[nwin] = .{ .z = app.synth_win.z, .draw = .synth };
+        nwin += 1;
+    }
+    if (mixer_open) {
+        wins[nwin] = .{ .z = app.mixer_win.z, .draw = .mixer };
+        nwin += 1;
+    }
+    if (effect_open) {
+        wins[nwin] = .{ .z = app.effect_win.z, .draw = .effect };
+        nwin += 1;
+    }
+    {
+        var i: usize = 1;
+        while (i < nwin) : (i += 1) {
+            const key = wins[i];
+            var j: usize = i;
+            while (j > 0 and wins[j - 1].z > key.z) : (j -= 1) wins[j] = wins[j - 1];
+            wins[j] = key;
+        }
+    }
 
     ui.resetLayers();
     _ = ui.declare(.{ .prio = 0, .rect = .{ .x = 0, .y = 0, .w = w, .h = h } }); // 主界面
     // 模态确认框（最高优先级，全屏屏蔽）：存在时所有低层不响应鼠标
     if (app.modal != null) {
-        _ = ui.declare(.{ .prio = 10, .rect = .{ .x = 0, .y = 0, .w = w, .h = h }, .modal = true });
+        _ = ui.declare(.{ .prio = 1000, .rect = .{ .x = 0, .y = 0, .w = w, .h = h }, .modal = true });
     }
-    if (rack_open) {
-        _ = ui.declare(.{ .prio = 1, .rect = .{ .x = app.rack.x, .y = app.rack.y, .w = app.rack.w, .h = app.rack.h } });
-    }
-    if (synth_open) {
-        _ = ui.declare(.{ .prio = 2, .rect = .{ .x = app.synth_win.x, .y = app.synth_win.y, .w = app.synth_win.w, .h = app.synth_win.h } });
+    // 浮动窗口：prio = 窗口 z（+1 避开主界面 0）；按 z 升序声明（同层上覆盖下）
+    // 注：prio 用 1 + idx（idx = 排序后的位次）而非窗口 z 值——declare 对
+    // 同 prio 是覆盖且要求 prio 互不相同；位次天然互异且与排序一致。
+    for (wins[0..nwin], 0..) |win, wi| {
+        const r: @import("ui.zig").Rect = switch (win.draw) {
+            .rack => .{ .x = app.rack.x, .y = app.rack.y, .w = app.rack.w, .h = app.rack.h },
+            .synth => .{ .x = app.synth_win.x, .y = app.synth_win.y, .w = app.synth_win.w, .h = app.synth_win.h },
+            .mixer => .{ .x = app.mixer_win.x, .y = app.mixer_win.y, .w = app.mixer_win.w, .h = app.mixer_win.h },
+            .effect => .{ .x = app.effect_win.x, .y = app.effect_win.y, .w = app.effect_win.w, .h = app.effect_win.h },
+        };
+        _ = ui.declare(.{ .prio = 1 + @as(i32, @intCast(wi)), .rect = r });
     }
     if (menu_open) {
-        // 任何菜单展开 = 模态层（全屏屏蔽）
-        _ = ui.declare(.{ .prio = 3, .rect = .{ .x = 0, .y = 0, .w = w, .h = h }, .modal = true });
+        // 任何菜单展开 = 最上模态层（全屏屏蔽）
+        _ = ui.declare(.{ .prio = 900, .rect = .{ .x = 0, .y = 0, .w = w, .h = h }, .modal = true });
     }
 
     // 主界面（prio 0）
@@ -515,17 +628,15 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     view_panels.drawStatusBar(ui, app, w, h);
     ui.endLayer(); // 主界面层结束（浮动窗口之前）
 
-    // 通道机架（浮动窗口）：进入自己的层（自动屏蔽：被合成器/菜单覆盖时不响应）
-    // 用 NoClip：窗口阴影/右键菜单会超出窗口矩形，裁剪会切掉它们。
-    if (rack_open) {
-        _ = ui.beginLayerNoClip(1);
-        _ = view_rack.draw(ui, app, w, h, menu_open);
-        ui.endLayer();
-    }
-    // 合成器编辑器（最上层浮动窗口）——同理：阴影超界
-    if (synth_open) {
-        _ = ui.beginLayerNoClip(2);
-        _ = view_synth.draw(ui, app, w, h);
+    // 浮动窗口：按 z 升序绘制（后画 = 在上；与层声明同一顺序）
+    for (wins[0..nwin], 0..) |win, wi| {
+        _ = ui.beginLayerNoClip(1 + @as(i32, @intCast(wi)));
+        switch (win.draw) {
+            .rack => _ = view_rack.draw(ui, app, w, h, menu_open),
+            .synth => _ = view_synth.draw(ui, app, w, h),
+            .mixer => _ = view_mixer.draw(ui, app, w, h),
+            .effect => _ = view_effect.draw(ui, app, w, h),
+        }
         ui.endLayer();
     }
 }
@@ -546,13 +657,13 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
     const menus = [_][]const u8{ "文件", "选项", "视图", "乐器", "混音台" };
     for (menus, 0..) |m, i| {
         const mw: i32 = @as(i32, @intFromFloat(ui.font.measure(m))) + 16;
-        const active = (i == 3 and app.rack.open) or (i == 0 and app.file_menu_open);
+        const active = (i == 3 and app.rack.open) or (i == 0 and app.file_menu_open) or (i == 4 and app.mixer_win.open);
         if (active) {
             if (ui.buttonEx(100 + @as(u64, i), m, x, by, mw, bh, true)) {
-                if (i == 3) app.rack.open = false else if (i == 0) app.file_menu_open = false;
+                if (i == 3) app.rack.open = false else if (i == 0) app.file_menu_open = false else if (i == 4) app.mixer_win.open = false;
             }
         } else if (ui.button(100 + @as(u64, i), m, x, by, mw, bh)) {
-            if (i == 3) app.rack.open = true else if (i == 0) app.file_menu_open = !app.file_menu_open;
+            if (i == 3) app.rack.open = true else if (i == 0) app.file_menu_open = !app.file_menu_open else if (i == 4) app.mixer_win.open = !app.mixer_win.open;
         }
         if (i == 0) {
             file_menu_x = x;

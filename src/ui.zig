@@ -339,7 +339,14 @@ pub const Ui = struct {
 
     /// 旋钮（0-1）：拖动上下调节；显示为**底部缺口的圆环**——
     /// 数值 0 = 全不亮；0.5 = 左半边亮；1 = 全亮（从底部缺口起、逆着时针往左长）。
+    /// `vmin`/`vmax`：值域（默认 0..1；绘制按归一化位置）。
     pub fn knob(self: *Ui, id: u64, value: *f32, x: i32, y: i32, size: i32) bool {
+        return self.knobRange(id, value, x, y, size, 0, 1);
+    }
+
+    /// 带值域的旋钮（如 Q 值 0.1..4.0）——绘制按 `(v - vmin) / (vmax - vmin)` 归一化。
+    pub fn knobRange(self: *Ui, id: u64, value: *f32, x: i32, y: i32, size: i32, vmin: f32, vmax: f32) bool {
+        const range = @max(1e-6, vmax - vmin);
         const hovered = self.hit(x, y, size, size);
         var changed = false;
         if (hovered and self.mouse_pressed) {
@@ -352,13 +359,14 @@ pub const Ui = struct {
                 self.active_id = 0;
             } else {
                 const dy = self.drag_start - self.mouse_y; // 上拖增大
-                const nv = std.math.clamp(self.drag_anchor + @as(f32, @floatFromInt(dy)) / 120.0, 0, 1);
+                const nv = std.math.clamp(self.drag_anchor + @as(f32, @floatFromInt(dy)) / 120.0 * range, vmin, vmax);
                 if (nv != value.*) {
                     value.* = nv;
                     changed = true;
                 }
             }
         }
+        const norm = std.math.clamp((value.* - vmin) / range, 0, 1);
 
         // 绘制：底部缺口圆环（底轨）+ 亮弧（从底部起往左长）
         const cx = x + @divTrunc(size, 2);
@@ -369,8 +377,8 @@ pub const Ui = struct {
         const a0: f32 = pi / 2 + gap / 2; // 底部（屏幕 y 向下）
         const a1: f32 = pi / 2 + 2 * pi - gap / 2;
         drawArc(self.renderer, cx, cy, r, a0, a1, self.theme.slider_track);
-        if (value.* > 0.002) {
-            drawArc(self.renderer, cx, cy, r, a0, a0 + (a1 - a0) * value.*, if (hovered or self.active_id == id) self.theme.accent else self.theme.slider_fill);
+        if (norm > 0.002) {
+            drawArc(self.renderer, cx, cy, r, a0, a0 + (a1 - a0) * norm, if (hovered or self.active_id == id) self.theme.accent else self.theme.slider_fill);
         }
         self.renderer.fillRect(cx - 1, cy - 1, 2, 2, self.theme.text_dim);
         return changed;

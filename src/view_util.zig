@@ -7,6 +7,7 @@ const std = @import("std");
 const Ui = @import("ui.zig").Ui;
 const Theme = @import("ui.zig").Theme;
 const r_mod = @import("render.zig");
+const Rect = @import("ui.zig").Rect;
 const model = @import("model.zig");
 
 // ── 布局常量 ──
@@ -68,6 +69,108 @@ pub const rack_mix_w: i32 = 26; // 混音通道列宽
 pub const rack_name_w: i32 = 150; // 名称列宽
 pub const rack_add_h: i32 = 24; // 添加按钮高
 pub const menu_item_h: i32 = 20; // 下拉菜单项高
+
+// ── 下拉菜单（“按钮 → 菜单”的共享实现）──
+//
+// 动机：机架“+ 添加乐器”与调音台“+ 效果器”是同一套交互（按钮 → 下拉选类型），
+// 却各写一份 → 两边各踩一次同样的坑（同帧关闭、菜单追随鼠标）。
+// 共享实现 = 一次修对、以后不再各踩一遍。
+//
+// 为保持分层（app ↛ view_util），这里不定义状态结构体：
+// 调用方在**自己的状态**里放四个字段（open/just_opened/x/y），传指针进来。
+
+/// 菜单锚定方式
+pub const MenuAnchor = union(enum) {
+    /// 锚到按钮下方（下方放不下 → 向上展开）
+    button: struct { x: i32, y: i32, w: i32, h: i32 },
+    /// 跟随鼠标（位置在**开启那一帧快照后固定**——否则菜单会跟着鼠标跑，
+    /// “钓竿上的胡萝卜”，永远点不到）
+    cursor: void,
+};
+
+/// 帧首调用：清零“刚打开”标记（必须逐帧做，否则“点外部关闭”永久失效）
+pub fn menuFrameBegin(just_opened: *bool) void {
+    just_opened.* = false;
+}
+
+/// 下拉菜单的按钮：点击切换开/关；**开启那一帧**置 `just_opened`（供 menuPanel）。
+pub fn menuButton(ui: *Ui, label: []const u8, x: i32, y: i32, w: i32, h: i32, open: *bool, just_opened: *bool) void {
+    const hovered = hitUI(ui, x, y, w, h);
+    ui.renderer.fillRect(x, y, w, h, if (hovered) ui.theme.item_hover else ui.theme.slider_track);
+    ui.renderer.strokeRect(x, y, w, h, ui.theme.panel_border);
+    const tw: i32 = @intFromFloat(ui.font.measure(label));
+    ui.label(label, x + @divTrunc(w - tw, 2), y + @divTrunc(h - 10, 2), ui.theme.text);
+    if (hovered and ui.mouse_pressed) {
+        open.* = !open.*;
+        if (open.*) just_opened.* = true; // 只在“开启”那一帧标记
+    }
+}
+
+/// 菜单面板：位置快照（仅开启帧）、hover、点击、“点外部关闭”（跳过开启帧）。
+/// - `mx`/`my`：菜单坐标状态（开启帧快照后固定）
+/// - `open`：菜单开关（点外部/点条目时置 false）
+/// - `bounds`：所在窗口矩形（越界翻转/钳制）
+/// - `enabled`：条目可用性（null = 全可用；禁用项变暗且不可点）
+/// 返回被点击的条目下标（null = 无）。
+pub fn menuPanel(
+    ui: *Ui,
+    mx: *i32,
+    my: *i32,
+    open: *bool,
+    just_opened: bool,
+    anchor: MenuAnchor,
+    bounds: Rect,
+    items: []const []const u8,
+    item_w: i32,
+    enabled: ?[]const bool,
+) ?usize {
+    const count: i32 = @intCast(items.len);
+    const mh: i32 = count * menu_item_h + 4;
+    if (just_opened) {
+        switch (anchor) {
+            .button => |b| {
+                mx.* = b.x;
+                my.* = b.y + b.h;
+                // 下方放不下 → 向上展开
+                if (my.* + mh > bounds.y + bounds.h) my.* = @max(bounds.y, b.y - mh);
+            },
+            .cursor => {
+                mx.* = ui.mouse_x;
+                my.* = ui.mouse_y + 6;
+                if (my.* + mh > bounds.y + bounds.h) my.* = @max(bounds.y, ui.mouse_y - mh - 6);
+            },
+        }
+        // 右/下越界兜底
+        mx.* = std.math.clamp(mx.*, bounds.x, @max(bounds.x, bounds.x + bounds.w - item_w));
+        my.* = std.math.clamp(my.*, bounds.y, @max(bounds.y, bounds.y + bounds.h - mh));
+    }
+
+    const pmx = mx.*;
+    const pmy = my.*;
+    ui.renderer.fillRect(pmx, pmy, item_w, mh, ui.theme.panel);
+    ui.renderer.strokeRect(pmx, pmy, item_w, mh, ui.theme.accent);
+
+    var clicked: ?usize = null;
+    var inside_any = false;
+    for (items, 0..) |item, i| {
+        const iy = pmy + 2 + @as(i32, @intCast(i)) * menu_item_h;
+        const ih = inRect(ui.mouse_x, ui.mouse_y, pmx + 1, iy, item_w - 2, menu_item_h);
+        const ok = enabled == null or enabled.?[i];
+        if (ih) {
+            inside_any = true;
+            if (ok) ui.renderer.fillRect(pmx + 1, iy, item_w - 2, menu_item_h, ui.theme.item_hover);
+        }
+        ui.labelClipped(item, pmx + 8, iy + 2, item_w - 16, if (!ok) ui.theme.text_dim else if (ih) ui.theme.accent else ui.theme.text);
+        if (ih and ok and ui.mouse_pressed) clicked = i;
+    }
+    // 点外部关闭（**跳过“刚打开”那一帧**：同帧点击会立刻把它关掉，
+    // 实测 bug：菜单闪一下消失）
+    if (ui.mouse_pressed and !inside_any and !just_opened and clicked == null) {
+        open.* = false;
+    }
+    if (clicked != null) open.* = false;
+    return clicked;
+}
 pub const rack_min_w: i32 = 360;
 pub const rack_min_h: i32 = 120;
 

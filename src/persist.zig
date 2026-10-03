@@ -11,7 +11,8 @@ const synth = @import("synth.zig");
 
 /// 当前文件格式版本
 /// v1 → v2：片段坐标由“小节”改为 **U=96 步**（`bar` → `start`，`len` 单位同步）
-pub const file_version: u32 = 2;
+/// v2 → v3：乐器的 `mixer` 由 **1 起**改为 **0 起**（加载时减 1）
+pub const file_version: u32 = 3;
 
 /// 默认文件名
 pub const default_file_name: []const u8 = "project.saw";
@@ -91,13 +92,42 @@ pub const SavedInstrument = struct {
     volume: f32 = 0.8,
     pan: f32 = 0.5,
     muted: bool = false,
-    mixer: i32 = 1,
+    /// 混音通道（**0 起**；v3 起。v1/v2 存档是 1 起——加载时减 1）
+    mixer: i32 = 0,
     /// MIDI 通道（0-15；-1 = 无；旧存档缺失 → -1）
     midi_channel: i32 = -1,
     synth: SavedSynth = .{},
 };
 
 /// 完整工程存档
+/// 存档中的一段 EQ
+pub const SavedEqBand = struct {
+    freq: f32 = 1000,
+    gain_db: f32 = 0,
+    q: f32 = 1.0,
+};
+
+/// 存档中的一个效果器（`kind`：1 = EQ；0 = 无效——旧存档空槽）
+pub const SavedEffectSlot = struct {
+    kind: u32 = 0, // 1 = EQ（与 app.EffectKind 对应；0 = 无效）
+    enabled: bool = true,
+    /// 干湿比（0 = 干声、1 = 完全效果）
+    mix: f32 = 1.0,
+    /// EQ 段（**只读切片**：兼容旧存档的 4 段；加载时按需截断/补齐）
+    bands: []const SavedEqBand = &.{},
+};
+
+/// 存档中的一个调音台通道
+pub const SavedMixerChannel = struct {
+    volume: f32 = 0.8,
+    pan: f32 = 0.5,
+    muted: bool = false,
+    /// 有效效果器数（0 = 旧存档：按 kind != 0 推断）
+    effect_count: u32 = 0,
+    /// 效果器链（固定 4 槽存储；`effect_count` 之前的项有效）
+    effects: [4]SavedEffectSlot = .{ .{}, .{}, .{}, .{} },
+};
+
 pub const Project = struct {
     version: u32 = file_version,
     bpm: i32 = 120,
@@ -112,6 +142,8 @@ pub const Project = struct {
     clips: []SavedClip = &.{},
     notes: []SavedNote = &.{},
     instruments: []SavedInstrument = &.{},
+    /// 调音台通道（旧存档缺失 → 全默认 8 通道；加载时长度不匹配则重置）
+    mixer: []SavedMixerChannel = &.{},
 };
 
 /// 从合成器参数导出存档结构（读原子 → 普通值）
@@ -183,6 +215,13 @@ pub fn fromJson(allocator: std.mem.Allocator, data: []const u8) !std.json.Parsed
         }
         parsed.value.version = 2;
     }
+    if (parsed.value.version < 3) {
+        // v2：乐器 `mixer` 是 **1 起**（主通道 = 1）→ v3 改为 0 起（减 1）
+        for (parsed.value.instruments) |*inst| {
+            inst.mixer -= 1;
+        }
+        parsed.value.version = 3;
+    }
     return parsed;
 }
 
@@ -238,13 +277,13 @@ test "persist: JSON 往返（序列化 → 解析）" {
     defer allocator.free(json);
 
     // JSON 可读性：应含版本与关键字段
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"version\": 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"version\": 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"bpm\": 140") != null);
 
     const parsed = try fromJson(allocator, json);
     defer parsed.deinit();
 
-    try std.testing.expectEqual(@as(u32, 2), parsed.value.version);
+    try std.testing.expectEqual(@as(u32, 3), parsed.value.version);
     try std.testing.expectEqual(@as(i32, 140), parsed.value.bpm);
     try std.testing.expectEqual(@as(i32, 3), parsed.value.time_num);
     try std.testing.expectEqual(@as(i32, 72), parsed.value.steps_per_bar);
@@ -279,7 +318,7 @@ test "persist: v1 存档自动迁移（小节 → 步）" {
     const parsed = try fromJson(allocator, json);
     defer parsed.deinit();
 
-    try std.testing.expectEqual(@as(u32, 2), parsed.value.version); // 已升级
+    try std.testing.expectEqual(@as(u32, 3), parsed.value.version); // 已升级
     try std.testing.expectEqual(@as(usize, 1), parsed.value.clips.len);
     const c = parsed.value.clips[0];
     const B: i32 = model.units_per_whole;
@@ -294,6 +333,28 @@ test "persist: v1 存档自动迁移（小节 → 步）" {
     defer parsed2.deinit();
     try std.testing.expectEqual(2 * B, parsed2.value.clips[0].start);
     try std.testing.expectEqual(2 * B, parsed2.value.clips[0].len);
+}
+
+test "persist: v2 存档自动迁移（mixer 1 起 → 0 起）" {
+    const allocator = std.testing.allocator;
+    // v2：乐器 mixer = 1（旧语义：主通道 = 1）→ v3 应为 0
+    const json =
+        \\{"version":2,"bpm":120,"time_num":4,"time_den":4,"steps_per_bar":96,
+        \\ "clips":[],"notes":[],
+        \\ "instruments":[{"name":"A","mixer":1},{"name":"B","mixer":3}]}
+    ;
+    const parsed = try fromJson(allocator, json);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(u32, 3), parsed.value.version);
+    try std.testing.expectEqual(@as(i32, 0), parsed.value.instruments[0].mixer); // 1 → 0
+    try std.testing.expectEqual(@as(i32, 2), parsed.value.instruments[1].mixer); // 3 → 2
+
+    // 回写再读：不重复迁移
+    const json2 = try toJson(allocator, parsed.value);
+    defer allocator.free(json2);
+    const parsed2 = try fromJson(allocator, json2);
+    defer parsed2.deinit();
+    try std.testing.expectEqual(@as(i32, 0), parsed2.value.instruments[0].mixer);
 }
 
 test "persist: 缺失字段用默认值（向后兼容）" {
@@ -346,6 +407,57 @@ test "persist: 真实文件往返（写盘 → 读回）" {
     try std.testing.expectEqualStrings("测试乐器", parsed.value.instruments[0].name);
     try std.testing.expectApproxEqAbs(@as(f32, 0.55), parsed.value.instruments[0].volume, 1e-6);
     _ = tmp_path;
+}
+
+test "persist: 调音台通道往返（增益/声像/静音/效果链）" {
+    const allocator = std.testing.allocator;
+    const mix = [_]SavedMixerChannel{
+        .{ .volume = 0.33, .pan = 0.2, .muted = true, .effects = .{
+            .{ .kind = 1, .enabled = true, .mix = 0.7, .bands = &[_]SavedEqBand{
+                .{ .freq = 80, .gain_db = -6, .q = 0.7 },
+                .{ .freq = 600, .gain_db = 3.5, .q = 1.2 },
+                .{ .freq = 2500, .gain_db = -12, .q = 2.0 },
+                .{ .freq = 9000, .gain_db = 8, .q = 0.9 },
+            } },
+            .{},
+            .{},
+            .{},
+        } },
+        .{ .volume = 0.9, .pan = 0.8, .muted = false },
+    };
+    const project = Project{ .mixer = @constCast(&mix) };
+
+    const json = try toJson(allocator, project);
+    defer allocator.free(json);
+    // JSON 里应有调音台字段
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"mixer\"") != null);
+
+    const parsed = try fromJson(allocator, json);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.mixer.len);
+    const m0 = parsed.value.mixer[0];
+    try std.testing.expectApproxEqAbs(@as(f32, 0.33), m0.volume, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), m0.pan, 1e-6);
+    try std.testing.expect(m0.muted);
+    // 效果链：第 0 槽 = EQ
+    try std.testing.expectEqual(@as(u32, 1), m0.effects[0].kind);
+    try std.testing.expect(m0.effects[0].enabled);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7), m0.effects[0].mix, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 80), m0.effects[0].bands[0].freq, 1e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, -6), m0.effects[0].bands[0].gain_db, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.2), m0.effects[0].bands[1].q, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -12), m0.effects[0].bands[2].gain_db, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 8), m0.effects[0].bands[3].gain_db, 1e-5);
+    // 空槽
+    try std.testing.expectEqual(@as(u32, 0), m0.effects[1].kind);
+    // 第二通道
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), parsed.value.mixer[1].pan, 1e-6);
+    try std.testing.expect(!parsed.value.mixer[1].muted);
+
+    // 旧存档无 mixer 字段 → 空数组（不报错）
+    const old = try fromJson(allocator, "{\"version\":2,\"bpm\":100}");
+    defer old.deinit();
+    try std.testing.expectEqual(@as(usize, 0), old.value.mixer.len);
 }
 
 test "persist: v2 输出不含 v1 兼容字段（bar/len_bars）" {

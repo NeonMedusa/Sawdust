@@ -11,6 +11,7 @@ const synth = @import("synth.zig");
 const sequencer = @import("sequencer.zig");
 const persist = @import("persist.zig");
 const midi = @import("midi.zig");
+const eq = @import("eq.zig");
 
 pub const Clip = model.Clip;
 pub const Note = model.Note;
@@ -59,6 +60,8 @@ pub const HistoryState = struct {
     clips: []model.Clip,
     /// 乐器快照（name 为堆分配副本；synth 为值快照）
     instruments: []persist.SavedInstrument,
+    /// 调音台通道快照（含效果链；条数 = 快照时的通道数）
+    mixer: []persist.SavedMixerChannel,
     pattern_count: i32 = model.default_pattern_count,
     bpm: i32 = 120,
     time_num: i32 = 4,
@@ -245,6 +248,11 @@ pub const RackState = struct {
     y: i32 = 110,
     w: i32 = 620,
     h: i32 = 300,
+    /// Z 序（越大越靠上；**点窗口即置顶**）。
+    /// 注：窗口各自持有 z，`main` 每帧按 z 排序绘制与声明层——
+    /// 早期版本用固定 prio（两窗口同 prio），`ui.declare` 会把后声明的顶掉，
+    /// 导致被顶那层的点击穿透（实测 bug）。
+    z: i32 = 10,
     /// 标题栏拖动抓取偏移
     grab_dx: i32 = 0,
     grab_dy: i32 = 0,
@@ -260,8 +268,11 @@ pub const RackState = struct {
     ctx_y: i32 = 0,
 
     // ── 下拉菜单 ──
-    /// 添加乐器的下拉菜单：展开中
-    add_menu_open: bool = false,
+    /// 添加乐器的下拉菜单（共享控件 view_util.menu*）：四个平铺字段
+    menu_open: bool = false,
+    menu_just_opened: bool = false,
+    menu_x: i32 = 0,
+    menu_y: i32 = 0,
     /// 右键菜单中的乐器（删除用；null = 未展开）
     ctx_instrument: ?usize = null,
 };
@@ -321,6 +332,8 @@ pub const SynthWindow = struct {
     y: i32 = 150,
     w: i32 = 520,
     h: i32 = 300,
+    /// Z 序（越大越靠上；点窗口即置顶）——见 `RackState.z` 注释
+    z: i32 = 30,
     grab_dx: i32 = 0,
     grab_dy: i32 = 0,
     resize_w0: i32 = 0,
@@ -329,6 +342,118 @@ pub const SynthWindow = struct {
     resize_my: i32 = 0,
     /// 当前编辑的乐器槽位（0 起）
     instrument: i32 = 0,
+};
+
+/// 调音台通道数：**默认 2**（主通道 + 通道#1），可添加；上限见 `max_mixer_channels`
+pub const default_mixer_channels = 2;
+/// 调音台通道上限（音频层的原子数组按此设容量）
+pub const max_mixer_channels = 32;
+/// 每通道效果器链上限（音频层的原子数组按此设容量）
+pub const max_effects_per_channel = 16;
+
+/// 效果器类型（插件式：通道上可挂多个效果器；目前只有 EQ）
+pub const EffectKind = enum(u32) {
+    empty = 0,
+    eq = 1,
+
+    pub fn displayName(self: EffectKind) []const u8 {
+        return switch (self) {
+            .empty => "（空槽）",
+            .eq => "EQ 参量均衡",
+        };
+    }
+};
+
+/// 一个效果器槽（插件实例）
+pub const EffectSlot = struct {
+    kind: EffectKind = .empty,
+    /// 开关（旁通）
+    enabled: bool = true,
+    /// 干湿比（0-1）
+    mix: f32 = 1.0,
+    /// EQ 参数（kind == .eq 时有效）
+    bands: [eq.band_count]eq.BandParams = .{
+        .{ .freq = 100, .q = 1.0 },
+        .{ .freq = 500, .q = 1.0 },
+        .{ .freq = 2000, .q = 1.0 },
+        .{ .freq = 8000, .q = 1.0 },
+        .{ .freq = 12000, .q = 1.0 },
+    },
+};
+
+/// 每通道效果器槽数（已废弃：效果器链改为**动态列表**，见 `MixerChannel.effects`；
+/// 上限见 `max_effects_per_channel`）
+pub const effects_per_channel = max_effects_per_channel;
+
+/// 一个调音台通道：增益/声像/静音 + **效果器链**（插件式，动态列表）
+pub const MixerChannel = struct {
+    volume: f32 = 0.8, // 0-1（线性增益）
+    pan: f32 = 0.5, // 0-1（0.5 = 居中）
+    muted: bool = false,
+    /// 效果器链（**动态**：顺序处理；空列表 = 无效果）
+    effects: std.ArrayListUnmanaged(EffectSlot) = .{ .items = &.{}, .capacity = 0 },
+};
+
+/// 调音台窗口状态
+pub const MixerWindow = struct {
+    open: bool = false,
+    x: i32 = 120,
+    y: i32 = 90,
+    w: i32 = 760,
+    h: i32 = 420,
+    /// Z 序（越大越靠上；点窗口即置顶）——见 `RackState.z` 注释
+    z: i32 = 20,
+    grab_dx: i32 = 0,
+    grab_dy: i32 = 0,
+    resize_w0: i32 = 0,
+    resize_h0: i32 = 0,
+    resize_mx: i32 = 0,
+    resize_my: i32 = 0,
+    /// “添加效果器”下拉：所属通道（null = 未展开）
+    add_effect_ch: ?usize = null,
+    /// 下拉菜单状态（共享控件 view_util.menu*）：四个平铺字段
+    menu_open: bool = false,
+    menu_just_opened: bool = false,
+    menu_x: i32 = 0,
+    menu_y: i32 = 0,
+    /// 效果器右键菜单中的槽位（删除/上移/下移用）——null = 未展开
+    ctx_effect: ?EffectRef = null,
+    /// 通道右键菜单中的通道（删除/上移/下移用）——null = 未展开
+    ctx_channel: ?usize = null,
+    /// 右键菜单位置（**打开时快照**——不跟鼠标跑，否则永远点不到）
+    ctx_menu_x: i32 = 0,
+    ctx_menu_y: i32 = 0,
+    /// 打开的效果器面板（通道 × 槽位；null = 未开）
+    panel: ?EffectRef = null,
+    /// 当前选中的通道（右侧效果器链显示哪个通道；默认 0）
+    selected_channel: i32 = 0,
+    /// 通道竖条区的横向滚动（像素；窗口太窄时滚轮查看）
+    strips_scroll: i32 = 0,
+    /// 效果链区的纵向滚动（像素；效果器太多放不下时滚轮查看）
+    fx_scroll: i32 = 0,
+    /// 效果器链区宽度（**可拖动分割条调整**；0 = 用默认值 `ww/4` 重算）
+    fx_w: i32 = 0,
+};
+
+/// 效果器定位（通道 × 槽位）
+pub const EffectRef = struct { ch: usize, slot: usize };
+
+/// 效果器独立面板（像合成器窗口一样可拖动/缩放）
+pub const EffectWindow = struct {
+    x: i32 = 260,
+    y: i32 = 130,
+    w: i32 = 620,
+    h: i32 = 340,
+    /// Z 序（越大越靠上；点窗口即置顶）——见 `RackState.z` 注释
+    z: i32 = 40,
+    grab_dx: i32 = 0,
+    grab_dy: i32 = 0,
+    resize_w0: i32 = 0,
+    resize_h0: i32 = 0,
+    resize_mx: i32 = 0,
+    resize_my: i32 = 0,
+    /// 正在拖动的 EQ 控制点（段；null = 无）
+    eq_drag: ?usize = null,
 };
 
 pub const App = struct {
@@ -371,6 +496,11 @@ pub const App = struct {
     /// 待提交的操作名（**拖动类操作**在拖动中每帧设置，帧末鼠标松开后才真正提交——
     /// 实现 coalesce：一次拖动 = 一条历史，而不是每帧一条）
     history_pending: ?[]const u8 = null,
+    /// `history_pending` 是否属于**滚轮类**操作（无“松开”事件——
+    /// 改用**静默间隔**提交：停止滚动约 0.6s 后提交一次）
+    history_pending_wheel: bool = false,
+    /// 滚轮类 pending 的最后一次变动时间（音频帧计数；`frames_played`）
+    history_pending_frame: u64 = 0,
 
     // ── 保存 / 加载（工程文件）──
     /// 当前工程路径（null = 尚未保存过）
@@ -432,6 +562,12 @@ pub const App = struct {
     rack: RackState = .{},
     panels: PanelsState = .{},
     synth_win: SynthWindow = .{},
+    mixer_win: MixerWindow = .{},
+    effect_win: EffectWindow = .{},
+    /// 浮动窗口 Z 序的**全局计数器**（点窗口置顶时 +1，见 `bringToFront`）
+    z_top: i32 = 50,
+    /// 调音台通道（**动态**；默认 2 个，可添加；乐器通过 `Instrument.mixer` 路由到其中之一）
+    mixer_channels_state: std.ArrayListUnmanaged(MixerChannel) = .{ .items = &.{}, .capacity = 0 },
 
     // ── 占位数据 ──
     /// 样式列表（**动态**；名字由 App 管理生命周期，如 "样式 7"）。
@@ -1019,6 +1155,7 @@ pub const App = struct {
         self.clipboard_notes.deinit(self.allocator);
         self.clipboard_clips.deinit(self.allocator);
         self.batch_snap.deinit(self.allocator);
+        self.deinitMixerChannels();
         self.deinitHistory();
         self.deinitPatterns();
         self.deinitInstruments();
@@ -1046,6 +1183,159 @@ pub const App = struct {
         self.dirty = true;
     }
 
+    /// 滚轮类操作的 coalesce：设置待提交名 + 记录本次变动时间。
+    /// （滚轮无“松开”事件——用**静默间隔**判定：见 `pollWheelHistory`）
+    pub fn markWheelHistory(self: *App, label: []const u8) void {
+        self.history_pending = label;
+        self.history_pending_wheel = true;
+        self.history_pending_frame = self.params.frames_played.load(.monotonic);
+    }
+
+    /// 帧末调用：滚轮类 pending 若已**静默 ≥ 0.6s** → 提交一条历史。
+    /// （0.6s = 采样率 × 0.6；用音频帧计数当时间源——它单调且与 UI 帧率无关）
+    pub fn pollWheelHistory(self: *App) void {
+        if (!self.history_pending_wheel) return;
+        const label = self.history_pending orelse {
+            self.history_pending_wheel = false;
+            return;
+        };
+        const now = self.params.frames_played.load(.monotonic);
+        const quiet_frames: u64 = self.params.sample_rate * 6 / 10; // 0.6s
+        if (now -| self.history_pending_frame >= quiet_frames) {
+            self.commitHistory(label);
+            self.history_pending = null;
+            self.history_pending_wheel = false;
+        }
+    }
+
+    // ── 调音台通道 ──
+
+    /// 当前通道数
+    pub fn mixerChannelCount(self: *const App) usize {
+        return self.mixer_channels_state.items.len;
+    }
+
+    /// 初始化调音台通道（启动/新建/加载无 mixer 字段时）：默认 `default_mixer_channels` 个。
+    /// 先释放旧链（每通道效果器列表）再重建。
+    pub fn resetMixerChannels(self: *App, count: usize) void {
+        self.deinitMixerChannels();
+        var i: usize = 0;
+        while (i < count and i < max_mixer_channels) : (i += 1) {
+            self.mixer_channels_state.append(self.allocator, .{}) catch break;
+        }
+    }
+
+    /// 释放调音台通道（每通道的效果器链 + **列表底层数组**）
+    pub fn deinitMixerChannels(self: *App) void {
+        for (self.mixer_channels_state.items) |*mc| mc.effects.deinit(self.allocator);
+        // 注：必须 `deinit`（释放底层数组）——`clearRetainingCapacity` 只清长度，
+        // 会把数组泄漏掉（实测：undo → importMixerChannels → 重建通道后泄漏）
+        self.mixer_channels_state.deinit(self.allocator);
+        self.mixer_channels_state = .{ .items = &.{}, .capacity = 0 };
+    }
+
+    /// 添加一个通道（返回新通道下标；达到上限返回 null）
+    pub fn addMixerChannel(self: *App) ?usize {
+        if (self.mixer_channels_state.items.len >= max_mixer_channels) return null;
+        self.mixer_channels_state.append(self.allocator, .{}) catch return null;
+        return self.mixer_channels_state.items.len - 1;
+    }
+
+    /// 给某通道添加一个效果器（返回新槽下标；达到上限返回 null）
+    pub fn addEffect(self: *App, ch: usize, kind: EffectKind) ?usize {
+        if (ch >= self.mixer_channels_state.items.len) return null;
+        const chain = &self.mixer_channels_state.items[ch].effects;
+        if (chain.items.len >= max_effects_per_channel) return null;
+        chain.append(self.allocator, .{ .kind = kind }) catch return null;
+        return chain.items.len - 1;
+    }
+
+    /// 删除某通道的第 `slot` 个效果器
+    pub fn removeEffect(self: *App, ch: usize, slot: usize) void {
+        if (ch >= self.mixer_channels_state.items.len) return;
+        const chain = &self.mixer_channels_state.items[ch].effects;
+        if (slot >= chain.items.len) return;
+        _ = chain.orderedRemove(slot);
+    }
+
+    /// 效果器上移/下移（`dir`：-1 上、+1 下）；返回是否移动了。
+    /// 面板跟随移动后的槽位。
+    pub fn moveEffect(self: *App, ch: usize, slot: usize, dir: i32) bool {
+        if (ch >= self.mixer_channels_state.items.len) return false;
+        const chain = &self.mixer_channels_state.items[ch].effects;
+        if (slot >= chain.items.len or chain.items.len < 2) return false;
+        const ni: usize = if (dir < 0) slot -| 1 else @min(slot + 1, chain.items.len - 1);
+        if (ni == slot) return false;
+        std.mem.swap(EffectSlot, &chain.items[slot], &chain.items[ni]);
+        if (self.mixer_win.panel) |p| {
+            if (p.ch == ch and p.slot == slot) self.mixer_win.panel = .{ .ch = ch, .slot = ni };
+        }
+        return true;
+    }
+
+    /// 通道上移/下移（`dir`：-1 上、+1 下）；返回是否移动了。
+    /// **乐器的通道路由与选中通道跟随交换**。
+    pub fn moveMixerChannel(self: *App, ch: usize, dir: i32) bool {
+        const n = self.mixer_channels_state.items.len;
+        if (ch >= n or n < 2) return false;
+        const ni: usize = if (dir < 0) ch -| 1 else @min(ch + 1, n - 1);
+        if (ni == ch) return false;
+        std.mem.swap(MixerChannel, &self.mixer_channels_state.items[ch], &self.mixer_channels_state.items[ni]);
+        // 乐器路由跟随（交换两个通道号）
+        for (self.instruments.items) |*inst| {
+            if (inst.mixer == @as(i32, @intCast(ch))) {
+                inst.mixer = @intCast(ni);
+            } else if (inst.mixer == @as(i32, @intCast(ni))) {
+                inst.mixer = @intCast(ch);
+            }
+        }
+        // 选中/面板跟随
+        if (self.mixer_win.selected_channel == @as(i32, @intCast(ch))) {
+            self.mixer_win.selected_channel = @intCast(ni);
+        } else if (self.mixer_win.selected_channel == @as(i32, @intCast(ni))) {
+            self.mixer_win.selected_channel = @intCast(ch);
+        }
+        if (self.mixer_win.panel) |p| {
+            if (p.ch == ch) {
+                self.mixer_win.panel = .{ .ch = ni, .slot = p.slot };
+            } else if (p.ch == ni) {
+                self.mixer_win.panel = .{ .ch = ch, .slot = p.slot };
+            }
+        }
+        return true;
+    }
+
+    /// 删除一个调音台通道（**至少保留 1 条**）；路由到此通道的乐器向前补位。
+    /// 返回是否删除成功。
+    pub fn removeMixerChannel(self: *App, ch: usize) bool {
+        const n = self.mixer_channels_state.items.len;
+        if (ch >= n or n <= 1) return false;
+        var removed = self.mixer_channels_state.items[ch];
+        removed.effects.deinit(self.allocator);
+        _ = self.mixer_channels_state.orderedRemove(ch);
+        // 面板/选中修正
+        if (self.mixer_win.panel) |p| {
+            if (p.ch == ch) self.mixer_win.panel = null;
+        }
+        const new_n: i32 = @intCast(self.mixer_channels_state.items.len);
+        if (self.mixer_win.selected_channel >= new_n) self.mixer_win.selected_channel = new_n - 1;
+        // 乐器路由：删除点之后的向前补位，并钳到有效范围
+        for (self.instruments.items) |*inst| {
+            if (inst.mixer > @as(i32, @intCast(ch))) inst.mixer -= 1;
+            inst.mixer = std.math.clamp(inst.mixer, 0, @max(0, new_n - 1));
+        }
+        return true;
+    }
+
+    // ── 浮动窗口 Z 序（“点谁谁置顶”）──
+
+    /// 把某窗口提到最上层（点击该窗口时调用）。
+    /// 参数是窗口 z 字段的指针——四个窗口结构都持有 `z: i32`。
+    pub fn bringToFront(self: *App, z: *i32) void {
+        self.z_top += 1;
+        z.* = self.z_top;
+    }
+
     // ── 撤销/重做（快照式）──
 
     /// 历史容量上限（超出后丢弃最旧的快照）
@@ -1067,8 +1357,87 @@ pub const App = struct {
         self.allocator.free(st.label);
         self.allocator.free(st.notes);
         self.allocator.free(st.clips);
+        // 注：**不要**加 `if (len > 0)`——`alloc(T, 0)` 也必须配对 `free`
+        // （测试分配器会把 0 长度分配记为泄漏）
+        self.freeSavedMixerChannels(st.mixer);
+        self.allocator.free(st.mixer);
         for (st.instruments) |si| self.allocator.free(si.name);
         self.allocator.free(st.instruments);
+    }
+
+    /// 把当前调音台通道导出为存档切片（历史快照 / 工程保存共用）
+    fn exportMixerChannels(self: *App, allocator: std.mem.Allocator) ![]persist.SavedMixerChannel {
+        const n_ch = self.mixer_channels_state.items.len;
+        // 注：即使 0 条也要返回**已分配**切片（与 `free` 配对；
+        // 不能直接返回 `&.{}`——那样 `freeHistoryState` 的 `free` 会崩，
+        // 而返回 `alloc(0)` 又必须被 free）
+        const mix = try allocator.alloc(persist.SavedMixerChannel, n_ch);
+        errdefer allocator.free(mix);
+        for (self.mixer_channels_state.items, 0..) |mc, i| {
+            var sm = persist.SavedMixerChannel{
+                .volume = mc.volume,
+                .pan = mc.pan,
+                .muted = mc.muted,
+            };
+            for (mc.effects.items, 0..) |es, si| {
+                if (si >= sm.effects.len) break; // 超出存档容量：截断
+                // 效果器段：分配切片（长度 = band_count）
+                const bands = try allocator.alloc(persist.SavedEqBand, es.bands.len);
+                for (es.bands, 0..) |b, bi| {
+                    bands[bi] = .{ .freq = b.freq, .gain_db = b.gain_db, .q = b.q };
+                }
+                sm.effects[si] = .{
+                    .kind = @intFromEnum(es.kind),
+                    .enabled = es.enabled,
+                    .mix = es.mix,
+                    .bands = bands,
+                };
+            }
+            sm.effect_count = @intCast(@min(mc.effects.items.len, sm.effects.len));
+            mix[i] = sm;
+        }
+        return mix;
+    }
+
+    /// 用存档切片恢复调音台通道（历史恢复 / 工程加载共用）
+    fn importMixerChannels(self: *App, mixer: []const persist.SavedMixerChannel) void {
+        if (mixer.len == 0) {
+            self.resetMixerChannels(default_mixer_channels);
+            return;
+        }
+        self.resetMixerChannels(@min(mixer.len, max_mixer_channels));
+        for (mixer[0..self.mixer_channels_state.items.len], 0..) |sm, i| {
+            self.mixer_channels_state.items[i].volume = sm.volume;
+            self.mixer_channels_state.items[i].pan = sm.pan;
+            self.mixer_channels_state.items[i].muted = sm.muted;
+            // 效果链：按 effect_count 恢复（0 = 旧存档：按 kind != 0 推断）
+            const n_eff: usize = if (sm.effect_count > 0)
+                @min(@as(usize, @intCast(sm.effect_count)), sm.effects.len)
+            else blk: {
+                var n: usize = 0;
+                for (sm.effects) |se| {
+                    if (se.kind != 0) n += 1;
+                }
+                break :blk n;
+            };
+            var se_i: usize = 0;
+            while (se_i < n_eff) : (se_i += 1) {
+                const se = sm.effects[se_i];
+                const kind: EffectKind = switch (se.kind) {
+                    1 => .eq,
+                    else => continue, // 未知类型跳过
+                };
+                const slot = self.addEffect(i, kind) orelse break;
+                const es = &self.mixer_channels_state.items[i].effects.items[slot];
+                es.enabled = se.enabled;
+                es.mix = se.mix;
+                // 段：按需复制（旧存档 4 段 → 剩下的段保留默认值）
+                const nb: usize = @min(se.bands.len, es.bands.len);
+                for (se.bands[0..nb], 0..) |b, bi| {
+                    es.bands[bi] = .{ .freq = b.freq, .gain_db = b.gain_db, .q = b.q };
+                }
+            }
+        }
     }
 
     /// 捕获当前状态为快照（调用方负责释放；失败返回 error）
@@ -1097,11 +1466,13 @@ pub const App = struct {
             };
             n += 1;
         }
+        const mixer = try self.exportMixerChannels(self.allocator);
         return .{
             .label = label_copy,
             .notes = notes,
             .clips = clips,
             .instruments = insts,
+            .mixer = mixer,
             .pattern_count = self.patternCount(),
             .bpm = self.bpm,
             .time_num = self.time_num,
@@ -1136,6 +1507,21 @@ pub const App = struct {
         }
         if (st.bpm != self.bpm or st.time_num != self.time_num or st.time_den != self.time_den) return false;
         if (st.pattern_count != self.patternCount()) return false;
+        // 调音台通道（数量/增益/声像/静音/效果链）——否则“添加通道/效果器”会被判无变化
+        if (st.mixer.len != self.mixer_channels_state.items.len) return false;
+        for (st.mixer, self.mixer_channels_state.items) |a, b| {
+            if (a.volume != b.volume or a.pan != b.pan or a.muted != b.muted) return false;
+            const bn: usize = @min(b.effects.items.len, a.effects.len);
+            if (a.effect_count != b.effects.items.len) return false;
+            for (0..bn) |si| {
+                const ae = a.effects[si];
+                const be = b.effects.items[si];
+                if (ae.kind != @intFromEnum(be.kind) or ae.enabled != be.enabled or ae.mix != be.mix) return false;
+                for (ae.bands, be.bands) |ab, bb| {
+                    if (ab.freq != bb.freq or ab.gain_db != bb.gain_db or ab.q != bb.q) return false;
+                }
+            }
+        }
         return true;
     }
 
@@ -1167,6 +1553,7 @@ pub const App = struct {
     fn applyHistoryState(self: *App, st: *const HistoryState) void {
         self.stopPlayback(); // 调度器引用旧数据：先停
         self.history_pending = null; // 拖动中的 coalesce 标记作废
+        self.history_pending_wheel = false; // 滚轮类 pending 一并作废
         // 拖动状态全部清空：撤销/重做后数据已换，旧拖动（及其快照/下标）
         // 会指向错误内容（下标可能越界）；用户需重新按下才能继续拖
         self.piano.drag_note = null;
@@ -1232,8 +1619,21 @@ pub const App = struct {
         self.time_num = st.time_num;
         self.time_den = st.time_den;
         self.steps_per_bar = st.steps_per_bar;
+        // 调音台通道（含效果链）
+        self.importMixerChannels(st.mixer);
         // 选择钳制
         if (self.sel.pattern >= self.patternCount()) self.sel.pattern = self.patternCount() - 1;
+        if (self.mixer_win.selected_channel >= @as(i32, @intCast(self.mixer_channels_state.items.len))) {
+            self.mixer_win.selected_channel = @intCast(@max(0, self.mixer_channels_state.items.len - 1));
+        }
+        // 效果器面板：目标可能已不存在 → 关闭
+        if (self.mixer_win.panel) |p| {
+            if (p.ch >= self.mixer_channels_state.items.len or
+                p.slot >= self.mixer_channels_state.items[p.ch].effects.items.len)
+            {
+                self.mixer_win.panel = null;
+            }
+        }
     }
 
     /// 撤销（Ctrl+Z）。返回是否成功。
@@ -1268,6 +1668,7 @@ pub const App = struct {
         for (self.history.items) |*st| self.freeHistoryState(st);
         self.history.clearRetainingCapacity();
         self.history_pending = null;
+        self.history_pending_wheel = false;
         if (self.captureHistory(label)) |st| {
             self.history.append(self.allocator, st) catch self.freeHistoryState(&st);
         } else |_| {}
@@ -1401,6 +1802,8 @@ pub const App = struct {
                 .synth = persist.exportSynth(inst.synth),
             };
         }
+        // 调音台通道（增益/声像/静音/效果链）——共用 `exportMixerChannels`
+        const mix = try self.exportMixerChannels(alloc);
         return .{
             .bpm = self.bpm,
             .time_num = self.time_num,
@@ -1410,15 +1813,29 @@ pub const App = struct {
             .clips = clips,
             .notes = notes,
             .instruments = insts,
+            .mixer = mix,
         };
     }
 
     /// 释放 `exportProject` 返回的存档（含内部字符串）
+    /// 释放存档切片里的调音台通道（含每效果的 bands 子切片）——多处共用
+    fn freeSavedMixerChannels(self: *App, mixer: []const persist.SavedMixerChannel) void {
+        for (mixer) |sm| {
+            for (sm.effects[0..@min(sm.effects.len, sm.effect_count)]) |se| {
+                if (se.bands.len > 0) self.allocator.free(se.bands);
+            }
+        }
+    }
+
     pub fn freeProject(self: *App, p: persist.Project) void {
         for (p.instruments) |inst| self.allocator.free(inst.name);
         self.allocator.free(p.clips);
         self.allocator.free(p.notes);
         self.allocator.free(p.instruments);
+        if (p.mixer.len > 0) {
+            self.freeSavedMixerChannels(p.mixer);
+            self.allocator.free(p.mixer);
+        }
     }
 
     /// 用存档替换当前工程内容（先清空旧数据）
@@ -1458,6 +1875,8 @@ pub const App = struct {
         self.time_num = p.time_num;
         self.time_den = p.time_den;
         self.steps_per_bar = p.steps_per_bar;
+        // 调音台通道：**动态数量**（旧存档无此字段 → 保持默认 2 个）——共用 `importMixerChannels`
+        self.importMixerChannels(p.mixer);
         // 样式列表：恢复到存档数量（旧存档无此字段 → 默认 6）
         self.resetPatterns(if (p.pattern_count > 0) p.pattern_count else model.default_pattern_count);
 
@@ -1881,12 +2300,158 @@ test "app: 批量拉伸——往回拖经过 0 格必须还原（修“卡在二
     try std.testing.expectEqual(@as(i32, 24), app.notes.items[0].len);
 }
 
+test "app: 滚轮类操作 coalesce（静默 0.6s 才提交一条历史）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+    const base = app.history.items.len;
+
+    // 模拟连续滚动：每帧改一点数据 + markWheelHistory（帧间隔小）
+    // 音频帧计数手动推进（测试里无真实音频）
+    var f: u64 = app.params.frames_played.load(.monotonic);
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        f += 1000; // 1k 帧/步（约 20ms）
+        app.params.frames_played.store(f, .monotonic);
+        // 真改数据（否则 commitHistory 判“无变化”而静默跳过）
+        app.mixer_channels_state.items[0].effects.append(app.allocator, .{ .kind = .eq }) catch {};
+        app.markWheelHistory("调整 EQ Q 值");
+        app.pollWheelHistory(); // 间隔远小于 0.6s → 不提交
+    }
+    try std.testing.expectEqual(base, app.history.items.len); // 还没提交
+
+    // 静默 ≥ 0.6s（= 28800 帧）→ 提交**一条**
+    f += app.params.sample_rate * 7 / 10;
+    app.params.frames_played.store(f, .monotonic);
+    app.pollWheelHistory();
+    try std.testing.expectEqual(base + 1, app.history.items.len); // 只多一条
+
+    // 再滚一轮（又会开新的一条）
+    f += 1000;
+    app.params.frames_played.store(f, .monotonic);
+    app.mixer_channels_state.items[0].effects.append(app.allocator, .{ .kind = .eq }) catch {};
+    app.markWheelHistory("调整 EQ Q 值");
+    f += app.params.sample_rate * 7 / 10;
+    app.params.frames_played.store(f, .monotonic);
+    app.pollWheelHistory();
+    try std.testing.expectEqual(base + 2, app.history.items.len);
+}
+
+test "app: 调音台——通道/效果器上移下移 + 删除通道（路由跟随）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(4);
+    _ = app.addInstrument("减法合成器");
+    _ = app.addInstrument("减法合成器");
+    // 乐器 0 → 通道 1；乐器 1 → 通道 2
+    app.instruments.items[0].mixer = 1;
+    app.instruments.items[1].mixer = 2;
+    app.resetHistory("初始状态");
+
+    // 给通道 1 加 2 个效果器（带可区分参数）
+    _ = app.addEffect(1, .eq);
+    _ = app.addEffect(1, .eq);
+    app.mixer_channels_state.items[1].effects.items[0].mix = 0.1;
+    app.mixer_channels_state.items[1].effects.items[1].mix = 0.9;
+
+    // 效果器下移：0 ↔ 1 交换
+    try std.testing.expect(app.moveEffect(1, 0, 1));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), app.mixer_channels_state.items[1].effects.items[0].mix, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), app.mixer_channels_state.items[1].effects.items[1].mix, 0.001);
+    // 已在末尾 → 不能再下移
+    try std.testing.expect(!app.moveEffect(1, 1, 1));
+    // 上移回来
+    try std.testing.expect(app.moveEffect(1, 1, -1));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), app.mixer_channels_state.items[1].effects.items[0].mix, 0.001);
+
+    // 通道下移：通道 1（含效果链）→ 2；**乐器路由跟随交换**
+    try std.testing.expect(app.moveMixerChannel(1, 1));
+    try std.testing.expectEqual(@as(usize, 2), app.mixer_channels_state.items[2].effects.items.len); // 链跟着走
+    try std.testing.expectEqual(@as(i32, 2), app.instruments.items[0].mixer); // 1 → 2
+    try std.testing.expectEqual(@as(i32, 1), app.instruments.items[1].mixer); // 2 → 1
+
+    // 删除通道 2（当前它带 2 个效果器）→ 路由补位；视图层会提交历史，测试里手动提交
+    try std.testing.expect(app.removeMixerChannel(2));
+    app.commitHistory("删除通道");
+    try std.testing.expectEqual(@as(usize, 3), app.mixer_channels_state.items.len);
+    // 原来路由到 2 的乐器 → 被钳到 2（现最大下标）
+    try std.testing.expectEqual(@as(i32, 2), app.instruments.items[0].mixer);
+
+    // 只剩 1 条时不能删
+    _ = app.removeMixerChannel(0);
+    _ = app.removeMixerChannel(0);
+    try std.testing.expectEqual(@as(usize, 1), app.mixer_channels_state.items.len);
+    try std.testing.expect(!app.removeMixerChannel(0));
+
+    // 撤销：删除通道可恢复（含效果链）——撤销最后一次**已提交**的操作
+    // （上面两次 removeMixerChannel 未提交历史，所以撤销回到“删除通道”之前 = 4 条）
+    try std.testing.expect(app.undo());
+    try std.testing.expectEqual(@as(usize, 4), app.mixer_channels_state.items.len);
+}
+
+test "app: 调音台——添加通道/效果器 + 撤销恢复（动态链）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    // 默认 2 条通道（主通道 + 通道#1）
+    try std.testing.expectEqual(@as(usize, 2), app.mixer_channels_state.items.len);
+
+    // 添加通道 → 3 条；提交历史
+    try std.testing.expect(app.addMixerChannel() != null);
+    app.commitHistory("添加通道");
+    try std.testing.expectEqual(@as(usize, 3), app.mixer_channels_state.items.len);
+
+    // 添加效果器（动态链）：第一条通道加 2 个
+    try std.testing.expect(app.addEffect(0, .eq) != null);
+    try std.testing.expect(app.addEffect(0, .eq) != null);
+    app.commitHistory("添加效果器");
+    try std.testing.expectEqual(@as(usize, 2), app.mixer_channels_state.items[0].effects.items.len);
+
+    // **撤销应恢复效果链**（回到 0 个效果器）
+    try std.testing.expect(app.undo());
+    try std.testing.expectEqual(@as(usize, 0), app.mixer_channels_state.items[0].effects.items.len);
+    // 再撤销 → 回到 2 条通道
+    try std.testing.expect(app.undo());
+    try std.testing.expectEqual(@as(usize, 2), app.mixer_channels_state.items.len);
+
+    // 重做 → 回到 3 条 + 2 个效果器
+    try std.testing.expect(app.redo());
+    try std.testing.expectEqual(@as(usize, 3), app.mixer_channels_state.items.len);
+    try std.testing.expect(app.redo());
+    try std.testing.expectEqual(@as(usize, 2), app.mixer_channels_state.items[0].effects.items.len);
+
+    // 删除效果器（中间删）
+    app.removeEffect(0, 0);
+    app.commitHistory("删除效果器");
+    try std.testing.expectEqual(@as(usize, 1), app.mixer_channels_state.items[0].effects.items.len);
+
+    // 通道上限：添到满
+    while (app.addMixerChannel() != null) {}
+    try std.testing.expectEqual(@as(usize, max_mixer_channels), app.mixer_channels_state.items.len);
+    try std.testing.expect(app.addMixerChannel() == null);
+}
+
 test "app: 撤销——合成器参数（ADSR）也恢复（修“调 ADSR 不产生历史”）" {
     var app = App{ .allocator = std.testing.allocator };
     defer app.clips.deinit(app.allocator);
     defer app.notes.deinit(app.allocator);
     defer app.deinitAll();
     app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
     _ = app.addInstrument("减法合成器");
     app.resetHistory("初始状态");
 
@@ -1912,6 +2477,7 @@ test "app: 撤销/重做——快照式（放置/删除/修改 + redo 截断 + �
     defer app.notes.deinit(app.allocator);
     defer app.deinitAll();
     app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
     _ = app.addInstrument("减法合成器");
     app.resetHistory("初始状态");
 
@@ -1981,6 +2547,7 @@ test "app: 撤销——乐器/全局设置（BPM、拍号、乐器增删）也�
     defer app.notes.deinit(app.allocator);
     defer app.deinitAll();
     app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
     _ = app.addInstrument("减法合成器");
     app.resetHistory("初始状态");
 

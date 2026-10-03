@@ -15,6 +15,39 @@ fn makeUi(fb: *r_mod.Framebuffer) Ui {
     return Ui.init(r_mod.Renderer.init(fb), fake_font);
 }
 
+test "ui: 旋钮值域——超出 0..1 的值也能拖回（Q 值卡最大值事故）" {
+    // 实测事故：Q 旋钮（0.1..4.0）误用 `knob`（内部 clamp 到 0..1）→
+    // 拖一下就被压到 1.0，之后再怎么拖都回不去（“拧不动/卡在最大值”）。
+    var buf: [60 * 40]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 60, .height = 40 };
+    var ui = makeUi(&fb);
+    const x: i32 = 10;
+    const y: i32 = 10;
+    const size: i32 = 20;
+
+    // `knobRange`：初值 1.0（范围内）→ 下拖应能降到 0.1 附近（不被钳到 0）
+    var q: f32 = 1.0;
+    ui.mouse_x = x + 10;
+    ui.mouse_y = y + 10;
+    ui.mouse_down = true;
+    ui.mouse_pressed = true;
+    _ = ui.knobRange(1, &q, x, y, size, 0.1, 4.0);
+    ui.endFrame();
+    // 下拖 120px → 减 1.0 个量程（range=3.9 → 3.9）→ 1.0-3.9 = -2.9 → 钳到 0.1
+    ui.mouse_y = y + 10 + 120;
+    ui.mouse_down = true;
+    ui.mouse_pressed = false;
+    _ = ui.knobRange(1, &q, x, y, size, 0.1, 4.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), q, 0.01);
+    ui.endFrame();
+
+    // 再上拖 → 能回升（不是“卡住”）
+    ui.mouse_y = y + 10;
+    _ = ui.knobRange(1, &q, x, y, size, 0.1, 4.0);
+    try std.testing.expect(q > 0.5);
+    ui.endFrame();
+}
+
 test "游标：三角的不变量（居中、1px 尖端、不越出标尺行）" {
     // 注：三角宽度是**装饰性常量**（可随时微调）——本测试只验不变量，
     // 不硬编码宽度（否则调外观就挂）。
@@ -566,6 +599,69 @@ test "ui: 层系统——beginLayer 自动收窄绘制裁剪区" {
     try std.testing.expectEqual(r_mod.rgb(0, 0, 0), buf[40 * 100 + 40]);
 }
 
+test "ui: 层系统——多窗口各自独立层（同 prio 不会互相顶掉、无点击穿透）" {
+    // 实测事故：合成器与调音台曾都用 prio 2——`declare` 对同 prio 是**覆盖**，
+    // 后声明的把先声明的层顶掉 → 被顶那层矩形不在表里 → 鼠标在其上时不被屏蔽
+    // → 点击穿透到下层（“三者同开时击穿减法合成器”）。
+    // 修法：每窗口独立 prio（= z 序位次）。本测试锁死该不变量。
+    var buf: [400 * 300]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 400, .height = 300 };
+    var ui = makeUi(&fb);
+
+    // 三个窗口矩形（互不重叠便于断言）：
+    //   下：合成器 (10,10)-(110,60)；上：调音台 (150,10)-(250,60)；机架 (10,100)-(110,150)
+    ui.resetLayers();
+    _ = ui.declare(.{ .prio = 0, .rect = .{ .x = 0, .y = 0, .w = 400, .h = 300 } });
+    _ = ui.declare(.{ .prio = 1, .rect = .{ .x = 10, .y = 100, .w = 100, .h = 50 } }); // 机架
+    _ = ui.declare(.{ .prio = 2, .rect = .{ .x = 10, .y = 10, .w = 100, .h = 50 } }); // 合成器
+    _ = ui.declare(.{ .prio = 3, .rect = .{ .x = 150, .y = 10, .w = 100, .h = 50 } }); // 调音台
+    try std.testing.expectEqual(@as(usize, 4), ui.layer_n); // 四个层都在（无覆盖）
+
+    // 鼠标在合成器上：合成器层可响应（未被调音台顶掉）、主界面被屏蔽
+    ui.mouse_x = 60;
+    ui.mouse_y = 35;
+    try std.testing.expect(!ui.beginLayer(0));
+    ui.endLayer();
+    try std.testing.expect(ui.beginLayer(2)); // 合成器：**能**响应（修好前会因层被顶掉而误判）
+    ui.endLayer();
+    // 调音台在合成器之上：鼠标不在其矩形内 → 仍可响应
+    try std.testing.expect(ui.beginLayer(3));
+    ui.endLayer();
+
+    // 鼠标在调音台上：调音台可响应，合成器被屏蔽
+    ui.mouse_x = 200;
+    ui.mouse_y = 35;
+    try std.testing.expect(!ui.beginLayer(2));
+    ui.endLayer();
+    try std.testing.expect(ui.beginLayer(3));
+    ui.endLayer();
+}
+
+test "ui: 层系统——高 prio 窗口矩形内屏蔽低 prio 窗口（防穿透）" {
+    var buf: [400 * 300]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 400, .height = 300 };
+    var ui = makeUi(&fb);
+
+    // 两窗口**重叠**（模拟合成器/调音台叠在一起）
+    ui.resetLayers();
+    _ = ui.declare(.{ .prio = 0, .rect = .{ .x = 0, .y = 0, .w = 400, .h = 300 } });
+    _ = ui.declare(.{ .prio = 1, .rect = .{ .x = 50, .y = 50, .w = 200, .h = 100 } }); // 下（合成器）
+    _ = ui.declare(.{ .prio = 2, .rect = .{ .x = 100, .y = 50, .w = 200, .h = 100 } }); // 上（调音台）
+
+    // 重叠区（x=150）：上层可响应，**下层被屏蔽**（不穿透）
+    ui.mouse_x = 150;
+    ui.mouse_y = 100;
+    try std.testing.expect(!ui.beginLayer(1)); // 下层被上层矩形屏蔽
+    ui.endLayer();
+    try std.testing.expect(ui.beginLayer(2));
+    ui.endLayer();
+    // 非重叠区（x=70）：下层可响应（上层矩形不覆盖）
+    ui.mouse_x = 70;
+    ui.mouse_y = 100;
+    try std.testing.expect(ui.beginLayer(1));
+    ui.endLayer();
+}
+
 // ── 缩放下限的被动抬高不得改动用户缩放 ──
 
 test "ui: 内容缩短后不自动回缩（缩放量不被被动钳制）" {
@@ -682,4 +778,23 @@ test "ui: 指数式推子（拍号分母）——拖 1 单位翻倍、无吸附�
     exp += 1;
     den = @as(i32, 1) << @intCast(exp);
     try std.testing.expectEqual(@as(i32, 16), den);
+}
+
+// ── 字符串格式化：不能自别名 ──
+
+test "fmt: 增量拼接要把上一个结果留在**别的**缓冲（自别名会 panic）" {
+    // 实测事故：效果器面板标题拼乐器名时写成
+    //   names = bufPrint(&buf, "{s}+", .{names});
+    // 第二次时 names 已指向同一 buf → 源与目标别名 → “@memcpy arguments alias”
+    // 运行时 panic（两个乐器都路由到同通道时必崩）。
+    // 本测试用**正确写法**（前一个结果存独立缓冲）验证不 panic 且内容正确。
+    var buf_a: [64]u8 = undefined;
+    var buf_b: [64]u8 = undefined;
+    const n1 = try std.fmt.bufPrint(&buf_a, "{s}", .{"减法合成器"});
+    const n2 = try std.fmt.bufPrint(&buf_b, "{s} +1", .{n1});
+    try std.testing.expectEqualStrings("减法合成器 +1", n2);
+
+    // 格式化源来自**另一**缓冲时，可以回写第一个缓冲区（不构成别名）
+    const n3 = try std.fmt.bufPrint(&buf_a, "{s}", .{n2});
+    try std.testing.expectEqualStrings("减法合成器 +1", n3);
 }

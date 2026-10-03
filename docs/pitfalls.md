@@ -297,6 +297,29 @@ if (ui.mouse_pressed and !inRect(mouse, 菜单区)) open.* = false;  // ② 鼠�
 **修法**：把“本帧是否点了按钮”传给菜单，那一帧**跳过外部关闭判断**：
 `if (!skip_close and ui.mouse_pressed and !inRect(...)) open.* = false;`
 
+#### “按钮 → 下拉菜单”三件套（踩过两遍的完整清单）
+
+同一套交互我在不同地方写了两遍，**两遍各踩一个坑**——这类控件有
+三个必须同时做对的点：
+
+1. **跳过开启帧的“点外部关闭”**（上面那一条：菜单闪一下消失）；
+2. **位置只在开启帧快照，之后固定**——若每帧取鼠标位置：
+   菜单会跟着鼠标跑（“钓竿上的胡萝卜”，永远点不到）；
+   ```zig
+   // ✗ 每帧取鼠标 → 菜单追着鼠标跑
+   var mx = ui.mouse_x;
+   // ✓ 开启帧快照进状态，之后每帧读状态
+   if (just_opened) { st.menu_x = ui.mouse_x; st.menu_y = ui.mouse_y + 6; }
+   const mx = st.menu_x;
+   ```
+3. **“刚打开”标记必须每帧重置**（`menuFrameBegin`）——否则第二帧起
+   “点外部关闭”永久失效（菜单再也关不掉）。
+
+**根修法：抽成共享控件**（`view_util.menuButton` / `menuPanel`）——
+三件事都已在 helper 内部处理对，每个新下拉菜单不再重复踩坑。
+（注：`snapSelector*` / `titleSelector*` 是另一套“锚在按钮上”的选择器，
+它们的位置天然固定，不会踩坑 2；但坑 1/3 同样适用。）
+
 ### 浮动窗口的“点击穿透”：输入分层必须在帧首决定
 
 立即式 UI 里**绘制顺序 = 事件处理顺序**：底层面板先绘制、先响应。
@@ -651,6 +674,29 @@ if (app.history_pending) |label| {      // 帧末（主循环）
 
 **教训**：快照式撤销的三个坑：拖动 coalesce、恢复时清瞬态、等价判定忽略瞬态。
 
+### 音频效果链路的“陈旧快照”陷阱（频谱分析）
+
+回调里的频谱分析（`analyzeSpectrum`）用滑动窗：每 8 帧抽 1 个样本入窗，
+窗长 256。原实现只在“窗写指针恰为 0”时分析——而**块长 % 窗长 通常不整除**，
+就此几乎永不触发（实测 bug：测试里频谱恒为 0，UI 背景永远空白）。
+
+```zig
+// ✗ 要求块结束时 pos == 0（2400 % 256 = 96 → 永不满足）
+if (engine.spec_pos != 0) return;
+// ✓ 本块内写过一轮就分析（置 filled_this_block 标记）
+var filled = false;
+... if (engine.spec_pos == 0) filled = true; ...
+if (!filled) return;
+```
+另：窗内样本必须**按写指针重排**（写指针处 = 最旧样本），否则分析的是错位的窗口。
+**教训**：环形缓冲的“写完一轮”判定不能依赖“恰好回到 0”——要显式记标记。
+
+### 频谱幅度必须归一化（2/N）
+
+FFT 幅度未归一化时，任意信号都不会恰好“满刻度”：大幅信号全部撞上限、
+柱间无法区分（实测：测试断言恒不成立）。按 `2/N` 归一化后（单幅正弦
+= 1.0 → 0dB），-60..0dB 的映射才有意义。
+
 ## 音频
 
 ### 实时回调的约束
@@ -663,3 +709,25 @@ if (app.history_pending) |label| {      // 帧末（主循环）
 
 Windows 上会打印大量 `SarMMDeviceEnumerator` / `mmwrapper.cpp` 日志——
 **这是音频驱动（不是 miniaudio）的输出**，属正常现象。
+
+### `bufPrint` 不能自别名（“@memcpy arguments alias” panic）
+
+症状：打开效果器面板时崩溃（两个乐器都路由到同一通道时必现）：
+`thread panic: @memcpy arguments alias`（strip 后无行号，很难定位）。
+
+```zig
+// ✗ 增量拼接：第二次时 inst_names 已指向 inst_names_buf
+//    → 源与目标同一块内存 → 运行时 panic
+if (n > 0) inst_names = std.fmt.bufPrint(&inst_names_buf, "{s}+", .{inst_names}) catch ...;
+
+// ✓ 方案 A：源留在**另一**缓冲（交错使用两个缓冲）
+// ✓ 方案 B（本处采用）：**不用增量拼接**——先扫描得到首名与总数，一次成型
+var first: ?[]const u8 = null;
+var total: usize = 0;
+for (items) |it| { if (!match(it)) continue; if (total == 0) first = it.name; total += 1; }
+const names = if (total == 1) first.? else
+    std.fmt.bufPrint(&buf, "{s} +{d}", .{ first.?, total - 1 }) catch first.?;
+```
+**教训**：`bufPrint` 的目标只能是“与所有源都无重叠”的缓冲。
+“把上次结果接上后缀”这种增量拼接尤其危险（看起来对，第二帧/第二个元素才炸）。
+更稳的直觉：**要拼接就先收集再格式化**，别在同一个栈缓冲上反复写读。

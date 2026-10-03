@@ -50,7 +50,8 @@ pub const Instrument = struct {
     volume: f32 = 0.8, // 0-1
     pan: f32 = 0.5, // 0-1（0.5 = 居中）
     muted: bool = false,
-    mixer: i32 = 1, // 混音通道（占位）
+    /// 混音通道（**0 起**，对应调音台通道序号 0..n-1）
+    mixer: i32 = 0,
     /// MIDI 通道（0-15；-1 = 无）——MIDI 导入时记住来源通道，
     /// 导出时优先按它写通道号（保证往返稳定）；手动建的乐器 = -1（导出用序号 mod 16）
     midi_channel: i32 = -1,

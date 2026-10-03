@@ -166,7 +166,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     {
         const kh = app.piano.key_h;
         // 菜单展开中 → 琴键不响应（机架的下拉/右键菜单，以及卷帘自己的两个选单）
-        const menu_blocks = app.rack.add_menu_open or app.rack.ctx_instrument != null or
+        const menu_blocks = app.rack.menu_open or app.rack.ctx_instrument != null or
             app.piano.inst_menu_open or app.piano.snap_menu_open;
         const in_keys = !menu_blocks and ui.hitRect(keys_x, lane_y, util.piano_header_w, lane_h);
         const over_other_drag = ui.active_id != 0 and ui.active_id != 6000;

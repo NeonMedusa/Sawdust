@@ -6,7 +6,8 @@
 const std = @import("std");
 const r_mod = @import("render.zig");
 const Ui = @import("ui.zig").Ui;
-const App = @import("app.zig").App;
+const app_mod = @import("app.zig");
+const App = app_mod.App;
 const model = @import("model.zig");
 const util = @import("view_util.zig");
 
@@ -39,7 +40,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
     // （否则菜单项点击会穿透到下面的行/按钮）。
     // 注意：**不覆盖**“被上层窗口屏蔽”的状态（那是 beginLayer 算的；
     // 上面用 or 合幷而不直接赋值）。
-    const menu_modal = menu_was_open or app.rack.add_menu_open or app.rack.ctx_instrument != null;
+    const menu_modal = menu_was_open or app.rack.menu_open or app.rack.ctx_instrument != null;
     if (menu_modal) ui.input_blocked = true;
 
     // 窗口阴影 + 背景 + 边框
@@ -57,9 +58,14 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
     ui.label("×", close_x + 6, title_y + 4, ui.theme.text);
     if (close_hovered and ui.mouse_pressed) {
         rk.open = false;
-        app.rack.add_menu_open = false;
+        app.rack.menu_open = false;
         app.rack.ctx_instrument = null;
         return true;
+    }
+
+    // 点窗口内任意处 → 置顶（“点谁谁在上”；在层系统判定前提升，本帧即生效）
+    if (rk.open and util.inRect(ui.mouse_x, ui.mouse_y, x, y, ww, hh) and ui.mouse_pressed) {
+        app.bringToFront(&rk.z);
     }
 
     // 标题拖动
@@ -121,46 +127,26 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
         }
     }
 
-    // ── 添加按钮 ──
+    // 帧首：清“刚打开”标记（共享下拉控件；必须逐帧做）
+    util.menuFrameBegin(&app.rack.menu_just_opened);
+
+    // ── 添加按钮（共享下拉控件：按钮 + 菜单）──
     const add_x = x + 1;
     const add_y = y + hh - add_btn_h - 1;
     const add_w = ww - 2;
-    const add_hovered = util.hitUI(ui, add_x, add_y, add_w, add_btn_h);
-    ui.renderer.fillRect(add_x, add_y, add_w, add_btn_h, if (add_hovered) ui.theme.item_hover else ui.theme.bg);
-    ui.renderer.strokeRect(add_x, add_y, add_w, add_btn_h, ui.theme.panel_border);
-    ui.label("+ 添加乐器", add_x + 8, add_y + 3, ui.theme.text_dim);
-    if (add_hovered and ui.mouse_pressed) {
-        app.rack.add_menu_open = !app.rack.add_menu_open;
-        app.rack.ctx_instrument = null;
-    }
+    util.menuButton(ui, "+ 添加乐器", add_x, add_y, add_w, add_btn_h, &app.rack.menu_open, &app.rack.menu_just_opened);
 
-    // 添加下拉菜单（插件列表；目前只有减法合成器占位）——菜单层：
-    // 菜单展开时取消屏蔽（菜单项用直接坐标命中）
-    if (app.rack.add_menu_open) ui.input_blocked = false;
-    if (app.rack.add_menu_open) {
+    // 下拉菜单（插件列表；菜单层：展开时取消屏蔽——菜单项用直接坐标命中）
+    if (app.rack.menu_open) {
+        ui.input_blocked = false;
         const menu_items = [_][]const u8{ "减法合成器 (Subtractive)", "采样器 (Sampler)", "FM 合成器" };
-        const mw: i32 = 240;
-        const mh: i32 = @as(i32, @intCast(menu_items.len)) * util.menu_item_h + 4;
-        var my = add_y - mh; // 向上展开（添加按钮在底部）
-        if (my < 0) my = add_y + add_btn_h;
-        const mx = add_x + 8;
-        ui.renderer.fillRect(mx, my, mw, mh, ui.theme.panel);
-        ui.renderer.strokeRect(mx, my, mw, mh, ui.theme.accent);
-        for (menu_items, 0..) |item, mi| {
-            const iy = my + 2 + @as(i32, @intCast(mi)) * util.menu_item_h;
-            // 注：菜单为最高层（层系统已保证被它盖住的下层不响应）；此处直接命中
-            const ih = util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, mw - 2, util.menu_item_h);
-            if (ih) ui.renderer.fillRect(mx + 1, iy, mw - 2, util.menu_item_h, ui.theme.item_hover);
-            ui.label(item, mx + 8, iy + 2, if (mi == 0) ui.theme.text else ui.theme.text_dim);
-            if (ih and ui.mouse_pressed) {
+        const ok = [_]bool{ true, false, false };
+        if (util.menuPanel(ui, &app.rack.menu_x, &app.rack.menu_y, &app.rack.menu_open, app.rack.menu_just_opened, .{ .button = .{ .x = add_x + 8, .y = add_y, .w = add_w, .h = add_btn_h } }, .{ .x = x, .y = y, .w = ww, .h = hh }, &menu_items, 240, &ok)) |mi| {
+            if (mi == 0) {
                 _ = app.addInstrument("减法合成器");
-                app.rack.add_menu_open = false;
                 app.commitHistory("添加乐器"); // 原子操作：立即提交
             }
         }
-        // 点菜单外关闭（直接坐标；add_hovered 被屏蔽时无效）
-        const over_add = util.inRect(ui.mouse_x, ui.mouse_y, add_x, add_y, add_w, add_btn_h);
-        if (ui.mouse_pressed and !util.inRect(ui.mouse_x, ui.mouse_y, mx, my, mw, mh) and !over_add) app.rack.add_menu_open = false;
     }
 
     // 右键菜单（删除乐器）——同理：仅在展开时取消屏蔽
@@ -227,12 +213,45 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, x: i32, y: i32, w: i32, clip_top: i32
     if (ui.knob(4000 + @as(u64, idx) * 2 + 1, &inst.volume, cx, ky, util.rack_knob_size)) app.history_pending = "调整乐器音量";
     cx += util.rack_knob_size + 10;
 
-    // 混音通道
-    var buf: [8]u8 = undefined;
-    const mix_t = std.fmt.bufPrint(&buf, "{d}", .{inst.mixer}) catch "";
-    ui.renderer.fillRect(cx, y + 4, util.rack_mix_w, util.rack_row_h - 8, ui.theme.slider_track);
-    ui.renderer.strokeRect(cx, y + 4, util.rack_mix_w, util.rack_row_h - 8, ui.theme.panel_border);
-    ui.labelClipped(mix_t, cx + 4, y + @divTrunc(util.rack_row_h - 10, 2), util.rack_mix_w - 6, ui.theme.text_dim);
+    // 混音通道（**推子式**：上下拖动改路由通道 0..n-1；点击不拖动 = 平推）
+    // 上界 = **实际通道数 - 1**（不再固定 8——否则通道只有 0..3 时能拖到 4，实测 bug）
+    {
+        const mix_x = cx;
+        const mix_y = y + 4;
+        const mix_h = util.rack_row_h - 8;
+        const hovered = util.hitUI(ui, mix_x, mix_y, util.rack_mix_w, mix_h);
+        const active = ui.active_id == 4100 + @as(u64, idx);
+        ui.renderer.fillRect(mix_x, mix_y, util.rack_mix_w, mix_h, if (active) ui.theme.accent else if (hovered) ui.theme.item_hover else ui.theme.slider_track);
+        ui.renderer.strokeRect(mix_x, mix_y, util.rack_mix_w, mix_h, ui.theme.panel_border);
+        // 通道号（1 起显示）
+        var buf: [8]u8 = undefined;
+        const mix_t = std.fmt.bufPrint(&buf, "{d}", .{inst.mixer}) catch "";
+        const tw: i32 = @intFromFloat(ui.font.measure(mix_t));
+        ui.label(mix_t, mix_x + @divTrunc(util.rack_mix_w - tw, 2), mix_y + @divTrunc(mix_h - 10, 2), ui.theme.text);
+        // 推子交互：按下 → 捕获；上下拖动 = 通道增减；吸附到 1..8
+        if (hovered and ui.mouse_pressed) {
+            ui.active_id = 4100 + @as(u64, idx);
+            ui.mouse_capture = true; // 隐藏/冻结鼠标（推子手感）
+            ui.zoom_last_dy = ui.frozen_dy;
+        }
+        if (ui.active_id == 4100 + @as(u64, idx)) {
+            if (!ui.mouse_down) {
+                ui.active_id = 0;
+                ui.mouse_capture = false;
+            } else {
+                const dd = ui.frozen_dy - ui.zoom_last_dy;
+                ui.zoom_last_dy = ui.frozen_dy;
+                // 上拖减小通道号、下拖增大（-20px/通道）
+                const n_mixer: i32 = @intCast(app.mixer_channels_state.items.len);
+                var v = inst.mixer - @divTrunc(dd, 20);
+                v = std.math.clamp(v, 0, @max(0, n_mixer - 1));
+                if (v != inst.mixer) inst.mixer = v; // 拖动中实时生效
+            }
+        }
+        // 松开时统一提交历史（拖动中 coalesce）
+        if (hovered and ui.mouse_released) app.history_pending = "调整混音通道";
+        if (active and !ui.mouse_down) app.history_pending = "调整混音通道";
+    }
     cx += util.rack_mix_w + 8;
 
     // 名称（点击选中；双击打开合成器；右键删除）
