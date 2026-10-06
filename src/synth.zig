@@ -123,6 +123,16 @@ pub const SchedEvent = struct {
     gen: u32 = 0,
 };
 
+/// 调度事件排序：步升序；**同一步 off 先于 on**（允许同音高快速重触发）。
+/// 序列器 gather 与音频 stash 共用（播放中补发的事件会乱序到达——
+/// 见 `sequencer.scheduleAdded` 与 `audio.stashInsert`）。
+pub fn schedEventLess(_: void, a: SchedEvent, b: SchedEvent) bool {
+    if (a.step != b.step) return a.step < b.step;
+    const pa: u8 = if (a.kind == .off) 0 else 1;
+    const pb: u8 = if (b.kind == .off) 0 else 1;
+    return pa < pb;
+}
+
 /// 无锁单生产者单消费者（SPSC）环形队列：UI 线程 push、音频线程 drain。
 pub fn Ring(comptime T: type, comptime capacity: usize) type {
     return struct {

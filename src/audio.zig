@@ -235,6 +235,24 @@ fn handleGenChange(engine: *Engine, gen: u32, was_playing: bool) void {
     }
 }
 
+/// 按步序插入一个调度事件（保持 stash 有序）。
+///
+/// 为什么不是追加：播放中补发的新增音符事件可能**早于**已 stash 的事件
+/// （如新增音符在窗口最前端——见 `sequencer.scheduleAdded`）；
+/// 追加会被前面的事件挡着，拖到很晚才触发（表现：补发的 on 迟到/整段不响）。
+/// 插不进去（stash 满）时丢弃——宁可丢一个事件也不阻塞音频线程；
+/// stash 溢出本身会由下一块的重扫/正常排水自愈。
+fn stashInsert(engine: *Engine, ev: synth.SchedEvent) void {
+    if (engine.stash_n >= engine.stash.len) return; // 满：丢弃
+    // 从尾部往前找插入点（stash 已按步序）
+    var i: usize = engine.stash_n;
+    while (i > 0 and synth.schedEventLess({}, ev, engine.stash[i - 1])) : (i -= 1) {
+        engine.stash[i] = engine.stash[i - 1];
+    }
+    engine.stash[i] = ev;
+    engine.stash_n += 1;
+}
+
 /// 回传“正在发声的音高”（位掩码；UI 用于播放/试听高亮）
 fn publishSounding(engine: *Engine, params: *Params) void {
     for (0..synth.max_instruments) |i| {
@@ -454,14 +472,15 @@ fn dataCallback(
 
     // 4) 播放：stash 管理 + 样本级事件触发
     if (gen != engine.stash_gen) handleGenChange(engine, gen, was_playing);
-    // 尽量多取新事件（stash 有空位时）
+    // 尽量多取新事件（stash 有空位时）。**按步序插入**（不是追加）：
+    // 播放中补发的新增音符事件可能落在已 stash 的事件之前
+    // （见 `sequencer.scheduleAdded`）——追加的话它们会被前面的事件挡着，
+    // 拖到很晚才触发（表现：新增音符的 on 迟到/整段不响）。
     if (engine.stash_n < engine.stash.len) {
-        const space = engine.stash.len - engine.stash_n;
         var tmp: [synth.sched_drain_max]synth.SchedEvent = undefined;
-        const want = @min(space, tmp.len);
+        const want = @min(engine.stash.len - engine.stash_n, tmp.len);
         const got = params.sched_events.drain(tmp[0..want]);
-        @memcpy(engine.stash[engine.stash_n .. engine.stash_n + got], tmp[0..got]);
-        engine.stash_n += got;
+        for (tmp[0..got]) |ev| stashInsert(engine, ev);
     }
 
     const abs0 = params.frames_played.load(.monotonic);

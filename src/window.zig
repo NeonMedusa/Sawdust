@@ -91,6 +91,11 @@ const WindowsWindow = struct {
     pub fn init(self: *WindowsWindow, allocator: std.mem.Allocator, title: []const u8, width: u32, height: u32) !void {
         self.* = WindowsWindow{ .allocator = allocator };
 
+        // 提升系统计时器精度到 1ms（**必须**：默认粒度 ≈ 15.6ms，
+        // `Io.sleep(8ms)` 实测睡成 ~15.6ms、`sleep(16ms)` 睡成 ~26ms——
+        // 帧率被腰斩，表现为“UI 不流畅/操作滞后”。实测数据见 docs/pitfalls.md）
+        _ = timeBeginPeriod(1);
+
         // DPI 感知（避免系统缩放导致模糊）
         _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
@@ -144,6 +149,8 @@ const WindowsWindow = struct {
     }
 
     pub fn deinit(self: *WindowsWindow) void {
+        // 恢复系统计时器精度（与 init 的 timeBeginPeriod(1) 配对）
+        _ = timeEndPeriod(1);
         if (self.hbitmap) |hb| {
             if (self.hdc_mem) |dc| {
                 if (self.old_bitmap) |ob| _ = SelectObject(@ptrCast(dc), @ptrCast(ob));
@@ -612,6 +619,9 @@ extern "user32" fn DestroyCursor(*anyopaque) callconv(.winapi) i32;
 extern "user32" fn SetCapture(*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "user32" fn ReleaseCapture() callconv(.winapi) i32;
 extern "user32" fn SetProcessDpiAwarenessContext(?*anyopaque) callconv(.winapi) i32;
+// winmm：提升系统计时器精度（默认 15.6ms 粒度会把 sleep(8ms) 拉成 ~15.6ms）
+extern "winmm" fn timeBeginPeriod(uPeriod: u32) callconv(.winapi) u32;
+extern "winmm" fn timeEndPeriod(uPeriod: u32) callconv(.winapi) u32;
 extern "user32" fn GetSystemMetrics(i32) callconv(.winapi) i32;
 extern "gdi32" fn CreateCompatibleDC(?*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "gdi32" fn DeleteDC(*anyopaque) callconv(.winapi) i32;

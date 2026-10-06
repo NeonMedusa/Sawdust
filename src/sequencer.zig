@@ -5,7 +5,10 @@
 //!   窗口内的音符开关事件推入 `SchedQueue`；
 //! - 音频线程按播放步边界精确触发（时序不受 UI 帧率抖动影响）；
 //! - transport 变化（开始/跳转）→ `reset`：gen 递增作废旧事件，并为
-//!   「跨起点的长音符」补发 note-on（从音符中间开始播放会触发它）。
+//!   「跨起点的长音符」补发 note-on（从音符中间开始播放会触发它）；
+//! - 播放中**新增内容**（放置/克隆/粘贴）→ `scheduleAdded`：水位线只前进
+//!   不回头，落在“已扫过窗口”的新增音符必须补发事件，否则永远不会被调度
+//!   （实测 bug：播放中追加到游标前方的音符不响）。
 //!
 //! 坐标：全局步（0 = 第 1 小节第 1 步；每小节 16 步）。
 //! - SONG：片段窗口 = `[(bar-1)*16, (bar-1)*16 + len*16)`；音符全局位置 =
@@ -25,14 +28,6 @@ pub const Scheduler = struct {
 
 /// 单次 gather 上限（超出时截断窗口，剩余下一帧再调度）
 const max_gather = 512;
-
-fn evLess(_: void, a: synth.SchedEvent, b: synth.SchedEvent) bool {
-    if (a.step != b.step) return a.step < b.step;
-    // 同一步：off 先于 on（允许同音高快速重触发）
-    const pa: u8 = if (a.kind == .off) 0 else 1;
-    const pb: u8 = if (b.kind == .off) 0 else 1;
-    return pa < pb;
-}
 
 fn pushEv(evs: []synth.SchedEvent, n: *usize, ev: synth.SchedEvent) bool {
     if (n.* >= evs.len) return false;
@@ -172,7 +167,7 @@ pub fn reset(
     var evs: [max_gather]synth.SchedEvent = undefined;
     var n: usize = 0;
     gatherMidOns(&evs, &n, clips, notes, song_mode, pattern, from_step, sched.gen);
-    std.mem.sort(synth.SchedEvent, evs[0..n], {}, evLess);
+    std.mem.sort(synth.SchedEvent, evs[0..n], {}, synth.schedEventLess);
     for (evs[0..n]) |ev| queue.push(ev);
 }
 
@@ -194,7 +189,7 @@ pub fn scheduleRange(
     var n: usize = 0;
     var max_step: i32 = from - 1;
     gatherRange(&evs, &n, &max_step, clips, notes, song_mode, pattern, from, to, sched.gen);
-    std.mem.sort(synth.SchedEvent, evs[0..n], {}, evLess);
+    std.mem.sort(synth.SchedEvent, evs[0..n], {}, synth.schedEventLess);
     for (evs[0..n]) |ev| queue.push(ev);
 
     // 截断保护：gather 满时只推进到最后一个事件所在步
@@ -203,6 +198,90 @@ pub fn scheduleRange(
     } else {
         sched.scheduled_upto = to;
     }
+}
+
+/// 播放中**新增内容**（放置/克隆/粘贴）的补发调度
+/// （水位线只前进不回头——见 `scheduleRange`）：
+/// 新增音符/片段落在「已扫过窗口」`[cur, scheduled_upto)` 时，其 on/off
+/// 永远不会被 gather 到（实测 bug：播放中追加到游标前方的音符不响）。
+///
+/// **只补新增、不作废旧事件**——纯增量，无双触发/悬挂风险：
+/// - 新增音符映射完全在游标之前（`end <= cur`）→ 跳过（过去的位置不发声）；
+/// - 映射 `start >= 水位线` → 跳过（窗口推进时会正常 gather）；
+/// - 否则补 `on@max(start, cur)`（跨游标的新增立即发声）；
+///   `off@end` 仅当 `end < 水位线`（≥ 水位线的由窗口 gather，避免重复）。
+///
+/// 补发事件的步序可能落在**已入队事件之前**——音频侧 stash 按步序
+/// **插入**（`audio.stashInsert`），否则会被前面的事件挡着、很晚才触发。
+///
+/// SONG：新增音符经**所有**含其样式的片段映射（与 gather 一致）；
+/// 新增片段则把其样式的**全部**音符经该片段映射。
+/// PAT：只看新增音符（片段不参与 PAT 播放）。
+/// 返回 false = 事件数超缓冲上限（调用方退化为 `reset` 全量重扫）。
+pub fn scheduleAdded(
+    sched: *Scheduler,
+    queue: *synth.SchedQueue,
+    clips: []const model.Clip,
+    notes: []const model.Note,
+    added_clips: []const model.Clip,
+    added_notes: []const model.Note,
+    song_mode: bool,
+    pattern: i32,
+    cur: i32,
+) bool {
+    const watermark = sched.scheduled_upto;
+    var evs: [max_gather]synth.SchedEvent = undefined;
+    var n: usize = 0;
+
+    if (song_mode) {
+        // 新增音符：在所有含该样式的片段里补发
+        for (clips) |clip| {
+            for (added_notes) |nt| {
+                if (nt.pattern != clip.pattern) continue;
+                const m = mapSong(clip, nt) orelse continue;
+                if (!pushAdded(&evs, &n, nt, m, cur, watermark, sched.gen)) return false;
+            }
+        }
+        // 新增片段：其样式的全部音符经该片段补发
+        // （**跳过新增音符**——它们在上一循环经同一片段已补发，会重复）
+        for (added_clips) |clip| {
+            for (notes) |nt| {
+                if (nt.pattern != clip.pattern) continue;
+                if (noteInList(added_notes, nt)) continue;
+                const m = mapSong(clip, nt) orelse continue;
+                if (!pushAdded(&evs, &n, nt, m, cur, watermark, sched.gen)) return false;
+            }
+        }
+    } else {
+        for (added_notes) |nt| {
+            if (nt.pattern != pattern) continue;
+            const m = mapPat(nt) orelse continue;
+            if (!pushAdded(&evs, &n, nt, m, cur, watermark, sched.gen)) return false;
+        }
+    }
+    std.mem.sort(synth.SchedEvent, evs[0..n], {}, synth.schedEventLess);
+    for (evs[0..n]) |ev| queue.push(ev);
+    return true;
+}
+
+/// 音符是否在列表中（内容比对；新增去重用）
+fn noteInList(list: []const model.Note, nt: model.Note) bool {
+    for (list) |o| {
+        if (o.step == nt.step and o.len == nt.len and o.pitch == nt.pitch and
+            o.pattern == nt.pattern and o.instrument == nt.instrument) return true;
+    }
+    return false;
+}
+
+/// `scheduleAdded` 的单音符事件收集（规则见其文档注释）。
+fn pushAdded(evs: []synth.SchedEvent, n: *usize, nt: model.Note, m: Mapped, cur: i32, watermark: i32, gen: u32) bool {
+    if (m.end <= cur) return true; // 完全在过去：不发声
+    if (m.start >= watermark) return true; // 水位线会扫到
+    if (!pushEv(evs, n, makeEv(nt, .on, @max(m.start, cur), gen))) return false;
+    if (m.end < watermark) {
+        if (!pushEv(evs, n, makeEv(nt, .off, m.end, gen))) return false;
+    }
+    return true;
 }
 
 // ── 测试 ──
@@ -351,4 +430,118 @@ test "sequencer: gen 递增作废旧事件" {
         if (ev.gen == s.gen) saw_new_gen = true;
     }
     try std.testing.expect(saw_new_gen);
+}
+
+test "sequencer: 播放中新增音符——已扫过窗口内补发 on/off（复现 bug）" {
+    // 水位线已扫到 32、游标在 8；新增音符在 [16,20)（已扫过但还没播到）
+    // → 不补发就永远不响（实测 bug：播放中放置/克隆/粘贴的音符不响）
+    var q = synth.SchedQueue{};
+    var s = Scheduler{};
+    const clips = [_]model.Clip{};
+    const added = [_]model.Note{
+        .{ .step = 16, .len = 4, .pitch = 60, .pattern = 0 },
+    };
+
+    reset(&s, &q, &clips, &.{}, false, 0, 0);
+    scheduleRange(&s, &q, &clips, &.{}, false, 0, 0, 32); // 水位线 = 32
+    try std.testing.expectEqual(@as(i32, 32), s.scheduled_upto);
+
+    try std.testing.expect(scheduleAdded(&s, &q, &clips, &added, &.{}, &added, false, 0, 8));
+
+    var out: [8]synth.SchedEvent = undefined;
+    const n = drainAll(&q, &out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(synth.EventKind.on, out[0].kind);
+    try std.testing.expectEqual(@as(i32, 16), out[0].step);
+    try std.testing.expectEqual(synth.EventKind.off, out[1].kind);
+    try std.testing.expectEqual(@as(i32, 20), out[1].step);
+}
+
+test "sequencer: 播放中新增音符——跨游标立即发声；过去/未扫过不补" {
+    var q = synth.SchedQueue{};
+    var s = Scheduler{};
+    const clips = [_]model.Clip{};
+    // 三个新增：① 跨游标 [4,12)（游标 8）；② 完全在过去 [0,4)；
+    // ③ 在水位线之后 [40,44)
+    const added = [_]model.Note{
+        .{ .step = 4, .len = 8, .pitch = 60, .pattern = 0 },
+        .{ .step = 0, .len = 4, .pitch = 62, .pattern = 0 },
+        .{ .step = 40, .len = 4, .pitch = 64, .pattern = 0 },
+    };
+
+    reset(&s, &q, &clips, &.{}, false, 0, 0);
+    scheduleRange(&s, &q, &clips, &.{}, false, 0, 0, 32); // 水位线 = 32
+
+    try std.testing.expect(scheduleAdded(&s, &q, &clips, &added, &.{}, &added, false, 0, 8));
+
+    var out: [8]synth.SchedEvent = undefined;
+    const n = drainAll(&q, &out);
+    // 只补 ①：on@8（钳到游标）、off@12
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(synth.EventKind.on, out[0].kind);
+    try std.testing.expectEqual(@as(i32, 8), out[0].step);
+    try std.testing.expectEqual(@as(u8, 60), out[0].pitch);
+    try std.testing.expectEqual(synth.EventKind.off, out[1].kind);
+    try std.testing.expectEqual(@as(i32, 12), out[1].step);
+
+    // ③ 在水位线之后：窗口推进时正常 gather（不重复补发）
+    scheduleRange(&s, &q, &clips, &added, false, 0, 32, 48);
+    const n2 = drainAll(&q, &out);
+    try std.testing.expectEqual(@as(usize, 2), n2);
+    try std.testing.expectEqual(@as(i32, 40), out[0].step);
+    try std.testing.expectEqual(@as(i32, 44), out[1].step);
+}
+
+test "sequencer: 播放中新增片段——其样式音符经新片段补发（SONG）" {
+    var q = synth.SchedQueue{};
+    var s = Scheduler{};
+    const notes = [_]model.Note{
+        .{ .step = 0, .len = 4, .pitch = 60, .pattern = 0 },
+    };
+    // 新片段 [16,32)，样式 0：音符 → 全局 [16,20)
+    const added_clips = [_]model.Clip{
+        .{ .track = 0, .start = 16, .len = 16, .pattern = 0 },
+    };
+
+    reset(&s, &q, &.{}, &notes, true, 0, 0);
+    scheduleRange(&s, &q, &.{}, &notes, true, 0, 0, 64); // 水位线 = 64
+
+    try std.testing.expect(scheduleAdded(&s, &q, &added_clips, &notes, &added_clips, &.{}, true, 0, 8));
+
+    var out: [8]synth.SchedEvent = undefined;
+    const n = drainAll(&q, &out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(synth.EventKind.on, out[0].kind);
+    try std.testing.expectEqual(@as(i32, 16), out[0].step);
+    try std.testing.expectEqual(synth.EventKind.off, out[1].kind);
+    try std.testing.expectEqual(@as(i32, 20), out[1].step);
+}
+
+test "sequencer: 新增补发与窗口推进不重复（off 只在窗口内 gather 一次）" {
+    var q = synth.SchedQueue{};
+    var s = Scheduler{};
+    const clips = [_]model.Clip{};
+    // 新增音符 [16,40)：跨过水位线 32——on/off 都要正确处理
+    const added = [_]model.Note{
+        .{ .step = 16, .len = 24, .pitch = 60, .pattern = 0 },
+    };
+
+    reset(&s, &q, &clips, &.{}, false, 0, 0);
+    scheduleRange(&s, &q, &clips, &.{}, false, 0, 0, 32); // 水位线 = 32
+
+    try std.testing.expect(scheduleAdded(&s, &q, &clips, &added, &.{}, &added, false, 0, 8));
+
+    var out: [8]synth.SchedEvent = undefined;
+    const n = drainAll(&q, &out);
+    // on@16 补发；off@40 在**水位线之后**——不补（由窗口推进 gather）
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(synth.EventKind.on, out[0].kind);
+    try std.testing.expectEqual(@as(i32, 16), out[0].step);
+
+    // 窗口推进到 48：off@40 恰好 gather 一次（不重复）
+    scheduleRange(&s, &q, &clips, &added, false, 0, 32, 48);
+    const n2 = drainAll(&q, &out);
+    try std.testing.expectEqual(@as(usize, 1), n2);
+    try std.testing.expectEqual(synth.EventKind.off, out[0].kind);
+    try std.testing.expectEqual(@as(i32, 40), out[0].step);
 }

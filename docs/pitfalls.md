@@ -51,6 +51,45 @@ const a: i32 = @intCast(@abs(dy)); // ✓ 或先转再算
 
 ## Win32 互操作
 
+### `Sleep` 的精度陷阱：默认粒度 ≈ 15.6ms，会把帧率腰斩
+
+症状：主循环写 `sleep(16ms)`（名义 60fps），实际**只有 ~35fps**，UI 不流畅、操作滞后。
+
+根因：Windows 默认计时器粒度 ≈ 15.6ms——`Sleep(16)` 会被系统“向上取整”
+到下一个节拍，实测睡成 **~26ms**（有时 31ms）。
+
+```zig
+// ✗ 依赖默认精度：sleep(8ms) 实测 ~15.6ms、sleep(16ms) 实测 ~26ms
+std.Io.sleep(io, .fromMilliseconds(16), .awake) catch {};
+
+// ✓ ① 提高系统计时器精度（init 一次；deinit 配对恢复）
+_ = timeBeginPeriod(1);   // winmm；实测 sleep(8.33ms) → 8.9ms
+// ✓ ② 帧预算：睡“帧开始 + 预算 - 已耗时”，而非固定尾部睡眠
+const frame_budget_ns: i64 = 8_333_333; // 120fps
+while (true) {
+    const t0 = nowNs();
+    defer {
+        const remain = frame_budget_ns - (nowNs() - t0);
+        if (remain > 0) std.Io.sleep(io, .fromNanoseconds(remain), .awake) catch {};
+    }
+    // ... 本帧工作 ...
+}
+```
+
+**为什么不能只用固定尾部睡眠**：帧时长 = 渲染耗时 + 睡眠时长（两者叠加）——
+渲染变重（大工程、多浮动窗口）时帧率随内容浮动；帧预算则是“睡剩余部分”，
+总帧时长恒定（渲染耗时被扣掉）。
+
+**实测数据**（本机，Debug 构建）：
+| 写法 | 平均帧时长 | 有效帧率 |
+|---|---|---|
+| 尾部 `sleep(16ms)`（修复前） | 28239us | **35.4 fps** |
+| `timeBeginPeriod(1)` + 帧预算 8.33ms | 8785us | **113.8 fps** |
+
+**连带坑：按帧计数的时长逻辑**。帧率可变后，“N 帧 ≈ M 秒”的换算全错
+（如 toast 180 帧：60fps ≈ 3s → 120fps 变 1.5s）。修法：改用**时间**（纳秒），
+每帧传实际流逝时间递减：`tickToast(dt_ns)`。
+
 ### `CreateDIBSection` 的内存**不能用 allocator.free**
 
 ```zig
@@ -512,6 +551,50 @@ fn handleGenChange(engine: *Engine, gen: u32, was_playing: bool) void {
   新声部的 off 随后被作废 → 又悬挂；
 - 语义选“进入 release”（同暂停/停止）而非“播完剩余时值”：
   剩余时值的终点在旧时间线上，跳走后没有明确终点。
+
+### 播放中新增的音符不响：调度水位线只前进不回头
+
+症状：播放状态下，追加到游标**前方**的音符经常不响——鼠标放置、Ctrl+B
+克隆、Ctrl+V 粘贴都一样；落在更远处（4 小节外）的反而正常。
+
+机制：序列器用“水位线”（`scheduled_upto`）提前 4 小节 gather 事件——
+水位线**只前进**。播放中新增的音符若落在「已扫过但还没播到」的区间
+`[游标, 水位线)`，其 on/off 永远不会被 gather 到（下一帧只扫
+`[水位线, 水位线+4小节)`）→ 不响。
+
+```zig
+// ✗ 只靠 scheduleRange 推进水位线：新增音符落在已扫过区就永远不被扫到
+// ✓ 提交历史时补发“新增内容”的事件（只补新增，纯增量）
+pub fn scheduleAdded(..., added_notes: []const Note, cur: i32) bool {
+    const watermark = sched.scheduled_upto;
+    // 完全在过去（end <= cur）→ 不补；start >= 水位线 → 不补（窗口会扫）
+    // 否则补 on@max(start, cur)（跨游标的立即发声）；
+    // off@end 仅当 end < 水位线（≥ 的由窗口 gather，避免重复）
+}
+```
+
+**差分基准**：音符/片段无 ID，按**内容比对**当前数据与上一历史快照
+（提交点 `commitHistory` 正好两者都在手边）。
+
+**配套（音频侧）**：补发事件的步序可能落在**已 stash 事件之前**——
+stash 必须**按步序插入**（不是追加），否则被前面的事件挡着、拖到很晚
+才触发（表现：补发的 on 迟到）：
+
+```zig
+// ✗ @memcpy 追加：补发的 on@16 排在已 stash 的 off@100 之后 → 拖到 100 才响
+// ✓ 按步序插入（从尾部往前移位；共用 schedEventLess）
+fn stashInsert(engine: *Engine, ev: synth.SchedEvent) void {
+    var i: usize = engine.stash_n;
+    while (i > 0 and synth.schedEventLess({}, ev, engine.stash[i - 1])) : (i -= 1)
+        engine.stash[i] = engine.stash[i - 1];
+    engine.stash[i] = ev;
+    engine.stash_n += 1;
+}
+```
+
+**教训**：增量式调度器（水位线/游标类）必须想清楚“**编辑**”这个维度——
+数据是活的，水位线是死的。只补新增（不做全量作废）是**纯增量**方案：
+无双重触发/悬挂风险（不做废旧事件就不存在新旧代际交叠）。
 
 ### 同音高重叠：合成器的 note-off 必须 FIFO
 

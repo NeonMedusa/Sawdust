@@ -513,8 +513,11 @@ pub const App = struct {
     title_applied_name: ?[]u8 = null,
     /// 状态栏提示（短暂显示保存/加载结果；null = 无）
     toast: ?[]u8 = null,
-    /// toast 剩余帧数（main 每帧递减；到 0 清除）——约 60fps，180 帧 ≈ 3 秒
-    toast_frames: i32 = 0,
+    /// toast 剩余**纳秒**（main 每帧按实际流逝时间递减）——
+    /// 用时间而非帧数：帧率可变（60/120），帧计数会把时长搞乱
+    toast_remaining_ns: i64 = 0,
+    /// toast 总时长（显示用；3 秒）
+    toast_total_ns: i64 = 3_000_000_000,
     /// “文件”菜单展开中
     file_menu_open: bool = false,
     /// 待定的文件操作（帧末执行——对话框不能在事件迭代/绘制中弹出）。
@@ -1532,6 +1535,9 @@ pub const App = struct {
     /// 若当前状态与所在快照等价（忽略选区）→ 不产生新条目（防“点了没动”噪音）。
     pub fn commitHistory(self: *App, label: []const u8) void {
         if (self.history.items.len > 0 and self.stateEqualsCurrent()) return;
+        // 播放中：把**新增**的音符/片段补发到调度队列（水位线只前进不回头——
+        // 不补的话它们永远不响；实测 bug：播放中放置/克隆/粘贴的音符不响）
+        self.rescheduleAddedForPlayback();
         // 截断 redo 尾巴（新操作发生在撤销之后）
         while (self.history.items.len > self.history_current + 1) {
             var st = self.history.pop().?;
@@ -1549,6 +1555,80 @@ pub const App = struct {
             self.freeHistoryState(&old);
             if (self.history_current > 0) self.history_current -= 1;
             if (self.history_saved_index > 0) self.history_saved_index -= 1;
+        }
+    }
+
+    /// 播放中编辑提交后：把**新增**的音符/片段补发到调度队列。
+    ///
+    /// 背景（实测 bug）：调度水位线只前进不回头（提前 4 小节 gather）——
+    /// 播放中新增到“已扫过窗口”`[游标, 水位线)` 的音符永远不会被 gather，
+    /// 表现：放置/克隆/粘贴到游标前方的音符不响。
+    ///
+    /// 差分基准 = 提交前的上一快照（`history[history_current]`）——
+    /// 音符/片段无 ID，按**内容比对**找新增（O(n²)，量级可控）。
+    /// 只补新增、不作废旧事件（纯增量，无双触发/悬挂风险）；
+    /// 移动/删除的残留事件不在本函数处理范围。
+    fn rescheduleAddedForPlayback(self: *App) void {
+        if (!self.playing) return;
+        if (self.history.items.len == 0) return;
+        const old = &self.history.items[self.history_current];
+
+        // 新增音符：当前有、旧快照没有
+        var added_notes: [256]model.Note = undefined;
+        var an: usize = 0;
+        for (self.notes.items) |nt| {
+            if (an >= added_notes.len) break;
+            var found = false;
+            for (old.notes) |o| {
+                if (o.step == nt.step and o.len == nt.len and o.pitch == nt.pitch and
+                    o.pattern == nt.pattern and o.instrument == nt.instrument)
+                {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                added_notes[an] = nt;
+                an += 1;
+            }
+        }
+        // 新增片段：同理
+        var added_clips: [64]model.Clip = undefined;
+        var ac: usize = 0;
+        for (self.clips.items) |c| {
+            if (ac >= added_clips.len) break;
+            var found = false;
+            for (old.clips) |o| {
+                if (o.track == c.track and o.start == c.start and o.len == c.len and
+                    o.pattern == c.pattern and o.offset == c.offset)
+                {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                added_clips[ac] = c;
+                ac += 1;
+            }
+        }
+        if (an == 0 and ac == 0) return;
+
+        const cur = self.playback.cursorStep(self.sel.song_mode);
+        const ok = sequencer.scheduleAdded(
+            &self.scheduler,
+            &self.sched_events,
+            self.clips.items,
+            self.notes.items,
+            added_clips[0..ac],
+            added_notes[0..an],
+            self.sel.song_mode,
+            self.sel.pattern,
+            cur,
+        );
+        if (!ok) {
+            // 事件数超缓冲上限（罕见）：退化为全量重扫（按当前位置 reset）
+            sequencer.reset(&self.scheduler, &self.sched_events, self.clips.items, self.notes.items, self.sel.song_mode, self.sel.pattern, cur);
+            self.params.sched_gen.store(self.scheduler.gen, .monotonic);
         }
     }
 
@@ -1750,7 +1830,7 @@ pub const App = struct {
     pub fn setToast(self: *App, text: []const u8) void {
         if (self.toast) |old| self.allocator.free(old);
         self.toast = self.allocator.dupe(u8, text) catch null;
-        self.toast_frames = 180;
+        self.toast_remaining_ns = self.toast_total_ns;
     }
 
     /// 格式化版提示（如含文件名/错误名）
@@ -1767,14 +1847,14 @@ pub const App = struct {
     pub fn clearToast(self: *App) void {
         if (self.toast) |old| self.allocator.free(old);
         self.toast = null;
-        self.toast_frames = 0;
+        self.toast_remaining_ns = 0;
     }
 
-    /// 每帧递减 toast 计时（main 调用）
-    pub fn tickToast(self: *App) void {
-        if (self.toast_frames > 0) {
-            self.toast_frames -= 1;
-            if (self.toast_frames == 0) self.clearToast();
+    /// 每帧递减 toast 计时（main 调用）——`dt_ns` = 本帧实际流逝时间
+    pub fn tickToast(self: *App, dt_ns: i64) void {
+        if (self.toast_remaining_ns > 0) {
+            self.toast_remaining_ns -= dt_ns;
+            if (self.toast_remaining_ns <= 0) self.clearToast();
         }
     }
 
@@ -2472,6 +2552,48 @@ test "app: 撤销——合成器参数（ADSR）也恢复（修“调 ADSR 不�
     // 重做 → 回到 0.8
     try std.testing.expect(app.redo());
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), app.instruments.items[0].synth.attack.load(.monotonic), 0.0001);
+}
+
+test "app: 播放中新增音符——提交历史时补发调度（修“追加的音符不响”）" {
+    // 复现：水位线已扫到 32、游标在 8；播放中放置/克隆/粘贴到 [8,32) 的音符
+    // 必须被补发（否则永远不响——实测 bug）
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    // 播放中（PAT 模式）：水位线扫到 32，游标 8
+    app.playing = true;
+    app.sel.song_mode = false;
+    app.playback.piano_step = 8;
+    sequencer.reset(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, false, 0, 0);
+    sequencer.scheduleRange(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, false, 0, 0, 32);
+    // 排空既有事件（不干扰断言）
+    var drain: [16]synth.SchedEvent = undefined;
+    _ = app.sched_events.drain(&drain);
+
+    // 放置一个音符（游标后方、水位线之内）→ 提交历史
+    app.addNote(.{ .step = 16, .len = 4, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.commitHistory("放置音符");
+
+    var out: [8]synth.SchedEvent = undefined;
+    const n = app.sched_events.drain(&out);
+    try std.testing.expectEqual(@as(usize, 2), n); // 补发 on@16 + off@20
+    try std.testing.expectEqual(synth.EventKind.on, out[0].kind);
+    try std.testing.expectEqual(@as(i32, 16), out[0].step);
+    try std.testing.expectEqual(synth.EventKind.off, out[1].kind);
+    try std.testing.expectEqual(@as(i32, 20), out[1].step);
+
+    // 未播放时不补发（无水位线语义）
+    app.stopPlayback();
+    _ = app.sched_events.drain(&drain);
+    app.addNote(.{ .step = 20, .len = 4, .pitch = 62, .pattern = 0, .instrument = 0 });
+    app.commitHistory("放置音符");
+    try std.testing.expectEqual(@as(usize, 0), app.sched_events.drain(&out));
 }
 
 test "app: 撤销/重做——快照式（放置/删除/修改 + redo 截断 + 选区无关）" {

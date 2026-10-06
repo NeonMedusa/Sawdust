@@ -85,7 +85,25 @@ pub fn main(init: std.process.Init) !u8 {
     var ui_input = InputState{};
     var ui = Ui.init(r_mod.Renderer.init(&win.fb), &font);
 
+    // 帧率上限：120fps（帧预算 8.33ms）。
+    // 历史：原为固定 `sleep(16ms)`（名义 60fps），但 Windows 默认计时器
+    // 粒度 ≈ 15.6ms → 实测 sleep(16ms) 睡成 ~26ms，加上渲染耗时实际仅
+    // ~30 多帧，表现为“UI 不流畅/操作滞后”。修法：
+    //   ① window.init 里 timeBeginPeriod(1) 提高计时器精度；
+    //   ② 改为**帧预算**：睡到“帧开始 + 预算”截止，而非固定睡眠
+    //      （固定睡眠会与渲染耗时叠加，帧率随内容复杂度浮动）。
+    const frame_budget_ns: i64 = 8_333_333; // 120fps
+
     while (true) {
+        const frame_start_ns: i64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
+        defer {
+            // 5) 帧预算：睡完本帧剩余时间（渲染耗时已扣掉）
+            const now_ns: i64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
+            const remain_ns = frame_budget_ns - (now_ns - frame_start_ns);
+            if (remain_ns > 0) {
+                std.Io.sleep(io, .fromNanoseconds(remain_ns), .awake) catch {};
+            }
+        }
         // ── 脏确认流程（自绘模态；**不用系统 MessageBox**——
         // 系统弹窗会把鼠标吸到默认按钮上，实测体验差）──
         // 两种场景共用：① 退出程序；② 打开其他工程（都会丢失未保存修改）
@@ -402,8 +420,9 @@ pub fn main(init: std.process.Init) !u8 {
         }
         ui.frozen_dy = win.frozenDeltaY();
 
-        // 每帧递减状态栏提示（保存/加载结果）
-        app.tickToast();
+        // 每帧递减状态栏提示（按实际流逝时间，与帧率无关）
+        const toast_now_ns: i64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
+        app.tickToast(toast_now_ns - frame_start_ns);
 
         ui.beginFrame();
         drawApp(&ui, &app, @intCast(win.fb.width), @intCast(win.fb.height));
@@ -490,8 +509,8 @@ pub fn main(init: std.process.Init) !u8 {
             win.setTitle(final_title);
         }
 
-        // 5) 帧率限制（约 60fps）
-        std.Io.sleep(io, .fromMilliseconds(16), .awake) catch {};
+        // （帧预算睡眠已移到循环首的 `defer`——睡眠时长需减去本帧渲染耗时，
+        // 固定尾部睡眠会与渲染耗时叠加，帧率随内容复杂度浮动）
     }
     return 0;
 }
