@@ -114,6 +114,76 @@ test "游标：三角的不变量（居中、1px 尖端、不越出标尺行）"
     try std.testing.expectEqual(col, buf[@as(usize, @intCast(first_line_row)) * width + @as(usize, @intCast(x))]);
 }
 
+test "ui: 传输图标按钮——自绘形状（不依赖字体字形）" {
+    // 动机：中文字体常缺几何符号字形（▶ U+25B6 等）→ 缺字退回 .notdef 方块
+    // （实测“播放按钮变竖长方形”）。自绘形状与字体无关——本测试锁死四个形状的像素级不变量。
+    var buf: [40 * 40]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 40, .height = 40 };
+    var ui = makeUi(&fb);
+
+    const x: i32 = 2;
+    const y: i32 = 7;
+    const w: i32 = 36;
+    const h: i32 = 26;
+    const cx = x + @divTrunc(w, 2); // 20
+    const cy = y + @divTrunc(h, 2); // 20
+    const fg = ui.theme.text;
+    const at = struct {
+        fn f(b: []const u32, px: i32, py: i32) u32 {
+            return b[@as(usize, @intCast(py)) * 40 + @as(usize, @intCast(px))];
+        }
+    }.f;
+
+    // ── 播放：右向三角（左缘竖直、中间行最宽、顶点朝右）──
+    @memset(fb.pixels, ui.theme.bg);
+    _ = ui.iconButton(200, .play, x, y, w, h, false, ui.theme.accent);
+    try std.testing.expectEqual(fg, at(&buf, cx - 5, cy)); // 左缘（中间行最左）
+    try std.testing.expectEqual(fg, at(&buf, cx + 4, cy)); // 顶点（中间行最右）
+    try std.testing.expectEqual(fg, at(&buf, cx - 5, cy - 6)); // 顶行仍从同一条左缘起
+    try std.testing.expect(at(&buf, cx + 4, cy - 6) != fg); // 顶行窄——顶点处无像素
+    try std.testing.expectEqual(fg, at(&buf, cx - 5, cy + 6)); // 底行
+
+    // ── 暂停：两根竖条 + 中间缝隙 ──
+    @memset(fb.pixels, ui.theme.bg);
+    _ = ui.iconButton(201, .pause, x, y, w, h, false, ui.theme.accent);
+    try std.testing.expectEqual(fg, at(&buf, cx - 4, cy)); // 左条
+    try std.testing.expectEqual(fg, at(&buf, cx + 4, cy)); // 右条
+    try std.testing.expect(at(&buf, cx, cy) != fg); // 缝隙
+    try std.testing.expectEqual(fg, at(&buf, cx - 4, cy - 6)); // 条高一致（上下端）
+    try std.testing.expectEqual(fg, at(&buf, cx + 4, cy + 6));
+
+    // ── 停止：实心方块（含四角）──
+    @memset(fb.pixels, ui.theme.bg);
+    _ = ui.iconButton(202, .stop, x, y, w, h, false, ui.theme.accent);
+    try std.testing.expectEqual(fg, at(&buf, cx, cy));
+    try std.testing.expectEqual(fg, at(&buf, cx - 6, cy - 6)); // 左上角
+    try std.testing.expectEqual(fg, at(&buf, cx + 6, cy + 6)); // 右下角
+
+    // ── 录制：实心圆（顶部/底部/左右都有像素，四角无）──
+    @memset(fb.pixels, ui.theme.bg);
+    _ = ui.iconButton(203, .record, x, y, w, h, false, ui.theme.accent);
+    try std.testing.expectEqual(fg, at(&buf, cx, cy));
+    try std.testing.expectEqual(fg, at(&buf, cx, cy - 6)); // 顶
+    try std.testing.expectEqual(fg, at(&buf, cx, cy + 6)); // 底
+    try std.testing.expectEqual(fg, at(&buf, cx - 6, cy)); // 左
+    try std.testing.expectEqual(fg, at(&buf, cx + 6, cy)); // 右
+    try std.testing.expect(at(&buf, cx - 6, cy - 6) != fg); // 四角在圆外（是圆不是方）
+
+    // ── 激活态：底色 = active_color；点击判定 = hovered && mouse_pressed ──
+    @memset(fb.pixels, ui.theme.bg);
+    ui.mouse_x = cx;
+    ui.mouse_y = cy;
+    ui.mouse_pressed = false;
+    try std.testing.expect(!ui.iconButton(204, .record, x, y, w, h, true, ui.theme.record));
+    try std.testing.expectEqual(ui.theme.record, at(&buf, x + 2, y + 2)); // 激活底色（角上避开图标）
+    ui.mouse_pressed = true;
+    try std.testing.expect(ui.iconButton(204, .record, x, y, w, h, true, ui.theme.record)); // 点击
+    ui.mouse_pressed = false;
+    // 按钮外不命中
+    ui.mouse_x = x - 2;
+    try std.testing.expect(!ui.iconButton(204, .record, x, y, w, h, false, ui.theme.record));
+}
+
 test "ui: 视图切换按钮（标题栏最右）——命中范围与点击" {
     var buf: [300 * 40]u32 = undefined;
     var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 300, .height = 40 };

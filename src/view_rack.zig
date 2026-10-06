@@ -46,7 +46,8 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
     // 窗口阴影 + 背景 + 边框
     ui.renderer.fillRect(x + 3, y + 3, ww, hh, r_mod.rgb(10, 11, 13));
     ui.renderer.fillRect(x, y, ww, hh, ui.theme.panel);
-    ui.renderer.strokeRect(x, y, ww, hh, ui.theme.panel_border);
+    // 亮蓝描边（与合成器/调音台/效果器面板一致）
+    ui.renderer.strokeRect(x, y, ww, hh, ui.theme.accent);
 
     // 标题栏
     ui.renderer.fillRect(x + 1, title_y + 1, ww - 2, util.rack_title_h - 1, ui.theme.toolbar);
@@ -131,9 +132,11 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
     util.menuFrameBegin(&app.rack.menu_just_opened);
 
     // ── 添加按钮（共享下拉控件：按钮 + 菜单）──
-    const add_x = x + 1;
-    const add_y = y + hh - add_btn_h - 1;
-    const add_w = ww - 2;
+    // 左右各留 5px 边距（原 1px）
+    const add_pad: i32 = 5;
+    const add_x = x + add_pad;
+    const add_y = y + hh - add_btn_h - add_pad;
+    const add_w = ww - add_pad * 2;
     util.menuButton(ui, "+ 添加乐器", add_x, add_y, add_w, add_btn_h, &app.rack.menu_open, &app.rack.menu_just_opened);
 
     // 下拉菜单（插件列表；菜单层：展开时取消屏蔽——菜单项用直接坐标命中）
@@ -192,6 +195,13 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, x: i32, y: i32, w: i32, clip_top: i32
     const bg = if (selected) ui.theme.item_selected else if (idx % 2 == 1) ui.theme.item_alt else ui.theme.panel;
     ui.renderer.fillRect(x, y, w, util.rack_row_h, bg);
     ui.renderer.hline(x, y + util.rack_row_h - 1, w, ui.theme.panel_border);
+
+    // **整行命中兜底**：点行内任何位置（含控件间的缝隙）→ 选中该乐器。
+    // 视觉上行是满的，但各控件的命中区之间有空隙（“看起来无缝、点上去有缝”）。
+    // 放在控件之前：控件自己也会处理点击（不冲突——两边都只是“选中”而已）。
+    if (util.hitUI(ui, x, y, w, util.rack_row_h) and ui.mouse_pressed) {
+        app.setInstrument(@intCast(idx));
+    }
 
     var cx = x + 6;
     const cy = y + @divTrunc(util.rack_row_h - util.rack_mute_w, 2);

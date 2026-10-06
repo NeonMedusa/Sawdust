@@ -550,6 +550,9 @@ pub const App = struct {
     /// 每小节步数（由拍号派生：`model.stepsPerBarFor`；拍号变更时同步）
     steps_per_bar: i32 = 96,
     playing: bool = false,
+    /// 录制武装（工具栏红点按钮）——目前只切换视觉状态（录音写入未实现）；
+    /// **不进入存档**（会话态；重开工程回到未武装）
+    record_armed: bool = false,
 
     // ── 各视图状态 ──
     sel: Selection = .{},

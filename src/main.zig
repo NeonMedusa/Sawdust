@@ -705,9 +705,10 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
     // 分隔
     ui.renderer.vline(x - 6, 6, util.toolbar_h - 12, ui.theme.panel_border);
 
-    // 传输控制（图标用 ASCII：中文字体常缺 ▶（U+25B6）/❚（U+275A），
-    // 缺失时会退回 .notdef 方块（实测“播放按钮变竖长方形”）
-    if (ui.button(200, if (app.playing) "||" else ">", x, by, 36, bh)) {
+    // 传输控制（图标**自绘**：中文字体常缺几何符号字形（▶ U+25B6 等），
+    // 缺字时退回 .notdef 方块——实测“播放按钮变竖长方形”；
+    // 像素级画形状则任何字体下外观一致）
+    if (ui.iconButton(200, if (app.playing) .pause else .play, x, by, 36, bh, app.playing, ui.theme.accent)) {
         app.playing = !app.playing;
         if (app.playing) {
             const from = if (app.sel.song_mode) app.playback.song_step else app.playback.piano_step;
@@ -723,7 +724,7 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
         }
     }
     x += 40;
-    if (ui.button(201, "■", x, by, 36, bh)) {
+    if (ui.iconButton(201, .stop, x, by, 36, bh, false, ui.theme.accent)) {
         // 停止：停声 + 作废调度事件 + 游标归位到第一小节
         app.stopPlayback();
         if (app.sel.song_mode) {
@@ -735,15 +736,20 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
         app.params.start_step.store(0, .monotonic);
     }
     x += 40;
-    _ = ui.button(202, "●", x, by, 36, bh);
+    // 录制开关：当前只切换“武装”状态（录音写入还没接）——
+    // 激活时红底白点（与播放的蓝底拉开区分）
+    if (ui.iconButton(202, .record, x, by, 36, bh, app.record_armed, ui.theme.record)) {
+        app.record_armed = !app.record_armed;
+    }
     x += 46;
 
     // BPM（按住上下拖：上滑增加 / 下滑减小；拖动时光标隐藏并冻结）
-    ui.label("BPM", x, by + 4, ui.theme.text_dim);
+    // 高度/位置与前面的菜单、SONG/PAT、传输按钮**同排对齐**（by/bh）
+    ui.labelCentered("BPM", x, by, bh, ui.theme.text_dim);
     x += @as(i32, @intFromFloat(ui.font.measure("BPM"))) + 8;
     {
         const old_bpm = app.bpm;
-        _ = ui.dragNumber(350, x, by + 3, 56, 20, &app.bpm, 20, 999, 2);
+        _ = ui.dragNumber(350, x, by, 56, bh, &app.bpm, 20, 999, 2);
         if (app.bpm != old_bpm) app.history_pending = "调整 BPM"; // 松手时 coalesce 提交
         x += 62;
     }
@@ -752,10 +758,10 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
     {
         const num_w: i32 = 30;
         const den_w: i32 = 30;
-        const changed_num = ui.dragNumber(351, x, by + 3, num_w, 20, &app.time_num, 1, 32, 4);
-        ui.label("/", x + num_w + 5, by + 4, ui.theme.text_dim);
+        const changed_num = ui.dragNumber(351, x, by, num_w, bh, &app.time_num, 1, 32, 4);
+        ui.labelCentered("/", x + num_w + 5, by, bh, ui.theme.text_dim);
         // 指数模式：拖动值 = log2(分母)（1..4 → 2/4/8/16）；不会因吸附写回而振荡
-        const changed_den = ui.dragNumberEx(352, x + num_w + 15, by + 3, den_w, 20, &app.time_den, 0, 4, 4, 1, null);
+        const changed_den = ui.dragNumberEx(352, x + num_w + 15, by, den_w, bh, &app.time_den, 0, 4, 4, 1, null);
         if (changed_num or changed_den) {
             app.steps_per_bar = model.stepsPerBarFor(app.time_num, app.time_den);
             app.history_pending = "调整拍号"; // 松手时 coalesce 提交
@@ -765,13 +771,14 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
         x += num_w + den_w + 24;
     }
 
-    // 时间显示
-    ui.label("00:00:00", x, by + 4, ui.theme.text_dim);
+    // 时间显示（占位：后续接真实播放位置）
+    ui.labelCentered("00:00:00", x, by, bh, ui.theme.text_dim);
 
-    // 右侧：主音量推子
+    // 右侧：主音量推子（保持原有 20px 高——推子把手随 h 全高绘制，
+    // 拉成 26px 会显得过粗；其中心与同排控件一致，标签仍居中）
     const vol_w: i32 = 120;
     const vol_x = w - vol_w - 16;
-    ui.label("音量", vol_x - 44, by + 4, ui.theme.text_dim);
+    ui.labelCentered("音量", vol_x - 44, by, bh, ui.theme.text_dim);
     if (ui.slider(300, &app.volume, vol_x, by + 3, vol_w, 20)) {
         app.params.volume.store(app.volume, .monotonic);
     }
@@ -1086,7 +1093,7 @@ fn drawModal(ui: *Ui, app: *App) void {
         ui.renderer.fillRect(bx, by, btn_w, btn_h, bg);
         ui.renderer.strokeRect(bx, by, btn_w, btn_h, ui.theme.panel_border);
         const tw: i32 = @intFromFloat(ui.font.measure(label));
-        ui.label(label, bx + @divTrunc(btn_w - tw, 2), by + 4, ui.theme.text);
+        ui.labelCentered(label, bx + @divTrunc(btn_w - tw, 2), by, btn_h, ui.theme.text);
 
         if (hovered and ui.mouse_pressed) app.modal_choice = choices[bi];
     }

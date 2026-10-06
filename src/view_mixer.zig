@@ -24,7 +24,11 @@ const win_min_h: i32 = 240;
 
 // ── 通道条（横向）──
 const row_h: i32 = 26; // 行高
+/// 行间距 = 2（视觉留缝）
 const row_gap: i32 = 2;
+/// **命中区扩展**：行命中区上下各扩这么多像素（盖住行间缝隙——
+/// 视觉留缝但手感无缝，实测反馈：点缝里“挫败感强”）
+const row_hit_ext: i32 = row_gap / 2;
 const ruler_w: i32 = 22; // 编号标尺列宽
 const mute_size: i32 = 18;
 const knob_size: i32 = 20;
@@ -81,6 +85,11 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     // 标题栏
     ui.renderer.fillRect(x + 1, y + 1, ww - 2, win_title_h - 1, ui.theme.toolbar);
     ui.label("调音台 (Mixer)", x + 8, y + 4, ui.theme.text);
+
+    // 点窗口内任意处 → 置顶（“点谁谁在上”——与其他浮动窗口一致）
+    if (util.inRect(ui.mouse_x, ui.mouse_y, x, y, ww, hh) and ui.mouse_pressed) {
+        app.bringToFront(&mw.z);
+    }
 
     // 关闭按钮
     const close_x = x + ww - 22;
@@ -219,8 +228,8 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
             const t = std.fmt.bufPrint(&b, "{d}", .{ci}) catch "";
             const tw: i32 = @intFromFloat(ui.font.measure(t));
             ui.label(t, left_x + 1 + @divTrunc(ruler_w - tw, 2), ry + @divTrunc(row_h - 10, 2), ui.theme.text_dim);
-            // 点标尺数字 → 选中该通道
-            if (util.hitUI(ui, left_x + 1, ry, ruler_w, row_h) and ui.mouse_pressed) {
+            // 点标尺数字 → 选中该通道（**命中区同条一样无缝**：上下各扩 row_hit_ext）
+            if (util.hitUI(ui, left_x + 1, ry - row_hit_ext, ruler_w, row_h + row_hit_ext * 2) and ui.mouse_pressed) {
                 app.mixer_win.selected_channel = ci;
             }
         }
@@ -283,7 +292,8 @@ fn drawStrip(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32) void
     ui.renderer.strokeRect(x, y, w, h, if (selected) ui.theme.accent else ui.theme.panel_border);
 
     // 点条（非控件区）= 选中
-    const bar_clicked = util.hitUI(ui, x, y, w, h) and ui.mouse_pressed;
+    // **命中区无缝**：向上/下各扩 `row_hit_ext` 盖住行间缝隙（视觉仍留缝，手感无缝）
+    const bar_clicked = util.hitUI(ui, x, y - row_hit_ext, w, h + row_hit_ext * 2) and ui.mouse_pressed;
     var consumed = false;
     var cx = x + 5;
 

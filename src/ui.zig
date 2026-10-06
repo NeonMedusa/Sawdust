@@ -41,6 +41,21 @@ pub const Layer = struct {
 /// 横向时间轴滚动条的手势模式
 pub const HBarMode = enum { body, left, right };
 
+/// 自绘图标形状（传输按钮用）。
+/// **为什么自绘**：中文字体常缺几何符号字形（▶ U+25B6 / ❚ / ■ 等），
+/// 缺字时退回 `.notdef` 方块——实测“播放按钮变竖长方形”。
+/// 像素级画形状则任何字体下外观一致（同 `view_util.viewSwitchButton` 的思路）。
+pub const IconShape = enum {
+    /// 播放：右向实心三角
+    play,
+    /// 暂停：两根竖条
+    pause,
+    /// 停止：实心方块
+    stop,
+    /// 录制：实心圆
+    record,
+};
+
 pub const Theme = struct {
     bg: Color = r_mod.rgb(24, 26, 30),
     panel: Color = r_mod.rgb(36, 39, 45),
@@ -84,6 +99,8 @@ pub const Theme = struct {
     /// 播放游标：停止（暗白）/ 播放（黄）
     cursor_idle: Color = r_mod.rgb(190, 195, 202),
     cursor_play: Color = r_mod.rgb(240, 208, 72),
+    /// 录制按钮激活（红点）
+    record: Color = r_mod.rgb(220, 68, 68),
 };
 
 pub const Ui = struct {
@@ -264,6 +281,15 @@ pub const Ui = struct {
 
     // ── 控件 ──
 
+    /// 文本在矩形内**垂直居中**的基线 y（`font.draw` 的 y 是基线）。
+    /// 排版框从 `ascent`（基线之上）到 `descent`（基线之下，**负值**），
+    /// 故居中基线 = 矩形中心 + (ascent + descent) / 2。
+    /// （旧写法用 `ascent - descent`——符号反了，文字比正确位置低 |descent| 像素，
+    /// 实测反馈：“按钮里文字没有垂直居中”）
+    fn centeredBaselineY(self: *Ui, y: i32, h: i32) i32 {
+        return y + @divTrunc(h, 2) + @divTrunc(@as(i32, @intFromFloat(self.font.ascent + self.font.descent)), 2);
+    }
+
     /// 按钮：返回 true = 本帧被点击
     pub fn button(self: *Ui, id: u64, text: []const u8, x: i32, y: i32, w: i32, h: i32) bool {
         _ = id; // 预留：将来的焦点/键盘导航
@@ -274,8 +300,7 @@ pub const Ui = struct {
 
         const tw = self.font.measure(text);
         const tx: i32 = x + @divTrunc(w - @as(i32, @intFromFloat(tw)), 2);
-        const ty: i32 = y + @divTrunc(h, 2) + @divTrunc(@as(i32, @intFromFloat(self.font.ascent - self.font.descent)), 2);
-        self.font.draw(self.renderer, text, @floatFromInt(tx), @floatFromInt(ty), self.theme.text);
+        self.font.draw(self.renderer, text, @floatFromInt(tx), @floatFromInt(self.centeredBaselineY(y, h)), self.theme.text);
 
         return hovered and self.mouse_pressed;
     }
@@ -289,9 +314,79 @@ pub const Ui = struct {
         self.renderer.strokeRect(x, y, w, h, self.theme.panel_border);
         const tw = self.font.measure(text);
         const tx: i32 = x + @divTrunc(w - @as(i32, @intFromFloat(tw)), 2);
-        const ty: i32 = y + @divTrunc(h, 2) + @divTrunc(@as(i32, @intFromFloat(self.font.ascent - self.font.descent)), 2);
-        self.font.draw(self.renderer, text, @floatFromInt(tx), @floatFromInt(ty), r_mod.rgb(240, 244, 250));
+        self.font.draw(self.renderer, text, @floatFromInt(tx), @floatFromInt(self.centeredBaselineY(y, h)), r_mod.rgb(240, 244, 250));
         return hovered and self.mouse_pressed;
+    }
+
+    /// 图标按钮（自绘形状）：返回 true = 本帧被点击。
+    /// - `active`：激活态（如播放中/录制中）——底色用 `active_color` 高亮；
+    /// - 形状在按钮内**居中**，图标高 ≈ 按钮高的 60%（随 h 自适应）。
+    pub fn iconButton(self: *Ui, id: u64, shape: IconShape, x: i32, y: i32, w: i32, h: i32, active: bool, active_color: Color) bool {
+        _ = id; // 预留：将来的焦点/键盘导航
+        const hovered = self.hit(x, y, w, h);
+        const bg = if (active)
+            active_color
+        else if (hovered and self.mouse_down)
+            self.theme.accent
+        else if (hovered)
+            r_mod.rgb(60, 66, 76)
+        else
+            self.theme.panel;
+        self.renderer.fillRect(x, y, w, h, bg);
+        self.renderer.strokeRect(x, y, w, h, self.theme.panel_border);
+
+        const fg = if (active) r_mod.rgb(250, 250, 250) else self.theme.text;
+        // 图标半尺寸 = h×3/10（如 h=26 → r=7：图标高 13px，按钮内留白充足）
+        drawIconShape(self.renderer, shape, x + @divTrunc(w, 2), y + @divTrunc(h, 2), @divTrunc(h * 3, 10), fg);
+        return hovered and self.mouse_pressed;
+    }
+
+    /// 像素级画图标形状：`cx`/`cy` 为图标中心，`r` 为半尺寸（像素）。
+    /// 注：`r` 必须**显式标 i32**——Zig 0.16 的 `@max(2, r_in)` 会把结果类型
+    /// 窄化成 u3（按操作数范围推导），后续 `-r` / `r*2-1` 会溢出或报
+    /// “negation of type 'u31'”。
+    fn drawIconShape(ren: Renderer, shape: IconShape, cx: i32, cy: i32, r_in: i32, color: Color) void {
+        const r: i32 = @max(2, r_in);
+        switch (shape) {
+            .play => {
+                // 右向实心三角：左缘竖直固定，逐行按线性插值取该行宽度（斜边平滑）。
+                // 尺寸：高 = 2r-1、宽 = 3r/2（**强制奇数**——偶数宽时
+                // `cx - wmax/2` 会让三角整体偏左半像素，视觉上“没居中”）
+                const wmax: i32 = @max(3, (@divTrunc(r * 3, 2) + 1) | 1);
+                const x0 = cx - @divTrunc(wmax, 2);
+                var dy: i32 = -r + 1;
+                while (dy <= r - 1) : (dy += 1) {
+                    // 注：`@abs(i32)` 在 Zig 0.16 返回 u32——需显式转回 i32
+                    const ady: i32 = @intCast(@abs(dy));
+                    const w_row: i32 = @max(1, @divTrunc(wmax * (r - ady), r));
+                    ren.hline(x0, cy + dy, w_row, color);
+                }
+            },
+            .pause => {
+                // 两根竖条：条宽 = r/2（至少 2px），间隙 = r/2；高 = 2r-1
+                const bw: i32 = @max(2, @divTrunc(r, 2));
+                const gap: i32 = @max(2, @divTrunc(r, 2));
+                const total = bw * 2 + gap;
+                const x0 = cx - @divTrunc(total, 2);
+                ren.fillRect(x0, cy - r + 1, bw, r * 2 - 1, color);
+                ren.fillRect(x0 + bw + gap, cy - r + 1, bw, r * 2 - 1, color);
+            },
+            .stop => {
+                // 实心方块（边长 = 2r-1，奇数居中）
+                const s = r * 2 - 1;
+                ren.fillRect(cx - r + 1, cy - r + 1, s, s, color);
+            },
+            .record => {
+                // 实心圆（直径 = 2r-1）：逐行扫描，行宽由半径插值（圆边平滑）
+                const rr = r - 1;
+                var dy: i32 = -rr;
+                while (dy <= rr) : (dy += 1) {
+                    const rem = rr * rr - dy * dy;
+                    const half: i32 = @intFromFloat(@sqrt(@as(f32, @floatFromInt(@max(0, rem)))));
+                    ren.hline(cx - half, cy + dy, half * 2 + 1, color);
+                }
+            },
+        }
     }
 
     /// 水平推子 + 数值显示：`scale` 把 0-1 映射到显示范围（如 100 表示百分比）
@@ -423,8 +518,7 @@ pub const Ui = struct {
             fn f(ui_: *Ui, text: []const u8, sx: i32, sw: i32, sy: i32, sh: i32) void {
                 const tw = ui_.font.measure(text);
                 const tx: i32 = sx + @divTrunc(sw - @as(i32, @intFromFloat(tw)), 2);
-                const ty: i32 = sy + @divTrunc(sh, 2) + @divTrunc(@as(i32, @intFromFloat(ui_.font.ascent - ui_.font.descent)), 2);
-                ui_.font.draw(ui_.renderer, text, @floatFromInt(tx), @floatFromInt(ty), r_mod.rgb(240, 244, 250));
+                ui_.font.draw(ui_.renderer, text, @floatFromInt(tx), @floatFromInt(ui_.centeredBaselineY(sy, sh)), r_mod.rgb(240, 244, 250));
             }
         }.f;
         drawSeg(self, left_text, x, half, y, h);
@@ -453,6 +547,12 @@ pub const Ui = struct {
 
     pub fn label(self: *Ui, text: []const u8, x: i32, y: i32, color: Color) void {
         self.font.draw(self.renderer, text, @floatFromInt(x), @floatFromInt(y + @as(i32, @intFromFloat(self.font.ascent))), color);
+    }
+
+    /// 文本在矩形内**垂直居中**（与同排控件对齐用：传同一组 `(y, h)`，
+    /// 如工具栏一整排控件共用的 `(by, bh)`）
+    pub fn labelCentered(self: *Ui, text: []const u8, x: i32, y: i32, h: i32, color: Color) void {
+        self.font.draw(self.renderer, text, @floatFromInt(x), @floatFromInt(self.centeredBaselineY(y, h)), color);
     }
 
     /// 列表项：返回 true = 本帧被点击。`selected` 控制高亮。
@@ -535,8 +635,7 @@ pub const Ui = struct {
         // 提示符号「↕」（无字形时退化为空方块）
         const tw = self.font.measure("↕");
         const tx: i32 = x + @divTrunc(size - @as(i32, @intFromFloat(tw)), 2);
-        const ty: i32 = y + @divTrunc(size, 2) + @divTrunc(@as(i32, @intFromFloat(self.font.ascent - self.font.descent)), 2);
-        self.font.draw(self.renderer, "↕", @floatFromInt(tx), @floatFromInt(ty), self.theme.text);
+        self.font.draw(self.renderer, "↕", @floatFromInt(tx), @floatFromInt(self.centeredBaselineY(y, size)), self.theme.text);
         if (hovered or active) self.cursor = .resize_v;
         return changed;
     }
@@ -610,8 +709,7 @@ pub const Ui = struct {
             std.fmt.bufPrint(&buf, "{d}", .{value.*}) catch "---";
         const tw: i32 = @intFromFloat(self.font.measure(t));
         const tx = x + @divTrunc(w - tw, 2);
-        const ty = y + @divTrunc(h, 2) + @divTrunc(@as(i32, @intFromFloat(self.font.ascent - self.font.descent)), 2);
-        self.font.draw(self.renderer, t, @floatFromInt(tx), @floatFromInt(ty), self.theme.text);
+        self.font.draw(self.renderer, t, @floatFromInt(tx), @floatFromInt(self.centeredBaselineY(y, h)), self.theme.text);
         if (hovered or active) self.cursor = .resize_v;
         return changed;
     }
