@@ -92,13 +92,17 @@ fn makeKeyEv(pitch: i32, instrument: i32, kind: synth.EventKind, step: i32, sche
     };
 }
 
-/// 收集 [from, to) 窗口内的音符开关事件。
-/// 规则：on 在 `start` 落入窗口时发；off 在 `end` 落入窗口时发
-/// （每个事件恰好在它进入窗口的那一帧被调度一次，不重不漏）。
+/// 收集 [from, to) 窗口内的音符开关事件（扫描**整个**数组，不提前退出）。
+/// 规则：on 在 `start` 落入窗口时发；off 在 `end` 落入窗口时发。
+/// 返回 false = 事件数超缓冲上限（**收集不完整**）。
+///
+/// 为什么必须返回“完整/不完整”：扫描是**数组序**（≈ note-off 时间序，
+/// 非步序）——缓冲满时数组靠后的音符可能尚未扫到（它们的步值可能很小）；
+/// 此时若推进水位线，这批事件将**永久丢失**（实测 bug：大 MIDI 导入后
+/// 某些起始位置“卡音 / 整段静音”）。
 fn gatherRange(
     evs: []synth.SchedEvent,
     n: *usize,
-    max_step: *i32,
     clips: []const model.Clip,
     notes: []const model.Note,
     song_mode: bool,
@@ -106,19 +110,17 @@ fn gatherRange(
     from: i32,
     to: i32,
     sched: *const Scheduler,
-) void {
+) bool {
     if (song_mode) {
         for (clips) |clip| {
             for (notes) |nt| {
                 if (nt.pattern != clip.pattern) continue;
                 const m = mapSong(clip, nt) orelse continue;
                 if (m.start >= from and m.start < to) {
-                    if (!pushEv(evs, n, makeEv(nt, .on, m.start, sched))) return;
-                    max_step.* = @max(max_step.*, m.start);
+                    if (!pushEv(evs, n, makeEv(nt, .on, m.start, sched))) return false;
                 }
                 if (m.end >= from and m.end < to) {
-                    if (!pushEv(evs, n, makeEv(nt, .off, m.end, sched))) return;
-                    max_step.* = @max(max_step.*, m.end);
+                    if (!pushEv(evs, n, makeEv(nt, .off, m.end, sched))) return false;
                 }
             }
         }
@@ -127,15 +129,14 @@ fn gatherRange(
             if (nt.pattern != pattern) continue;
             const m = mapPat(nt) orelse continue;
             if (m.start >= from and m.start < to) {
-                if (!pushEv(evs, n, makeEv(nt, .on, m.start, sched))) return;
-                max_step.* = @max(max_step.*, m.start);
+                if (!pushEv(evs, n, makeEv(nt, .on, m.start, sched))) return false;
             }
             if (m.end >= from and m.end < to) {
-                if (!pushEv(evs, n, makeEv(nt, .off, m.end, sched))) return;
-                max_step.* = @max(max_step.*, m.end);
+                if (!pushEv(evs, n, makeEv(nt, .off, m.end, sched))) return false;
             }
         }
     }
+    return true;
 }
 
 /// 收集「跨 reset 点」的长音符（严格跨越 `point` 的）的 note-on。
@@ -192,8 +193,17 @@ pub fn reset(
     for (evs[0..n]) |ev| queue.push(ev);
 }
 
-/// 调度 [from, to) 窗口（推入队列；已按步排序）。
-/// 事件数超过 gather 上限时截断窗口（剩余下一帧继续）。
+/// 调度 [from, to) 窗口（推入队列）。
+///
+/// **正确性**：推进水位线前，窗口内的事件必须**全部**发出——扫描是
+/// 数组序（≈ note-off 时间序），非步序；缓冲满时数组靠后的音符可能
+/// 尚未扫到（步值可能很小）。旧实现“截断到已收集最大步 + 1”会把这批
+/// 音符的事件**永久跳过**：实测 bug——导入大 MIDI（海阔天空.mid，
+/// 13 通道）后从某些位置起播，“MIDI 通道 #11”（= MIDI 通道 13，
+/// 音符在数组末尾）要么 on 丢失（整段静音）、要么 off 丢失（卡音）。
+///
+/// 做法：把窗口切成**子区间**，完整收集一个子区间才推进水位线；
+/// 溢出时子区间减半重扫（对数收敛；现实数据 1-2 次即可）。
 pub fn scheduleRange(
     sched: *Scheduler,
     queue: *synth.SchedQueue,
@@ -207,17 +217,31 @@ pub fn scheduleRange(
     if (to <= from) return;
 
     var evs: [max_gather]synth.SchedEvent = undefined;
-    var n: usize = 0;
-    var max_step: i32 = from - 1;
-    gatherRange(&evs, &n, &max_step, clips, notes, song_mode, pattern, from, to, sched);
-    std.mem.sort(synth.SchedEvent, evs[0..n], {}, synth.schedEventLess);
-    for (evs[0..n]) |ev| queue.push(ev);
-
-    // 截断保护：gather 满时只推进到最后一个事件所在步
-    if (n >= evs.len) {
-        sched.scheduled_upto = @min(to, max_step + 1);
-    } else {
-        sched.scheduled_upto = to;
+    var cur = from;
+    while (cur < to) {
+        var sub_len: i32 = to - cur;
+        while (true) {
+            const sub_to = @min(to, cur + sub_len);
+            var n: usize = 0;
+            if (gatherRange(&evs, &n, clips, notes, song_mode, pattern, cur, sub_to, sched)) {
+                // 完整收集：排序 + 推入 + 推进水位线
+                std.mem.sort(synth.SchedEvent, evs[0..n], {}, synth.schedEventLess);
+                for (evs[0..n]) |ev| queue.push(ev);
+                cur = sub_to;
+                sched.scheduled_upto = cur;
+                break;
+            }
+            if (sub_len <= 1) {
+                // 单步仍溢出（单步事件数 > 512；现实不可达）：
+                // 尽力发出已收集部分并前进，防死循环
+                std.mem.sort(synth.SchedEvent, evs[0..n], {}, synth.schedEventLess);
+                for (evs[0..n]) |ev| queue.push(ev);
+                cur += 1;
+                sched.scheduled_upto = cur;
+                break;
+            }
+            sub_len = @max(1, @divTrunc(sub_len, 2));
+        }
     }
 }
 
@@ -735,4 +759,46 @@ test "sequencer: 编辑重扫——SONG 模式新增片段其样式音符重扫�
     try std.testing.expectEqual(@as(i32, 16), out[0].step);
     try std.testing.expectEqual(synth.EventKind.off, out[1].kind);
     try std.testing.expectEqual(@as(i32, 20), out[1].step);
+}
+
+test "sequencer: 密集窗口不丢事件（gather 溢出子区间收敛）" {
+    // 实测 bug（海阔天空.mid，13 通道）：窗口内事件数 > gather 缓冲（512）时，
+    // 旧实现把水位线推进到“已收集事件的最大步 + 1”——扫描是**数组序**
+    // （≈ note-off 时间序），数组靠后的音符（步值可能很小）被永久跳过：
+    // 某些起始位置“卡音 / 整段静音”（典型：MIDI 通道 #11）。
+    //
+    // 构造：1200 个音符**故意倒序**排列（数组序与步序相反——最坏情况），
+    // 全部落在小窗口内。新实现必须把它们全部发出，且水位线只推到 to。
+    var q = synth.SchedQueue{};
+    var s = Scheduler{};
+    const clips = [_]model.Clip{};
+
+    var notes_buf: [1200]model.Note = undefined;
+    for (&notes_buf, 0..) |*nt, i| {
+        // 倒序：数组前面的音符步大、后面的步小（数组序 ≠ 步序）
+        const step: i32 = @intCast(1200 - i);
+        nt.* = .{ .step = step, .len = 2, .pitch = @intCast(60 + (i % 12)), .pattern = 0 };
+    }
+
+    reset(&s, &q, &clips, &notes_buf, false, 0, 0);
+    scheduleRange(&s, &q, &clips, &notes_buf, false, 0, 0, 1203);
+
+    // 水位线必须推到 to（完整扫描；旧实现会停在中间某步）
+    try std.testing.expectEqual(@as(i32, 1203), s.scheduled_upto);
+
+    // 排空：on + off 各 1200 个（on 在 step∈[0,1203)、off 在 step+2∈[0,1203)——
+    // 即 step ∈ 1..1200 的 on 与 step ∈ 1..1198 的 off，再加 step=1199（end=1201）
+    // 和 step=1200（end=1202）的 off——共 1200 个 off
+    var on_count: usize = 0;
+    var off_count: usize = 0;
+    var out: [256]synth.SchedEvent = undefined;
+    while (true) {
+        const n = drainAll(&q, &out);
+        if (n == 0) break;
+        for (out[0..n]) |ev| {
+            if (ev.kind == .on) on_count += 1 else off_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1200), on_count); // 一个不丢
+    try std.testing.expectEqual(@as(usize, 1200), off_count);
 }
