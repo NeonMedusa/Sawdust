@@ -1,4 +1,7 @@
 //! 钢琴卷帘视图：琴键列 + 音符编辑 + 乐器选择器。
+//!
+//! 布局：标题栏 → 横向滚动条 → 小节标尺 → 音符区 → 分割条 →
+//! 力度/声像编辑轨（`view_note_lane.zig`）。
 
 const std = @import("std");
 const r_mod = @import("render.zig");
@@ -7,6 +10,7 @@ const App = @import("app.zig").App;
 const model = @import("model.zig");
 const synth = @import("synth.zig");
 const util = @import("view_util.zig");
+const view_note_lane = @import("view_note_lane.zig");
 
 pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     const pattern = app.piano.pattern orelse return;
@@ -60,10 +64,30 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     const hsb_y = list_y;
     const ruler_y = list_y + ruler_h;
     const lane_y = list_y + ruler_h * 2; // 音符区顶部
-    const lane_h = list_h - ruler_h * 2;
     const keys_x = main_x;
     const lane_x = main_x + util.piano_header_w;
     const view_w = @max(1, main_w - util.piano_header_w);
+
+    // ── 底部力度/声像编辑轨（见 `docs/note-lane.md`）──
+    // 高度：会话态（`app.piano.lane_h`）；**0 = 未初始化** → 首帧 220px。
+    // 每帧钳制 [min_h, min(35%·content, content−124)]（保证音符区至少 ~6 行）。
+    // 分割条在**布局最前**处理（拖动后重算高度——本帧绘制/命中用新值，不滞后一帧）。
+    const splitter_h: i32 = 4;
+    const content_all = list_h - ruler_h * 2;
+    {
+        const max_by_frac: i32 = @intFromFloat(@as(f32, @floatFromInt(content_all)) * view_note_lane.max_frac);
+        const max_h: i32 = @min(max_by_frac, @max(view_note_lane.min_h, content_all - 124));
+        if (app.piano.lane_h <= 0) {
+            app.piano.lane_h = 220; // 默认高度（小窗时由下方 clamp 收窄）
+        }
+        app.piano.lane_h = std.math.clamp(app.piano.lane_h, view_note_lane.min_h, max_h);
+        // 分割条：**向上拖增高**；`sp_y` 随当前 lane_h 动（拖动中每帧重算 → 跟手）
+        const sp_y = lane_y + @max(48, content_all - splitter_h - app.piano.lane_h);
+        _ = ui.splitterH(7002, &app.piano.lane_h, sp_y, x + 1, w - 2, splitter_h, view_note_lane.min_h, max_h);
+        app.piano.lane_h = std.math.clamp(app.piano.lane_h, view_note_lane.min_h, max_h);
+    }
+    const editor_h: i32 = app.piano.lane_h;
+    const lane_h = @max(48, content_all - splitter_h - editor_h); // 音符区高度
     // 每小节步数由**拍号**决定（动态；App 字段）
     const spb: i32 = app.steps_per_bar;
     const bar_w = spb * util.piano_step_w;
@@ -424,7 +448,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 量化/吸附格（步）——音符移动/拉伸对齐到它；网格也按它加一层（已在函数顶部声明）。
 
     // ── 交互（音符区）──
-    const in_lane = !menu_click and ui.hitRect(lane_x, lane_y, view_w, lane_h);
+    // 注：命中区下缘避开分割条的 ±3px 拖拽带（否则贴底点击会同时启动分割条拖动）
+    const in_lane = !menu_click and ui.hitRect(lane_x, lane_y, view_w, lane_h - 3);
     // 鼠标 → 内容坐标（除以 zoom）→ 步号
     const mouse_cx: i32 = app.piano.scroll_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(ui.mouse_x - lane_x)) / zoom));
     const step_i = @divFloor(mouse_cx, util.piano_step_w);
@@ -748,8 +773,21 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     }
 
     // 纵向滚动（128 个音高）+ 右侧滚动条
+    // 注：滚轮命中区**含编辑轨**（在轨上滚 = 与音符区同款滚动/缩放）
     const content_h: i32 = 128 * app.piano.key_h;
-    if (ui.hitRect(main_x, lane_y, main_w, lane_h)) {
+    // Alt+滚轮（音符区）：调**距鼠标最近的音符**的力度/声像
+    // （有选区时 → 全部选中整体增减；见 `view_note_lane.altWheelAdjust`）。
+    // 在编辑轨上的 Alt+滚轮由 `view_note_lane.draw` 自己处理（“最近”
+    // 标准不同：柱条末端而非音符矩形）——这里用 `lane_y..lane_y+lane_h` 避开。
+    if (ui.wheel != 0 and ui.wheel_alt and ui.hitRect(lane_x, lane_y, view_w, lane_h - 3)) {
+        const mode = app.piano.lane_mode;
+        const near = view_note_lane.nearestNoteInPiano(app, ui.mouse_x, ui.mouse_y, lane_x, lane_y, step_ws, scroll_s, app.piano.key_h, app.piano.scroll, pattern);
+        if (view_note_lane.altWheelAdjust(app, mode, ui.wheel, near)) {
+            app.markWheelHistory(if (mode == .velocity) "调整力度" else "调整声像");
+        }
+        ui.wheel = 0; // 消费
+    }
+    if (!ui.wheel_alt and ui.hitRect(main_x, lane_y, main_w, lane_h + splitter_h + editor_h)) {
         if (ui.wheel_ctrl) {
             // Ctrl+滚轮：横向缩放（锚定鼠标下的内容）+ 内容区拉回
             // 注：拉回**无条件执行**（不只在 zoom 变化时）——
@@ -772,6 +810,14 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     }
     _ = ui.scrollbarV(11, sb_x, lane_y, ruler_h, lane_h, &app.piano.scroll, content_h, lane_h);
     ui.renderer.vline(sb_x, lane_y, lane_h, ui.theme.panel_border);
+
+    // ── 力度/声像编辑轨（分割条已在布局最前处理）──
+    const editor_y2 = lane_y + lane_h + splitter_h;
+    const lane_changed = view_note_lane.draw(ui, app, x + 1, editor_y2, w - 2, editor_h, lane_x, step_ws, scroll_s, zoom, pattern, snap_steps);
+    // 编辑轨改动：coalesce 提交（拖动中每帧置 pending，松手后帧末提交一条）
+    if (lane_changed) {
+        app.history_pending = if (app.piano.lane_mode == .velocity) "调整力度" else "调整声像";
+    }
 
     // ── 编辑快捷键执行（框选/批量；按当前视图上下文）──
     // 由 main 的键盘处理登记（`pending_edit_op`）；本视图消费后清除。

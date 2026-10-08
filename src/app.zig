@@ -41,7 +41,14 @@ pub const FileAction = enum { open, save, save_as, import_midi, export_midi };
 pub const EditOp = enum { delete_selected, clone_right, copy, paste, select_all };
 
 /// 剪贴板音符（step 存为**相对**最左音符的偏移；粘贴时加到锚点）
-pub const ClipboardNote = struct { step: i32, len: i32, pitch: i32 };
+/// ——力度/声像随复制粘贴携带（默认值兜底旧数据）
+pub const ClipboardNote = struct {
+    step: i32,
+    len: i32,
+    pitch: i32,
+    velocity: i32 = model.default_velocity,
+    pan: i32 = model.default_pan,
+};
 
 /// 批量拉伸快照项（拖选中音符期间；按音符数组顺序对应）
 /// 批量操作快照项（拖选中音符/片段期间；按数组顺序对应）
@@ -238,7 +245,26 @@ pub const PianoState = struct {
     /// 正在试听的音高（null = 无）——**单一真源**：
     /// 琴键点击、音符放置、音符拖动换音都写它；行高亮/琴键高亮/发声都由它派生。
     held_pitch: ?i32 = null,
+
+    // ── 力度/声像编辑轨（钢琴卷帘底部；见 `docs/note-lane.md`）──
+    /// 编辑轨高度（像素；**0 = 未初始化**——首帧按内容 12% 初始化）
+    lane_h: i32 = 0,
+    /// 编辑模式：力度 / 声像
+    lane_mode: NoteLaneMode = .velocity,
+    /// 拖动中：上次刷过的鼠标 x（扫刷插值用；-1 = 未刷）
+    lane_last_x: i32 = -1,
+    /// 画笔范围（**按下瞬间**判定）：true = 只编辑选中的柱条；
+    /// false = 自由刷。不能用“实时选区”——点未选中柱条会先清选区单选它，
+    /// 若据此限制则从柱条起笔画曲线会失效（只刷那一根）。
+    lane_paint_selected_only: bool = false,
+    /// 拖动中：上次刷过的值（扫刷去重用；-1 = 未刷）
+    lane_last_val: i32 = -1,
+    /// 本次拖动是否已改动
+    lane_drag_dirty: bool = false,
 };
+
+/// 编辑轨模式（力度 / 声像）
+pub const NoteLaneMode = enum { velocity, pan };
 
 /// 通道机架（浮动窗口）状态
 pub const RackState = struct {
@@ -867,6 +893,8 @@ pub const App = struct {
                 .step = nt.step - min_step,
                 .len = nt.len,
                 .pitch = nt.pitch,
+                .velocity = nt.velocity,
+                .pan = nt.pan,
             }) catch {};
         }
         return self.clipboard_notes.items.len;
@@ -918,6 +946,8 @@ pub const App = struct {
                 .pitch = cn.pitch,
                 .pattern = pattern,
                 .instrument = instrument,
+                .velocity = cn.velocity,
+                .pan = cn.pan,
                 .selected = true,
             }) catch {};
         }
@@ -1496,6 +1526,9 @@ pub const App = struct {
         for (st.notes, self.notes.items) |a, b| {
             if (a.step != b.step or a.len != b.len or a.pitch != b.pitch or
                 a.pattern != b.pattern or a.instrument != b.instrument) return false;
+            // 力度/声像也要比较——否则改力度被判为“无变化”，静默丢弃历史条目
+            // （与 ADSR 同一个坑：调了值但不产生历史）
+            if (a.velocity != b.velocity or a.pan != b.pan) return false;
         }
         for (st.clips, self.clips.items) |a, b| {
             if (a.track != b.track or a.start != b.start or a.len != b.len or
@@ -1535,9 +1568,10 @@ pub const App = struct {
     /// 若当前状态与所在快照等价（忽略选区）→ 不产生新条目（防“点了没动”噪音）。
     pub fn commitHistory(self: *App, label: []const u8) void {
         if (self.history.items.len > 0 and self.stateEqualsCurrent()) return;
-        // 播放中：把**新增**的音符/片段补发到调度队列（水位线只前进不回头——
-        // 不补的话它们永远不响；实测 bug：播放中放置/克隆/粘贴的音符不响）
-        self.rescheduleAddedForPlayback();
+        // 播放中：按新旧快照重扫调度窗口（水位线只前进不回头——不重扫的话
+        // 新增/移动/删除/改值到已扫过窗口的音符都不会生效：实测 bug
+        // “播放中放置/克隆/粘贴的音符不响”、“改力度不生效”）
+        self.rescanForPlaybackEdit();
         // 截断 redo 尾巴（新操作发生在撤销之后）
         while (self.history.items.len > self.history_current + 1) {
             var st = self.history.pop().?;
@@ -1558,78 +1592,33 @@ pub const App = struct {
         }
     }
 
-    /// 播放中编辑提交后：把**新增**的音符/片段补发到调度队列。
+    /// 播放中编辑提交后：按新旧快照重扫调度（见 `sequencer.rescanForEdit`）。
     ///
     /// 背景（实测 bug）：调度水位线只前进不回头（提前 4 小节 gather）——
-    /// 播放中新增到“已扫过窗口”`[游标, 水位线)` 的音符永远不会被 gather，
-    /// 表现：放置/克隆/粘贴到游标前方的音符不响。
+    /// 播放中新增/移动/删除/改值到“已扫过窗口”`[游标, 水位线)` 的音符
+    /// 永远不会被重新 gather（表现：放置/克隆/粘贴的音符不响、改力度不生效）。
     ///
     /// 差分基准 = 提交前的上一快照（`history[history_current]`）——
-    /// 音符/片段无 ID，按**内容比对**找新增（O(n²)，量级可控）。
-    /// 只补新增、不作废旧事件（纯增量，无双触发/悬挂风险）；
-    /// 移动/删除的残留事件不在本函数处理范围。
-    fn rescheduleAddedForPlayback(self: *App) void {
+    /// 音符/片段无 ID，序列器按（音高+乐器）的**跨游标实例数**比对
+    /// （数量变化 → 补 on/off；数量不变如仅改力度 → 不补，正在响的
+    /// 声部无法改值、下次触发生效）。
+    fn rescanForPlaybackEdit(self: *App) void {
         if (!self.playing) return;
         if (self.history.items.len == 0) return;
         const old = &self.history.items[self.history_current];
-
-        // 新增音符：当前有、旧快照没有
-        var added_notes: [256]model.Note = undefined;
-        var an: usize = 0;
-        for (self.notes.items) |nt| {
-            if (an >= added_notes.len) break;
-            var found = false;
-            for (old.notes) |o| {
-                if (o.step == nt.step and o.len == nt.len and o.pitch == nt.pitch and
-                    o.pattern == nt.pattern and o.instrument == nt.instrument)
-                {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                added_notes[an] = nt;
-                an += 1;
-            }
-        }
-        // 新增片段：同理
-        var added_clips: [64]model.Clip = undefined;
-        var ac: usize = 0;
-        for (self.clips.items) |c| {
-            if (ac >= added_clips.len) break;
-            var found = false;
-            for (old.clips) |o| {
-                if (o.track == c.track and o.start == c.start and o.len == c.len and
-                    o.pattern == c.pattern and o.offset == c.offset)
-                {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                added_clips[ac] = c;
-                ac += 1;
-            }
-        }
-        if (an == 0 and ac == 0) return;
-
         const cur = self.playback.cursorStep(self.sel.song_mode);
-        const ok = sequencer.scheduleAdded(
+        sequencer.rescanForEdit(
             &self.scheduler,
             &self.sched_events,
             self.clips.items,
             self.notes.items,
-            added_clips[0..ac],
-            added_notes[0..an],
+            old.clips,
+            old.notes,
             self.sel.song_mode,
             self.sel.pattern,
             cur,
         );
-        if (!ok) {
-            // 事件数超缓冲上限（罕见）：退化为全量重扫（按当前位置 reset）
-            sequencer.reset(&self.scheduler, &self.sched_events, self.clips.items, self.notes.items, self.sel.song_mode, self.sel.pattern, cur);
-            self.params.sched_gen.store(self.scheduler.gen, .monotonic);
-        }
+        self.params.sched_edit_gen.store(self.scheduler.edit_gen, .monotonic);
     }
 
     /// 应用历史快照（恢复 = 整块回写；顺带钳制选择/乐器索引）
@@ -1869,7 +1858,7 @@ pub const App = struct {
         const notes = try alloc.alloc(persist.SavedNote, self.notes.items.len);
         errdefer alloc.free(notes);
         for (self.notes.items, 0..) |n, i| {
-            notes[i] = .{ .step = n.step, .len = n.len, .pitch = n.pitch, .pattern = n.pattern, .instrument = n.instrument };
+            notes[i] = .{ .step = n.step, .len = n.len, .pitch = n.pitch, .pattern = n.pattern, .instrument = n.instrument, .velocity = n.velocity, .pan = n.pan };
         }
         const insts = try alloc.alloc(persist.SavedInstrument, self.instruments.items.len);
         errdefer alloc.free(insts);
@@ -1939,7 +1928,7 @@ pub const App = struct {
             self.addClip(.{ .track = c.track, .start = c.start, .len = c.len, .pattern = c.pattern, .offset = c.offset });
         }
         for (p.notes) |n| {
-            self.addNote(.{ .step = n.step, .len = n.len, .pitch = n.pitch, .pattern = n.pattern, .instrument = n.instrument });
+            self.addNote(.{ .step = n.step, .len = n.len, .pitch = n.pitch, .pattern = n.pattern, .instrument = n.instrument, .velocity = n.velocity, .pan = n.pan });
         }
         for (p.instruments) |inst| {
             const idx = self.addInstrument(inst.name);
@@ -2035,6 +2024,8 @@ pub const App = struct {
                 .pitch = pn.pitch,
                 .pattern = new_pat,
                 .instrument = inst,
+                .velocity = pn.velocity,
+                .pan = pn.pan,
             });
             imported += 1;
         }
@@ -2086,6 +2077,8 @@ pub const App = struct {
                     .len_steps = @max(1, e - s),
                     .pitch = @intCast(n.pitch),
                     .channel = @intCast(ch),
+                    .velocity = @intCast(std.math.clamp(n.velocity, 1, 127)),
+                    .pan = @intCast(std.math.clamp(n.pan, 0, 127)),
                 });
             }
         }
@@ -2594,6 +2587,47 @@ test "app: 播放中新增音符——提交历史时补发调度（修“追加
     app.addNote(.{ .step = 20, .len = 4, .pitch = 62, .pattern = 0, .instrument = 0 });
     app.commitHistory("放置音符");
     try std.testing.expectEqual(@as(usize, 0), app.sched_events.drain(&out));
+}
+
+test "app: 播放中改力度——提交历史时重扫（带新力度）且产生历史条目" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    // 一个窗口内的音符（水位线已扫过，事件带旧力度 100）
+    app.addNote(.{ .step = 16, .len = 4, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.commitHistory("放置音符");
+
+    app.playing = true;
+    app.sel.song_mode = false;
+    app.playback.piano_step = 8;
+    sequencer.reset(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, false, 0, 0);
+    sequencer.scheduleRange(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, false, 0, 0, 32);
+    var drain: [16]synth.SchedEvent = undefined;
+    _ = app.sched_events.drain(&drain);
+
+    // 改力度 → 提交历史
+    const before_len = app.history.items.len;
+    app.notes.items[0].velocity = 40;
+    app.commitHistory("调整力度");
+    try std.testing.expectEqual(before_len + 1, app.history.items.len); // 产生历史条目
+
+    // 重扫：on@16/off@20 重发，且**带新力度 40** + 新编辑代
+    var out: [8]synth.SchedEvent = undefined;
+    const n = app.sched_events.drain(&out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(synth.EventKind.on, out[0].kind);
+    try std.testing.expectEqual(@as(u8, 40), out[0].velocity);
+    try std.testing.expectEqual(app.scheduler.edit_gen, out[0].edit_gen);
+
+    // 撤销 → 力度恢复 100
+    try std.testing.expect(app.undo());
+    try std.testing.expectEqual(@as(i32, 100), app.notes.items[0].velocity);
 }
 
 test "app: 撤销/重做——快照式（放置/删除/修改 + redo 截断 + 选区无关）" {

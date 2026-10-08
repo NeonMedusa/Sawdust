@@ -167,6 +167,7 @@ pub fn main(init: std.process.Init) !u8 {
         ui_input.mouse_double = false;
         ui_input.wheel = 0;
         ui_input.wheel_ctrl = false;
+        ui_input.wheel_alt = false;
 
         // 1) 输入
         const events = try win.pollEvents();
@@ -217,6 +218,7 @@ pub fn main(init: std.process.Init) !u8 {
                 .mouse_wheel => |m| {
                     ui_input.wheel += m.delta;
                     ui_input.wheel_ctrl = m.ctrl;
+                    ui_input.wheel_alt = m.alt;
                     ui_input.mouse_x = m.x;
                     ui_input.mouse_y = m.y;
                 },
@@ -408,6 +410,7 @@ pub fn main(init: std.process.Init) !u8 {
         ui.mouse_double = ui_input.mouse_double;
         ui.wheel = ui_input.wheel;
         ui.wheel_ctrl = ui_input.wheel_ctrl;
+        ui.wheel_alt = ui_input.wheel_alt;
         ui.mods_ctrl = ui_input.mods_ctrl;
         ui.mods_shift = ui_input.mods_shift;
 
@@ -526,6 +529,7 @@ const InputState = struct {
     mouse_double: bool = false,
     wheel: i32 = 0,
     wheel_ctrl: bool = false,
+    wheel_alt: bool = false,
     mods_ctrl: bool = false,
     mods_shift: bool = false,
 };
@@ -1147,6 +1151,7 @@ test {
     _ = @import("view_util.zig");
     _ = @import("view_playlist.zig");
     _ = @import("view_pianoroll.zig");
+    _ = @import("view_note_lane.zig");
     _ = @import("view_rack.zig");
     _ = @import("view_synth.zig");
     _ = @import("view_panels.zig");

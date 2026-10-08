@@ -39,9 +39,18 @@ pub const Note = struct {
     pitch: i32, // MIDI 音高（0-127）
     pattern: i32, // 所属样式序号
     instrument: i32 = 0, // 所属乐器（通道机架槽位，0 起）
+    /// 力度（1-127；默认 100 = MIDI 惯例）——影响发声响度
+    velocity: i32 = default_velocity,
+    /// 声像（0-127；64 = 居中）——与 MIDI CC10 坐标一致
+    pan: i32 = default_pan,
     /// 框选/批量操作选中（**瞬态**：不存档）
     selected: bool = false,
 };
+
+/// 默认力度（新音符；MIDI 惯例 100——柱条不顶格、有编辑余量）
+pub const default_velocity: i32 = 100;
+/// 默认声像（居中；= MIDI CC10 坐标）
+pub const default_pan: i32 = 64;
 
 /// 乐器（通道机架中的一个槽位）。
 /// `synth` 指向该乐器自己的合成器参数（堆分配、地址稳定——音频线程可安全读取）。

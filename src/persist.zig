@@ -60,6 +60,10 @@ pub const SavedNote = struct {
     pitch: i32,
     pattern: i32,
     instrument: i32 = 0,
+    /// 力度（1-127；默认 100）
+    velocity: i32 = model.default_velocity,
+    /// 声像（0-127；64 = 居中）
+    pan: i32 = model.default_pan,
 };
 
 /// 存档中的振荡器（原子字段 → 普通值）
@@ -368,6 +372,37 @@ test "persist: 缺失字段用默认值（向后兼容）" {
     try std.testing.expectEqual(@as(i32, 90), parsed.value.bpm);
     try std.testing.expectEqual(@as(i32, 4), parsed.value.time_num); // 默认
     try std.testing.expectEqual(@as(usize, 0), parsed.value.clips.len);
+}
+
+test "persist: 力度/声像往返（缺字段的旧存档 → 默认值）" {
+    const allocator = std.testing.allocator;
+    const notes = [_]SavedNote{
+        .{ .step = 0, .len = 24, .pitch = 60, .pattern = 0, .velocity = 40, .pan = 20 },
+        .{ .step = 48, .len = 24, .pitch = 64, .pattern = 0 }, // 默认 100 / 64
+    };
+    const project = Project{ .notes = @constCast(&notes) };
+
+    const json = try toJson(allocator, project);
+    defer allocator.free(json);
+    const parsed = try fromJson(allocator, json);
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.notes.len);
+    try std.testing.expectEqual(@as(i32, 40), parsed.value.notes[0].velocity);
+    try std.testing.expectEqual(@as(i32, 20), parsed.value.notes[0].pan);
+    try std.testing.expectEqual(@as(i32, 100), parsed.value.notes[1].velocity);
+    try std.testing.expectEqual(@as(i32, 64), parsed.value.notes[1].pan);
+
+    // 旧存档（无字段）→ 默认值
+    const legacy =
+        \\{"version":3,"bpm":120,"time_num":4,"time_den":4,"steps_per_bar":96,
+        \\ "clips":[],"notes":[{"step":0,"len":12,"pitch":60,"pattern":0,"instrument":0}],
+        \\ "instruments":[]}
+    ;
+    const old = try fromJson(allocator, legacy);
+    defer old.deinit();
+    try std.testing.expectEqual(@as(i32, 100), old.value.notes[0].velocity);
+    try std.testing.expectEqual(@as(i32, 64), old.value.notes[0].pan);
 }
 
 test "persist: 真实文件往返（写盘 → 读回）" {

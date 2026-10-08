@@ -120,6 +120,8 @@ pub const Ui = struct {
     wheel: i32 = 0,
     /// 本帧滚轮是否按着 Ctrl（横向缩放）
     wheel_ctrl: bool = false,
+    /// 本帧滚轮是否按着 Alt（微调力度/声像——见 `view_pianoroll`/`view_note_lane`）
+    wheel_alt: bool = false,
     /// 本帧修饰键状态（每帧由 main 从窗口读取；框选/批量操作用）
     mods_ctrl: bool = false,
     mods_shift: bool = false,
@@ -245,6 +247,7 @@ pub const Ui = struct {
         self.mouse_double = false;
         self.wheel = 0;
         self.wheel_ctrl = false;
+        self.wheel_alt = false;
     }
 
     // ── 文本工具 ──
@@ -613,6 +616,37 @@ pub const Ui = struct {
         const color = if (active or hovered) self.theme.accent else self.theme.panel_border;
         self.renderer.fillRect(x, y, thickness, h, color);
         if (active or hovered) self.cursor = .resize_h;
+        return changed;
+    }
+
+    /// 可拖动分隔条（水平方向）：拖动时修改 `pos`（像素高度），返回 true = 位置变了。
+    /// 与 `splitterV` 同套路（先更新 pos，再用新位置判断/绘制；拖动中高亮常显）：
+    /// - `y` 是分隔条的绝对绘制位置，`pos` 是被拖动修改的值；
+    /// - 方向：**向上拖 = 增高**（与“上方区域的下缘”直觉一致）。
+    pub fn splitterH(self: *Ui, id: u64, pos: *i32, y: i32, x: i32, w: i32, thickness: i32, min_pos: i32, max_pos: i32) bool {
+        var changed = false;
+        // 1) 拖动中：先更新位置（向上拖增高）
+        if (self.active_id == id) {
+            if (!self.mouse_down) {
+                self.active_id = 0;
+            } else {
+                const new_pos = std.math.clamp(self.drag_start - self.mouse_y, min_pos, max_pos);
+                if (new_pos != pos.*) {
+                    pos.* = new_pos;
+                    changed = true;
+                }
+            }
+        }
+        // 2) 用（可能刚更新的）位置判断命中与绘制
+        const hovered = self.hit(x, y - 3, w, thickness + 6);
+        if (self.active_id != id and hovered and self.mouse_pressed) {
+            self.active_id = id;
+            self.drag_start = self.mouse_y + pos.*;
+        }
+        const active = self.active_id == id;
+        const color = if (active or hovered) self.theme.accent else self.theme.panel_border;
+        self.renderer.fillRect(x, y, w, thickness, color);
+        if (active or hovered) self.cursor = .resize_v;
         return changed;
     }
 

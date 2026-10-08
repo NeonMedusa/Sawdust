@@ -25,7 +25,7 @@ pub const Event = union(enum) {
     /// 因此本事件会**同时**发一条 mouse_down（否则快速连点的第二下被吞）。
     mouse_double: struct { x: i32, y: i32 },
     /// 滚轮（delta > 0 = 向上/远离用户；ctrl = 按下 Ctrl，用于横向缩放）
-    mouse_wheel: struct { x: i32, y: i32, delta: i32, ctrl: bool },
+    mouse_wheel: struct { x: i32, y: i32, delta: i32, ctrl: bool, alt: bool },
     key_down: struct { code: u32, repeat: bool, ctrl: bool, shift: bool, alt: bool },
     key_up: struct { code: u32 },
     /// 已翻译的字符（含 IME 结果）
@@ -447,13 +447,17 @@ const WindowsWindow = struct {
             WM_MOUSEWHEEL => {
                 if (self) |s| {
                     const delta: i32 = @intCast(@as(i16, @bitCast(@as(u16, @truncate(wparam >> 16)))));
-                    // wparam 低位是键状态标志：MK_CONTROL = 0x0008
+                    // wparam 低位是键状态标志：MK_CONTROL = 0x0008。
+                    // **Alt 没有对应的 MK_ 标志**（0x0020 是 MK_XBUTTON1！）——
+                    // 必须用 GetKeyState(VK_MENU)（实测 bug：用 wparam 位判断
+                    // Alt 永远为 false，alt+滚轮完全无效）。
                     const ctrl = (wparam & 0x0008) != 0;
+                    const alt = (@as(u16, @bitCast(GetKeyState(VK_MENU))) & 0x8000) != 0;
                     // 屏幕坐标 → 客户区坐标
                     const lp: u32 = @bitCast(@as(i32, @truncate(lparam)));
                     var pt = POINT{ .x = lowWordSigned(lp), .y = highWordSigned(lp) };
                     _ = ScreenToClient(@ptrCast(hwnd), &pt);
-                    s.pushEvent(.{ .mouse_wheel = .{ .x = pt.x, .y = pt.y, .delta = @divTrunc(delta, 120), .ctrl = ctrl } });
+                    s.pushEvent(.{ .mouse_wheel = .{ .x = pt.x, .y = pt.y, .delta = @divTrunc(delta, 120), .ctrl = ctrl, .alt = alt } });
                 }
                 return 0;
             },

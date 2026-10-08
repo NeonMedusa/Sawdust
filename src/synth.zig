@@ -96,6 +96,11 @@ pub const SynthParams = struct {
 
 // ── 事件 ──
 
+/// 默认力度（新音符；MIDI 惯例 100——柱条不顶格、有编辑余量）
+pub const default_velocity: u8 = 100;
+/// 默认声像（居中；= MIDI CC10 坐标）
+pub const default_pan: u8 = 64;
+
 pub const EventKind = enum(u8) {
     /// 按下（分配新声部）
     on,
@@ -110,6 +115,10 @@ pub const NoteEvent = struct {
     kind: EventKind = .off,
     pitch: u8 = 0,
     instrument: u8 = 0,
+    /// 力度（1-127；0 不允许）
+    velocity: u8 = default_velocity,
+    /// 声像（0-127；64 = 居中）
+    pan: u8 = default_pan,
 };
 
 /// 调度事件（序列器）：带**步时间戳**，音频线程按播放步边界触发
@@ -121,6 +130,13 @@ pub const SchedEvent = struct {
     step: i32 = 0,
     /// 调度 generation（transport 变化时递增；旧事件作废）
     gen: u32 = 0,
+    /// 编辑代（播放中编辑提交时递增）：音频线程丢弃 `edit_gen` **小于**
+    /// 当前值的事件（丢弃但不释放声部）——见 `sequencer.rescanForEdit`
+    edit_gen: u32 = 0,
+    /// 力度（1-127）——播放中改力度需重扫（水位线不回头）
+    velocity: u8 = default_velocity,
+    /// 声像（0-127；64 = 居中）
+    pan: u8 = default_pan,
 };
 
 /// 调度事件排序：步升序；**同一步 off 先于 on**（允许同音高快速重触发）。
@@ -186,6 +202,11 @@ pub const Voice = struct {
     release_from: f32 = 0,
     /// 分配序号（无空闲声部时偷取最旧）
     start_seq: u64 = 0,
+    /// 力度增益（= velocity / 127；默认 127/127 = 1.0）
+    vel_gain: f32 = 1.0,
+    /// 声像增益（等功率；居中 = 1.0/1.0——与调音台通道声像同一公式）
+    pan_l: f32 = 1.0,
+    pan_r: f32 = 1.0,
     /// 高通滤波的“低通分量”状态
     hpf_lp: f32 = 0,
     /// 低通滤波状态
@@ -256,8 +277,10 @@ fn allocVoice(state: *Synth) *Voice {
     return &state.voices[oldest];
 }
 
-/// 音符开（分配声部）——公开：音频回调按事件路由调用
-pub fn noteOn(state: *Synth, pitch: u8) void {
+/// 音符开（分配声部）——公开：音频回调按事件路由调用。
+/// `velocity`：1-127（钳制；0 按 1 处理——力度 0 = 静音是 MIDI 的 note-on
+/// 退化语义，本项目不做）；`pan`：0-127（64 = 居中）。
+pub fn noteOn(state: *Synth, pitch: u8, velocity: u8, pan: u8) void {
     state.note_counter += 1;
     const v = allocVoice(state);
     v.pitch = pitch;
@@ -265,6 +288,13 @@ pub fn noteOn(state: *Synth, pitch: u8) void {
     v.env_stage = .attack;
     v.release_from = 0;
     v.start_seq = state.note_counter;
+    v.vel_gain = @as(f32, @floatFromInt(@max(1, velocity))) / 127.0;
+    // 等功率声像：t = -1..+1（64 = 中心），angle = (t+1)·π/4 →
+    // 居中时 cos=sin=√2/2，×√2 = 1.0/1.0（与调音台通道声像同一公式）
+    const t = std.math.clamp(@as(f32, @floatFromInt(@as(i32, pan) - 64)) / 63.0, -1.0, 1.0);
+    const ang = (t + 1.0) * (std.math.pi / 4.0);
+    v.pan_l = @cos(ang) * std.math.sqrt2;
+    v.pan_r = @sin(ang) * std.math.sqrt2;
     // 每声部独立的噪声种子（不同音符噪声不相关）
     v.rng = 0x9E3779B9 ^ @as(u32, @truncate(state.note_counter *% 2654435761));
 }
@@ -368,7 +398,10 @@ pub fn render(
 
     var i: u32 = 0;
     while (i < frames) : (i += 1) {
-        var mix: f32 = 0;
+        // 逐声部 L/R 两路累加（声像需要各声部自己的左右增益；
+        // 居中时 pan_l == pan_r == 1.0，与旧版单声道混音**逐位相同**）
+        var mix_l: f32 = 0;
+        var mix_r: f32 = 0;
         var a: usize = 0;
         while (a < nactive) : (a += 1) {
             const v = &state.voices[active[a]];
@@ -432,19 +465,24 @@ pub fn render(
                 x = v.lpf_lp;
             }
 
-            mix += x * v.env_level;
+            // 声部信号 × 包络 × 力度增益 → 左右两路（等功率声像）
+            const vs = x * v.env_level * v.vel_gain;
+            mix_l += vs * v.pan_l;
+            mix_r += vs * v.pan_r;
         }
 
         // ── 主音量平滑（防拖动旋钮的 zipper 噪声）──
         state.smoothed_master += (gain - state.smoothed_master) * 0.0008;
 
         // ── 输出（软削波防爆音；多声部叠加溢出时自然压缩）──
-        var s = mix * state.smoothed_master;
-        s = s / (1.0 + @abs(s));
+        var s_l = mix_l * state.smoothed_master;
+        s_l = s_l / (1.0 + @abs(s_l));
+        var s_r = mix_r * state.smoothed_master;
+        s_r = s_r / (1.0 + @abs(s_r));
         const prev_l: f32 = if (add) out[i * 2] else 0;
         const prev_r: f32 = if (add) out[i * 2 + 1] else 0;
-        out[i * 2] = prev_l + s;
-        out[i * 2 + 1] = prev_r + s;
+        out[i * 2] = prev_l + s_l;
+        out[i * 2 + 1] = prev_r + s_r;
     }
 }
 
@@ -458,7 +496,7 @@ fn pump(p: *const SynthParams, st: *Synth, q: *EventQueue, buf: []f32, frames: u
     const n = q.drain(&evbuf);
     for (evbuf[0..n]) |ev| {
         switch (ev.kind) {
-            .on => noteOn(st, ev.pitch),
+            .on => noteOn(st, ev.pitch, ev.velocity, ev.pan),
             .off => noteOff(st, ev.pitch),
             .all_off => allOff(st),
         }
@@ -684,7 +722,7 @@ test "synth: render(add=true) 叠加而不覆盖" {
 
     // 第二个声部池（同相位）叠加渲染 → 能量应约翻倍（验证 add 而非覆盖）
     var st2 = Synth{};
-    noteOn(&st2, 60);
+    noteOn(&st2, 60, default_velocity, default_pan);
     render(&p, &st2, &buf, 64, test_sr, 1.0, true);
     var e2: f32 = 0;
     for (buf) |s| e2 += @abs(s);

@@ -49,6 +49,9 @@ pub const Params = struct {
     start_step: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
     /// 调度 generation（reset 时递增；音频线程丢弃旧事件）
     sched_gen: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
+    /// 编辑代（播放中编辑重扫时递增）：音频线程丢弃 `edit_gen` **小于**
+    /// 当前值的事件（丢弃但不释放声部）——见 `sequencer.rescanForEdit`
+    sched_edit_gen: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
 
     // ── 队列与乐器（指针地址稳定）──
     /// 立即事件队列（试听/all_off）
@@ -282,7 +285,7 @@ fn publishSounding(engine: *Engine, params: *Params) void {
 fn fireSched(engine: *Engine, ev: synth.SchedEvent) void {
     if (ev.instrument >= synth.max_instruments) return;
     switch (ev.kind) {
-        .on => synth.noteOn(&engine.synths[ev.instrument], ev.pitch),
+        .on => synth.noteOn(&engine.synths[ev.instrument], ev.pitch, ev.velocity, ev.pan),
         .off => synth.noteOff(&engine.synths[ev.instrument], ev.pitch),
         .all_off => for (engine.synths) |*s| synth.allOff(s),
     }
@@ -442,7 +445,7 @@ fn dataCallback(
     const n_imm = params.events.drain(&evbuf);
     for (evbuf[0..n_imm]) |ev| {
         switch (ev.kind) {
-            .on => if (ev.instrument < synth.max_instruments) synth.noteOn(&engine.synths[ev.instrument], ev.pitch),
+            .on => if (ev.instrument < synth.max_instruments) synth.noteOn(&engine.synths[ev.instrument], ev.pitch, ev.velocity, ev.pan),
             .off => if (ev.instrument < synth.max_instruments) synth.noteOff(&engine.synths[ev.instrument], ev.pitch),
             .all_off => for (engine.synths) |*s| synth.allOff(s),
         }
@@ -472,10 +475,15 @@ fn dataCallback(
 
     // 4) 播放：stash 管理 + 样本级事件触发
     if (gen != engine.stash_gen) handleGenChange(engine, gen, was_playing);
+    // 编辑代（重扫）：**不**清空 stash（有 drain 竞态会丢新事件），
+    // 由触发循环按 `edit_gen < 当前值` 过滤——在响的音符保持发声
+    const edit_gen = params.sched_edit_gen.load(.monotonic);
     // 尽量多取新事件（stash 有空位时）。**按步序插入**（不是追加）：
-    // 播放中补发的新增音符事件可能落在已 stash 的事件之前
-    // （见 `sequencer.scheduleAdded`）——追加的话它们会被前面的事件挡着，
+    // 播放中重扫补发的事件可能落在已 stash 的事件之前
+    // （见 `sequencer.rescanForEdit`）——追加的话它们会被前面的事件挡着，
     // 拖到很晚才触发（表现：新增音符的 on 迟到/整段不响）。
+    // 作废事件（旧 gen / 旧编辑代）**不在此处过滤**——存进 stash 由触发
+    // 循环统一丢（避免过滤后 `got == 0` 提前退出而漏取后续有效事件）。
     if (engine.stash_n < engine.stash.len) {
         var tmp: [synth.sched_drain_max]synth.SchedEvent = undefined;
         const want = @min(engine.stash.len - engine.stash_n, tmp.len);
@@ -495,8 +503,8 @@ fn dataCallback(
     var si: usize = 0;
     while (done < frames and si < engine.stash_n) {
         const ev = engine.stash[si];
-        if (ev.gen != gen) {
-            si += 1; // 旧 generation：丢弃
+        if (ev.gen != gen or ev.edit_gen < edit_gen) {
+            si += 1; // 作废（旧传输代 / 旧编辑代）：丢弃，**不**释放声部
             continue;
         }
         // 事件应在的绝对帧位置
@@ -546,7 +554,7 @@ test "audio: 播放中 gen 变化（跳转）释放全部声部（修“跳走�
     var buf: [4800 * 2]f32 = undefined; // 0.1s @ 48k
 
     // 声部正在发声（模拟播放中扫到了音符）
-    synth.noteOn(&engine.synths[0], 60);
+    synth.noteOn(&engine.synths[0], 60, synth.default_velocity, synth.default_pan);
     synth.render(&p, &engine.synths[0], &buf, 4800, 48000, 1.0, false); // 进入 sustain
     try std.testing.expectEqual(@as(usize, 1), synth.activeCount(&engine.synths[0]));
     engine.stash_n = 3;
@@ -562,7 +570,7 @@ test "audio: 播放中 gen 变化（跳转）释放全部声部（修“跳走�
     try std.testing.expectEqual(@as(usize, 0), synth.activeCount(&engine.synths[0]));
 
     // 起播（上一块未播放）→ **不释放**（不误杀试听/释音尾音）
-    synth.noteOn(&engine.synths[0], 64);
+    synth.noteOn(&engine.synths[0], 64, synth.default_velocity, synth.default_pan);
     handleGenChange(&engine, 9, false);
     synth.render(&p, &engine.synths[0], &buf, 4800, 48000, 1.0, false);
     try std.testing.expectEqual(@as(usize, 1), synth.activeCount(&engine.synths[0])); // 仍在响
@@ -584,8 +592,8 @@ test "audio: 暂停边沿释放全部声部（修“暂停后音符一直响”�
     for (engine.synths) |*s| s.* = .{};
 
     // 两个乐器各发一个音（模拟播放中的状态）
-    synth.noteOn(&engine.synths[0], 60);
-    synth.noteOn(&engine.synths[1], 64);
+    synth.noteOn(&engine.synths[0], 60, synth.default_velocity, synth.default_pan);
+    synth.noteOn(&engine.synths[1], 64, synth.default_velocity, synth.default_pan);
     try std.testing.expectEqual(@as(usize, 1), synth.activeCount(&engine.synths[0]));
     try std.testing.expectEqual(@as(usize, 1), synth.activeCount(&engine.synths[1]));
 

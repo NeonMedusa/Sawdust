@@ -73,6 +73,11 @@ pub const ParsedNote = struct {
     end_tick: i64,
     pitch: u8,
     channel: u8,
+    /// 力度（1-127）——note-on 的力度字节
+    velocity: u8 = 100,
+    /// 声像（0-127；64 = 居中）——音符开始时该通道的 CC10 值
+    /// （无 CC10 则 64；同通道同时响的多音符会互相覆盖，best-effort）
+    pan: u8 = 64,
 };
 
 pub const Parsed = struct {
@@ -86,7 +91,7 @@ pub const Parsed = struct {
     }
 };
 
-const Pending = struct { channel: u8, pitch: u8, start: i64 };
+const Pending = struct { channel: u8, pitch: u8, start: i64, velocity: u8, pan: u8 };
 
 /// 关闭最早的 (channel, pitch) 配对（FIFO——同 MIDI 接收端语义）
 fn closeNote(
@@ -105,6 +110,8 @@ fn closeNote(
                 .end_tick = @max(end_tick, p.start + 1),
                 .pitch = pitch,
                 .channel = channel,
+                .velocity = p.velocity,
+                .pan = p.pan,
             });
             return;
         }
@@ -124,6 +131,8 @@ fn parseTrack(
     var i: usize = 0;
     var abs: i64 = 0;
     var running: u8 = 0; // running status（上一个事件状态字节）
+    // 每通道当前 CC10（声像）值——音符开始时快照进音符（还原导入前听感）
+    var chan_pan = [_]u8{64} ** 16;
     while (i < data.len) {
         const delta = readVlq(data, &i) orelse return; // 损坏：宽容停止
         abs += delta;
@@ -147,12 +156,20 @@ fn parseTrack(
                 const vel = data[i + 1];
                 i += 2;
                 if (kind == 0x90 and vel > 0) {
-                    try pending.append(allocator, .{ .channel = ch, .pitch = key, .start = abs });
+                    try pending.append(allocator, .{ .channel = ch, .pitch = key, .start = abs, .velocity = vel, .pan = chan_pan[ch & 0x0F] });
                 } else {
                     try closeNote(allocator, notes, &pending, ch, key, abs);
                 }
             },
-            0xA0, 0xB0, 0xE0 => i += 2, // 触后 / 控制器 / 弯音：跳过
+            0xB0 => {
+                // 控制器：CC10 = 声像（其余跳过）
+                if (i + 2 > data.len) return;
+                const cc = data[i];
+                const val = data[i + 1];
+                i += 2;
+                if (cc == 10) chan_pan[ch & 0x0F] = val;
+            },
+            0xA0, 0xE0 => i += 2, // 触后 / 弯音：跳过
             0xC0, 0xD0 => i += 1, // 音色 / 通道触后：跳过
             0xF0 => switch (status) {
                 0xF0, 0xF7 => {
@@ -180,6 +197,8 @@ fn parseTrack(
             .end_tick = @max(abs, p.start + 1),
             .pitch = p.pitch,
             .channel = p.channel,
+            .velocity = p.velocity,
+            .pan = p.pan,
         });
     }
 }
@@ -221,6 +240,11 @@ pub const ExportNote = struct {
     len_steps: i32,
     pitch: u8,
     channel: u8,
+    /// 力度（1-127；默认 100）
+    velocity: u8 = 100,
+    /// 声像（0-127；64 = 居中）——导出时在音符前插 CC10（best-effort：
+    /// 同通道同时响的多音符会互相覆盖，MIDI 协议限制）
+    pan: u8 = 64,
 };
 
 pub const ExportSong = struct {
@@ -230,7 +254,10 @@ pub const ExportSong = struct {
     notes: []const ExportNote,
 };
 
-const Event = struct { tick: i64, pitch: u8, is_on: bool };
+const Event = struct { tick: i64, pitch: u8, is_on: bool, velocity: u8 = 100 };
+
+/// CC10（声像）事件（导出声像 ≠ 64 的音符时插入）
+const CcEvent = struct { tick: i64, value: u8 };
 
 fn evLess(_: void, a: Event, b: Event) bool {
     if (a.tick != b.tick) return a.tick < b.tick;
@@ -238,6 +265,10 @@ fn evLess(_: void, a: Event, b: Event) bool {
     const pa: u8 = if (a.is_on) 1 else 0;
     const pb: u8 = if (b.is_on) 1 else 0;
     return pa < pb;
+}
+
+fn ccLess(_: void, a: CcEvent, b: CcEvent) bool {
+    return a.tick < b.tick;
 }
 
 /// 写指挥轨（tempo + 拍号 + 结束）
@@ -268,21 +299,39 @@ fn writeConductorTrack(
     try out.appendSlice(allocator, &.{ 0xFF, 0x2F, 0x00 });
 }
 
-/// 写一条音符轨（固定通道；note-on 力度 100、note-off 释放速度 64）
+/// 写一条音符轨（固定通道；力度用音符自身的；声像 CC10 已在事件前插入）
 fn writeNoteTrack(
     allocator: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
     evs: []const Event,
+    ccs: []const CcEvent,
     channel: u4,
 ) !void {
+    // 合并两个有序序列（音符事件 + CC10），按 tick 先后写出
     var last: i64 = 0;
-    for (evs) |e| {
-        try writeVlq(out, allocator, @intCast(@max(0, e.tick - last)));
-        last = e.tick;
-        const status: u8 = (if (e.is_on) @as(u8, 0x90) else 0x80) | @as(u8, channel);
-        try out.append(allocator, status);
-        try out.append(allocator, e.pitch);
-        try out.append(allocator, if (e.is_on) 100 else 64);
+    var ei: usize = 0;
+    var ci: usize = 0;
+    while (ei < evs.len or ci < ccs.len) {
+        // 同 tick：CC 先于音符事件（声像在音符开之前就位）
+        const take_cc = ci < ccs.len and (ei >= evs.len or ccs[ci].tick <= evs[ei].tick);
+        if (take_cc) {
+            const c = ccs[ci];
+            ci += 1;
+            try writeVlq(out, allocator, @intCast(@max(0, c.tick - last)));
+            last = c.tick;
+            try out.append(allocator, 0xB0 | @as(u8, channel));
+            try out.append(allocator, 10); // CC10 = 声像
+            try out.append(allocator, c.value);
+        } else {
+            const e = evs[ei];
+            ei += 1;
+            try writeVlq(out, allocator, @intCast(@max(0, e.tick - last)));
+            last = e.tick;
+            const status: u8 = (if (e.is_on) @as(u8, 0x90) else 0x80) | @as(u8, channel);
+            try out.append(allocator, status);
+            try out.append(allocator, e.pitch);
+            try out.append(allocator, if (e.is_on) e.velocity else 64);
+        }
     }
     try writeVlq(out, allocator, 0);
     try out.appendSlice(allocator, &.{ 0xFF, 0x2F, 0x00 });
@@ -292,9 +341,11 @@ fn writeNoteTrack(
 pub fn write(allocator: std.mem.Allocator, song: ExportSong) ![]u8 {
     const tpq = export_tpq;
 
-    // 按通道收集事件
+    // 按通道收集事件（音符 + 声像 CC10；CC 去重：同值连续不重发）
     var evs: [16]std.ArrayListUnmanaged(Event) = [_]std.ArrayListUnmanaged(Event){.{ .items = &.{}, .capacity = 0 }} ** 16;
+    var ccs: [16]std.ArrayListUnmanaged(CcEvent) = [_]std.ArrayListUnmanaged(CcEvent){.{ .items = &.{}, .capacity = 0 }} ** 16;
     defer for (&evs) |*e| e.deinit(allocator);
+    defer for (&ccs) |*c| c.deinit(allocator);
     var used = [_]bool{false} ** 16;
 
     for (song.notes) |n| {
@@ -302,11 +353,16 @@ pub fn write(allocator: std.mem.Allocator, song: ExportSong) ![]u8 {
         used[ch] = true;
         const on_tick = stepToTick(n.start_step, tpq);
         const off_tick = stepToTick(n.start_step + @max(1, n.len_steps), tpq);
-        try evs[ch].append(allocator, .{ .tick = on_tick, .pitch = n.pitch, .is_on = true });
+        try evs[ch].append(allocator, .{ .tick = on_tick, .pitch = n.pitch, .is_on = true, .velocity = @max(1, n.velocity) });
         try evs[ch].append(allocator, .{ .tick = off_tick, .pitch = n.pitch, .is_on = false });
+        // 声像 ≠ 居中 → 在音符起点前插 CC10
+        if (n.pan != 64) {
+            try ccs[ch].append(allocator, .{ .tick = on_tick, .value = @min(127, n.pan) });
+        }
     }
     for (&evs, 0..) |*e, ch| {
         if (used[ch]) std.mem.sort(Event, e.items, {}, evLess);
+        if (used[ch]) std.mem.sort(CcEvent, ccs[ch].items, {}, ccLess);
     }
 
     // 头块
@@ -336,7 +392,7 @@ pub fn write(allocator: std.mem.Allocator, song: ExportSong) ![]u8 {
         if (!used[ch]) continue;
         var track: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 };
         defer track.deinit(allocator);
-        try writeNoteTrack(allocator, &track, e.items, @intCast(ch));
+        try writeNoteTrack(allocator, &track, e.items, ccs[ch].items, @intCast(ch));
         try appendChunk(allocator, &out, track.items);
     }
 
@@ -502,6 +558,40 @@ test "midi: 导出 → 解析往返（音高/时值/通道）" {
             if (s == want.start_step and e - s == want.len_steps) found = true;
         }
         try std.testing.expect(found);
+    }
+}
+
+test "midi: 力度/声像（CC10）导出 → 解析往返" {
+    const allocator = std.testing.allocator;
+    const notes = [_]ExportNote{
+        .{ .start_step = 0, .len_steps = 24, .pitch = 60, .channel = 0, .velocity = 40, .pan = 20 },
+        .{ .start_step = 24, .len_steps = 24, .pitch = 64, .channel = 0, .velocity = 127, .pan = 100 },
+        .{ .start_step = 48, .len_steps = 24, .pitch = 67, .channel = 1 }, // 默认 100 / 64（不写 CC10）
+    };
+    const bytes = try write(allocator, .{ .notes = &notes });
+    defer allocator.free(bytes);
+
+    var parsed = try parse(allocator, bytes);
+    defer parsed.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 3), parsed.notes.len);
+
+    // 力度逐音符还原；声像：音符开始时该通道的 CC10（同通道后一个音符覆盖前值）
+    for (parsed.notes) |got| {
+        switch (got.pitch) {
+            60 => {
+                try std.testing.expectEqual(@as(u8, 40), got.velocity);
+                try std.testing.expectEqual(@as(u8, 20), got.pan);
+            },
+            64 => {
+                try std.testing.expectEqual(@as(u8, 127), got.velocity);
+                try std.testing.expectEqual(@as(u8, 100), got.pan);
+            },
+            67 => {
+                try std.testing.expectEqual(@as(u8, 100), got.velocity);
+                try std.testing.expectEqual(@as(u8, 64), got.pan); // 无 CC10 → 默认居中
+            },
+            else => unreachable,
+        }
     }
 }
 
