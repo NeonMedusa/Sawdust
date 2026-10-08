@@ -139,6 +139,21 @@ pub fn clipLocalToSong(c: Clip, local_step: i32) ?i32 {
     return c.start + (local_step - lo);
 }
 
+/// 局部步 → 全局步（**带鉗制**：超出片段窗口 → 鉗到窗口边缘）。
+/// 用于“在局部视图（钢琴卷帘标尺）上设置全局区域（SONG 循环）”
+pub fn clipLocalToSongClamped(c: Clip, local_step: i32) i32 {
+    if (local_step < c.offset) return c.start;
+    if (local_step >= c.offset + c.len) return c.start + c.len;
+    return c.start + (local_step - c.offset);
+}
+
+/// 全局步 → 局部步（**带鉗制**）。用于“在局部视图上显示全局区域”
+pub fn clipSongToLocalClamped(c: Clip, song_step: i32) i32 {
+    if (song_step < c.start) return c.offset;
+    if (song_step >= c.start + c.len) return c.offset + c.len;
+    return c.offset + (song_step - c.start);
+}
+
 test "游标换算：最左片段 / 全局↔局部 / 折叠截断" {
     const B: i32 = units_per_whole; // 一小节（4/4）= 96 步
     const clips = [_]Clip{
@@ -166,6 +181,19 @@ test "游标换算：最左片段 / 全局↔局部 / 折叠截断" {
     try std.testing.expectEqual(4 * B + 2 * B - 1, clipLocalToSong(fold, 3 * B - 1).?);
     try std.testing.expect(clipLocalToSong(fold, 4 * B) == null); // 超出可见末小节
     try std.testing.expectEqual(B, clipSongToLocal(fold, 4 * B).?);
+
+    // 鉗制版（循环区域跨出片段窗口的换算）：局部→全局、全局→局部都鉗到边缘
+    try std.testing.expectEqual(4 * B, clipLocalToSongClamped(fold, B - 1)); // 左溢出 → 片段起点
+    try std.testing.expectEqual(4 * B + 3 * B, clipLocalToSongClamped(fold, 9 * B)); // 右溢出 → 片段终点
+    try std.testing.expectEqual(4 * B + B, clipLocalToSongClamped(fold, 2 * B)); // 窗口内：正常换算
+    try std.testing.expectEqual(B, clipSongToLocalClamped(fold, 4 * B - 1)); // 左溢出 → offset
+    try std.testing.expectEqual(4 * B, clipSongToLocalClamped(fold, 9 * B)); // 右溢出 → offset+len
+    try std.testing.expectEqual(2 * B, clipSongToLocalClamped(fold, 5 * B)); // 窗口内：正常换算
+    // 往返一致（窗口内）：局部 → 全局 → 局部 = 原值
+    var lp: i32 = B;
+    while (lp < 4 * B) : (lp += B) {
+        try std.testing.expectEqual(lp, clipSongToLocalClamped(fold, clipLocalToSongClamped(fold, lp)));
+    }
 }
 
 /// **量化/吸附网格**：分母（1/1 … 1/96）→ 步数（U=96 单位）。

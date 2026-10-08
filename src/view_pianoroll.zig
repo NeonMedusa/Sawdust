@@ -54,6 +54,12 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         app.closePiano();
     }
 
+    // 菜单展开时的点击只归菜单：屏蔽本帧其它交互（标尺/音符区）——
+    // 必须在**任何交互处理之前**算（实测 bug：点选单条目穿透命中小节标尺，
+    // 游标跳到鼠标位置——旧代码在末尾才算，标尺早已吃掉点击）。
+    // 覆盖：帧首已有选单展开 / 本帧刚点选择器按钮（那两个点击都不该落到下层）。
+    const menu_click = (inst_menu_was_open or snap_menu_was_open or snap_clicked or inst_clicked) and ui.mouse_pressed;
+
     const ruler_h: i32 = 20; // 标尺行高 = 滚动条厚度（与播放列表一致）
     const list_y = y + util.title_h;
     const list_h = h - util.title_h;
@@ -152,6 +158,29 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     const bar_ws: f32 = @as(f32, @floatFromInt(bar_w)) * zoom; // 屏幕上的小节宽
     const scroll_s: f32 = @as(f32, @floatFromInt(app.piano.scroll_x)) * zoom; // 屏幕上的滚动量
 
+    // 循环区域在**本视图的局部坐标**（本视图时间轴 = 当前样式最左片段的局部轴）：
+    // - PAT：`loop_pat` 即局部步，直接用；
+    // - SONG：`loop_song` 是全局步，经最左片段换算（同一参照系）
+    const loop_clip: ?model.Clip = if (app.sel.song_mode) model.leftmostClipFor(app.clips.items, pattern) else null;
+    const loop_local: ?[2]i32 = blk: {
+        const lr = app.loopRegion() orelse break :blk null;
+        if (!app.sel.song_mode) break :blk lr;
+        const c = loop_clip orelse break :blk null; // 无片段：无局部时间轴，不显示
+        const lo_l = model.clipSongToLocalClamped(c, lr[0]);
+        const hi_l = model.clipSongToLocalClamped(c, lr[1]);
+        if (hi_l <= lo_l) break :blk null; // 区域完全在片段窗口外
+        break :blk .{ lo_l, hi_l };
+    };
+
+    // 鼠标 x → 局部步（**吸附到当前网格**；标尺交互/循环拖动共用）
+    const mouseLocalStepSnap = struct {
+        fn f(mx: i32, lx: i32, scroll_x: i32, zm: f32, spb_v: i32, bar_w_v: i32, snap: i32) i32 {
+            const cpx: i32 = scroll_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(mx - lx)) / zm));
+            const raw: i32 = @max(0, @divFloor(cpx * spb_v, bar_w_v));
+            return @max(0, model.snapRound(raw, snap));
+        }
+    }.f;
+
     // 局部小节标尺
     ui.renderer.fillRect(main_x, ruler_y, main_w, ruler_h, ui.theme.toolbar);
     {
@@ -168,10 +197,39 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             const t = std.fmt.bufPrint(&buf, "{d}", .{bar}) catch "";
             ui.label(t, bx + 3, ruler_y + 1, ui.theme.text_dim);
         }
+        // 循环区域（标尺行部分；内容区部分在下面音符层里另行绘制）。
+        // `loop_local` 已把 SONG 全局区域换算为**本视图局部步**（见顶部）；
+        // 拖动中优先显示实时预览（首次设置区域也能看到预览）
+        {
+            var lo: i32 = 0;
+            var hi: i32 = 0;
+            var show = false;
+            if (app.playback.loop_drag_from) |df| {
+                // **按当前网格步进**（与松手时一致；旧版预览用 1/96 原始步，
+                // 拖动时端点乱跳、松手忽然吸到网格——手感不对）
+                const cur_step: i32 = mouseLocalStepSnap(ui.mouse_x, lane_x, app.piano.scroll_x, zoom, spb, bar_w, snap_steps);
+                lo = @min(df, cur_step);
+                hi = @max(df, cur_step);
+                show = hi > lo;
+            } else if (loop_local) |lr_in| {
+                lo = lr_in[0];
+                hi = lr_in[1];
+                show = hi > lo;
+            }
+            if (show) {
+                const x0 = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(lo)) * step_ws - scroll_s));
+                const x1 = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(hi)) * step_ws - scroll_s));
+                const tint = (@as(u32, 40) << 24) | (ui.theme.note_selected & 0x00FFFFFF);
+                ui.renderer.fillRect(x0, ruler_y, x1 - x0, ruler_h, tint);
+                ui.renderer.vline(x0, ruler_y, ruler_h, ui.theme.note_selected);
+                ui.renderer.vline(x1, ruler_y, ruler_h, ui.theme.note_selected);
+            }
+        }
     }
     ui.renderer.vline(sb_x, ruler_y, ruler_h, ui.theme.panel_border); // □ 缺口左边界
     ui.renderer.vline(lane_x, ruler_y, ruler_h, ui.theme.panel_border); // 琴键列分界
     ui.renderer.hline(x + 1, lane_y, w - 2, ui.theme.panel_border);
+
 
     // □ 缺口：按住上下拖 = 音高行高缩放（方块本身固定不动；视口中心音高保持不动）
     {
@@ -302,6 +360,40 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             }
         }
 
+        // 循环区域背景（半透明橙黄 = 选中音符同款色；叠在网格/行高亮之上、
+        // 音符之下——只做背景层，不影响内容可读性）；标尺行同时叠加。
+        // **单独裁剪到音符区**：外层裁剪含琴键列（main_x 起），
+        // 不收紧的话区域会盖到琴键上（实测 bug）。
+        {
+            const saved_loop = ui.renderer.pushClip(lane_x, lane_y, view_w, lane_h);
+            defer ui.renderer.popClip(saved_loop);
+            // 区域来源：拖动中 → 实时预览（起点.. 鼠标）；否则 → 已设区域（已换算）
+            var lo: i32 = 0;
+            var hi: i32 = 0;
+            var show = false;
+            if (app.playback.loop_drag_from) |df| {
+                // **按当前网格步进**（与松手时一致；见标尺行同名注释）
+                const cur_step: i32 = mouseLocalStepSnap(ui.mouse_x, lane_x, app.piano.scroll_x, zoom, spb, bar_w, snap_steps);
+                lo = @min(df, cur_step);
+                hi = @max(df, cur_step);
+                show = hi > lo;
+            } else if (loop_local) |lr_in| {
+                lo = lr_in[0];
+                hi = lr_in[1];
+                show = hi > lo;
+            }
+            if (show) {
+                const x0 = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(lo)) * step_ws - scroll_s));
+                const x1 = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(hi)) * step_ws - scroll_s));
+                // 半透明叠加（alpha ≈ 40；与选中音符颜色同源）
+                const tint = (@as(u32, 40) << 24) | (ui.theme.note_selected & 0x00FFFFFF);
+                ui.renderer.fillRect(x0, lane_y, x1 - x0, lane_h, tint);
+                // 边界竖线（不透明；精确范围）
+                ui.renderer.vline(x0, lane_y, lane_h, ui.theme.note_selected);
+                ui.renderer.vline(x1, lane_y, lane_h, ui.theme.note_selected);
+            }
+        }
+
         // 幽灵音符（**同样式、其它乐器**；灰色半透明——只读参考，无交互）：
         // 画在主体音符**之前** → 真实音符压在上层。
         // 交互（命中/框选/行选）的乐器筛选保留——幽灵不参与选择与拖动。
@@ -400,16 +492,60 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                     util.drawCursor(ui, localStepX(local, lane_x, step_ws, scroll_s), ruler_y, ruler_h, lane_y + lane_h, app.playing);
                 }
                 // 设置：局部 → 全局（超出片段可见范围 → 归位到片段起点）
-                const in_ruler = ui.hitRect(lane_x, ruler_y, view_w, ruler_h);
-                if (in_ruler and ui.mouse_pressed) {
+                // （`menu_click` 门控：点选单条目的那一帧不得穿透到标尺）
+                const in_ruler = !menu_click and ui.hitRect(lane_x, ruler_y, view_w, ruler_h);
+                // Ctrl+标尺：拖动 = 设循环区域；单击（未拖动）= 取消循环
+                // （手势存**局部步**做预览；松手时换算成**全局步**入 SONG 槽——
+                // 本视图 SONG 时间轴 = 最左片段的局部轴，见顶部 `loop_local`）
+                if (in_ruler and ui.mouse_pressed and ui.mods_ctrl) {
+                    app.playback.loop_drag_from = mouseLocalStepSnap(ui.mouse_x, lane_x, app.piano.scroll_x, zoom, spb, bar_w, snap_steps);
+                    app.playback.loop_drag_press_x = ui.mouse_x;
+                    app.playback.loop_drag_moved = false;
+                    ui.active_id = 7500;
+                }
+                if (ui.active_id == 7500) {
+                    if (!ui.mouse_down) {
+                        if (app.playback.loop_drag_moved) {
+                            if (app.playback.loop_drag_from) |df| {
+                                const cur_step: i32 = mouseLocalStepSnap(ui.mouse_x, lane_x, app.piano.scroll_x, zoom, spb, bar_w, snap_steps);
+                                const lo_l = @min(df, cur_step);
+                                const hi_l = @max(df, cur_step);
+                                // 存 SONG 槽（局部 → 全局，鉗制到片段窗口）
+                                const a = model.clipLocalToSongClamped(c, lo_l);
+                                const b = model.clipLocalToSongClamped(c, hi_l);
+                                app.setLoopRegion(a, b);
+                                // 选中区域内的音符：**当前样式 + 当前乐器**（本视图可见/可编辑
+                                // 范围；用局部步——区域在屏幕上就是局部轴）
+                                app.selectNotesInRegionPat(lo_l, hi_l);
+                            }
+                        } else {
+                            app.clearLoopRegion();
+                            app.clearNoteSelection(); // 取消循环时一并取消音符选区
+                        }
+                        app.playback.loop_drag_from = null;
+                        app.playback.loop_drag_moved = false;
+                        ui.active_id = 0;
+                    } else {
+                        if (@abs(ui.mouse_x - app.playback.loop_drag_press_x) > 3) {
+                            app.playback.loop_drag_moved = true;
+                        }
+                        // 拖动中**实时高亮**：区域内的音符每帧重算选中
+                        // （同框选“框内 = 选中”；不必等松手）
+                        if (app.playback.loop_drag_moved) {
+                            if (app.playback.loop_drag_from) |df| {
+                                const cur_step: i32 = mouseLocalStepSnap(ui.mouse_x, lane_x, app.piano.scroll_x, zoom, spb, bar_w, snap_steps);
+                                app.selectNotesInRegionPat(@min(df, cur_step), @max(df, cur_step));
+                            }
+                        }
+                    }
+                } else if (in_ruler and ui.mouse_pressed) {
                     ui.active_id = 7100;
                 }
                 if (ui.active_id == 7100) {
                     if (!ui.mouse_down) {
                         ui.active_id = 0;
                     } else {
-                        const content_px: i32 = app.piano.scroll_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(ui.mouse_x - lane_x)) / zoom));
-                        const local = @max(0, @divFloor(content_px * spb, bar_w));
+                        const local = mouseLocalStepSnap(ui.mouse_x, lane_x, app.piano.scroll_x, zoom, spb, bar_w, snap_steps);
                         // **点 SONG 标尺 = 切回 SONG**（与“点播放列表标尺 = 切 SONG”对称）
                         app.sel.song_mode = true;
                         // 超出可见范围 → 归位到片段起点（局部 offset）；
@@ -421,19 +557,56 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         } else {
             // PAT：局部步自由设置
             util.drawCursor(ui, localStepX(app.playback.piano_step, lane_x, step_ws, scroll_s), ruler_y, ruler_h, lane_y + lane_h, app.playing);
-            const in_ruler = ui.hitRect(lane_x, ruler_y, view_w, ruler_h);
-            if (in_ruler and ui.mouse_pressed) {
+            // （`menu_click` 门控：点选单条目的那一帧不得穿透到标尺）
+            const in_ruler = !menu_click and ui.hitRect(lane_x, ruler_y, view_w, ruler_h);
+            // Ctrl+标尺：拖动 = 设循环区域；单击（未拖动）= 取消循环（同上）
+            if (in_ruler and ui.mouse_pressed and ui.mods_ctrl) {
+                app.playback.loop_drag_from = mouseLocalStepSnap(ui.mouse_x, lane_x, app.piano.scroll_x, zoom, spb, bar_w, snap_steps);
+                app.playback.loop_drag_press_x = ui.mouse_x;
+                app.playback.loop_drag_moved = false;
+                ui.active_id = 7500;
+            }
+            if (ui.active_id == 7500) {
+                if (!ui.mouse_down) {
+                    if (app.playback.loop_drag_moved) {
+                        if (app.playback.loop_drag_from) |df| {
+                            const cur_step: i32 = mouseLocalStepSnap(ui.mouse_x, lane_x, app.piano.scroll_x, zoom, spb, bar_w, snap_steps);
+                            const lo = @min(df, cur_step);
+                            const hi = @max(df, cur_step);
+                            app.setLoopRegion(lo, hi);
+                            app.selectNotesInRegionPat(lo, hi);
+                        }
+                    } else {
+                        app.clearLoopRegion();
+                        app.clearNoteSelection(); // 取消循环时一并取消音符选区
+                    }
+                    app.playback.loop_drag_from = null;
+                    app.playback.loop_drag_moved = false;
+                    ui.active_id = 0;
+                } else {
+                    if (@abs(ui.mouse_x - app.playback.loop_drag_press_x) > 3) {
+                        app.playback.loop_drag_moved = true;
+                    }
+                    // 拖动中实时高亮（同上）
+                    if (app.playback.loop_drag_moved) {
+                        if (app.playback.loop_drag_from) |df| {
+                            const cur_step: i32 = mouseLocalStepSnap(ui.mouse_x, lane_x, app.piano.scroll_x, zoom, spb, bar_w, snap_steps);
+                            app.selectNotesInRegionPat(@min(df, cur_step), @max(df, cur_step));
+                        }
+                    }
+                }
+            } else if (in_ruler and ui.mouse_pressed) {
                 ui.active_id = 7200;
             }
             if (ui.active_id == 7200) {
                 if (!ui.mouse_down) {
                     ui.active_id = 0;
                 } else {
-                    const content_px: i32 = app.piano.scroll_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(ui.mouse_x - lane_x)) / zoom));
                     // **点 PAT 标尺 = 切回 PAT**（与“点 SONG 标尺 = 切 SONG”对称）
                     app.sel.song_mode = false;
-                    // 跳转**去重**（按住期间只在目标步变化/按下帧才跳）
-                    app.jumpPlaybackCursorDrag(@max(0, @divFloor(content_px * spb, bar_w)), ui.mouse_pressed);
+                    // 跳转**去重**（按住期间只在目标步变化/按下帧才跳）；
+                    // 吸附到当前网格
+                    app.jumpPlaybackCursorDrag(mouseLocalStepSnap(ui.mouse_x, lane_x, app.piano.scroll_x, zoom, spb, bar_w, snap_steps), ui.mouse_pressed);
                 }
             }
         }
@@ -441,9 +614,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
 
     // ── 乐器选择器已移至标题栏（网格选单右侧；见函数顶部）——
     // 标尺行左端保持为空（不再占用琴键列上方）。
-    // 菜单展开时的点击只归菜单：屏蔽音符交互一帧
-    // （乐器选单、吸附网格选单、以及本帧点击选择器按钮本身）
-    const menu_click = (inst_menu_was_open or snap_menu_was_open or snap_clicked or inst_clicked) and ui.mouse_pressed;
+    // （`menu_click` 已提前到函数顶部计算——标尺/音符区都用它门控；
+    // 实测 bug：点选单条目穿透命中小节标尺 → 游标跳到鼠标位置）
 
     // 量化/吸附格（步）——音符移动/拉伸对齐到它；网格也按它加一层（已在函数顶部声明）。
 

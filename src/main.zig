@@ -383,8 +383,13 @@ pub fn main(init: std.process.Init) !u8 {
                 app.playback.piano_step = cur;
             }
 
+            // 循环回跳（循环区域 / 内容末尾自动循环）——
+            // 必须在推进后、调度前检查：回跳会重置传输基准并重扫调度窗口。
+            app.tickPlaybackLoop();
+
             // 调度 lookahead：提前 4 小节（步单位随拍号/分辨率变化）
-            const horizon = cur + app.steps_per_bar * 4;
+            const cur2 = app.playback.cursorStep(app.sel.song_mode);
+            const horizon = cur2 + app.steps_per_bar * 4;
             if (horizon > app.scheduler.scheduled_upto) {
                 sequencer.scheduleRange(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, app.sel.song_mode, app.sel.pattern, app.scheduler.scheduled_upto, horizon);
             }

@@ -321,6 +321,17 @@ pub const Playback = struct {
     /// 见 `App.jumpPlaybackCursorDrag`
     ruler_drag_step: i32 = -1,
 
+    /// 循环区域（**SONG 语义**：全局步；与 `song_step` 同坐标）：null = 未设置
+    loop_song: ?[2]i32 = null,
+    /// 循环区域（**PAT 语义**：当前样式的局部步；与 `piano_step` 同坐标）：null = 未设置
+    loop_pat: ?[2]i32 = null,
+    /// 循环标尺拖动：起点（步）——null = 未在拖动
+    loop_drag_from: ?i32 = null,
+    /// 循环标尺拖动：按下时的鼠标 x（区分“Ctrl+单击 = 取消”与“Ctrl+拖动 = 设置”）
+    loop_drag_press_x: i32 = 0,
+    /// 循环标尺拖动：是否已移动（超过死区）
+    loop_drag_moved: bool = false,
+
     /// 当前显示的游标位置（步）
     pub fn cursorStep(self: *const Playback, song_mode: bool) i32 {
         return if (song_mode) self.song_step else self.piano_step;
@@ -865,6 +876,28 @@ pub const App = struct {
 
     /// 删除全部选中音符（返回删除数）
     pub fn deleteSelectedNotes(self: *App) usize {
+        // 优先级：有框选 → 删框选；框选内无音符（本就空）→ 退而删**循环区域内**
+        // 的音符（有循环区域时）。
+        // 注意：框选为空 = “没有 selected 的音符”；循环区域删除用
+        // `selectNotesInRegion*` 的同一套映射（左右视图坐标不同，各自处理）
+        var any_selected = false;
+        for (self.notes.items) |nt| {
+            if (nt.selected) {
+                any_selected = true;
+                break;
+            }
+        }
+        if (!any_selected) {
+            if (self.loopRegion()) |lr| {
+                // 选区为空 + 有循环区域 → 选中区域音符后删除（与拖选同一选区语义）
+                if (self.sel.song_mode) {
+                    self.selectNotesInRegionSong(lr[0], lr[1]);
+                } else {
+                    self.selectNotesInRegionPat(lr[0], lr[1]);
+                }
+                // 若区域也没音符 → 下面的循环空转（removed 0，不改 dirty）
+            }
+        }
         var removed: usize = 0;
         var i: usize = 0;
         while (i < self.notes.items.len) {
@@ -2094,6 +2127,138 @@ pub const App = struct {
         self.events.push(.{ .kind = .all_off });
     }
 
+    /// 当前模式（SONG/PAT）的循环区域（与当前游标同坐标；null = 未设置）
+    pub fn loopRegion(self: *const App) ?[2]i32 {
+        return if (self.sel.song_mode) self.playback.loop_song else self.playback.loop_pat;
+    }
+
+    /// 设置当前模式的循环区域（归一化；空区域 → 取消）
+    pub fn setLoopRegion(self: *App, a: i32, b: i32) void {
+        const lo = @max(0, @min(a, b));
+        const hi = @max(0, @max(a, b));
+        if (hi <= lo) {
+            self.clearLoopRegion();
+            return;
+        }
+        if (self.sel.song_mode) {
+            self.playback.loop_song = .{ lo, hi };
+        } else {
+            self.playback.loop_pat = .{ lo, hi };
+        }
+    }
+
+    /// 取消当前模式的循环区域
+    pub fn clearLoopRegion(self: *App) void {
+        if (self.sel.song_mode) {
+            self.playback.loop_song = null;
+        } else {
+            self.playback.loop_pat = null;
+        }
+        self.playback.loop_drag_from = null;
+        self.playback.loop_drag_moved = false;
+    }
+
+    /// 当前上下文（SONG/PAT）的**内容末尾步**（最后一个有效音符结束之后的
+    /// 一步）；无音符 → 0。
+    /// - SONG：所有片段的映射（音符经每片段映射的 end 最大值）——
+    ///   与序列器一致（片段窗口截断后的 end）；
+    /// - PAT：当前样式 + **当前乐器**？不——样式内**所有乐器**（当前样式
+    ///   的最后一个音符，不分乐器；与“听全曲/全样式”直觉一致）。
+    pub fn contentEndStep(self: *const App) i32 {
+        var last: i32 = 0;
+        if (self.sel.song_mode) {
+            for (self.clips.items) |clip| {
+                for (self.notes.items) |nt| {
+                    if (nt.pattern != clip.pattern) continue;
+                    if (nt.len <= 0) continue;
+                    const clip_end = clip.start + clip.len;
+                    const local_lo = clip.offset;
+                    const gs = clip.start + (nt.step - local_lo);
+                    const ge = gs + nt.len;
+                    if (ge <= clip.start or gs >= clip_end) continue; // 窗口外
+                    last = @max(last, @min(ge, clip_end));
+                }
+            }
+        } else {
+            for (self.notes.items) |nt| {
+                if (nt.pattern != self.sel.pattern) continue;
+                if (nt.len <= 0) continue;
+                last = @max(last, nt.step + nt.len);
+            }
+        }
+        return last;
+    }
+
+    /// 播放推进后的**循环回跳**（main 主循环每帧调用，播放中）。
+    ///
+    /// 规则（两条叠加）：
+    /// 1. **循环区域**（用户设置）：游标到 `loop[1]` → 回跳到 `loop[0]`；
+    /// 2. **自动循环**（未设区域）：游标超过内容末尾（最后一个有效音符）
+    ///    → 回跳到开头（0）。
+    /// 循环区域存在时只按 1 循环（不叠加自动），否则区域播放时会被
+    /// “内容末尾”绕开。
+    ///
+    /// 回跳用 `jumpPlaybackCursor`（重置传输基准 + 作废旧调度事件 + 补发
+    /// 跨起点音符）——与手动跳转同一套语义，声部释放/重触发都正确。
+    pub fn tickPlaybackLoop(self: *App) void {
+        if (!self.playing) return;
+        const song_mode = self.sel.song_mode;
+        const cur = self.playback.cursorStep(song_mode);
+
+        // ① 循环区域（区域与游标同坐标：SONG 用全局、PAT 用局部）
+        if (self.loopRegion()) |l| {
+            if (cur >= l[1]) {
+                self.jumpPlaybackCursor(l[0]);
+            }
+            return;
+        }
+        // ② 自动循环：超过内容末尾
+        const end = self.contentEndStep();
+        if (end > 0 and cur >= end) {
+            self.jumpPlaybackCursor(0);
+        }
+    }
+
+    /// 选中落入**全局步区域** `[lo, hi)` 的音符（按片段映射；播放列表
+    /// 的循环选区用）。
+    pub fn selectNotesInRegionSong(self: *App, lo: i32, hi: i32) void {
+        self.clearNoteSelection();
+        for (self.notes.items) |*nt| {
+            if (nt.len <= 0) continue;
+            for (self.clips.items) |clip| {
+                if (nt.pattern != clip.pattern) continue;
+                const clip_end = clip.start + clip.len;
+                const gs = clip.start + (nt.step - clip.offset);
+                const ge = gs + nt.len;
+                if (ge <= clip.start or gs >= clip_end) continue;
+                // 映射到片段窗口后的实际区间 [ms, me)，再与区域**相交判定**：
+                // 音头在区域左、音尾伸进区域 → 也算（实测直觉：拖动框选应捕获
+                // 与区域有重叠的所有音符，而不只是“起点在内”的）
+                const ms = @max(gs, clip.start);
+                const me = @min(ge, clip_end);
+                if (ms < hi and me > lo) {
+                    nt.selected = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    /// 选中与**局部步区域** `[lo, hi)` 相交的音符（当前样式 + 当前乐器；
+    /// 钢琴卷帘的循环选区用——与该视图的可编辑/可见范围一致）。
+    /// **相交判定**（非“起点在内”）：音头在区域左、音尾伸进区域也算。
+    pub fn selectNotesInRegionPat(self: *App, lo: i32, hi: i32) void {
+        self.clearNoteSelection();
+        for (self.notes.items) |*nt| {
+            if (nt.pattern != self.sel.pattern) continue;
+            if (nt.instrument != self.sel.instrument) continue;
+            if (nt.len <= 0) continue;
+            const ns = nt.step;
+            const ne = nt.step + nt.len;
+            if (ns < hi and ne > lo) nt.selected = true;
+        }
+    }
+
     /// 试听音符（路由到**当前乐器**）
     pub fn auditionOn(self: *App, pitch: i32) void {
         if (self.sel.instrument < 0 or self.sel.instrument >= synth.max_instruments) return;
@@ -2545,6 +2710,145 @@ test "app: 撤销——合成器参数（ADSR）也恢复（修“调 ADSR 不�
     // 重做 → 回到 0.8
     try std.testing.expect(app.redo());
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), app.instruments.items[0].synth.attack.load(.monotonic), 0.0001);
+}
+
+test "app: 循环播放——自动回跳（内容末尾）与循环区域" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    // PAT：两个音符，末尾 = 24（第二个音符 16..24）
+    app.sel.song_mode = false;
+    app.sel.pattern = 0;
+    app.addNote(.{ .step = 0, .len = 8, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.addNote(.{ .step = 16, .len = 8, .pitch = 62, .pattern = 0, .instrument = 0 });
+    try std.testing.expectEqual(@as(i32, 24), app.contentEndStep());
+
+    // ① 自动循环：游标过末尾（未设区域）→ 回跳 0
+    app.playing = true;
+    app.playback.piano_step = 23;
+    app.tickPlaybackLoop();
+    try std.testing.expectEqual(@as(i32, 23), app.playback.piano_step); // 未到末尾：不动
+    app.playback.piano_step = 24;
+    app.tickPlaybackLoop();
+    try std.testing.expectEqual(@as(i32, 0), app.playback.piano_step); // 到末尾：回跳
+
+    // ② 循环区域（PAT 局部步）：到 loop[1] → 回跳到 loop[0]
+    app.setLoopRegion(4, 20);
+    try std.testing.expectEqual(@as(?[2]i32, .{ 4, 20 }), app.loopRegion());
+    app.playback.piano_step = 19;
+    app.tickPlaybackLoop();
+    try std.testing.expectEqual(@as(i32, 19), app.playback.piano_step); // 未到：不动
+    app.playback.piano_step = 20;
+    app.tickPlaybackLoop();
+    try std.testing.expectEqual(@as(i32, 4), app.playback.piano_step); // 到区域末端：回跳到区域头
+
+    // 区域优先于自动循环：内容末尾 24 不在区域内 → 到 20 就回跳（而非 24）
+    app.playback.piano_step = 21;
+    app.tickPlaybackLoop();
+    try std.testing.expectEqual(@as(i32, 4), app.playback.piano_step);
+
+    // ③ 取消循环区域 → 恢复自动循环
+    app.clearLoopRegion();
+    try std.testing.expectEqual(@as(?[2]i32, null), app.loopRegion());
+    app.playback.piano_step = 24;
+    app.tickPlaybackLoop();
+    try std.testing.expectEqual(@as(i32, 0), app.playback.piano_step);
+
+    // ④ SONG 区域与 PAT 区域互不干扰
+    app.setLoopRegion(8, 16); // PAT 槽
+    app.sel.song_mode = true;
+    try std.testing.expectEqual(@as(?[2]i32, null), app.loopRegion()); // SONG 槽未设
+    app.setLoopRegion(32, 64); // SONG 槽
+    app.sel.song_mode = false;
+    try std.testing.expectEqual(@as(?[2]i32, .{ 8, 16 }), app.loopRegion()); // PAT 槽不变
+    app.sel.song_mode = true;
+    try std.testing.expectEqual(@as(?[2]i32, .{ 32, 64 }), app.loopRegion());
+
+    app.stopPlayback();
+}
+
+test "app: 循环标尺选区——相交判定（音尾伸进区域也算；PAT 局部 / SONG 全局）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    // PAT：[0,4) / [16,20) / [32,36) / [4,12)（音头在区域左、音尾伸进 [8,24)）
+    app.sel.song_mode = false;
+    app.sel.pattern = 0;
+    app.addNote(.{ .step = 0, .len = 4, .pitch = 60, .pattern = 0, .instrument = 0 }); // 窗口外（左）
+    app.addNote(.{ .step = 16, .len = 4, .pitch = 62, .pattern = 0, .instrument = 0 }); // 完全在内
+    app.addNote(.{ .step = 32, .len = 4, .pitch = 64, .pattern = 0, .instrument = 0 }); // 窗口外（右）
+    app.addNote(.{ .step = 4, .len = 8, .pitch = 65, .pattern = 0, .instrument = 0 }); // 音头在区域左、音尾伸进区域
+    app.selectNotesInRegionPat(8, 24);
+    try std.testing.expect(!app.notes.items[0].selected); // [0,4)：不相交
+    try std.testing.expect(app.notes.items[1].selected); // 完全在内
+    try std.testing.expect(!app.notes.items[2].selected); // [32,36)：不相交
+    try std.testing.expect(app.notes.items[3].selected); // [4,12)：尾伸进 → 算
+
+    // SONG：片段 [0, 32) 映射；[4,12) 音符只映射一次（经片段）→ 全局 [4,12) 尾伸进 [8,24)
+    app.clearNoteSelection();
+    app.sel.song_mode = true;
+    app.clips.append(app.allocator, .{ .track = 0, .start = 0, .len = 32, .pattern = 0, .offset = 0 }) catch {};
+    app.selectNotesInRegionSong(8, 24);
+    try std.testing.expect(!app.notes.items[0].selected); // 全局 [0,4)：不相交
+    try std.testing.expect(app.notes.items[1].selected); // 全局 [16,20)：在内
+    try std.testing.expect(app.notes.items[3].selected); // 全局 [4,12)：尾伸进
+    try std.testing.expect(!app.notes.items[2].selected); // 全局 [32,36)：出片段窗口 + 不相交
+    try std.testing.expect(!app.notes.items[2].selected); // 全局 32：出片段窗口 + 不在区域
+}
+
+test "app: Del 优先删框选；框选为空时删循环区域内音符" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    // PAT：[0,4) / [16,20) / [32,36)；循环区域 [8, 24)
+    app.sel.song_mode = false;
+    app.sel.pattern = 0;
+    app.addNote(.{ .step = 0, .len = 4, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.addNote(.{ .step = 16, .len = 4, .pitch = 62, .pattern = 0, .instrument = 0 });
+    app.addNote(.{ .step = 32, .len = 4, .pitch = 64, .pattern = 0, .instrument = 0 });
+    app.setLoopRegion(8, 24);
+
+    // ① 框选为空 → 删循环区域内的音符（step 16 那个）
+    try std.testing.expectEqual(@as(usize, 0), app.selectedNoteCount());
+    try std.testing.expectEqual(@as(usize, 1), app.deleteSelectedNotes());
+    try std.testing.expectEqual(@as(usize, 2), app.notes.items.len);
+    for (app.notes.items) |nt| try std.testing.expect(nt.step != 16);
+
+    // ② 有框选 → 优先删框选（即使框选在循环区域之外）
+    for (app.notes.items) |*nt| {
+        if (nt.step == 32) nt.selected = true;
+    }
+    try std.testing.expectEqual(@as(usize, 1), app.deleteSelectedNotes());
+    try std.testing.expectEqual(@as(usize, 1), app.notes.items.len);
+    try std.testing.expectEqual(@as(i32, 0), app.notes.items[0].step); // 循环区域内的 16 已在①删了；32 被框选删了
+
+    // ③ 框选为空 + 循环区域也无音符 → 不删（返回 0）
+    try std.testing.expectEqual(@as(usize, 0), app.selectedNoteCount());
+    try std.testing.expectEqual(@as(usize, 0), app.deleteSelectedNotes());
+    try std.testing.expectEqual(@as(usize, 1), app.notes.items.len);
+
+    // ④ 无循环区域 + 框选为空 → 不删（返回 0）
+    app.clearLoopRegion();
+    try std.testing.expectEqual(@as(usize, 0), app.deleteSelectedNotes());
+    try std.testing.expectEqual(@as(usize, 1), app.notes.items.len);
 }
 
 test "app: 播放中新增音符——提交历史时补发调度（修“追加的音符不响”）" {

@@ -59,6 +59,11 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         app.openPiano(app.sel.pattern);
     }
 
+    // 菜单展开时的点击只归菜单：屏蔽本帧其它交互（标尺/轨道区）——
+    // 必须在**任何交互处理之前**算（实测 bug：点选单条目穿透命中小节标尺，
+    // 游标跳到鼠标位置）。
+    const menu_click = (snap_menu_was_open or snap_clicked) and ui.mouse_pressed;
+
     const header_w: i32 = 90; // 轨道名列宽
     const ruler_h: i32 = 20; // 标尺行高 = 滚动条厚度（横条高 = 纵条宽）
     const list_y = y + util.title_h;
@@ -128,6 +133,17 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     const bar_ws: f32 = @as(f32, @floatFromInt(bar_w)) * zoom; // 屏幕上的小节宽
     const scroll_s: f32 = @as(f32, @floatFromInt(app.playlist.scroll_x)) * zoom; // 屏幕上的滚动量
 
+    // 鼠标 x → 全局步（**吸附到当前网格**；标尺/循环拖动共用——
+    // 必须在任何使用点之前定义）
+    const pl_snap: i32 = model.snapSteps(app.playlist.snap);
+    const playlistMouseStepSnap = struct {
+        fn f(mx: i32, lx: i32, scroll_x: i32, zm: f32, step_px_v: f32, snap: i32) i32 {
+            const px: f32 = @as(f32, @floatFromInt(scroll_x)) + @as(f32, @floatFromInt(mx - lx)) / zm;
+            const raw: i32 = @max(0, @as(i32, @intFromFloat(px / step_px_v)));
+            return @max(0, model.snapRound(raw, snap));
+        }
+    }.f;
+
     // 小节标尺（随横向滚动与缩放；只画在轨道内容区上方）
     ui.renderer.fillRect(main_x, ruler_y, main_w, ruler_h, ui.theme.toolbar);
     {
@@ -143,6 +159,33 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             var buf: [8]u8 = undefined;
             const t = std.fmt.bufPrint(&buf, "{d}", .{bar}) catch "";
             ui.label(t, bx + 3, ruler_y + 1, ui.theme.text_dim);
+        }
+        // 循环区域（标尺行部分；轨道区部分在轨道行之后叠加）。
+        // 本视图时间轴**始终是全局步**，所以直接看 `loop_song`（不看当前模式）；
+        // 拖动中优先显示实时预览（首次设置区域也能看到预览）
+        {
+            var lo: i32 = 0;
+            var hi: i32 = 0;
+            var show = false;
+            if (app.playback.loop_drag_from) |df| {
+                // **按当前网格步进**（与松手时一致）
+                const cur_step = playlistMouseStepSnap(ui.mouse_x, lane_x, app.playlist.scroll_x, zoom, step_px, pl_snap);
+                lo = @min(df, cur_step);
+                hi = @max(df, cur_step);
+                show = hi > lo;
+            } else if (app.playback.loop_song) |lr_in| {
+                lo = lr_in[0];
+                hi = lr_in[1];
+                show = hi > lo;
+            }
+            if (show) {
+                const x0 = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(lo)) * step_px * zoom - scroll_s));
+                const x1 = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(hi)) * step_px * zoom - scroll_s));
+                const tint = (@as(u32, 40) << 24) | (ui.theme.note_selected & 0x00FFFFFF);
+                ui.renderer.fillRect(x0, ruler_y, x1 - x0, ruler_h, tint);
+                ui.renderer.vline(x0, ruler_y, ruler_h, ui.theme.note_selected);
+                ui.renderer.vline(x1, ruler_y, ruler_h, ui.theme.note_selected);
+            }
         }
     }
 
@@ -285,6 +328,38 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             if (ty > tracks_y + tracks_h) break;
         }
 
+        // 循环区域背景（半透明橙黄 = 选中音符同款色；叠在片段之上——
+        // 只做背景提示，不遮挡内容交互）。
+        // **单独裁剪到轨道内容区**：外层裁剪含轨道名列（main_x 起），
+        // 不收紧的话区域会盖到轨道头上（实测 bug）。
+        // 同上：直接看 `loop_song`（本视图时间轴始终是全局步）
+        {
+            const saved_loop2 = ui.renderer.pushClip(lane_x, tracks_y, view_w, tracks_h);
+            defer ui.renderer.popClip(saved_loop2);
+            var lo: i32 = 0;
+            var hi: i32 = 0;
+            var show = false;
+            if (app.playback.loop_drag_from) |df| {
+                // **按当前网格步进**（与松手时一致）
+                const cur_step = playlistMouseStepSnap(ui.mouse_x, lane_x, app.playlist.scroll_x, zoom, step_px, pl_snap);
+                lo = @min(df, cur_step);
+                hi = @max(df, cur_step);
+                show = hi > lo;
+            } else if (app.playback.loop_song) |lr_in| {
+                lo = lr_in[0];
+                hi = lr_in[1];
+                show = hi > lo;
+            }
+            if (show) {
+                const x0 = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(lo)) * step_px * zoom - scroll_s));
+                const x1 = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(hi)) * step_px * zoom - scroll_s));
+                const tint = (@as(u32, 40) << 24) | (ui.theme.note_selected & 0x00FFFFFF);
+                ui.renderer.fillRect(x0, tracks_y, x1 - x0, tracks_h, tint);
+                ui.renderer.vline(x0, tracks_y, tracks_h, ui.theme.note_selected);
+                ui.renderer.vline(x1, tracks_y, tracks_h, ui.theme.note_selected);
+            }
+        }
+
         // 框选矩形（半透明填充 + 描边；画在片段之上；裁剪到轨道内容区）
         if (app.playlist.marquee_active) {
             const mx0 = @min(app.playlist.marquee_x0, ui.mouse_x);
@@ -311,9 +386,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 轨道名列与内容区的分界线
     ui.renderer.vline(lane_x, tracks_y, tracks_h, ui.theme.panel_border);
 
-    // ── 播放游标（标尺区单击/拖动设置位置；播放时按音频时钟推进）──
     // **必须在轨道行之后绘制**：否则竖线会被轨道行背景盖住（实测 bug）。
-    // 位置 = 全局步（song_step）；屏幕 x = lane_x + (步/16) × 小节宽 × zoom − 滚动量
     {
         // 裁剪到「标尺行 + 轨道区」：左滚时游标 x 会变负，不裁剪会画到轨道名列/左侧面板上
         const saved_cursor = ui.renderer.pushClip(lane_x, ruler_y, view_w, ruler_h + tracks_h);
@@ -324,17 +397,59 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         util.drawCursor(ui, cx, ruler_y, ruler_h, tracks_y + tracks_h, app.playing);
 
         // 交互（仅标尺行）：按下 → 直接设置位置并进入拖动；拖动中跟随鼠标
-        const in_ruler = ui.hitRect(lane_x, ruler_y, view_w, ruler_h);
-        if (in_ruler and ui.mouse_pressed) {
+        // （`menu_click` 门控：点选单条目的那一帧不得穿透到标尺）
+        const in_ruler = !menu_click and ui.hitRect(lane_x, ruler_y, view_w, ruler_h);
+        // Ctrl+标尺：拖动 = 设循环区域；单击（未拖动）= 取消循环
+        // （全局步；点播放列表标尺会切 SONG——见下方跳转分支）；
+        // 鼠标→步**吸附到当前网格**
+        if (in_ruler and ui.mouse_pressed and ui.mods_ctrl) {
+            const step = playlistMouseStepSnap(ui.mouse_x, lane_x, app.playlist.scroll_x, zoom, step_px, pl_snap);
+            app.sel.song_mode = true; // 循环区域存 SONG 槽（与下方坐标系一致）
+            app.playback.loop_drag_from = step;
+            app.playback.loop_drag_press_x = ui.mouse_x;
+            app.playback.loop_drag_moved = false;
+            ui.active_id = 7501; // 循环标尺手势（播放列表版）
+        }
+        if (ui.active_id == 7501) {
+            if (!ui.mouse_down) {
+                if (app.playback.loop_drag_moved) {
+                    if (app.playback.loop_drag_from) |df| {
+                        const step = playlistMouseStepSnap(ui.mouse_x, lane_x, app.playlist.scroll_x, zoom, step_px, pl_snap);
+                        const lo = @min(df, step);
+                        const hi = @max(df, step);
+                        app.sel.song_mode = true;
+                        app.setLoopRegion(lo, hi);
+                        app.selectNotesInRegionSong(lo, hi); // 选中被拖过区域的音符（全局映射）
+                    }
+                } else {
+                    app.clearLoopRegion(); // 单击未拖动 = 取消循环
+                    app.clearNoteSelection(); // 一并取消音符选区
+                }
+                app.playback.loop_drag_from = null;
+                app.playback.loop_drag_moved = false;
+                ui.active_id = 0;
+            } else {
+                if (@abs(ui.mouse_x - app.playback.loop_drag_press_x) > 3) {
+                    app.playback.loop_drag_moved = true;
+                }
+                // 拖动中**实时高亮**：区域内的音符每帧重算选中
+                // （同框选“框内 = 选中”；不必等松手）
+                if (app.playback.loop_drag_moved) {
+                    if (app.playback.loop_drag_from) |df| {
+                        const cur = playlistMouseStepSnap(ui.mouse_x, lane_x, app.playlist.scroll_x, zoom, step_px, pl_snap);
+                        app.selectNotesInRegionSong(@min(df, cur), @max(df, cur));
+                    }
+                }
+            }
+        } else if (in_ruler and ui.mouse_pressed) {
             ui.active_id = 7000;
         }
         if (ui.active_id == 7000) {
             if (!ui.mouse_down) {
                 ui.active_id = 0;
             } else {
-                // 鼠标 → 全局步（吸附到步；范围 ≥ 0）
-                const content_px: f32 = @as(f32, @floatFromInt(app.playlist.scroll_x)) + @as(f32, @floatFromInt(ui.mouse_x - lane_x)) / zoom;
-                const step: i32 = @max(0, @as(i32, @intFromFloat(content_px / step_px)));
+                // 鼠标 → 全局步（**吸附到当前网格**；范围 ≥ 0）
+                const step = playlistMouseStepSnap(ui.mouse_x, lane_x, app.playlist.scroll_x, zoom, step_px, pl_snap);
                 // **点播放列表标尺 = 自动切 SONG**（本视图编辑的是全曲时间线；
                 // 符合直觉：在播放列表里定游标 → 就是要听全曲）。
                 // 切换后下面的 jumpPlaybackCursorDrag 会按 SONG 语义跳转。
@@ -348,8 +463,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
 
     // ── 鼠标交互（轨道内容区）──
     // 左键空位：放置样式；左键片段：拖动移动；片段右缘：拉伸长度；右键片段：删除
-    // 菜单展开时的点击只归菜单：屏蔽轨道交互一帧（含本帧点击选择器按钮）
-    const menu_click = (snap_menu_was_open or snap_clicked) and ui.mouse_pressed;
+    // （`menu_click` 门控已在函数顶部提前计算——标尺/轨道区都用它）
     const in_lane = !menu_click and ui.hitRect(lane_x, tracks_y, view_w, tracks_h);
     const track_i = @divFloor(ui.mouse_y - tracks_y + app.playlist.scroll, track_h);
     // 鼠标 → 内容坐标（除以 zoom）→ **全局步**（U=96）
