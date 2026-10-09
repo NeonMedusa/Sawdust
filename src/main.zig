@@ -772,24 +772,26 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
     x += 46;
 
     // BPM（按住上下拖：上滑增加 / 下滑减小；拖动时光标隐藏并冻结）
+    // 灵敏度：8px/单位（再降一半——拖 8px 变 1 BPM）
     // 高度/位置与前面的菜单、SONG/PAT、传输按钮**同排对齐**（by/bh）
     ui.labelCentered("BPM", x, by, bh, ui.theme.text_dim);
     x += @as(i32, @intFromFloat(ui.font.measure("BPM"))) + 8;
     {
         const old_bpm = app.bpm;
-        _ = ui.dragNumber(350, x, by, 56, bh, &app.bpm, 20, 999, 2);
+        _ = ui.dragNumber(350, x, by, 56, bh, &app.bpm, 20, 999, 8);
         if (app.bpm != old_bpm) app.history_pending = "调整 BPM"; // 松手时 coalesce 提交
         x += 62;
     }
 
     // 拍号（分子/分母都可推；分母为 2 的幂：指数式推子——拖 1 单位 = 翻倍）
+    // 灵敏度：分子 12px/单位（范围 1..32）、分母 12px/档（指数 0..4）
     {
         const num_w: i32 = 30;
         const den_w: i32 = 30;
-        const changed_num = ui.dragNumber(351, x, by, num_w, bh, &app.time_num, 1, 32, 4);
+        const changed_num = ui.dragNumber(351, x, by, num_w, bh, &app.time_num, 1, 32, 12);
         ui.labelCentered("/", x + num_w + 5, by, bh, ui.theme.text_dim);
         // 指数模式：拖动值 = log2(分母)（1..4 → 2/4/8/16）；不会因吸附写回而振荡
-        const changed_den = ui.dragNumberEx(352, x + num_w + 15, by, den_w, bh, &app.time_den, 0, 4, 4, 1, null);
+        const changed_den = ui.dragNumberEx(352, x + num_w + 15, by, den_w, bh, &app.time_den, 0, 4, 12, 1, null);
         if (changed_num or changed_den) {
             app.steps_per_bar = model.stepsPerBarFor(app.time_num, app.time_den);
             app.history_pending = "调整拍号"; // 松手时 coalesce 提交

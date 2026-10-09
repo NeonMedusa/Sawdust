@@ -135,6 +135,8 @@ pub const SavedMixerChannel = struct {
 pub const Project = struct {
     version: u32 = file_version,
     bpm: i32 = 120,
+    /// 主音量（0-1；旧存档缺失 → 默认 0.75，与 App.volume 一致）
+    volume: f32 = 0.75,
     time_num: i32 = 4,
     time_den: i32 = 4,
     /// 每小节步数（冗余存储：拍号换算规则若变更仍能正确还原）
@@ -269,6 +271,7 @@ test "persist: JSON 往返（序列化 → 解析）" {
 
     const project = Project{
         .bpm = 140,
+        .volume = 0.42,
         .time_num = 3,
         .time_den = 4,
         .steps_per_bar = 72,
@@ -283,12 +286,12 @@ test "persist: JSON 往返（序列化 → 解析）" {
     // JSON 可读性：应含版本与关键字段
     try std.testing.expect(std.mem.indexOf(u8, json, "\"version\": 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"bpm\": 140") != null);
-
     const parsed = try fromJson(allocator, json);
     defer parsed.deinit();
 
     try std.testing.expectEqual(@as(u32, 3), parsed.value.version);
     try std.testing.expectEqual(@as(i32, 140), parsed.value.bpm);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.42), parsed.value.volume, 1e-6); // 主音量往返
     try std.testing.expectEqual(@as(i32, 3), parsed.value.time_num);
     try std.testing.expectEqual(@as(i32, 72), parsed.value.steps_per_bar);
     try std.testing.expectEqual(@as(usize, 2), parsed.value.clips.len);
@@ -371,6 +374,7 @@ test "persist: 缺失字段用默认值（向后兼容）" {
     defer parsed.deinit();
     try std.testing.expectEqual(@as(i32, 90), parsed.value.bpm);
     try std.testing.expectEqual(@as(i32, 4), parsed.value.time_num); // 默认
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), parsed.value.volume, 1e-6); // 缺字段 → 默认主音量
     try std.testing.expectEqual(@as(usize, 0), parsed.value.clips.len);
 }
 

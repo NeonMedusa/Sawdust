@@ -777,32 +777,47 @@ test "ui: 主动缩放（滚轮）仍受动态下限约束" {
 // ── 拖动数值控件（BPM）的内核：zoomStep + 每步帧数换算 ──
 // 注：dragNumber 的绘制依赖字体（测里没有真字体），故只测其数值内核与换算。
 
-test "ui: BPM 拖动内核——2px/单位、上滑增下滑减、慢拖累积、范围钳制" {
-    // 上滑 4px → +2
+test "ui: BPM 拖动内核——8px/单位、上滑增下滑减、慢拖累积、范围钳制" {
+    // 上滑 16px → +2（8px/单位）
     {
-        const r = Ui.zoomStep(120, -4, 0, 2, 20, 999);
+        const r = Ui.zoomStep(120, -16, 0, 8, 20, 999);
         try std.testing.expectEqual(@as(i32, 122), r.v);
     }
-    // 下滑 4px → -2
+    // 下滑 16px → -2
     {
-        const r = Ui.zoomStep(120, 4, 0, 2, 20, 999);
+        const r = Ui.zoomStep(120, 16, 0, 8, 20, 999);
         try std.testing.expectEqual(@as(i32, 118), r.v);
     }
-    // 慢拖：每次 1px，2 次才 -1（不丢步）
+    // 慢拖：每次 1px，8 次才 -1（不丢步）
     {
         var v: i32 = 120;
         var rem: i32 = 0;
         var i: usize = 0;
-        while (i < 2) : (i += 1) {
-            const r = Ui.zoomStep(v, 1, rem, 2, 20, 999);
+        while (i < 8) : (i += 1) {
+            const r = Ui.zoomStep(v, 1, rem, 8, 20, 999);
             v = r.v;
             rem = r.rem;
         }
         try std.testing.expectEqual(@as(i32, 119), v);
     }
     // 钳制
-    try std.testing.expectEqual(@as(i32, 999), Ui.zoomStep(998, -100, 0, 2, 20, 999).v);
-    try std.testing.expectEqual(@as(i32, 20), Ui.zoomStep(21, 100, 0, 2, 20, 999).v);
+    try std.testing.expectEqual(@as(i32, 999), Ui.zoomStep(998, -100, 0, 8, 20, 999).v);
+    try std.testing.expectEqual(@as(i32, 20), Ui.zoomStep(21, 100, 0, 8, 20, 999).v);
+}
+
+test "ui: 推子式慢拖——每帧小位移跨帧累积（修通道机架推子“慢拖无响应”）" {
+    // 通道机架推子：40px/通道。旧实现每帧 `@divTrunc(dd, 20)` 且**丢弃余数**：
+    // 每帧 5px 的慢拖每帧都截成 0 → 拖半天无响应；快拖单帧跳好几格。
+    // 用 zoomStep 后：5px/帧 × 8 帧 = 40px → 恰好 1 通道（不丢步）。
+    var ch: i32 = 0;
+    var rem: i32 = 0;
+    var i: usize = 0;
+    while (i < 8) : (i += 1) {
+        const r = Ui.zoomStep(ch, -5, rem, 40, 0, 7); // 上拖 5px/帧
+        ch = r.v;
+        rem = r.rem;
+    }
+    try std.testing.expectEqual(@as(i32, 1), ch); // 8 帧后恰好 +1（而非 0 或跳多格）
 }
 
 test "ui: 每步帧数换算（BPM × 每拍步数 → 步长）——U=96 对照" {

@@ -238,11 +238,12 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, x: i32, y: i32, w: i32, clip_top: i32
         const mix_t = std.fmt.bufPrint(&buf, "{d}", .{inst.mixer}) catch "";
         const tw: i32 = @intFromFloat(ui.font.measure(mix_t));
         ui.label(mix_t, mix_x + @divTrunc(util.rack_mix_w - tw, 2), mix_y + @divTrunc(mix_h - 10, 2), ui.theme.text);
-        // 推子交互：按下 → 捕获；上下拖动 = 通道增减；吸附到 1..8
+        // 推子交互：按下 → 捕获；上下拖动 = 通道增减（**上拖增大、下拖减小**）
         if (hovered and ui.mouse_pressed) {
             ui.active_id = 4100 + @as(u64, idx);
             ui.mouse_capture = true; // 隐藏/冻结鼠标（推子手感）
             ui.zoom_last_dy = ui.frozen_dy;
+            ui.zoom_rem = 0; // 余数清零（防上一控件残留的不足一单位余数带来首帧误步）
         }
         if (ui.active_id == 4100 + @as(u64, idx)) {
             if (!ui.mouse_down) {
@@ -251,11 +252,15 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, x: i32, y: i32, w: i32, clip_top: i32
             } else {
                 const dd = ui.frozen_dy - ui.zoom_last_dy;
                 ui.zoom_last_dy = ui.frozen_dy;
-                // 上拖减小通道号、下拖增大（-20px/通道）
                 const n_mixer: i32 = @intCast(app.mixer_channels_state.items.len);
-                var v = inst.mixer - @divTrunc(dd, 20);
-                v = std.math.clamp(v, 0, @max(0, n_mixer - 1));
-                if (v != inst.mixer) inst.mixer = v; // 拖动中实时生效
+                // 用 `zoomStep`：**跨帧累积余数**（慢拖不丢步）。
+                // 旧实现 `@divTrunc(dd, 20)` 每帧截断且**丢弃余数**——慢拖
+                // （每帧位移 < 20px）永远无响应、快拖单帧跳 4-5 格（实测手感 bug）。
+                // 40px/通道（再降一半——8 通道全推完约 280px）；方向与
+                // dragNumber/zoomSquare 一致（上拖增大）。
+                const r = Ui.zoomStep(inst.mixer, dd, ui.zoom_rem, 40, 0, @max(0, n_mixer - 1));
+                ui.zoom_rem = r.rem;
+                if (r.v != inst.mixer) inst.mixer = r.v; // 拖动中实时生效
             }
         }
         // 松开时统一提交历史（拖动中 coalesce）

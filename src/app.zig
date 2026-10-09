@@ -579,7 +579,7 @@ pub const App = struct {
     // ── 音频 ──
     params: audio.Params = .{},
     engine: audio.Engine = .{ .params = undefined },
-    volume: f32 = 0.3,
+    volume: f32 = 0.75,
     /// BPM（拍/分；工具栏可上下拖动调整；范围 20-999）
     bpm: i32 = 120,
     /// 拍号分子（每小节拍数；工具栏可拖动）
@@ -1911,6 +1911,7 @@ pub const App = struct {
         const mix = try self.exportMixerChannels(alloc);
         return .{
             .bpm = self.bpm,
+            .volume = self.volume, // 主音量（持久化——重开工程恢复）
             .time_num = self.time_num,
             .time_den = self.time_den,
             .steps_per_bar = self.steps_per_bar,
@@ -1977,6 +1978,8 @@ pub const App = struct {
 
         // 全局设置
         self.bpm = p.bpm;
+        self.volume = p.volume; // 主音量（缺字段的旧存档 → 默认值）
+        self.params.volume.store(self.volume, .monotonic); // 立即同步到音频线程
         self.time_num = p.time_num;
         self.time_den = p.time_den;
         self.steps_per_bar = p.steps_per_bar;
@@ -2158,12 +2161,32 @@ pub const App = struct {
         self.playback.loop_drag_moved = false;
     }
 
+    /// 指定样式的**内容末尾步**（该样式所有音符的最大结束步，不分乐器；
+    /// 无音符 → 0）
+    pub fn patternEndStep(self: *const App, pattern: i32) i32 {
+        var last: i32 = 0;
+        for (self.notes.items) |nt| {
+            if (nt.pattern != pattern) continue;
+            if (nt.len <= 0) continue;
+            last = @max(last, nt.step + nt.len);
+        }
+        return last;
+    }
+
+    /// 指定样式的**有效长度**（步）：按拍号向上取整到小节倍数，至少 1 小节。
+    /// 供播放列表“放置片段”的默认长度用（内容 2.5 小节 → 放 3 小节）。
+    pub fn patternEffectiveLen(self: *const App, pattern: i32) i32 {
+        const end = self.patternEndStep(pattern);
+        const spb = @max(1, self.steps_per_bar);
+        const bars = @max(1, @divTrunc(end + spb - 1, spb)); // 向上取整，至少 1
+        return bars * spb;
+    }
+
     /// 当前上下文（SONG/PAT）的**内容末尾步**（最后一个有效音符结束之后的
     /// 一步）；无音符 → 0。
     /// - SONG：所有片段的映射（音符经每片段映射的 end 最大值）——
     ///   与序列器一致（片段窗口截断后的 end）；
-    /// - PAT：当前样式 + **当前乐器**？不——样式内**所有乐器**（当前样式
-    ///   的最后一个音符，不分乐器；与“听全曲/全样式”直觉一致）。
+    /// - PAT：当前样式内**所有乐器**的末尾（与“听全样式”直觉一致）。
     pub fn contentEndStep(self: *const App) i32 {
         var last: i32 = 0;
         if (self.sel.song_mode) {
@@ -2180,11 +2203,7 @@ pub const App = struct {
                 }
             }
         } else {
-            for (self.notes.items) |nt| {
-                if (nt.pattern != self.sel.pattern) continue;
-                if (nt.len <= 0) continue;
-                last = @max(last, nt.step + nt.len);
-            }
+            last = self.patternEndStep(self.sel.pattern);
         }
         return last;
     }
@@ -2712,6 +2731,45 @@ test "app: 撤销——合成器参数（ADSR）也恢复（修“调 ADSR 不�
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), app.instruments.items[0].synth.attack.load(.monotonic), 0.0001);
 }
 
+test "app: 样式有效长度——按内容末尾向上取整到小节（放置片段的默认长度）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    const spb: i32 = app.steps_per_bar; // 4/4 → 96
+    app.sel.song_mode = false;
+    app.sel.pattern = 0;
+
+    // ① 空样式 → 至少 1 小节
+    try std.testing.expectEqual(spb, app.patternEffectiveLen(0));
+
+    // ② 内容正好 1 小节 → 1 小节
+    app.addNote(.{ .step = 0, .len = spb, .pitch = 60, .pattern = 0, .instrument = 0 });
+    try std.testing.expectEqual(spb, app.patternEffectiveLen(0));
+
+    // ③ 内容超过 1 小节（1 小节 + 4 步）→ 2 小节
+    app.addNote(.{ .step = spb, .len = 4, .pitch = 62, .pattern = 0, .instrument = 0 });
+    try std.testing.expectEqual(spb * 2, app.patternEffectiveLen(0));
+
+    // ④ 内容正好 2 小节 → 2 小节（不额外膨胀）
+    app.addNote(.{ .step = spb + 4, .len = spb - 4, .pitch = 64, .pattern = 0, .instrument = 0 });
+    try std.testing.expectEqual(spb * 2, app.patternEffectiveLen(0));
+
+    // ⑤ 只看**指定样式**：其它样式的音符不影响
+    app.addNote(.{ .step = 0, .len = spb * 5, .pitch = 65, .pattern = 1, .instrument = 0 });
+    try std.testing.expectEqual(spb * 2, app.patternEffectiveLen(0));
+    try std.testing.expectEqual(spb * 5, app.patternEffectiveLen(1));
+
+    // ⑥ 不分乐器：另一个乐器的长音符也算
+    app.addNote(.{ .step = spb * 2, .len = spb, .pitch = 66, .pattern = 0, .instrument = 1 });
+    try std.testing.expectEqual(spb * 3, app.patternEffectiveLen(0));
+}
+
 test "app: 循环播放——自动回跳（内容末尾）与循环区域" {
     var app = App{ .allocator = std.testing.allocator };
     defer app.clips.deinit(app.allocator);
@@ -3002,6 +3060,23 @@ test "app: 撤销/重做——快照式（放置/删除/修改 + redo 截断 + �
     try std.testing.expect(app.jumpHistory(0));
     try std.testing.expectEqual(@as(usize, 0), app.notes.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.history_current);
+}
+
+test "app: 导入工程恢复主音量（并同步到音频线程）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), app.volume, 1e-6); // 默认
+    app.importProject(.{ .bpm = 120, .volume = 0.77 });
+    try std.testing.expectApproxEqAbs(@as(f32, 0.77), app.volume, 1e-6);
+    // 音频线程参数同步（不重开软件即时生效）
+    try std.testing.expectApproxEqAbs(@as(f32, 0.77), app.params.volume.load(.monotonic), 1e-6);
 }
 
 test "app: 撤销——乐器/全局设置（BPM、拍号、乐器增删）也恢复" {

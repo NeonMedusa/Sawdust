@@ -30,7 +30,7 @@ pub const eq_bands = eq.band_count;
 /// UI ↔ 音频线程共享的参数（原子，无锁）
 pub const Params = struct {
     /// 主音量 0.0 - 1.0
-    volume: std.atomic.Value(f32) = std.atomic.Value(f32).init(0.3),
+    volume: std.atomic.Value(f32) = std.atomic.Value(f32).init(0.75),
     /// 是否播放（序列器渲染开关）
     playing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// 音频线程回传：已播放帧数（UI 读取用于显示播放位置/驱动游标）
@@ -578,7 +578,7 @@ test "audio: 播放中 gen 变化（跳转）释放全部声部（修“跳走�
 
 test "audio: Params 默认值" {
     var p = Params{};
-    try std.testing.expectApproxEqAbs(@as(f32, 0.3), p.volume.load(.monotonic), 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), p.volume.load(.monotonic), 0.001);
     try std.testing.expect(!p.playing.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 1), p.sched_gen.load(.monotonic));
     try std.testing.expect(p.synth_ptrs[0].load(.monotonic) == null);

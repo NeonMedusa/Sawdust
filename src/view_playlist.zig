@@ -633,10 +633,12 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 }
             }
         } else {
-            // 放置：位置吸附到网格；默认长度 = 1 小节（步单位随拍号）
+            // 放置：位置吸附到网格；默认长度 = 样式的**有效小节数**
+            // （内容末尾向上取整到小节，至少 1 小节——旧版固定 1 小节，
+            // 内容超过 1 小节的样式会被截断，实测不符直觉）
             // 注：放置新片段时**取消选区**（符合直觉：新建 = 新焦点）
             app.clearClipSelection();
-            const new_len: i32 = spb;
+            const new_len: i32 = app.patternEffectiveLen(app.sel.pattern);
             if (!model.clipOverlaps(app.clips.items, app.clips.items.len, track_i, snap_step, new_len)) {
                 app.addClip(.{ .track = track_i, .start = snap_step, .len = new_len, .pattern = app.sel.pattern });
                 app.commitHistory("放置片段"); // 原子操作：立即提交
