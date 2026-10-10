@@ -488,7 +488,16 @@ const WindowsWindow = struct {
                 if (self) |s| {
                     const ch: u21 = @intCast(wparam & 0xffff);
                     // 过滤控制字符（保留退格/回车等由 key_down 处理）
-                    if (ch >= 32) s.pushEvent(.{ .char = ch });
+                    // 127 = DEL（控制字符但 >= 32，单独排除）
+                    if (ch >= 32 and ch != 127) {
+                        // **过滤代理对**（0xD800-0xDFFF）：emoji 等 BMP 外字符
+                        // 以两个 WM_CHAR 到达（高位 + 低位）——本项目只接收
+                        // 一般文本（中文/字母/数字/常用标点），丢弃这两半即可。
+                        // 注：IME 上屏字符就是经 WM_CHAR 到达的（Unicode 窗口下
+                        // WM_IME_CHAR == WM_CHAR），无需处理 WM_IME_COMPOSITION/
+                        // GCS_RESULTSTR——组合过程由系统 IME 自己显示。
+                        if (ch < 0xD800 or ch > 0xDFFF) s.pushEvent(.{ .char = ch });
+                    }
                 }
                 return 0;
             },

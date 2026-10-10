@@ -558,6 +558,70 @@ pub const Ui = struct {
         self.font.draw(self.renderer, text, @floatFromInt(x), @floatFromInt(self.centeredBaselineY(y, h)), color);
     }
 
+    /// 文本输入框（自绘；聚焦样式 = accent 边框 + 光标竖线 + 选区高亮）。
+    /// - `cursor`：光标字节偏移（code point 边界）；
+    /// - `sel`：选区字节区间 `[lo, hi)`（null = 无）；
+    /// - `view_off`：水平滚动偏移（px；由 `textFieldSyncOffset` 每帧算）。
+    /// 纯绘制：字符/退格/光标/选区由 `App.text_input` + main 的输入路由驱动。
+    pub fn textField(self: *Ui, text: []const u8, cursor: usize, sel: ?[2]usize, view_off: i32, x: i32, y: i32, w: i32, h: i32) void {
+        self.renderer.fillRect(x, y, w, h, self.theme.toolbar);
+        self.renderer.strokeRect(x, y, w, h, self.theme.accent);
+        const inner_w = w - 8;
+        if (inner_w <= 0) return;
+        const saved = self.renderer.pushClip(x + 1, y + 1, w - 2, h - 2);
+        defer self.renderer.popClip(saved);
+        const tx = x + 4 - view_off; // 文本原点（滚动后可为负）
+        const by = self.centeredBaselineY(y, h);
+        // 选区高亮（文本之下）
+        if (sel) |s| {
+            const sx0 = tx + @as(i32, @intFromFloat(self.font.measure(text[0..s[0]])));
+            const sx1 = tx + @as(i32, @intFromFloat(self.font.measure(text[0..s[1]])));
+            const hilite = (@as(u32, 70) << 24) | (self.theme.accent & 0x00FFFFFF);
+            self.renderer.fillRect(sx0, y + 3, @max(1, sx1 - sx0), h - 6, hilite);
+        }
+        self.font.draw(self.renderer, text, @floatFromInt(tx), @floatFromInt(by), self.theme.text);
+        // 光标（文本之上；不闪烁——简化）
+        const cx = tx + @as(i32, @intFromFloat(self.font.measure(text[0..cursor])));
+        self.renderer.vline(cx, y + 4, h - 8, self.theme.text);
+    }
+
+    /// 文本输入框：让**光标可见**的水平滚动偏移（px）。
+    /// `prev` 上一帧的偏移（光标已在可见区时就不滚）。
+    pub fn textFieldSyncOffset(self: *Ui, text: []const u8, cursor: usize, w: i32, prev: i32) i32 {
+        const inner = @as(f32, @floatFromInt(w - 8));
+        if (inner <= 0) return 0;
+        const tw = self.font.measure(text);
+        const max_off: f32 = @max(0, tw - inner);
+        var off: f32 = @max(0, @min(@as(f32, @floatFromInt(prev)), max_off));
+        const cx = self.font.measure(text[0..cursor]);
+        // 光标出界才滚（边缘留 2px 余量）
+        if (cx < off + 2) off = cx - 2;
+        if (cx > off + inner - 2) off = cx - inner + 2;
+        off = @max(0, @min(off, max_off));
+        return @intFromFloat(off);
+    }
+
+    /// 文本输入框：屏幕 x（**相对文本原点**，已加滚动偏移）→ 最近的
+    /// code point 边界字节偏移（点击定位光标用）。
+    pub fn textIndexAtX(self: *Ui, text: []const u8, px: f32) usize {
+        if (px <= 0) return 0;
+        var x: f32 = 0;
+        var i: usize = 0;
+        while (i < text.len) {
+            const n = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+            if (i + n > text.len) break;
+            const cp = std.unicode.utf8Decode(text[i .. i + n]) catch {
+                i += n;
+                continue;
+            };
+            const adv = if (self.font.getGlyph(cp)) |g| g.advance else self.font.size_px * 0.5;
+            if (px < x + adv * 0.5) return i; // 点在前半 → 落在本字符之前
+            x += adv;
+            i += n;
+        }
+        return text.len;
+    }
+
     /// 列表项：返回 true = 本帧被点击。`selected` 控制高亮。
     /// `y` 为该项顶部；`h` 为行高（调用方计算）。
     /// `bg_override`：非选中/非悬停时的底色覆盖（如播放列表的轨道名列加深）。

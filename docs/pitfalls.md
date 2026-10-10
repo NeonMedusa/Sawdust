@@ -166,6 +166,46 @@ if (dx > mouse_deadzone or dx < -mouse_deadzone or ...) {
 - 隐藏光标：`CreateCursor` 造 1×1 全透明 AND 掩码（`0xFF`）+ `SetCursor`；
 - **`WM_SETCURSOR` 必须重设光标句柄**（返回 1），否则系统在移动时改回类默认箭头。
 
+### 中文输入法（IME）：Unicode 窗口下**只需处理 WM_CHAR**
+
+自绘文本输入（重命名等）接中文输入的最简方案：
+
+- **不要**处理 `WM_IME_COMPOSITION`/`GCS_RESULTSTR`——那是 IME-aware
+  （自己渲染组合窗）的路线；普通窗口让系统 IME 自己显示组合窗/候选窗
+  即可（未处理时系统默认处理）；
+- **IME 上屏字符经 `WM_CHAR` 到达**：对 Unicode 窗口，`WM_IME_CHAR`
+  与 `WM_CHAR` 完全相同（MSDN 原话）；已上屏的汉字就是一条条 WM_CHAR
+  （wParam = UTF-16 code unit）；
+- **emoji/特殊符号过滤**：BMP 外字符以**代理对**（两个 WM_CHAR：
+  D800-DBFF + DC00-DFFF）到达——丢弃 0xD800-0xDFFF 区间的 code unit
+  即可完全排除 emoji；
+- 别忘 `ch != 127`（DEL 是控制字符但 ≥ 32，会漏网）。
+
+```zig
+WM_CHAR => {
+    const ch: u21 = @intCast(wparam & 0xffff);
+    if (ch >= 32 and ch != 127 and (ch < 0xD800 or ch > 0xDFFF)) {
+        s.pushEvent(.{ .char = ch });
+    }
+    return 0;
+},
+```
+
+**教训**：中文输入不必上 `ImmGetContext`/`ImmGetCompositionString`
+那套；先查 MSDN 确认“IME 结果怎么到达窗口”，能省一整层自绘组合窗。
+
+### 禁止用 PowerShell 的 Get-Content/Set-Content 改源码！
+
+**实测事故**：用 `Get-Content -Raw` + `.Replace(...)` + `Set-Content` 做
+文本替换（想省事改一个小 assert）——整套 UTF-8 中文注释被按 GBK 解码
+再写回：大量汉字变 `?`、**换行被吞**，文件彻底损坏（只能 git checkout
+恢复后重做全部未提交修改）。
+
+- PowerShell 5.1 的 `Get-Content/Set-Content` 默认用 ANSI（本机 GBK）
+  编码，读写 UTF-8 源码必损坏；
+- **正确做法**：用编辑器的文本替换（如 edit 工具/IDE），从不整体读写；
+- 单文件小改动也不要用 PowerShell——省一分钟，赔一小时。
+
 ## 立即式 UI
 
 ### `Ui` 上下文必须**跨帧复用**（否则控件"没反应"）

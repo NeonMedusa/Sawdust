@@ -152,24 +152,43 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
         }
     }
 
-    // 右键菜单（删除乐器）——同理：仅在展开时取消屏蔽
+    // 右键菜单（重命名 / 删除乐器）——同理：仅在展开时取消屏蔽
     if (app.rack.ctx_instrument != null) ui.input_blocked = false;
     if (app.rack.ctx_instrument) |ci| {
         if (ci < app.instruments.items.len) {
+            const items = [_][]const u8{ "重命名", "删除乐器" };
             const mw: i32 = 140;
-            const mh: i32 = util.menu_item_h + 4;
+            const mh: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
             const mx = app.rack.ctx_x; // 固定位置（打开时记录，不跟鼠标跑）
             const my = app.rack.ctx_y;
             ui.renderer.fillRect(mx, my, mw, mh, ui.theme.panel);
             ui.renderer.strokeRect(mx, my, mw, mh, ui.theme.accent);
-            const ih = util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, my + 2, mw - 2, util.menu_item_h);
-            if (ih) ui.renderer.fillRect(mx + 1, my + 2, mw - 2, util.menu_item_h, ui.theme.item_hover);
-            ui.label("删除乐器", mx + 8, my + 4, ui.theme.text);
-            if (ih and ui.mouse_pressed) {
-                app.removeInstrument(ci);
+            var clicked: ?usize = null;
+            var inside = false;
+            for (items, 0..) |item, i| {
+                const iy = my + 2 + @as(i32, @intCast(i)) * util.menu_item_h;
+                const ih = util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, mw - 2, util.menu_item_h);
+                if (ih) {
+                    inside = true;
+                    ui.renderer.fillRect(mx + 1, iy, mw - 2, util.menu_item_h, ui.theme.item_hover);
+                }
+                ui.label(item, mx + 8, iy + 2, ui.theme.text);
+                if (ih and ui.mouse_pressed) clicked = i;
+            }
+            if (clicked) |ic| {
+                switch (ic) {
+                    0 => {
+                        // 重命名：输入框弹在乐器名位置（行内就地）
+                        app.beginRenameInstrument(ci, mx + 4, my + 4);
+                    },
+                    1 => {
+                        app.removeInstrument(ci);
+                        app.commitHistory("删除乐器"); // 原子操作：立即提交
+                    },
+                    else => {},
+                }
                 app.rack.ctx_instrument = null;
-                app.commitHistory("删除乐器"); // 原子操作：立即提交
-            } else if (ui.mouse_pressed and !ih) {
+            } else if (ui.mouse_pressed and !inside) {
                 app.rack.ctx_instrument = null;
             }
         } else {

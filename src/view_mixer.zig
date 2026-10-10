@@ -268,9 +268,9 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     if (mw.ctx_effect) |ctx| {
         drawCtxMenu(ui, app, ctx);
     }
-    // ── 通道右键菜单（删除/上移/下移）──
+    // ── 通道右键菜单（重命名/删除/上移/下移）──
     if (mw.ctx_channel) |cc| {
-        const items = [_][]const u8{ "删除通道", "上移", "下移" };
+        const items = [_][]const u8{ "重命名", "删除通道", "上移", "下移" };
         drawCtxMenuGeneric(ui, app, cc, null, &items);
     }
 
@@ -335,10 +335,13 @@ fn drawStrip(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32) void
         }
         cx += knob_size + 8;
     }
-    // 通道名（**定宽**；超出裁剪——省略号待做）
+    // 通道名（**定宽**；超出裁剪——省略号待做）。自定义名优先
     {
         var nb: [24]u8 = undefined;
-        const name = channelName(ci, &nb);
+        const name = if (ci < app.mixer_channels_state.items.len)
+            app.mixer_channels_state.items[ci].displayName(ci, &nb)
+        else
+            app_mod.defaultChannelName(ci, &nb);
         ui.labelClipped(name, cx + 2, y + 4, name_w, if (selected) ui.theme.text else ui.theme.text_dim);
         cx += name_w + 10;
     }
@@ -374,12 +377,7 @@ fn drawStrip(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32) void
     }
 }
 
-/// 通道名（占位；将来右键重命名、增删通道）。
-/// 写入调用方提供的字节缓冲：通道 0 = `主通道`；其余 = `通道#N`。
-fn channelName(ci: usize, buf: []u8) []const u8 {
-    if (ci == 0) return "主通道";
-    return std.fmt.bufPrint(buf, "通道#{d}", .{ci}) catch "通道";
-}
+/// （已移除：通道名改由 `MixerChannel.displayName` 提供——自定义名/占位名）
 
 /// 右区：选中通道的效果器链（抬头 + 效果行 + 空槽 + 添加按钮）
 fn drawEffectPanel(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32) void {
@@ -575,9 +573,29 @@ fn drawCtxMenuGeneric(ui: *Ui, app: *App, ch: usize, slot: ?usize, items: []cons
     }
 
     if (clicked) |ci| {
-        switch (ci) {
-            0 => { // 删除
-                if (slot) |sl| {
+        if (slot == null) {
+            // 通道菜单：重命名 / 删除通道 / 上移 / 下移
+            switch (ci) {
+                0 => app.beginRenameMixerChannel(ch, mx + 4, my + 4),
+                1 => {
+                    if (app.removeMixerChannel(ch)) {
+                        app.commitHistory("删除通道");
+                    } else {
+                        app.setToast("至少保留一个通道");
+                    }
+                },
+                2 => {
+                    if (app.moveMixerChannel(ch, -1)) app.commitHistory("通道上移");
+                },
+                3 => {
+                    if (app.moveMixerChannel(ch, 1)) app.commitHistory("通道下移");
+                },
+                else => {},
+            }
+        } else if (slot) |sl| {
+            // 效果器菜单：删除效果器 / 上移 / 下移
+            switch (ci) {
+                0 => {
                     if (ch < app.mixer_channels_state.items.len and sl < app.mixer_channels_state.items[ch].effects.items.len) {
                         if (app.mixer_win.panel) |p| {
                             if (p.ch == ch and p.slot == sl) app.mixer_win.panel = null;
@@ -585,23 +603,15 @@ fn drawCtxMenuGeneric(ui: *Ui, app: *App, ch: usize, slot: ?usize, items: []cons
                         app.removeEffect(ch, sl);
                         app.commitHistory("删除效果器");
                     }
-                } else {
-                    if (app.removeMixerChannel(ch)) {
-                        app.commitHistory("删除通道");
-                    } else {
-                        app.setToast("至少保留一个通道");
-                    }
-                }
-            },
-            1 => { // 上移
-                const moved = if (slot) |sl| app.moveEffect(ch, sl, -1) else app.moveMixerChannel(ch, -1);
-                if (moved) app.commitHistory(if (slot != null) "效果器上移" else "通道上移");
-            },
-            2 => { // 下移
-                const moved = if (slot) |sl| app.moveEffect(ch, sl, 1) else app.moveMixerChannel(ch, 1);
-                if (moved) app.commitHistory(if (slot != null) "效果器下移" else "通道下移");
-            },
-            else => {},
+                },
+                1 => {
+                    if (app.moveEffect(ch, sl, -1)) app.commitHistory("效果器上移");
+                },
+                2 => {
+                    if (app.moveEffect(ch, sl, 1)) app.commitHistory("效果器下移");
+                },
+                else => {},
+            }
         }
         mw_win.ctx_effect = null;
         mw_win.ctx_channel = null;

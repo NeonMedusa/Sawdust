@@ -232,6 +232,25 @@ pub fn main(init: std.process.Init) !u8 {
                         }
                         continue;
                     }
+                    // 文本输入（重命名）激活：键盘优先路由（吞掉其余按键，
+                    // 防误触快捷键——如输入时的 S 不能变成 Ctrl+S）
+                    if (app.text_input.active) {
+                        switch (k.code) {
+                            0x0D => app.textInputCommit(), // Enter = 提交
+                            0x1B => app.textInputCancel(), // Esc = 取消
+                            0x08 => app.textInputBackspace(), // Backspace
+                            0x2E => app.textInputDelete(), // Del = 删光标后
+                            0x25 => app.textInputMoveCursor(-1, k.shift), // ←
+                            0x27 => app.textInputMoveCursor(1, k.shift), // →
+                            0x24 => app.textInputMoveCursor(-2, k.shift), // Home
+                            0x23 => app.textInputMoveCursor(2, k.shift), // End
+                            else => {
+                                // Ctrl+A：全选
+                                if (k.ctrl and (k.code == 'A' or k.code == 'a')) app.textInputSelectAll();
+                            },
+                        }
+                        continue;
+                    }
                     if (k.code == 0x1B) { // Esc：关闭文件菜单 / 返回播放列表（**不退出程序**）
                         if (app.file_menu_open) {
                             app.file_menu_open = false;
@@ -286,11 +305,45 @@ pub fn main(init: std.process.Init) !u8 {
                     }
                 },
                 .resize => {},
+                .char => |cp| {
+                    // 文本输入（重命名）：字符追加（含中文 IME 上屏——字符经
+                    // WM_CHAR 到达；emoji 等代理对已在 window.zig 过滤）
+                    if (app.text_input.active) app.textInputAppend(cp);
+                },
                 else => {},
             }
         }
 
         // 2) 绘制
+        // 文本输入（重命名）：输入期间鼠标也归输入框独占（下层控件收不到）：
+        // - 点在框外：提交（吞掉该次点击）
+        // - 点在框内：定位光标；按住拖动 = 框选（光标跟随鼠标，可拖出框外）
+        if (app.text_input.active) {
+            const ti = &app.text_input;
+            const in_box = ui_input.mouse_x >= ti.x and ui_input.mouse_x < ti.x + ti.w and
+                ui_input.mouse_y >= ti.y and ui_input.mouse_y < ti.y + text_input_h;
+            if (ui_input.mouse_pressed) {
+                if (!in_box) {
+                    app.textInputCommit();
+                    ui_input.mouse_down = false; // 防拖动启动
+                } else {
+                    // 框内：拖动 → 框选（锚点 = 击点）；单击 → 仅定位光标
+                    const local: f32 = @floatFromInt(ui_input.mouse_x - (ti.x + 4) + ti.view_off);
+                    app.textInputPointerDown(ui.textIndexAtX(ti.text(), local));
+                }
+                ui_input.mouse_pressed = false;
+                ui_input.mouse_double = false;
+            } else if (app.text_input.drag_active) {
+                if (ui_input.mouse_down) {
+                    const local: f32 = @floatFromInt(ui_input.mouse_x - (ti.x + 4) + ti.view_off);
+                    app.textInputPointerMove(ui.textIndexAtX(ti.text(), local));
+                } else {
+                    app.textInputPointerUp();
+                }
+            }
+            // 右键：同样吞掉（不让下层弹右键菜单，也不取消输入）
+            ui_input.mouse_right_pressed = false;
+        }
         // 同步乐器指针/增益到音频线程（成本极低；删除乐器后自动变 null）
         for (0..synth.max_instruments) |i| {
             const sp: ?*synth.SynthParams = if (i < app.instruments.items.len) app.instruments.items[i].synth else null;
@@ -439,12 +492,20 @@ pub fn main(init: std.process.Init) !u8 {
         if (app.file_menu_open) drawFileMenu(&ui, &app);
         // 模态确认框（最上层；自绘——避开系统 MessageBox 把鼠标吸到默认按钮）
         if (app.modal != null) drawModal(&ui, &app);
+        // 文本输入框（最顶层——跨窗口/菜单，重命名乐器/通道用）
+        if (app.text_input.active) {
+            const ti = &app.text_input;
+            ti.view_off = ui.textFieldSyncOffset(ti.text(), ti.cursor, ti.w, ti.view_off);
+            ui.renderer.fillRect(ti.x + 2, ti.y + 2, ti.w, text_input_h, r_mod.rgb(12, 13, 16)); // 阴影
+            ui.textField(ti.text(), ti.cursor, ti.selection(), ti.view_off, ti.x, ti.y, ti.w, text_input_h);
+        }
         ui.endFrame();
 
         // 普通拖动（滚动条/片段/音符/分隔条）捕获鼠标：拖出窗口后仍能收到松开事件
         // （否则拖动状态卡死，鼠标移回时误触发拖动分支 → 回弹/跳变）。
+        // 文本框框选（拖出框/窗口）同理由此受益。
         // 冻结模式由 begin/endMouseCapture 自行管理，此处不碰。
-        if (!ui.mouse_capture) win.setDragCapture(ui.active_id != 0);
+        if (!ui.mouse_capture) win.setDragCapture(ui.active_id != 0 or app.text_input.drag_active);
 
         // 冻结中的光标：强制隐藏（控件可能在绘制时请求了别的形状）
         if (win.mouse_captured) ui.cursor = .hidden;
@@ -523,6 +584,9 @@ pub fn main(init: std.process.Init) !u8 {
     return 0;
 }
 
+/// 文本输入框高度（重命名用；固定值）
+const text_input_h: i32 = 22;
+
 const InputState = struct {
     mouse_x: i32 = 0,
     mouse_y: i32 = 0,
@@ -557,6 +621,14 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     const mixer_open = app.mixer_win.open;
     // 效果器面板（依赖调音台的 panel 选择；通道/槽位有效才显示）
     const effect_open = app.mixer_win.panel != null;
+    // 频谱目标（EQ 背景 = **该效果器的输入信号**）：每帧发布（关窗 → -1：
+    // 音频线程停止捕获，省 CPU）。见 audio.captureSpectrum。
+    if (app.mixer_win.panel) |p| {
+        app.params.spec_target_ch.store(@intCast(@min(p.ch, audio.mixer_channels - 1)), .monotonic);
+        app.params.spec_target_slot.store(@intCast(@min(p.slot, audio.effect_slots - 1)), .monotonic);
+    } else {
+        app.params.spec_target_ch.store(-1, .monotonic);
+    }
     // 机架的下拉/右键菜单 = 模态层（全屏屏蔽）。
     // 注：钢琴卷帘的两个标题栏选单**不在此列**——它们保持轻量语义，
     // 这样两个选单可以单击直接互切（进模态层会让选择器按钮自身被屏蔽）。

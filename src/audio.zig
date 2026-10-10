@@ -112,10 +112,14 @@ pub const Params = struct {
     channel_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(2),
 
     // ── 音频线程回传：调音台频谱（用于 EQ 窗口背景）──
-    /// 主输出频谱柱（0-1）
+    /// 频谱柱（0-1）——**目标效果器的输入信号**（非主输出全混）
     spec_bars: [eq.spec_bars]std.atomic.Value(f32) = [_]std.atomic.Value(f32){std.atomic.Value(f32).init(0)} ** eq.spec_bars,
     /// 频谱版本（音频线程每分析一次递增；UI 据此拷贝）
     spec_version: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// 频谱分析目标：效果器所在通道（UI 每帧发布；-1 = 不分析）
+    spec_target_ch: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
+    /// 频谱分析目标：效果器在链上的槽位（-1 = 不分析）
+    spec_target_slot: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
 
     // ── 音频线程回传：正在发声的音高（位掩码，UI 用于播放/试听高亮）──
     /// 音高 0-63（位 = 音高）
@@ -149,10 +153,14 @@ pub const Engine = struct {
     chan_eq_ver: [mixer_channels]u32 = [_]u32{0} ** mixer_channels,
     /// 每通道渲染缓冲（**堆分配**：32 通道 × 32KB = 1MB，不能放栈）
     chan_bufs: []f32 = &.{},
-    /// 频谱分析：滑窗样本（单声道混合）
+    /// 频谱分析：滑窗样本（单声道混合）——滑窗取自
+    /// **目标效果器的输入点**（见 `captureSpectrum`）
     spec_win: [eq.fft_size]f32 = undefined,
     spec_pos: usize = 0,
-    spec_fill: usize = 0,
+    /// 滑窗已满（待分析）；由 `captureSpectrum` 置位、`analyzeSpectrum` 消费
+    spec_ready: bool = false,
+    /// 上次捕获时的目标（ch, slot）——变化时丢弃旧滑窗（防两种信号混窗）
+    spec_target_seen: [2]i32 = .{ -2, -2 },
 
     /// 初始化并启动音频设备（默认设备，双声道 f32）
     pub fn init(self: *Engine, params: *Params, allocator: std.mem.Allocator) !void {
@@ -305,6 +313,16 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
     if (engine.chan_bufs.len < mixer_channels * 2 * 4096 or engine.slot_eq.len < mixer_channels * effect_slots * eq_bands * 2) return;
     const buf_stride: usize = 2 * 4096;
 
+    // 频谱目标（UI 每帧发布）：目标效果器所在通道/槽位（-1 = 不分析）。
+    // 目标变化时丢弃旧滑窗——否则两种信号的样本会混进同一窗（频谱错乱）。
+    const tgt_ch = params.spec_target_ch.load(.monotonic);
+    const tgt_slot = params.spec_target_slot.load(.monotonic);
+    if (engine.spec_target_seen[0] != tgt_ch or engine.spec_target_seen[1] != tgt_slot) {
+        engine.spec_target_seen = .{ tgt_ch, tgt_slot };
+        engine.spec_pos = 0;
+        engine.spec_ready = false;
+    }
+
     // 1) 所有通道缓冲清零
     for (0..n_ch) |ci| @memset(engine.chan_bufs[ci * buf_stride ..][0..n], 0);
 
@@ -343,13 +361,28 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
                 break;
             }
         }
-        if (!used) continue;
 
-        // ── 效果器链（插件式；按槽顺序；长度以 `effect_count` 为准）──
-        // 干湿比：效果信号与干声逐样本混合（mix = 0 为完全干声）
+        // 效果器链长度（以 `effect_count` 为准）
         const eff_n: usize = @min(params.effect_count[ch_i].load(.monotonic), effect_slots);
+
+        if (!used) {
+            // 目标在本通道时：输入实际是静音（缓冲已清零）→ 照常捕获，
+            // 频谱自然衰减到 0（不捕获会停在旧值）。
+            if (@as(i32, @intCast(ch_i)) == tgt_ch and tgt_slot >= 0 and @as(usize, @intCast(tgt_slot)) < eff_n) {
+                captureSpectrum(engine, buf, frames);
+            }
+            continue;
+        }
+
+        // ── 效果器链（插件式；按槽顺序）──
+        // 干湿比：效果信号与干声逐样本混合（mix = 0 为完全干声）
         var slot: usize = 0;
         while (slot < eff_n) : (slot += 1) {
+            // 频谱捕获点 = 目标效果器的**输入**（本槽处理之前）。
+            // 注：与本槽是否 EQ/启用无关——“进入该效果器的声音”与旁通态无关。
+            if (@as(i32, @intCast(ch_i)) == tgt_ch and @as(i32, @intCast(slot)) == tgt_slot) {
+                captureSpectrum(engine, buf, frames);
+            }
             const kind = params.effect_kind[ch_i][slot].load(.monotonic);
             if (kind != 1) continue; // 1 = EQ
             if (!params.effect_enabled[ch_i][slot].load(.monotonic)) continue; // 旁通
@@ -382,31 +415,40 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
             out[f2 * 2 + 1] += buf[f2 * 2 + 1] * gr;
         }
     }
+
+    // 频谱分析（窗满时）——数据来自目标效果器的**输入点**（上面的捕获），
+    // 不是主输出全混。
+    analyzeSpectrum(engine, params, sr);
 }
 
-/// 频谱分析：把主输出 `out`（本块已混好的立体声）抽取入滑窗；
-/// 窗满 → FFT → 柱形回传（`params.spec_bars`）。
-/// 抽取：每 8 帧取 1 个（48k → 6kHz 有效带宽，覆盖显示范围足够）。
-pub fn analyzeSpectrum(engine: *Engine, params: *Params, out: [*]const f32, frames: u32, sr: f32) void {
+/// 频谱捕获：把**目标效果器输入点**的通道缓冲抽取入滑窗（每 8 帧取 1 个；
+/// 48k → 6kHz 有效带宽，覆盖显示范围足够）。窗满时置 `spec_ready`
+/// （FFT 在 `renderSegment` 末尾统一做）。
+fn captureSpectrum(engine: *Engine, buf: []const f32, frames: u32) void {
     const stride: usize = 8;
-    var filled_this_block = false;
     var f: usize = 0;
     while (f < frames) : (f += stride) {
-        const s = (out[f * 2] + out[f * 2 + 1]) * 0.5;
+        const s = (buf[f * 2] + buf[f * 2 + 1]) * 0.5;
         engine.spec_win[engine.spec_pos] = s;
         engine.spec_pos = (engine.spec_pos + 1) % eq.fft_size;
         if (engine.spec_pos == 0) {
-            engine.spec_fill = eq.fft_size;
-            filled_this_block = true;
+            engine.spec_ready = true;
         }
     }
-    if (engine.spec_fill < eq.fft_size) return;
-    // 注：**不能要求块结束时 pos == 0**——frames % fft_size 不整除时
-    // 永远凑不齐（实测 bug：测试里频谱恒为 0）。本块内写过一轮就分析。
-    if (!filled_this_block) return;
+}
+
+/// 频谱分析：窗满（`spec_ready`）时 FFT → 柱形回传（`params.spec_bars`）。
+/// 每段渲染末尾调用（一次分析 ≈ 2048 输入样本 ≈ 43ms @48k）。
+///
+/// 注：**不能要求块结束时 pos == 0**——frames % fft_size 不整除时
+/// 永远凑不齐（实测 bug：测试里频谱恒为 0）。故由 `spec_ready` 标记。
+fn analyzeSpectrum(engine: *Engine, params: *Params, sr: f32) void {
+    if (!engine.spec_ready) return;
+    engine.spec_ready = false;
 
     // 窗内样本重排（写指针 pos 处 = 最旧样本）
-    const eff_sr = sr / @as(f32, @floatFromInt(stride));
+    const stride: f32 = 8.0; // 抽样步长（与 captureSpectrum 一致）
+    const eff_sr = sr / stride;
     var re: [eq.fft_size]f32 = undefined;
     var im: [eq.fft_size]f32 = undefined;
     for (0..eq.fft_size) |k| {
@@ -467,7 +509,6 @@ fn dataCallback(
     // 3) 非播放：只渲染（试听/释音尾），调度事件不触发
     if (!playing) {
         renderSegment(engine, params, out, frames, sr, master);
-        analyzeSpectrum(engine, params, out, frames, sr);
         publishSounding(engine, params);
         _ = params.frames_played.fetchAdd(frames, .monotonic);
         return;
@@ -534,8 +575,7 @@ fn dataCallback(
         engine.stash_n = remaining;
     }
 
-    // 6) 频谱回传（UI 的 EQ 背景）
-    analyzeSpectrum(engine, params, out, frames, sr);
+    // 6) 频谱回传：已在 `renderSegment` 末尾完成（目标效果器输入点）
 
     // 7) 回传“正在发声的音高”（UI 用于播放/试听高亮）
     publishSounding(engine, params);
@@ -614,4 +654,95 @@ test "audio: 暂停边沿释放全部声部（修“暂停后音符一直响”�
     // 持续暂停（无新下降沿）：无副作用
     transportEdge(&engine, false);
     try std.testing.expectEqual(@as(usize, 0), synth.activeCount(&engine.synths[0]));
+}
+
+test "audio: 频谱取自目标效果器输入（非主输出全混）" {
+    const alloc = std.testing.allocator;
+    var params = Params{};
+    var engine = Engine{ .params = &params };
+    engine.synths = try alloc.alloc(synth.Synth, 2);
+    defer alloc.free(engine.synths);
+    engine.synths[0] = .{};
+    engine.synths[1] = .{};
+    engine.chan_bufs = try alloc.alloc(f32, mixer_channels * 2 * 4096);
+    defer alloc.free(engine.chan_bufs);
+    engine.slot_eq = try alloc.alloc(eq.Biquad, mixer_channels * effect_slots * eq_bands * 2);
+    defer alloc.free(engine.slot_eq);
+    @memset(engine.slot_eq, .{});
+
+    // 乐器 0 → 通道 0，乐器 1 → 通道 1；通道 0 有 1 个 EQ 槽
+    var sp0 = synth.SynthParams{};
+    var sp1 = synth.SynthParams{};
+    params.channel_count.store(2, .monotonic);
+    params.volume.store(1.0, .monotonic);
+    params.synth_ptrs[0].store(&sp0, .monotonic);
+    params.instrument_channel[0].store(0, .monotonic);
+    params.instrument_gain[0].store(1.0, .monotonic);
+    params.synth_ptrs[1].store(&sp1, .monotonic);
+    params.instrument_channel[1].store(1, .monotonic);
+    params.instrument_gain[1].store(1.0, .monotonic);
+    params.effect_count[0].store(1, .monotonic);
+    params.effect_kind[0][0].store(1, .monotonic);
+    params.effect_enabled[0][0].store(true, .monotonic);
+    // 通道 1 也挂一个 EQ 槽（频谱目标可以指向它——捕获点要求槽存在）
+    params.effect_count[1].store(1, .monotonic);
+    params.effect_kind[1][0].store(1, .monotonic);
+    params.effect_enabled[1][0].store(true, .monotonic);
+
+    // 两个乐器同时发声（A4）
+    synth.noteOn(&engine.synths[0], 69, synth.default_velocity, synth.default_pan);
+    synth.noteOn(&engine.synths[1], 69, synth.default_velocity, synth.default_pan);
+
+    const F = 512;
+    var out: [F * 2]f32 = undefined;
+
+    // ① 目标未发布（-1）：不分析（版本不增）
+    var i: usize = 0;
+    while (i < 4) : (i += 1) {
+        @memset(&out, 0);
+        renderSegment(&engine, &params, &out, F, 48000, 1.0);
+    }
+    try std.testing.expectEqual(@as(u32, 0), params.spec_version.load(.monotonic));
+
+    // ② 目标 = 通道 0 槽 0：渲染满一窗（fft_size×8 = 2048 样本）→ 有分析、柱非零
+    params.spec_target_ch.store(0, .monotonic);
+    params.spec_target_slot.store(0, .monotonic);
+    i = 0;
+    while (i < 4) : (i += 1) {
+        @memset(&out, 0);
+        renderSegment(&engine, &params, &out, F, 48000, 1.0);
+    }
+    try std.testing.expect(params.spec_version.load(.monotonic) > 0);
+    var max_bar: f32 = 0;
+    for (params.spec_bars) |b| max_bar = @max(max_bar, b.load(.monotonic));
+    try std.testing.expect(max_bar > 0.05); // 目标通道在发声：频谱非零
+
+    // ③ 通道 0 静音（乐器移走），通道 1 仍在发声：
+    // 目标 = 通道 0 → 频谱应衰减到 ~0（旧实现会一直显示主输出全混 → 非零）
+    params.synth_ptrs[0].store(null, .monotonic);
+    // 先把旧窗清掉（目标切换会重置滑窗）：-1 → 0
+    params.spec_target_ch.store(-1, .monotonic);
+    @memset(&out, 0);
+    renderSegment(&engine, &params, &out, 8, 48000, 1.0);
+    params.spec_target_ch.store(0, .monotonic);
+    i = 0;
+    while (i < 8) : (i += 1) { // 两窗（4096 样本）：第一窗混旧样本，第二窗纯静音
+        @memset(&out, 0);
+        renderSegment(&engine, &params, &out, F, 48000, 1.0);
+    }
+    max_bar = 0;
+    for (params.spec_bars) |b| max_bar = @max(max_bar, b.load(.monotonic));
+    // 通道 1 仍在响（主输出非零）——但目标通道已静音 → 频谱≈0
+    var mix_energy: f32 = 0;
+    @memset(&out, 0);
+    renderSegment(&engine, &params, &out, F, 48000, 1.0);
+    for (out) |s| mix_energy += @abs(s);
+    try std.testing.expect(mix_energy > 1.0); // 主输出仍有声（通道 1）
+    try std.testing.expect(max_bar < 0.01); // 而频谱已衰减到零（非全混）
+
+    // ④ 目标切换会重置滑窗
+    params.spec_target_ch.store(1, .monotonic);
+    @memset(&out, 0);
+    renderSegment(&engine, &params, &out, 8, 48000, 1.0);
+    try std.testing.expectEqual(@as(usize, 1), engine.spec_pos); // 8/8（新目标从头开始）
 }

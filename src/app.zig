@@ -338,6 +338,49 @@ pub const Playback = struct {
     }
 };
 
+/// 文本输入（就地重命名：乐器名 / 调音台通道名）
+///
+/// 输入字符经 WM_CHAR 到达（含中文 IME 上屏——Unicode 窗口下
+/// `WM_IME_CHAR == WM_CHAR`，组合过程由系统 IME 自己显示；emoji 等
+/// 代理对字符已在 window.zig 过滤）。
+///
+/// 交互：字符追加；退格删末尾一个 code point；回车 = 提交；ESC = 取消；
+/// 点击输入框外 = 提交（吞掉该次点击）。
+pub const TextInput = struct {
+    pub const Target = enum { instrument, mixer_channel };
+
+    active: bool = false,
+    target: Target = .instrument,
+    /// 目标下标（乐器槽位 / 通道序号）
+    index: usize = 0,
+    /// UTF-8 缓冲（64 字节 ≈ 21 个汉字）
+    buf: [64]u8 = [_]u8{0} ** 64,
+    len: usize = 0,
+    /// 光标位置（**字节偏移**；总是落在 code point 边界上）
+    cursor: usize = 0,
+    /// 选区锚点（null = 无选区；否则为另一端字节偏移）
+    sel_anchor: ?usize = null,
+    /// 鼠标拖动选区中（按下且未松手）
+    drag_active: bool = false,
+    /// 水平滚动偏移（px；`textFieldSyncOffset` 每帧更新）
+    view_off: i32 = 0,
+    /// 输入框弹出位置（屏幕坐标；由右键菜单激活时快照）
+    x: i32 = 0,
+    y: i32 = 0,
+    w: i32 = 160,
+
+    pub fn text(self: *const TextInput) []const u8 {
+        return self.buf[0..self.len];
+    }
+
+    /// 选区字节区间 `[lo, hi)`（null = 无选区；锚点 == 光标时也视为无选区）
+    pub fn selection(self: *const TextInput) ?[2]usize {
+        const a = self.sel_anchor orelse return null;
+        if (a == self.cursor) return null;
+        return .{ @min(a, self.cursor), @max(a, self.cursor) };
+    }
+};
+
 /// 发声音高缓存（每帧从音频线程回传的位掩码展开；供视图高亮用）
 /// —— 只关心**当前乐器**：索引 = 音高（0-127）
 pub const SoundingPitches = struct {
@@ -427,9 +470,25 @@ pub const MixerChannel = struct {
     volume: f32 = 0.8, // 0-1（线性增益）
     pan: f32 = 0.5, // 0-1（0.5 = 居中）
     muted: bool = false,
+    /// 自定义名字（UTF-8；`name_len == 0` = 用默认占位名“主通道/通道#N”）。
+    /// 定长存储（≤ 32 字节 ≈ 10 个汉字）——避免动态分配的生命周期管理
+    name: [32]u8 = [_]u8{0} ** 32,
+    name_len: usize = 0,
     /// 效果器链（**动态**：顺序处理；空列表 = 无效果）
     effects: std.ArrayListUnmanaged(EffectSlot) = .{ .items = &.{}, .capacity = 0 },
+
+    /// 显示名（自定义 → 原名；否则占位）
+    pub fn displayName(self: *const MixerChannel, index: usize, buf: []u8) []const u8 {
+        if (self.name_len > 0) return self.name[0..self.name_len];
+        return defaultChannelName(index, buf);
+    }
 };
+
+/// 通道默认占位名（写入调用方缓冲）：通道 0 = “主通道”；其余 = “通道#N”
+pub fn defaultChannelName(index: usize, buf: []u8) []const u8 {
+    if (index == 0) return "主通道";
+    return std.fmt.bufPrint(buf, "通道#{d}", .{index}) catch "通道";
+}
 
 /// 调音台窗口状态
 pub const MixerWindow = struct {
@@ -593,6 +652,8 @@ pub const App = struct {
     /// 录制武装（工具栏红点按钮）——目前只切换视觉状态（录音写入未实现）；
     /// **不进入存档**（会话态；重开工程回到未武装）
     record_armed: bool = false,
+    /// 文本输入（就地重命名乐器/通道）
+    text_input: TextInput = .{},
 
     // ── 各视图状态 ──
     sel: Selection = .{},
@@ -1448,6 +1509,10 @@ pub const App = struct {
                 .pan = mc.pan,
                 .muted = mc.muted,
             };
+            // 自定义名字（空 = 无；dupe 供快照/存档独立存活）
+            if (mc.name_len > 0) {
+                sm.name = try allocator.dupe(u8, mc.name[0..mc.name_len]);
+            }
             for (mc.effects.items, 0..) |es, si| {
                 if (si >= sm.effects.len) break; // 超出存档容量：截断
                 // 效果器段：分配切片（长度 = band_count）
@@ -1479,6 +1544,13 @@ pub const App = struct {
             self.mixer_channels_state.items[i].volume = sm.volume;
             self.mixer_channels_state.items[i].pan = sm.pan;
             self.mixer_channels_state.items[i].muted = sm.muted;
+            // 自定义名字（空 = 无）
+            {
+                const mc = &self.mixer_channels_state.items[i];
+                const n = @min(sm.name.len, mc.name.len);
+                @memcpy(mc.name[0..n], sm.name[0..n]);
+                mc.name_len = n;
+            }
             // 效果链：按 effect_count 恢复（0 = 旧存档：按 kind != 0 推断）
             const n_eff: usize = if (sm.effect_count > 0)
                 @min(@as(usize, @intCast(sm.effect_count)), sm.effects.len)
@@ -1583,6 +1655,8 @@ pub const App = struct {
         if (st.mixer.len != self.mixer_channels_state.items.len) return false;
         for (st.mixer, self.mixer_channels_state.items) |a, b| {
             if (a.volume != b.volume or a.pan != b.pan or a.muted != b.muted) return false;
+            // 通道名也要比较——否则重命名被判为“无变化”，静默丢弃历史条目
+            if (!std.mem.eql(u8, a.name, b.name[0..b.name_len])) return false;
             const bn: usize = @min(b.effects.items.len, a.effects.len);
             if (a.effect_count != b.effects.items.len) return false;
             for (0..bn) |si| {
@@ -1930,6 +2004,7 @@ pub const App = struct {
             for (sm.effects[0..@min(sm.effects.len, sm.effect_count)]) |se| {
                 if (se.bands.len > 0) self.allocator.free(se.bands);
             }
+            if (sm.name.len > 0) self.allocator.free(sm.name);
         }
     }
 
@@ -2344,6 +2419,235 @@ pub const App = struct {
         self.piano.scroll = (127 - 84) * self.piano.key_h; // 视野顶部从 C6 开始（下方可见 C3-C6）
         self.piano.scroll_x = 0;
         self.piano.content_w = 0; // 重置为一屏（由滚动条控件规范化）
+    }
+
+    // ── 文本输入（就地重命名）──
+    // 模型：`cursor`（字节偏移，总在 code point 边界）+ `sel_anchor`（选区另一端；
+    // null = 无选区）。所有编辑（输入/退格/Del）都作用于「光标位置」或「选区」；
+    // 鼠标点击定位光标、拖动框选；Ctrl+A 全选。
+
+    /// 开始重命名乐器（输入框预填当前名字；光标置末尾、无选区）
+    pub fn beginRenameInstrument(self: *App, idx: usize, x: i32, y: i32) void {
+        if (idx >= self.instruments.items.len) return;
+        const ti = &self.text_input;
+        ti.active = true;
+        ti.target = .instrument;
+        ti.index = idx;
+        ti.x = x;
+        ti.y = y;
+        const name = self.instruments.items[idx].name;
+        const n = @min(name.len, ti.buf.len);
+        @memcpy(ti.buf[0..n], name[0..n]);
+        ti.len = n;
+        ti.cursor = n;
+        ti.sel_anchor = null;
+        ti.drag_active = false;
+        ti.view_off = 0;
+    }
+
+    /// 开始重命名调音台通道（预填自定义名；无自定义名则空）
+    pub fn beginRenameMixerChannel(self: *App, idx: usize, x: i32, y: i32) void {
+        if (idx >= self.mixer_channels_state.items.len) return;
+        const ti = &self.text_input;
+        ti.active = true;
+        ti.target = .mixer_channel;
+        ti.index = idx;
+        ti.x = x;
+        ti.y = y;
+        const mc = &self.mixer_channels_state.items[idx];
+        const n = @min(mc.name_len, ti.buf.len);
+        @memcpy(ti.buf[0..n], mc.name[0..n]);
+        ti.len = n;
+        ti.cursor = n;
+        ti.sel_anchor = null;
+        ti.drag_active = false;
+        ti.view_off = 0;
+    }
+
+    // ── 内部：选区/光标编辑 ──
+
+    /// 删除选区（无选区 = 空操作）；光标置于选区起点
+    fn textInputDeleteSelection(self: *App) void {
+        const ti = &self.text_input;
+        const sel = ti.selection() orelse return;
+        const lo = sel[0];
+        const hi = sel[1];
+        const tail = ti.len - hi;
+        std.mem.copyForwards(u8, ti.buf[lo .. lo + tail], ti.buf[hi..ti.len]);
+        ti.len -= hi - lo;
+        ti.cursor = lo;
+        ti.sel_anchor = null;
+    }
+
+    /// 光标前一个 code point 的起始偏移（用于退格/左移）
+    fn prevCp(self: *const App, from: usize) usize {
+        if (from == 0) return 0;
+        var i = from - 1;
+        while (i > 0 and (self.text_input.buf[i] & 0xC0) == 0x80) : (i -= 1) {}
+        return i;
+    }
+
+    /// 光标后一个 code point 的结束偏移（用于 Del/右移）
+    fn nextCp(self: *const App, from: usize) usize {
+        const ti = &self.text_input;
+        if (from >= ti.len) return ti.len;
+        var i = from + 1;
+        while (i < ti.len and (ti.buf[i] & 0xC0) == 0x80) : (i += 1) {}
+        return i;
+    }
+
+    /// 追加一个字符（UTF-8；在**光标处插入**——有选区则先删除选区）
+    pub fn textInputAppend(self: *App, cp: u21) void {
+        const ti = &self.text_input;
+        if (!ti.active) return;
+        self.textInputDeleteSelection();
+        var tmp: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(cp, &tmp) catch return; // 非法 code point：丢弃
+        if (ti.len + n > ti.buf.len) return;
+        // 光标后的尾部右移 n 字节（从后往前——重叠安全）
+        const tail = ti.len - ti.cursor;
+        std.mem.copyBackwards(u8, ti.buf[ti.cursor + n .. ti.cursor + n + tail], ti.buf[ti.cursor .. ti.cursor + tail]);
+        @memcpy(ti.buf[ti.cursor .. ti.cursor + n], tmp[0..n]);
+        ti.len += n;
+        ti.cursor += n;
+    }
+
+    /// 退格：有选区 → 删选区；否则删光标前一个 code point
+    pub fn textInputBackspace(self: *App) void {
+        const ti = &self.text_input;
+        if (!ti.active) return;
+        if (ti.selection() != null) {
+            self.textInputDeleteSelection();
+            return;
+        }
+        if (ti.cursor == 0) return;
+        const prev = self.prevCp(ti.cursor);
+        const cut = ti.cursor - prev;
+        const tail = ti.len - ti.cursor;
+        std.mem.copyForwards(u8, ti.buf[prev .. prev + tail], ti.buf[ti.cursor..ti.len]);
+        ti.len -= cut;
+        ti.cursor = prev;
+    }
+
+    /// Delete 键：有选区 → 删选区；否则删光标后一个 code point
+    pub fn textInputDelete(self: *App) void {
+        const ti = &self.text_input;
+        if (!ti.active) return;
+        if (ti.selection() != null) {
+            self.textInputDeleteSelection();
+            return;
+        }
+        if (ti.cursor >= ti.len) return;
+        const next = self.nextCp(ti.cursor);
+        const cut = next - ti.cursor;
+        const tail = ti.len - next;
+        std.mem.copyForwards(u8, ti.buf[ti.cursor .. ti.cursor + tail], ti.buf[next..ti.len]);
+        ti.len -= cut;
+    }
+
+    /// 光标移动（方向键/Home/End）。`extend` = Shift 按住 → 扩展选区。
+    /// `dir`：-2 = Home，-1 = 左，1 = 右，2 = End。
+    /// Shift+Home/End：扩展到文本首/尾。
+    pub fn textInputMoveCursor(self: *App, dir: i32, extend: bool) void {
+        const ti = &self.text_input;
+        if (!ti.active) return;
+        // 有选区且不带 Shift：左/右先折叠到选区边界
+        if (!extend and ti.selection() != null) {
+            const sel = ti.selection().?;
+            ti.cursor = if (dir < 0) sel[0] else sel[1];
+            ti.sel_anchor = null;
+            return;
+        }
+        const new_pos: usize = switch (dir) {
+            -2 => 0,
+            -1 => self.prevCp(ti.cursor),
+            1 => self.nextCp(ti.cursor),
+            2 => ti.len,
+            else => ti.cursor,
+        };
+        if (extend) {
+            if (ti.sel_anchor == null) ti.sel_anchor = ti.cursor;
+            ti.cursor = new_pos;
+            // 注：光标回到锚点时**不**清锚点（同 `textInputPointerMove` 的坑）——
+            // “无选区”由 `selection()` 判定；保留锚点才能继续反向扩展。
+        } else {
+            ti.cursor = new_pos;
+            ti.sel_anchor = null;
+        }
+    }
+
+    /// Ctrl+A：全选
+    pub fn textInputSelectAll(self: *App) void {
+        const ti = &self.text_input;
+        if (!ti.active or ti.len == 0) return;
+        ti.sel_anchor = 0;
+        ti.cursor = ti.len;
+    }
+
+    /// 鼠标按下定位：`byte_off` = 击点对应的字节偏移（调用方用
+    /// `Ui.textIndexAtX` 换算）。置光标并开始拖选（锚点 = 击点）。
+    pub fn textInputPointerDown(self: *App, byte_off: usize) void {
+        const ti = &self.text_input;
+        if (!ti.active) return;
+        ti.cursor = byte_off;
+        ti.sel_anchor = byte_off; // 锚点 = 击点（拖出后成为选区起点）
+        ti.drag_active = true;
+    }
+
+    /// 鼠标拖动：扩展选区（锚点不变，光标跟鼠标）。
+    /// 注：**不能**在“光标拖回锚点”时把锚点置 null——拖动开始时鼠标
+    /// 必然先在同一字符格内移动（光标 == 锚点），一置 null 锚点就再也
+    /// 回不来了（实测 bug：拖动只剩移动光标、永远拉不出选区）；
+    /// “锚点 == 光标→ 无选区”由 `selection()` 判定，无需动状态。
+    pub fn textInputPointerMove(self: *App, byte_off: usize) void {
+        const ti = &self.text_input;
+        if (!ti.active or !ti.drag_active) return;
+        ti.cursor = byte_off;
+    }
+
+    /// 鼠标松开：结束拖选
+    pub fn textInputPointerUp(self: *App) void {
+        self.text_input.drag_active = false;
+    }
+
+    /// 提交：写入目标；空串 → 乐器保持原名、通道恢复默认占位名
+    pub fn textInputCommit(self: *App) void {
+        const ti = &self.text_input;
+        if (!ti.active) return;
+        const val = ti.buf[0..ti.len];
+        switch (ti.target) {
+            .instrument => {
+                if (ti.index < self.instruments.items.len and val.len > 0) {
+                    const inst = &self.instruments.items[ti.index];
+                    if (!std.mem.eql(u8, inst.name, val)) {
+                        const copy = self.allocator.dupe(u8, val) catch null;
+                        if (copy) |c| {
+                            self.allocator.free(inst.name);
+                            inst.name = c;
+                            self.commitHistory("重命名乐器");
+                        }
+                    }
+                }
+            },
+            .mixer_channel => {
+                if (ti.index < self.mixer_channels_state.items.len) {
+                    const mc = &self.mixer_channels_state.items[ti.index];
+                    const n = @min(val.len, mc.name.len);
+                    if (n != mc.name_len or !std.mem.eql(u8, mc.name[0..mc.name_len], val[0..n])) {
+                        @memcpy(mc.name[0..n], val[0..n]);
+                        mc.name_len = n;
+                        self.commitHistory("重命名通道");
+                    }
+                }
+            },
+        }
+        ti.active = false;
+    }
+
+    /// 取消（不写入）
+    pub fn textInputCancel(self: *App) void {
+        self.text_input.active = false;
+        self.text_input.drag_active = false;
     }
 };
 
@@ -3077,6 +3381,196 @@ test "app: 导入工程恢复主音量（并同步到音频线程）" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.77), app.volume, 1e-6);
     // 音频线程参数同步（不重开软件即时生效）
     try std.testing.expectApproxEqAbs(@as(f32, 0.77), app.params.volume.load(.monotonic), 1e-6);
+}
+
+test "app: 重命名乐器——预填/追加/退格（多字节）/提交/历史；空名不改" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    // ① 开始重命名：预填当前名
+    app.beginRenameInstrument(0, 0, 0);
+    try std.testing.expect(app.text_input.active);
+    try std.testing.expectEqualStrings("减法合成器", app.text_input.text());
+
+    // ② 退格 3 次（删“成器”与“合”）→ “减法”
+    var i: usize = 0;
+    while (i < 3) : (i += 1) app.textInputBackspace();
+    try std.testing.expectEqualStrings("减法", app.text_input.text());
+
+    // ③ 追加中文 + 英文（UTF-8 多字节）
+    app.textInputAppend('主');
+    app.textInputAppend('奏');
+    app.textInputAppend('A');
+    try std.testing.expectEqualStrings("减法主奏A", app.text_input.text());
+
+    // ④ 退格一次：删掉 'A'（ASCII）
+    app.textInputBackspace();
+    try std.testing.expectEqualStrings("减法主奏", app.text_input.text());
+
+    // ⑤ 提交：名字变更 + 纳入历史（撤销可恢复）
+    const hist_before = app.history.items.len;
+    app.textInputCommit();
+    try std.testing.expect(!app.text_input.active);
+    try std.testing.expectEqualStrings("减法主奏", app.instruments.items[0].name);
+    try std.testing.expectEqual(hist_before + 1, app.history.items.len);
+    try std.testing.expect(app.undo());
+    try std.testing.expectEqualStrings("减法合成器", app.instruments.items[0].name);
+
+    // ⑥ 空名提交：乐器保持原名（不允许空名）
+    try std.testing.expect(app.redo());
+    app.beginRenameInstrument(0, 0, 0);
+    var k: usize = 0;
+    while (k < 32) : (k += 1) app.textInputBackspace();
+    try std.testing.expectEqual(@as(usize, 0), app.text_input.text().len);
+    app.textInputCommit();
+    try std.testing.expectEqualStrings("减法主奏", app.instruments.items[0].name); // 空名：不改
+
+    // ⑦ ESC 取消：不动
+    app.beginRenameInstrument(0, 0, 0);
+    app.textInputAppend('X');
+    app.textInputCancel();
+    try std.testing.expect(!app.text_input.active);
+    try std.testing.expectEqualStrings("减法主奏", app.instruments.items[0].name);
+}
+
+test "app: 重命名——光标定位/插入/Del/选区/Ctrl+A" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("abcdef");
+    app.resetHistory("初始状态");
+
+    // 预填后光标在末尾
+    app.beginRenameInstrument(0, 0, 0);
+    try std.testing.expectEqualStrings("abcdef", app.text_input.text());
+    try std.testing.expectEqual(@as(usize, 6), app.text_input.cursor);
+
+    // ←/→ 移动（无选区）
+    app.textInputMoveCursor(-1, false);
+    try std.testing.expectEqual(@as(usize, 5), app.text_input.cursor);
+    app.textInputMoveCursor(1, false);
+    try std.testing.expectEqual(@as(usize, 6), app.text_input.cursor);
+    app.textInputMoveCursor(-2, false); // Home
+    try std.testing.expectEqual(@as(usize, 0), app.text_input.cursor);
+
+    // 光标处插入（不是末尾追加）
+    app.textInputAppend('X');
+    try std.testing.expectEqualStrings("Xabcdef", app.text_input.text());
+    try std.testing.expectEqual(@as(usize, 1), app.text_input.cursor);
+
+    // Del：删光标后一个字符
+    app.textInputDelete();
+    try std.testing.expectEqualStrings("Xbcdef", app.text_input.text());
+
+    // Shift+→ 三次 → 选区 [1, 4)；再无 Shift 右移 → 折叠到选区右侧
+    app.textInputMoveCursor(1, true);
+    app.textInputMoveCursor(1, true);
+    app.textInputMoveCursor(1, true);
+    try std.testing.expectEqual(@as(?[2]usize, .{ 1, 4 }), app.text_input.selection());
+    app.textInputMoveCursor(1, false);
+    try std.testing.expectEqual(@as(?[2]usize, null), app.text_input.selection());
+    try std.testing.expectEqual(@as(usize, 4), app.text_input.cursor);
+
+    // 输入字符替换选区：Ctrl+A 全选 + 输入 → 只剩新字符
+    app.textInputSelectAll();
+    try std.testing.expectEqual(@as(?[2]usize, .{ 0, 6 }), app.text_input.selection());
+    app.textInputAppend('Z');
+    try std.testing.expectEqualStrings("Z", app.text_input.text());
+
+    // Backspace/Del 删选区
+    app.textInputAppend('A');
+    app.textInputAppend('B');
+    app.textInputSelectAll();
+    app.textInputBackspace();
+    try std.testing.expectEqual(@as(usize, 0), app.text_input.text().len);
+    app.textInputAppend('C');
+    app.textInputAppend('D');
+    app.textInputMoveCursor(-2, false); // Home
+    app.textInputMoveCursor(1, true); // 选中 'C'
+    app.textInputDelete(); // 删选区
+    try std.testing.expectEqualStrings("D", app.text_input.text());
+
+    // 鼠标：按下定位（锚点 = 击点，无选区）→ 拖出 → 选区
+    app.textInputAppend('E'); // 光标在 0（删选区后）→ 插入后为 "ED"
+    app.textInputPointerDown(1);
+    try std.testing.expectEqual(@as(?[2]usize, null), app.text_input.selection());
+    app.textInputPointerMove(2);
+    try std.testing.expectEqual(@as(?[2]usize, .{ 1, 2 }), app.text_input.selection());
+    app.textInputPointerUp();
+    try std.testing.expectEqual(@as(?[2]usize, .{ 1, 2 }), app.text_input.selection()); // 松手后保留
+
+    // 拖回锚点 → 选区取消（锚点**保留**：再拖出可重新选区）
+    app.textInputPointerDown(0);
+    app.textInputPointerMove(2);
+    try std.testing.expect(app.text_input.selection() != null);
+    app.textInputPointerMove(0);
+    try std.testing.expectEqual(@as(?[2]usize, null), app.text_input.selection());
+    app.textInputPointerUp();
+
+    // 回归：拖动开始时鼠标**先在同一字符格内**移动（光标 == 锚点）——
+    // 实测 bug：旧代码在这里把锚点置 null，之后拖到别的字符只剩移动光标、
+    // 永远拉不出选区。锚点必须存活，再拖出应恢复选区。
+    app.textInputPointerDown(0);
+    app.textInputPointerMove(0); // 同一格：无选区但不该销毁锚点
+    try std.testing.expectEqual(@as(?[2]usize, null), app.text_input.selection());
+    app.textInputPointerMove(1);
+    try std.testing.expectEqual(@as(?[2]usize, .{ 0, 1 }), app.text_input.selection()); // 拖出 → 选区
+    app.textInputPointerUp();
+
+    // 回归（键盘同理）：Shift+右 → Shift+左（回锚点）→ Shift+右：
+    // 仍应从**原锚点**扩展（而非从头再来）
+    app.textInputMoveCursor(-2, false); // Home → 光标 0
+    app.textInputMoveCursor(1, true); // 锚点 0，光标 1 → [0,1)
+    app.textInputMoveCursor(-1, true); // 光标回 0 → 无选区（锚点 0 保留）
+    try std.testing.expectEqual(@as(?[2]usize, null), app.text_input.selection());
+    app.textInputMoveCursor(1, true); // 再从锚点 0 向右
+    try std.testing.expectEqual(@as(?[2]usize, .{ 0, 1 }), app.text_input.selection());
+    app.textInputMoveCursor(1, false); // 无 Shift → 折叠并清锚点
+    app.textInputMoveCursor(-2, false); // Home
+}
+
+test "app: 重命名调音台通道——空串恢复默认占位名" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    // 通道 0 默认占位名
+    var nb: [24]u8 = undefined;
+    try std.testing.expectEqualStrings("主通道", app.mixer_channels_state.items[0].displayName(0, &nb));
+    try std.testing.expectEqualStrings("通道#1", app.mixer_channels_state.items[1].displayName(1, &nb));
+
+    // 重命名通道 1 → “鼓组”
+    app.beginRenameMixerChannel(1, 0, 0);
+    app.textInputAppend('鼓');
+    app.textInputAppend('组');
+    app.textInputCommit();
+    try std.testing.expectEqualStrings("鼓组", app.mixer_channels_state.items[1].displayName(1, &nb));
+
+    // 清空重命名 → 恢复占位名
+    app.beginRenameMixerChannel(1, 0, 0);
+    var k: usize = 0;
+    while (k < 8) : (k += 1) app.textInputBackspace();
+    app.textInputCommit();
+    try std.testing.expectEqualStrings("通道#1", app.mixer_channels_state.items[1].displayName(1, &nb));
+
+    // 历史：两次重命名都有条目（第一次改名 + 第二次清空各一条）
+    try std.testing.expect(app.history.items.len >= 3); // 初始 + 改名 + 清空
+    try std.testing.expect(app.undo()); // 撤销“清空” → 恢复“鼓组”
+    try std.testing.expectEqualStrings("鼓组", app.mixer_channels_state.items[1].displayName(1, &nb));
 }
 
 test "app: 撤销——乐器/全局设置（BPM、拍号、乐器增删）也恢复" {

@@ -123,6 +123,8 @@ pub const SavedEffectSlot = struct {
 
 /// 存档中的一个调音台通道
 pub const SavedMixerChannel = struct {
+    /// 自定义名字（UTF-8；空 = 无自定义名——用默认占位名）
+    name: []const u8 = "",
     volume: f32 = 0.8,
     pan: f32 = 0.5,
     muted: bool = false,
@@ -451,7 +453,7 @@ test "persist: 真实文件往返（写盘 → 读回）" {
 test "persist: 调音台通道往返（增益/声像/静音/效果链）" {
     const allocator = std.testing.allocator;
     const mix = [_]SavedMixerChannel{
-        .{ .volume = 0.33, .pan = 0.2, .muted = true, .effects = .{
+        .{ .name = "鼓组", .volume = 0.33, .pan = 0.2, .muted = true, .effects = .{
             .{ .kind = 1, .enabled = true, .mix = 0.7, .bands = &[_]SavedEqBand{
                 .{ .freq = 80, .gain_db = -6, .q = 0.7 },
                 .{ .freq = 600, .gain_db = 3.5, .q = 1.2 },
@@ -475,6 +477,8 @@ test "persist: 调音台通道往返（增益/声像/静音/效果链）" {
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 2), parsed.value.mixer.len);
     const m0 = parsed.value.mixer[0];
+    try std.testing.expectEqualStrings("鼓组", m0.name); // 通道名往返
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.mixer[1].name.len); // 无自定义名 → 空
     try std.testing.expectApproxEqAbs(@as(f32, 0.33), m0.volume, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.2), m0.pan, 1e-6);
     try std.testing.expect(m0.muted);

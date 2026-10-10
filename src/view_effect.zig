@@ -201,7 +201,7 @@ fn drawEqGraph(ui: *Ui, app: *App, es: *app_mod.EffectSlot, gx: i32, gy: i32, gw
     ui.renderer.fillRect(gx, gy, gw, gh, ui.theme.bg);
     ui.renderer.strokeRect(gx, gy, gw, gh, ui.theme.panel_border);
 
-    // 频谱背景（主输出；对数对齐）
+    // 频谱背景（**该效果器的输入信号**；对数对齐）
     const bar_w_f = @as(f32, @floatFromInt(gw)) / @as(f32, @floatFromInt(eq.spec_bars));
     for (0..eq.spec_bars) |bi| {
         const b = app.params.spec_bars[bi].load(.monotonic);
