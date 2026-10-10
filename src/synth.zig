@@ -62,12 +62,41 @@ pub const waveform_count: u8 = 5;
 /// 振荡器数量（2×2 布局）
 pub const osc_count: usize = 4;
 
+/// 每个振荡器最多叠加的合奏副本数（推子 1-16）
+pub const max_unison: usize = 16;
+/// 合奏散布的上限：100%（= `unison_detune` 1.0）对应 ±此值（cent）。
+/// 参考实测：±25c 已是“宽堆叠”（supersaw 级）——所以 50% ≈ 典型 supersaw、
+/// 100% 留作极端调制（类 JP-8000 满发 ≈ ±200c 的 1/4）
+pub const unison_max_cents: f32 = 50.0;
+/// 合奏立体声展开（0 = 不展开；副本按位置缩放 L/R 增益）
+const unison_spread: f32 = 0.55;
+
+/// 合奏副本位置的“功率”重映射（指数扭曲；常见合成器中的
+/// “Unison Detune Power” 即此参数）：
+/// `(e^(p·t) − 1) / (e^p − 1)`——端点固定（0→0、1→1），中间指数扭曲：
+/// p > 0 副本向中心聚拢、p < 0 向外拉开（非均匀间距→音程/和弦感）。
+/// `p ≈ 0` → 恒等（线性分布）。`t` = 单侧位置 0..1（中心 → 最外侧）。
+pub fn powerScale(t: f32, power: f32) f32 {
+    if (@abs(power) < 0.01) return t;
+    const num = @exp(power * t) - 1.0;
+    const den = @exp(power) - 1.0;
+    return num / den;
+}
+
 pub const OscParams = struct {
     enabled: Atomic(bool) = Atomic(bool).init(false),
     /// 0-1
     volume: Atomic(f32) = Atomic(f32).init(0.5),
     /// Waveform（存 u8 便于原子访问）
     waveform: Atomic(u8) = Atomic(u8).init(0),
+    /// 合奏**副本总数** 1-16（1 = 单发声源即无合奏；最少得有 1 个）
+    unison: Atomic(u32) = Atomic(u32).init(1),
+    /// 合奏音高散布 0-1（0% = 副本同音高只靠相位/立体声；
+    /// 1.0 = ±`unison_max_cents`。实用参考：lead 0.2、supersaw 0.5；
+    /// 默认 5%——轻装饰量，避免“一开除合奏就糊”）
+    unison_detune: Atomic(f32) = Atomic(f32).init(0.05),
+    /// 散布位置功率 -5..5（见 `powerScale`；0 = 线性）
+    detune_power: Atomic(f32) = Atomic(f32).init(0),
 };
 
 pub const FilterParams = struct {
@@ -194,8 +223,9 @@ pub const Voice = struct {
     /// 当前音高（-1 = 空闲）
     pitch: i32 = -1,
     freq: f32 = 0,
-    /// 各振荡器相位 [0,1)
-    phase: [osc_count]f32 = .{ 0, 0, 0, 0 },
+    /// 各振荡器**各副本**的相位 [0,1)：`[osc][副本]`。
+    /// 副本 0 = 基础音；1..copies-1 = 合奏副本（见 `OscParams.unison`）
+    phase: [osc_count][max_unison]f32 = [_][max_unison]f32{[_]f32{0} ** max_unison} ** osc_count,
     env_stage: EnvStage = .idle,
     env_level: f32 = 0,
     /// 进入 release 时的电平（线性下降用）
@@ -207,10 +237,11 @@ pub const Voice = struct {
     /// 声像增益（等功率；居中 = 1.0/1.0——与调音台通道声像同一公式）
     pan_l: f32 = 1.0,
     pan_r: f32 = 1.0,
-    /// 高通滤波的“低通分量”状态
-    hpf_lp: f32 = 0,
-    /// 低通滤波状态
-    lpf_lp: f32 = 0,
+    /// 高通滤波的“低通分量”状态（[0] = L，[1] = R——合奏展开需要逐声道；
+    /// 单声部时两路输入相同、状态同步，与旧单声道实现逐位一致）
+    hpf_lp: [2]f32 = .{ 0, 0 },
+    /// 低通滤波状态（同上）
+    lpf_lp: [2]f32 = .{ 0, 0 },
     /// 噪声用 RNG（xorshift32）
     rng: u32 = 0x9E3779B9,
 };
@@ -259,6 +290,17 @@ fn nextNoise(rng: *u32) f32 {
     return @as(f32, @floatFromInt(x >> 8)) / 8388608.0 - 1.0;
 }
 
+/// 波形采样（给定相位；噪声每调用推进 rng）
+inline fn waveAt(w: Waveform, phase: f32, rng: *u32) f32 {
+    return switch (w) {
+        .sine => @sin(phase * 2.0 * std.math.pi),
+        .square => if (phase < 0.5) @as(f32, 1.0) else @as(f32, -1.0),
+        .triangle => 4.0 * @abs(phase - 0.5) - 1.0,
+        .sawtooth => 2.0 * phase - 1.0,
+        .noise => nextNoise(rng),
+    };
+}
+
 /// 找空闲声部（轮转扫描）；无空闲时偷取最旧的声部
 fn allocVoice(state: *Synth) *Voice {
     var k: usize = 0;
@@ -297,6 +339,15 @@ pub fn noteOn(state: *Synth, pitch: u8, velocity: u8, pan: u8) void {
     v.pan_r = @sin(ang) * std.math.sqrt2;
     // 每声部独立的噪声种子（不同音符噪声不相关）
     v.rng = 0x9E3779B9 ^ @as(u32, @truncate(state.note_counter *% 2654435761));
+    // 合奏副本的初始相位：随机散布（副本同相时起始会像“单声部变响”，
+    // 相位散布才能立即听到合奏厚度）。副本 0 保持相位连续（旧行为不变——
+    // 相位重置会给方波/锯齿带来咔嗒风险）。
+    for (0..osc_count) |o| {
+        var k: usize = 1;
+        while (k < max_unison) : (k += 1) {
+            v.phase[o][k] = (nextNoise(&v.rng) + 1.0) * 0.5;
+        }
+    }
 }
 
 /// 音符关（该音高的声部进入释音）——**FIFO**：只释放**最早分配**的声部。
@@ -393,6 +444,41 @@ pub fn render(
         osc_wave[i] = @enumFromInt(params.osc[i].waveform.load(.monotonic) % waveform_count);
     }
 
+    // 合奏（unison）快照（每块一次）：副本数 / 每副本失谐 / 立体声展开 / 增益补偿。
+    // 副本位置 d ∈ [-1,+1] 均匀铺开（1 个副本时 d = 0），再经 **powerScale
+    // 扭曲**（Detune Power：端点固定 —— ±1 不动、中间变形；0 = 线性）——
+    // p > 0 向中心聚拢、p < 0 向外拉开（非均匀间距 → 音程/和弦感）。
+    var osc_copies: [osc_count]usize = undefined;
+    var osc_copy_gain: [osc_count]f32 = undefined;
+    var osc_detune: [osc_count][max_unison]f32 = undefined;
+    var osc_spread_l: [osc_count][max_unison]f32 = undefined;
+    var osc_spread_r: [osc_count][max_unison]f32 = undefined;
+    for (0..osc_count) |i| {
+        // 副本总数 1-16（1 = 无合奏）
+        const copies: usize = @intCast(std.math.clamp(params.osc[i].unison.load(.monotonic), 1, @as(u32, max_unison)));
+        osc_copies[i] = copies;
+        // 音高散布：0-1 → 0..±unison_max_cents（0% 时副本同音高）
+        const spread_cents = std.math.clamp(params.osc[i].unison_detune.load(.monotonic), 0, 1) * unison_max_cents;
+        // 位置功率：-5..5（0 = 线性；见 `powerScale`）
+        const power = std.math.clamp(params.osc[i].detune_power.load(.monotonic), -5, 5);
+        // 失谐副本不相干叠加：幅度 ≈ √copies → 除 √copies 保持响度
+        osc_copy_gain[i] = 1.0 / @sqrt(@as(f32, @floatFromInt(copies)));
+        var k: usize = 0;
+        while (k < copies) : (k += 1) {
+            const d_raw: f32 = if (copies == 1)
+                0
+            else
+                (2.0 * @as(f32, @floatFromInt(k))) / @as(f32, @floatFromInt(copies - 1)) - 1.0;
+            // 功率扭曲（单侧位置 |d| → powerScale；保号；端点 ±1 不动）
+            // 注：power ≈ 0 时 powerScale 返回原值 → 与旧线性行为逐位一致
+            const t_warp = powerScale(@abs(d_raw), power);
+            const d: f32 = if (d_raw < 0) -t_warp else t_warp;
+            osc_detune[i][k] = std.math.pow(f32, 2.0, (d * spread_cents) / 1200.0);
+            osc_spread_l[i][k] = 1.0 - d * unison_spread;
+            osc_spread_r[i][k] = 1.0 + d * unison_spread;
+        }
+    }
+
     // 静默启动/静音恢复：直接跳到目标增益（避免“开头淡入”迟滞）
     if (state.smoothed_master <= 0.0001) state.smoothed_master = gain;
 
@@ -435,40 +521,51 @@ pub fn render(
                 },
             }
 
-            // ── 振荡器混音 ──
-            var vmix: f32 = 0;
+            // ── 振荡器混音（含合奏副本；L/R 两路——副本立体声展开）──
+            var vmix_l: f32 = 0;
+            var vmix_r: f32 = 0;
+            const fstep = v.freq * dt; // 基础相位步长（副乘失谐系数）
             for (0..osc_count) |o| {
                 if (!osc_on[o]) continue;
-                const s = switch (osc_wave[o]) {
-                    .sine => @sin(v.phase[o] * 2.0 * std.math.pi),
-                    .square => if (v.phase[o] < 0.5) @as(f32, 1.0) else @as(f32, -1.0),
-                    .triangle => 4.0 * @abs(v.phase[o] - 0.5) - 1.0,
-                    .sawtooth => 2.0 * v.phase[o] - 1.0,
-                    .noise => nextNoise(&v.rng),
-                };
-                vmix += s * osc_vol[o];
-                if (osc_wave[o] != .noise) {
-                    v.phase[o] += v.freq / sample_rate;
-                    if (v.phase[o] >= 1.0) v.phase[o] -= 1.0;
+                const w = osc_wave[o];
+                const is_noise = w == .noise;
+                const copies = osc_copies[o];
+                const g = osc_vol[o] * osc_copy_gain[o];
+                var k: usize = 0;
+                while (k < copies) : (k += 1) {
+                    const ph = v.phase[o][k];
+                    const s = waveAt(w, ph, &v.rng);
+                    vmix_l += s * (g * osc_spread_l[o][k]);
+                    vmix_r += s * (g * osc_spread_r[o][k]);
+                    if (!is_noise) {
+                        const np = ph + fstep * osc_detune[o][k];
+                        v.phase[o][k] = if (np >= 1.0) np - 1.0 else np;
+                    }
                 }
             }
-            vmix *= 0.5; // 单声部内多振荡器叠加的余量
+            vmix_l *= 0.5; // 单声部内多振荡器叠加的余量
+            vmix_r *= 0.5;
 
-            // ── 滤波（高通 = 减去低通分量；低通 = 一阶）──
-            var x = vmix;
+            // ── 滤波（L/R 各自状态；无合奏时两路输入相同 → 结果与旧单声道逐位一致）──
+            var xl = vmix_l;
+            var xr = vmix_r;
             if (hpf_on) {
-                v.hpf_lp += (x - v.hpf_lp) * hpf_coeff;
-                x -= v.hpf_lp;
+                v.hpf_lp[0] += (xl - v.hpf_lp[0]) * hpf_coeff;
+                xl -= v.hpf_lp[0];
+                v.hpf_lp[1] += (xr - v.hpf_lp[1]) * hpf_coeff;
+                xr -= v.hpf_lp[1];
             }
             if (lpf_on) {
-                v.lpf_lp += (x - v.lpf_lp) * lpf_coeff;
-                x = v.lpf_lp;
+                v.lpf_lp[0] += (xl - v.lpf_lp[0]) * lpf_coeff;
+                xl = v.lpf_lp[0];
+                v.lpf_lp[1] += (xr - v.lpf_lp[1]) * lpf_coeff;
+                xr = v.lpf_lp[1];
             }
 
             // 声部信号 × 包络 × 力度增益 → 左右两路（等功率声像）
-            const vs = x * v.env_level * v.vel_gain;
-            mix_l += vs * v.pan_l;
-            mix_r += vs * v.pan_r;
+            const ve = v.env_level * v.vel_gain;
+            mix_l += xl * ve * v.pan_l;
+            mix_r += xr * ve * v.pan_r;
         }
 
         // ── 主音量平滑（防拖动旋钮的 zipper 噪声）──
@@ -525,6 +622,138 @@ test "synth: 正弦振荡器输出有限且非零" {
     for (buf) |s| energy += @abs(s);
     try std.testing.expect(energy > 0.1);
     for (buf) |s| try std.testing.expect(std.math.isFinite(s));
+}
+
+test "synth: 合奏——立体声展开与响度量级（增益补偿）" {
+    var p = SynthParams{};
+    p.osc[0].enabled.store(true, .monotonic);
+    p.osc[0].volume.store(1.0, .monotonic);
+    p.osc[0].waveform.store(@intFromEnum(Waveform.sawtooth), .monotonic);
+    p.attack.store(0.0, .monotonic); // → 1ms
+    p.sustain.store(1.0, .monotonic);
+
+    const F = 2048;
+
+    // ① 单副本（unison = 0）：居中声像 → L == R（与旧单声道实现一致）
+    var st0 = Synth{};
+    noteOn(&st0, 60, 127, 64);
+    var buf0: [F * 2]f32 = undefined;
+    render(&p, &st0, &buf0, F, 48000, 1.0, false);
+    var e0: f64 = 0;
+    var lr_diff0: f64 = 0;
+    for (0..F) |i| {
+        e0 += @abs(buf0[i * 2]);
+        lr_diff0 += @abs(buf0[i * 2] - buf0[i * 2 + 1]);
+    }
+    try std.testing.expect(e0 > 1.0);
+    try std.testing.expectApproxEqAbs(@as(f64, 0), lr_diff0, 1e-9);
+
+    // ② 合奏 8 副本：副本失谐 + 立体声展开 → L/R 不同；1/√copies 补偿保量级
+    p.osc[0].unison.store(8, .monotonic);
+    var st1 = Synth{};
+    noteOn(&st1, 60, 127, 64);
+    var buf1: [F * 2]f32 = undefined;
+    render(&p, &st1, &buf1, F, 48000, 1.0, false);
+    var e1: f64 = 0;
+    var lr_diff1: f64 = 0;
+    var finite = true;
+    for (0..F) |i| {
+        e1 += @abs(buf1[i * 2]);
+        lr_diff1 += @abs(buf1[i * 2] - buf1[i * 2 + 1]);
+        if (!std.math.isFinite(buf1[i * 2]) or !std.math.isFinite(buf1[i * 2 + 1])) finite = false;
+    }
+    try std.testing.expect(finite);
+    try std.testing.expect(lr_diff1 > 0.5); // 立体声展开生效
+    const ratio = e1 / e0;
+    try std.testing.expect(ratio > 0.5 and ratio < 2.0); // 量级相近（补偿生效）
+
+    // ③ 合奏改变了波形（失谐副本与单副本不逐位相同）
+    var same: usize = 0;
+    for (0..F) |i| {
+        if (@abs(buf0[i * 2] - buf1[i * 2]) < 1e-6) same += 1;
+    }
+    try std.testing.expect(same < F / 4);
+}
+
+test "synth: 合奏散布——0% 无拍频（每窗电平恒定）、50% 明显拍频" {
+    // 行为验证（不用 FFT）：副本同音高（0%）时相位差固定 → 波形周期稳定 →
+    // 逐窗 RMS 几乎不变；有散布（±25c）时副本互相拍频 → 逐窗 RMS 起伏。
+    var p = SynthParams{};
+    p.osc[0].enabled.store(true, .monotonic);
+    p.osc[0].volume.store(1.0, .monotonic);
+    p.osc[0].waveform.store(@intFromEnum(Waveform.sawtooth), .monotonic);
+    p.osc[0].unison.store(8, .monotonic);
+    p.attack.store(0.0, .monotonic); // → 1ms
+    p.sustain.store(1.0, .monotonic); // 包络恒定（不干扰电平测量）
+
+    const W = 2400; // 50ms 窗 @48k
+    const NCH = 40; // 2s
+    var rel_spread: [2]f64 = undefined;
+    for ([_]f32{ 0.0, 0.5 }, 0..) |det, di| {
+        p.osc[0].unison_detune.store(det, .monotonic);
+        var st = Synth{};
+        noteOn(&st, 45, 127, 64); // A2（110Hz）：±25c 的最外对拍频 ≈3Hz——窗内可见
+        var buf: [W * 2]f32 = undefined;
+        var mn: f64 = std.math.inf(f64);
+        var mx: f64 = 0;
+        var n: usize = 0;
+        while (n < NCH) : (n += 1) {
+            render(&p, &st, &buf, W, 48000, 1.0, false);
+            var e: f64 = 0;
+            for (0..W) |i| e += @as(f64, buf[i * 2]) * buf[i * 2];
+            const rms = @sqrt(e / W);
+            mn = @min(mn, rms);
+            mx = @max(mx, rms);
+        }
+        rel_spread[di] = (mx - mn) / mx;
+    }
+    // 0%：电平波动 < 2%（固定相位差的周期波，RMS 恒定）
+    try std.testing.expect(rel_spread[0] < 0.02);
+    // 50%（±25c）：拍频 → 波动明显（实测量级 ≥ 10%）
+    try std.testing.expect(rel_spread[1] > 0.10);
+}
+
+test "synth: powerScale（Detune Power 的位置扭曲函数）" {
+    // p ≈ 0 → 恒等（线性；与旧行为逐位一致）
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), powerScale(0.5, 0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), powerScale(0.25, 0.005), 1e-6);
+    // 端点固定（任意 p：0→0、1→1）——最外侧散布不受 power 影响
+    for ([_]f32{ -5, -1, 1, 5 }) |pwr| {
+        try std.testing.expectApproxEqAbs(@as(f32, 0), powerScale(0, pwr), 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 1), powerScale(1, pwr), 1e-6);
+    }
+    // p > 0 → 向中心聚拢（扭曲值 < 原值）；p < 0 → 向外拉开
+    try std.testing.expect(powerScale(0.5, 5) < 0.5);
+    try std.testing.expect(powerScale(0.5, -5) > 0.5);
+    try std.testing.expect(powerScale(0.25, 2) < 0.25);
+    try std.testing.expect(powerScale(0.25, -2) > 0.25);
+}
+
+test "synth: 散布功率——参数参与渲染（输出与线性不同）" {
+    var p = SynthParams{};
+    p.osc[0].enabled.store(true, .monotonic);
+    p.osc[0].volume.store(1.0, .monotonic);
+    p.osc[0].waveform.store(@intFromEnum(Waveform.sawtooth), .monotonic);
+    p.osc[0].unison.store(4, .monotonic);
+    p.osc[0].unison_detune.store(1.0, .monotonic);
+    p.attack.store(0.0, .monotonic);
+    p.sustain.store(1.0, .monotonic);
+
+    const F = 2048;
+    const powers = [_]f32{ 0, 5 };
+    var bufs: [2][F * 2]f32 = undefined;
+    for (powers, 0..) |pwr, bi| {
+        p.osc[0].detune_power.store(pwr, .monotonic);
+        var st = Synth{};
+        noteOn(&st, 45, 127, 64);
+        render(&p, &st, &bufs[bi], F, 48000, 1.0, false);
+    }
+    // 聚拢 vs 线性：波形明显不同（内圈副本位置变了）
+    var same: usize = 0;
+    for (0..F) |i| {
+        if (@abs(bufs[0][i * 2] - bufs[1][i * 2]) < 1e-6) same += 1;
+    }
+    try std.testing.expect(same < F / 4);
 }
 
 test "synth: 包络——起音到峰值、释音归零" {

@@ -11,6 +11,7 @@ const app_mod = @import("app.zig");
 const App = app_mod.App;
 const eq = @import("eq.zig");
 const util = @import("view_util.zig");
+const model = @import("model.zig");
 
 const win_title_h: i32 = 22;
 const win_min_w: i32 = 460;
@@ -46,29 +47,12 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     ui.renderer.fillRect(x + 1, y + 1, ww - 2, win_title_h - 1, ui.theme.toolbar);
     var tbuf: [96]u8 = undefined;
     var inst_names_buf: [64]u8 = undefined;
-    var inst_names: []const u8 = "";
-    {
-        // 路由到此通道的乐器名（最多展示前 2 个；更多则 `+N`）
-        // 注：**不能增量拼接**（`bufPrint(&inst_names_buf, "{s}+", .{inst_names})`）——
-        // 第二次时 inst_names 已指向同一缓冲 → 源与目标别名 → 运行时 panic
-        // （实测：两个乐器都路由到同通道时，打开效果器面板必崩）。
-        var first: ?[]const u8 = null;
-        var total: usize = 0;
-        for (app.instruments.items) |inst2| {
-            if (inst2.mixer != @as(i32, @intCast(panel.ch)) + 1) continue;
-            if (total == 0) first = inst2.name;
-            total += 1;
-        }
-        if (first) |fname| {
-            inst_names = if (total == 1)
-                fname
-            else
-                std.fmt.bufPrint(&inst_names_buf, "{s} +{d}", .{ fname, total - 1 }) catch fname;
-        }
-    }
+    // 路由到此通道的乐器名摘要（**0 起基准**——见 `model.routedInstrumentNames`；
+    // 曾经误用 `mixer == ch + 1`，显示成下一个通道的乐器）
+    const inst_names = model.routedInstrumentNames(app.instruments.items, panel.ch, &inst_names_buf);
     const title = std.fmt.bufPrint(&tbuf, "{s} — CH {d}{s}{s}", .{
         es.kind.displayName(),
-        panel.ch + 1,
+        panel.ch, // 与调音台标尺/默认通道名同一编号（0 起；曾误用 +1）
         if (inst_names.len > 0) " · " else "",
         inst_names,
     }) catch "效果器";
@@ -129,7 +113,10 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
 
     var cy = y + win_title_h + 6;
 
-    // ── 顶部控制行：开关 / 干湿比 ──
+    // ── 顶部控制行：开关（左）…… 干湿比（**右对齐独立分组**）──
+    // 干湿**不能贴着“启用”**（否则两个控制读成“启用干湿”）；
+    // 它是独立的混合参数：0% = 完全旁通（等同关效果）、1 = 完全处理；
+    // 对 EQ 而言近似“EQ 强度”（对未来的混响/延迟才是核心参数）。
     {
         const sw: i32 = 16;
         const sw_hovered = util.hitUI(ui, x + 10, cy + 2, sw, sw);
@@ -141,15 +128,16 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
             app.commitHistory("切换效果器开关");
         }
 
-        // 干湿比（横向推子）
-        const mix_x = x + 90;
-        const mix_w = @min(200, ww - 300);
+        // 干湿比（横向推子；右对齐到窗口右缘）
+        const pct_w: i32 = 44; // 预留 "100%" 文字宽度
+        const mix_w: i32 = @min(180, ww - 320);
         if (mix_w > 60) {
+            const mix_x = x + ww - 12 - pct_w - 8 - mix_w;
             ui.label("干湿", mix_x - 34, cy + 4, ui.theme.text_dim);
             var mix = es.mix;
             if (ui.slider(7602, &mix, mix_x, cy + 4, mix_w, 14)) {
                 es.mix = mix;
-                app.history_pending = "调整效果器音量";
+                app.history_pending = "调整效果器干湿";
             }
             var mb: [16]u8 = undefined;
             const mt = std.fmt.bufPrint(&mb, "{d:.0}%", .{es.mix * 100}) catch "";

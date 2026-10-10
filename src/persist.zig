@@ -71,6 +71,12 @@ pub const SavedOsc = struct {
     enabled: bool = false,
     volume: f32 = 0.5,
     waveform: u8 = 0,
+    /// 合奏副本总数 1-16（1 = 无合奏；缺字段的旧存档 → 1）
+    unison: u32 = 1,
+    /// 合奏音高散布 0-1（缺字段的旧存档 → 0.05 = 5%）
+    unison_detune: f32 = 0.05,
+    /// 散布位置功率 -5..5（缺字段 → 0 = 线性）
+    detune_power: f32 = 0,
 };
 
 /// 存档中的滤波器
@@ -169,6 +175,9 @@ pub fn exportSynth(p: *const synth.SynthParams) SavedSynth {
             .enabled = p.osc[i].enabled.load(.monotonic),
             .volume = p.osc[i].volume.load(.monotonic),
             .waveform = p.osc[i].waveform.load(.monotonic),
+            .unison = p.osc[i].unison.load(.monotonic),
+            .unison_detune = p.osc[i].unison_detune.load(.monotonic),
+            .detune_power = p.osc[i].detune_power.load(.monotonic),
         };
     }
     return s;
@@ -188,6 +197,9 @@ pub fn importSynth(s: *const SavedSynth, p: *synth.SynthParams) void {
         p.osc[i].enabled.store(s.osc[i].enabled, .monotonic);
         p.osc[i].volume.store(s.osc[i].volume, .monotonic);
         p.osc[i].waveform.store(s.osc[i].waveform, .monotonic);
+        p.osc[i].unison.store(@min(@max(s.osc[i].unison, 1), @as(u32, synth.max_unison)), .monotonic);
+        p.osc[i].unison_detune.store(std.math.clamp(s.osc[i].unison_detune, 0, 1), .monotonic);
+        p.osc[i].detune_power.store(std.math.clamp(s.osc[i].detune_power, -5, 5), .monotonic);
     }
 }
 
@@ -241,6 +253,9 @@ test "persist: 合成器参数往返（导出 → 导入）" {
     p.osc[2].enabled.store(true, .monotonic);
     p.osc[2].volume.store(0.33, .monotonic);
     p.osc[2].waveform.store(3, .monotonic); // 锯齿
+    p.osc[2].unison.store(7, .monotonic); // 合奏副本数
+    p.osc[2].unison_detune.store(0.35, .monotonic); // 合奏散布
+    p.osc[2].detune_power.store(-2.5, .monotonic); // 散布功率
     p.lpf.enabled.store(true, .monotonic);
     p.lpf.cutoff.store(0.9, .monotonic);
 
@@ -252,10 +267,37 @@ test "persist: 合成器参数往返（导出 → 导入）" {
     try std.testing.expect(q.osc[2].enabled.load(.monotonic));
     try std.testing.expectApproxEqAbs(@as(f32, 0.33), q.osc[2].volume.load(.monotonic), 1e-6);
     try std.testing.expectEqual(@as(u8, 3), q.osc[2].waveform.load(.monotonic));
+    try std.testing.expectEqual(@as(u32, 7), q.osc[2].unison.load(.monotonic));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.35), q.osc[2].unison_detune.load(.monotonic), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -2.5), q.osc[2].detune_power.load(.monotonic), 1e-6);
     try std.testing.expect(q.lpf.enabled.load(.monotonic));
     try std.testing.expectApproxEqAbs(@as(f32, 0.9), q.lpf.cutoff.load(.monotonic), 1e-6);
     // 未设置过的字段保持默认
     try std.testing.expectApproxEqAbs(@as(f32, 0.30), q.decay.load(.monotonic), 1e-6);
+    try std.testing.expectEqual(@as(u32, 1), q.osc[0].unison.load(.monotonic)); // 缺省单发声源
+
+    // 超范围值 → 鉗制；低于 1 → 抬到 1（最少一个发声源）
+    var s2 = saved;
+    s2.osc[1].unison = 999;
+    s2.osc[1].unison_detune = 5.0; // 越界
+    s2.osc[1].detune_power = -99; // 越界
+    var q2 = synth.SynthParams{};
+    importSynth(&s2, &q2);
+    try std.testing.expectEqual(@as(u32, synth.max_unison), q2.osc[1].unison.load(.monotonic));
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), q2.osc[1].unison_detune.load(.monotonic), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -5.0), q2.osc[1].detune_power.load(.monotonic), 1e-6);
+    var s2b = saved;
+    s2b.osc[1].unison = 0; // 0 也要抬到 1
+    var q2b = synth.SynthParams{};
+    importSynth(&s2b, &q2b);
+    try std.testing.expectEqual(@as(u32, 1), q2b.osc[1].unison.load(.monotonic));
+    // 缺字段默认（旧存档）：散布默认 5%、功率 0
+    var s3 = saved;
+    s3.osc[1] = .{};
+    var q3 = synth.SynthParams{};
+    importSynth(&s3, &q3);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.05), q3.osc[1].unison_detune.load(.monotonic), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0), q3.osc[1].detune_power.load(.monotonic), 1e-6);
 }
 
 test "persist: JSON 往返（序列化 → 解析）" {

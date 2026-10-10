@@ -252,7 +252,7 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, x: i32, y: i32, w: i32, clip_top: i32
         const active = ui.active_id == 4100 + @as(u64, idx);
         ui.renderer.fillRect(mix_x, mix_y, util.rack_mix_w, mix_h, if (active) ui.theme.accent else if (hovered) ui.theme.item_hover else ui.theme.slider_track);
         ui.renderer.strokeRect(mix_x, mix_y, util.rack_mix_w, mix_h, ui.theme.panel_border);
-        // 通道号（1 起显示）
+        // 通道号（**0 起**，与调音台标尺/默认通道名同一编号；0 = 主通道）
         var buf: [8]u8 = undefined;
         const mix_t = std.fmt.bufPrint(&buf, "{d}", .{inst.mixer}) catch "";
         const tw: i32 = @intFromFloat(ui.font.measure(mix_t));
@@ -296,11 +296,12 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, x: i32, y: i32, w: i32, clip_top: i32
         app.setInstrument(@intCast(idx)); // 切换清选区（防跨乐器孤儿选区）
         app.rack.ctx_instrument = null;
     }
-    // 双击名称 → 打开合成器编辑器（编辑该乐器）
+    // 双击名称 → 打开合成器编辑器（编辑该乐器），并**置顶**（最上层）
     if (ui.mouse_double and name_hovered) {
         app.setInstrument(@intCast(idx));
         app.synth_win.instrument = @intCast(idx);
         app.synth_win.open = true;
+        app.bringToFront(&app.synth_win.z); // 即时反馈：打开即置顶
     }
     if (name_hovered and ui.mouse_right_pressed) {
         app.rack.ctx_instrument = idx;

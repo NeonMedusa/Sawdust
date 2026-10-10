@@ -67,6 +67,30 @@ pub const Instrument = struct {
     synth: *synth.SynthParams, // 每乐器独立的合成器参数
 };
 
+/// 路由到混音通道 `ch`（**0 起**——与调音台标尺名、`Instrument.mixer`
+/// 同一基准）的乐器名摘要：单个 = 该名；多个 = `首个 +N`；无 = 空串。
+/// `buf` 供多乐器情形写入（≥ 64 字节足够）。
+///
+/// 提取为公用函数的动机：调音台右区抬头与效果器窗口标题都要这份摘要——
+/// 两处曾经各写一份，效果器那份误用 `mixer == ch + 1`（把 0 起当 1 起），
+/// 显示成**下一个通道**的乐器（实测 bug：通道 Bass 的 EQ 标题显示 CH2·Key）。
+///
+/// 注：**不能增量拼接**（`bufPrint(buf, "{s}+", .{inst_names})`）——第二次时
+/// `inst_names` 已指向同一缓冲 → 源与目标别名 → 运行时 panic（实测：两个乐器
+/// 都路由到同通道时，打开效果器面板必崩）。
+pub fn routedInstrumentNames(insts: []const Instrument, ch: usize, buf: []u8) []const u8 {
+    var first: ?[]const u8 = null;
+    var total: usize = 0;
+    for (insts) |inst| {
+        if (inst.mixer != @as(i32, @intCast(ch))) continue;
+        if (total == 0) first = inst.name;
+        total += 1;
+    }
+    const f = first orelse return "";
+    if (total == 1) return f;
+    return std.fmt.bufPrint(buf, "{s} +{d}", .{ f, total - 1 }) catch f;
+}
+
 /// **每全音符的份数**（分辨率 `U`）：数据层的时间单位。
 /// `96 = 2⁵ × 3`——可精确表示的分母 = 96 的约数：
 /// {1,2,3,4,6,8,12,16,24,32,48,96}——涵盖二进制细分与三连音体系。
@@ -593,4 +617,27 @@ test "noteOverlaps: 同音高重叠检测、排除自身、不同音高/样式" 
     try std.testing.expect(!noteOverlaps(&notes, notes.len, 1, 0, 2, 4, 60)); // 不同样式
     try std.testing.expect(!noteOverlaps(&notes, notes.len, 0, 1, 2, 4, 60)); // 不同乐器
     try std.testing.expect(!noteOverlaps(&notes, 0, 0, 0, 0, 4, 60)); // 排除自身
+}
+
+test "model: routedInstrumentNames——0 起基准（修效果器标题显示下一通道乐器）" {
+    var sp: synth.SynthParams = .{};
+    // 实测场景：Bass → 通道 1，Key → 通道 2。效果器标题曾误用
+    // `mixer == ch + 1`：打开通道 1 的 EQ 显示成通道 2 的 Key（应显示 Bass）。
+    const insts = [_]Instrument{
+        .{ .name = "Bass", .mixer = 1, .synth = &sp },
+        .{ .name = "Key", .mixer = 2, .synth = &sp },
+    };
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Bass", routedInstrumentNames(&insts, 1, &buf));
+    try std.testing.expectEqualStrings("Key", routedInstrumentNames(&insts, 2, &buf));
+    // 无路由到此通道 → 空串（而不是借位到别的通道）
+    try std.testing.expectEqualStrings("", routedInstrumentNames(&insts, 0, &buf));
+    try std.testing.expectEqualStrings("", routedInstrumentNames(&insts, 3, &buf));
+
+    // 多乐器同通道：首个 + N
+    const two = [_]Instrument{
+        .{ .name = "Bass", .mixer = 1, .synth = &sp },
+        .{ .name = "Key", .mixer = 1, .synth = &sp },
+    };
+    try std.testing.expectEqualStrings("Bass +1", routedInstrumentNames(&two, 1, &buf));
 }

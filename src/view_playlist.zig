@@ -294,7 +294,13 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                                 const range = model.rangeMap(pat_min_pitch[pi], pat_max_pitch[pi], 12);
                                 const win_lo = clip.offset;
                                 const win_steps = clip.len;
-                                var drawn: usize = 0;
+                                // 画**全部**乐器、全部音符（**不做“画满 N 个就停”的截断**）。
+                                // 实测 bug：旧版有 `drawn >= 64` 截断——多乐器共用一个大样式时，
+                                // 数组顺序靠前的那个乐器往往就占满 64 个名额（实测工程：样式 3578 个
+                                // 音符，前 64 个全属同一个乐器）——预览看起来“只显示单个乐器的音符”。
+                                // 性能：循环本就要扫全量 notes；每个命中音符只是一次 1-8px × 2px 的
+                                // `fillRect`（实测 3578 音符/剪辑每帧几万字节写入，软件光栅无感）。
+                                // 若要优化，应做“同像素列合并”而不是静默丢音符（截断即本 bug 之源）。
                                 for (app.notes.items) |n| {
                                     if (n.pattern != clip.pattern) continue;
                                     const rel = n.step - win_lo;
@@ -306,8 +312,6 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                                     const y_norm = range.yOf(n.pitch);
                                     const ny = inner_y + inner_h - 2 - @as(i32, @intFromFloat(y_norm * @as(f32, @floatFromInt(inner_h - 2))));
                                     ui.renderer.fillRect(nx, ny, nw, 2, base);
-                                    drawn += 1;
-                                    if (drawn >= 64) break; // 预览足够，防止极端情况卡顿
                                 }
                             }
                         }

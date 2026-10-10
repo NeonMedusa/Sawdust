@@ -50,8 +50,13 @@ pub const Params = struct {
     /// 调度 generation（reset 时递增；音频线程丢弃旧事件）
     sched_gen: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
     /// 编辑代（播放中编辑重扫时递增）：音频线程丢弃 `edit_gen` **小于**
-    /// 当前值的事件（丢弃但不释放声部）——见 `sequencer.rescanForEdit`
+    /// 当前值、**且步号 >= `sched_rescan_from`** 的旧事件（= 已有重发
+    /// 副本替换；低于安全界的旧副本**保留触发**）——见 `sequencer.rescanForEdit`
     sched_edit_gen: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
+    /// 最近一次重扫的**安全界**（步）：用 `schedEventObsolete` 判定旧事件
+    /// 是否已被重发替换——UI 必须**先本值、后 `sched_edit_gen`**发布
+    /// （见 `App.rescanForPlaybackEdit`）
+    sched_rescan_from: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
 
     // ── 队列与乐器（指针地址稳定）──
     /// 立即事件队列（试听/all_off）
@@ -255,6 +260,22 @@ fn handleGenChange(engine: *Engine, gen: u32, was_playing: bool) void {
 /// stash 溢出本身会由下一块的重扫/正常排水自愈。
 fn stashInsert(engine: *Engine, ev: synth.SchedEvent) void {
     if (engine.stash_n >= engine.stash.len) return; // 满：丢弃
+    // 去重：清掉**同键（种类+音高+乐器+步）的更旧编辑代**副本——
+    // 快速连续编辑（或 store/读竞态）时多代副本会同时在 stash 里存活，
+    // 全部触发就双发（on 双声部 → off 只释一个 → 悬挂）。
+    // 同代重复**保留**（合法：同位置同音高的两个音符本就该发两条事件）。
+    var di: usize = 0;
+    while (di < engine.stash_n) {
+        const ex = engine.stash[di];
+        if (ex.edit_gen < ev.edit_gen and ex.kind == ev.kind and ex.pitch == ev.pitch and
+            ex.instrument == ev.instrument and ex.step == ev.step)
+        {
+            std.mem.copyForwards(synth.SchedEvent, engine.stash[di .. engine.stash_n - 1], engine.stash[di + 1 .. engine.stash_n]);
+            engine.stash_n -= 1;
+        } else {
+            di += 1;
+        }
+    }
     // 从尾部往前找插入点（stash 已按步序）
     var i: usize = engine.stash_n;
     while (i > 0 and synth.schedEventLess({}, ev, engine.stash[i - 1])) : (i -= 1) {
@@ -262,6 +283,16 @@ fn stashInsert(engine: *Engine, ev: synth.SchedEvent) void {
     }
     engine.stash[i] = ev;
     engine.stash_n += 1;
+}
+
+/// 调度事件是否应**作废**（丢弃但不释放声部——与 `gen` 变化的区别）：
+/// - 旧传输代（`ev.gen != gen`）：reset/跳转语义，作废；
+/// - 旧编辑代且**步号 >= 该代重扫的安全界**：已有重发副本替换，作废；
+/// - 旧编辑代但步号更低：**保留触发**——重扫没覆盖这段（见
+///   `sequencer.rescanForEdit`），它们还没被音频走到，正常触发一次即可。
+fn schedEventObsolete(ev: synth.SchedEvent, gen: u32, edit_gen: u32, rescan_from: i32) bool {
+    if (ev.gen != gen) return true;
+    return ev.edit_gen < edit_gen and ev.step >= rescan_from;
 }
 
 /// 回传“正在发声的音高”（位掩码；UI 用于播放/试听高亮）
@@ -517,8 +548,10 @@ fn dataCallback(
     // 4) 播放：stash 管理 + 样本级事件触发
     if (gen != engine.stash_gen) handleGenChange(engine, gen, was_playing);
     // 编辑代（重扫）：**不**清空 stash（有 drain 竞态会丢新事件），
-    // 由触发循环按 `edit_gen < 当前值` 过滤——在响的音符保持发声
+    // 由触发循环按 `schedEventObsolete` 过滤——在响的音符保持发声。
+    // 注：读顺序为“代后界”（界先于代发布，读到新代时界必已就位）
     const edit_gen = params.sched_edit_gen.load(.monotonic);
+    const rescan_from = params.sched_rescan_from.load(.monotonic);
     // 尽量多取新事件（stash 有空位时）。**按步序插入**（不是追加）：
     // 播放中重扫补发的事件可能落在已 stash 的事件之前
     // （见 `sequencer.rescanForEdit`）——追加的话它们会被前面的事件挡着，
@@ -544,8 +577,8 @@ fn dataCallback(
     var si: usize = 0;
     while (done < frames and si < engine.stash_n) {
         const ev = engine.stash[si];
-        if (ev.gen != gen or ev.edit_gen < edit_gen) {
-            si += 1; // 作废（旧传输代 / 旧编辑代）：丢弃，**不**释放声部
+        if (schedEventObsolete(ev, gen, edit_gen, rescan_from)) {
+            si += 1; // 作废（旧传输代 / 已被重发替换的旧编辑代）：丢弃，**不**释放声部
             continue;
         }
         // 事件应在的绝对帧位置
@@ -622,6 +655,115 @@ test "audio: Params 默认值" {
     try std.testing.expect(!p.playing.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 1), p.sched_gen.load(.monotonic));
     try std.testing.expect(p.synth_ptrs[0].load(.monotonic) == null);
+}
+
+test "audio: 事件作废判定——旧代低步保留（安全界过滤）" {
+    // 实测 bug：重扫把音频已走过的 on 再发一次 → 双声部 → off 只释一个 →
+    // 悬挂。修法：重扫从**安全界**起；音频只作废“步 >= 安全界”的旧编辑代
+    // 事件（已有重发副本替换），低于安全界的旧副本保留、正常触发一次。
+    const ev = synth.SchedEvent{ .kind = .on, .pitch = 60, .step = 12, .gen = 1, .edit_gen = 1 };
+    // 同代：任何情况都不作废
+    try std.testing.expect(!schedEventObsolete(ev, 1, 1, 14));
+    try std.testing.expect(!schedEventObsolete(ev, 1, 1, 0));
+    // 旧传输代：作废（reset/跳转语义，不管步号）
+    try std.testing.expect(schedEventObsolete(ev, 2, 1, 14));
+    try std.testing.expect(schedEventObsolete(ev, 2, 1, 0));
+    // 旧编辑代 + 步 >= 安全界：作废（有重发副本）
+    var big = ev;
+    big.step = 20;
+    try std.testing.expect(schedEventObsolete(big, 1, 2, 14));
+    try std.testing.expect(schedEventObsolete(big, 1, 2, 20)); // 边界：等于安全界 → 作废
+    // 旧编辑代 + 步 < 安全界：**保留**（重扫没覆盖这段；必须触发一次）
+    try std.testing.expect(!schedEventObsolete(ev, 1, 2, 14));
+}
+
+test "audio: stash 去重——同键更旧代被替换；同代重复保留" {
+    var params = Params{};
+    var engine = Engine{ .params = &params };
+
+    // 旧副本（代 1）→ 重发副本（代 2）：后者插入时清掉前者
+    const e1 = synth.SchedEvent{ .kind = .on, .pitch = 60, .instrument = 0, .step = 100, .gen = 1, .edit_gen = 1 };
+    var e2 = e1;
+    e2.edit_gen = 2;
+    stashInsert(&engine, e1);
+    stashInsert(&engine, e2);
+    try std.testing.expectEqual(@as(usize, 1), engine.stash_n);
+    try std.testing.expectEqual(@as(u32, 2), engine.stash[0].edit_gen);
+
+    // 同代重复：两条都保留（合法：同位置同音高的两个音符）
+    stashInsert(&engine, e2);
+    try std.testing.expectEqual(@as(usize, 2), engine.stash_n);
+
+    // 不同键（不同步号）不受影响，且保持步序
+    var e3 = e1;
+    e3.step = 50;
+    e3.edit_gen = 3;
+    stashInsert(&engine, e3);
+    try std.testing.expectEqual(@as(usize, 3), engine.stash_n);
+    try std.testing.expectEqual(@as(i32, 50), engine.stash[0].step); // 插入到最前
+
+    // 不同编辑代的“不同种类/音高”不误删
+    var off = e2;
+    off.kind = .off;
+    stashInsert(&engine, off);
+    try std.testing.expectEqual(@as(usize, 4), engine.stash_n);
+}
+
+test "audio: EQ 干湿比生效（100% 与 0% 输出显著不同——非占位）" {
+    // 干湿（dry/wet）：dry = 未处理原声、wet = 效果输出；
+    // mix = 输出中效果声的混合比例（0 = 完全旁通、1 = 完全处理）。
+    // 本测试证明它**真实作用于 DSP**（用户实测“没感觉”另见：EQ 默认曲线
+    // 全平——无增益时滤波器直接跳过，此时混什么都不变）。
+    const alloc = std.testing.allocator;
+
+    const energy = struct {
+        fn run(alloc_: std.mem.Allocator, mix: f32) !f64 {
+            var params = Params{};
+            var engine = Engine{ .params = &params };
+            engine.synths = try alloc_.alloc(synth.Synth, 1);
+            defer alloc_.free(engine.synths);
+            engine.synths[0] = .{};
+            engine.chan_bufs = try alloc_.alloc(f32, mixer_channels * 2 * 4096);
+            defer alloc_.free(engine.chan_bufs);
+            engine.slot_eq = try alloc_.alloc(eq.Biquad, mixer_channels * effect_slots * eq_bands * 2);
+            defer alloc_.free(engine.slot_eq);
+            @memset(engine.slot_eq, .{});
+
+            var sp = synth.SynthParams{ .attack = std.atomic.Value(f32).init(0.0) };
+            params.channel_count.store(1, .monotonic);
+            params.volume.store(1.0, .monotonic);
+            params.synth_ptrs[0].store(&sp, .monotonic);
+            params.instrument_channel[0].store(0, .monotonic);
+            params.instrument_gain[0].store(1.0, .monotonic);
+            // EQ：440Hz +12dB 峰值；干湿 = mix
+            params.effect_count[0].store(1, .monotonic);
+            params.effect_kind[0][0].store(1, .monotonic);
+            params.effect_enabled[0][0].store(true, .monotonic);
+            params.effect_mix[0][0].store(mix, .monotonic);
+            params.channel_eq[0][0] = .{ .freq = 440, .q = 1.0, .gain_db = 12 };
+            params.channel_eq_version[0].store(1, .monotonic);
+
+            synth.noteOn(&engine.synths[0], 69, 30, 64); // A4 = 440Hz（小力度防软削波压缩）
+            var out: [1024 * 2]f32 = undefined;
+            var total: f64 = 0;
+            var i: usize = 0;
+            while (i < 8) : (i += 1) {
+                @memset(&out, 0);
+                renderSegment(&engine, &params, &out, 1024, 48000, 1.0);
+                for (out) |s| total += @as(f64, s) * s;
+            }
+            return total;
+        }
+    }.run;
+
+    const e_wet = try energy(alloc, 1.0); // 100%：完全 EQ
+    const e_dry = try energy(alloc, 0.0); // 0%：完全旁通
+    try std.testing.expect(e_dry > 0);
+    // +12dB 峰值在中心频率 ≈ 4× 幅度 ≈ 16× 能量（软削波会压缩，断言放宽到 2×）
+    try std.testing.expect(e_wet > e_dry * 2);
+    // 50% 介于两者之间
+    const e_mid = try energy(alloc, 0.5);
+    try std.testing.expect(e_mid > e_dry and e_mid < e_wet);
 }
 
 test "audio: 暂停边沿释放全部声部（修“暂停后音符一直响”）" {

@@ -410,8 +410,8 @@ pub const SynthWindow = struct {
     open: bool = true,
     x: i32 = 340,
     y: i32 = 150,
-    w: i32 = 520,
-    h: i32 = 300,
+    w: i32 = 590,
+    h: i32 = 430,
     /// Z 序（越大越靠上；点窗口即置顶）——见 `RackState.z` 注释
     z: i32 = 30,
     grab_dx: i32 = 0,
@@ -516,6 +516,8 @@ pub const MixerWindow = struct {
     ctx_effect: ?EffectRef = null,
     /// 通道右键菜单中的通道（删除/上移/下移用）——null = 未展开
     ctx_channel: ?usize = null,
+    /// 声像旋钮右键菜单中的通道（恢复默认值用）——null = 未展开
+    ctx_pan: ?usize = null,
     /// 右键菜单位置（**打开时快照**——不跟鼠标跑，否则永远点不到）
     ctx_menu_x: i32 = 0,
     ctx_menu_y: i32 = 0,
@@ -616,6 +618,9 @@ pub const App = struct {
     toast_total_ns: i64 = 3_000_000_000,
     /// “文件”菜单展开中
     file_menu_open: bool = false,
+    /// “文件”菜单刚打开（帧内标记；用于区分“打开菜单那一下”与“已展开后点按钮关”）。
+    /// 帧首由 drawToolbar 清零（`util.menuFrameBegin`）。
+    file_menu_just_opened: bool = false,
     /// 待定的文件操作（帧末执行——对话框不能在事件迭代/绘制中弹出）。
     /// null = 无
     pending_file_action: ?FileAction = null,
@@ -1675,10 +1680,12 @@ pub const App = struct {
     /// 若当前状态与所在快照等价（忽略选区）→ 不产生新条目（防“点了没动”噪音）。
     pub fn commitHistory(self: *App, label: []const u8) void {
         if (self.history.items.len > 0 and self.stateEqualsCurrent()) return;
-        // 播放中：按新旧快照重扫调度窗口（水位线只前进不回头——不重扫的话
-        // 新增/移动/删除/改值到已扫过窗口的音符都不会生效：实测 bug
-        // “播放中放置/克隆/粘贴的音符不响”、“改力度不生效”）
-        self.rescanForPlaybackEdit();
+        // 播放中：**仅当音符/片段真的变化**才重扫调度窗口。
+        // EQ/通道音量/声像等编辑不改变调度事件（事件只带时间/力度/声像/
+        // 乐器），重扫纯属浪费且有害——它会重发游标附近的事件，音频对
+        // “已过时”事件立即触发 → 重发已在响的 on = 双声部（单个 off 只
+        // 释放一个）→ 个别音悬挂（实测 bug：播放中调 EQ 概率悬挂）。
+        if (!self.notesClipsUnchanged()) self.rescanForPlaybackEdit();
         // 截断 redo 尾巴（新操作发生在撤销之后）
         while (self.history.items.len > self.history_current + 1) {
             var st = self.history.pop().?;
@@ -1699,6 +1706,24 @@ pub const App = struct {
         }
     }
 
+    /// 当前 notes/clips 与所在快照是否**内容等价**（忽略 `selected` 瞬态字段）。
+    /// 供 `commitHistory` 判断是否需要重扫调度——只关心会改变事件的内容。
+    fn notesClipsUnchanged(self: *const App) bool {
+        if (self.history.items.len == 0) return false; // 无基准：保守重扫
+        const old = &self.history.items[self.history_current];
+        if (old.notes.len != self.notes.items.len or old.clips.len != self.clips.items.len) return false;
+        for (old.notes, self.notes.items) |a, b| {
+            if (a.step != b.step or a.len != b.len or a.pitch != b.pitch or
+                a.pattern != b.pattern or a.instrument != b.instrument or
+                a.velocity != b.velocity or a.pan != b.pan) return false;
+        }
+        for (old.clips, self.clips.items) |a, b| {
+            if (a.track != b.track or a.start != b.start or a.len != b.len or
+                a.pattern != b.pattern or a.offset != b.offset) return false;
+        }
+        return true;
+    }
+
     /// 播放中编辑提交后：按新旧快照重扫调度（见 `sequencer.rescanForEdit`）。
     ///
     /// 背景（实测 bug）：调度水位线只前进不回头（提前 4 小节 gather）——
@@ -1714,6 +1739,7 @@ pub const App = struct {
         if (self.history.items.len == 0) return;
         const old = &self.history.items[self.history_current];
         const cur = self.playback.cursorStep(self.sel.song_mode);
+        const rescan_from = self.rescanSafeFromStep(cur);
         sequencer.rescanForEdit(
             &self.scheduler,
             &self.sched_events,
@@ -1724,8 +1750,33 @@ pub const App = struct {
             self.sel.song_mode,
             self.sel.pattern,
             cur,
+            rescan_from,
         );
+        // 发布顺序：**先安全界、后编辑代**——音频读到新代时安全界必然
+        // 已就位（反过来“新代 + 旧界”会丢弃还没重发的旧事件 → 漏 off → 悬挂）
+        self.params.sched_rescan_from.store(self.scheduler.rescan_from, .monotonic);
         self.params.sched_edit_gen.store(self.scheduler.edit_gen, .monotonic);
+    }
+
+    /// 重扫的**安全界**：音频线程**确定还没走到**的第一步。
+    ///
+    /// 动机（实测 bug）：UI 游标来自帧首快照、落后音频线程；从 `游标+1`
+    /// 重发会把音频**已经触发过**的 on 再发一次（音频对“已过时”事件立即
+    /// 触发）→ 双声部；而 off 只有一份 → 只释放一个 → 个别音悬挂。
+    /// 故用**新鲜读取**的 `frames_played` 估算音频位置，再加安全余量
+    /// （≥2 步且 ≥1536 帧 ≈ 32ms——覆盖音频读取新代前可能推进的部分）。
+    /// `(游标, 安全界)` 区间的旧副本由音频侧保留触发（不漏），代价是该
+    /// 区间内**新增**的音符首次不响（下一遍会响）。
+    fn rescanSafeFromStep(self: *const App, cur: i32) i32 {
+        const sr: u64 = @max(1, self.params.sample_rate);
+        const bpm: u64 = @intCast(std.math.clamp(self.bpm, 20, 999));
+        const beat: u64 = @intCast(@max(1, model.stepsPerBeat(self.time_den)));
+        const step_frames: u64 = @max(1, sr * 60 / (bpm * beat));
+        const frames_now = self.params.frames_played.load(.monotonic);
+        const el: u64 = frames_now -| self.playback.start_frame;
+        const bound: i32 = self.playback.start_step + @as(i32, @intCast(el / step_frames));
+        const margin: i32 = @intCast(@max(2, @divTrunc(1536 + step_frames - 1, step_frames)));
+        return @max(cur + 1, bound + 1 + margin);
     }
 
     /// 应用历史快照（恢复 = 整块回写；顺带钳制选择/乐器索引）
@@ -1920,6 +1971,16 @@ pub const App = struct {
         const base = std.fs.path.basename(p);
         if (base.len == 0) return null;
         return base;
+    }
+
+    /// 是否有下拉/右键菜单展开（= 声明全屏模态层屏蔽下层交互）。
+    ///
+    /// **集中在这一处**：每种菜单都必须计入——漏项会让菜单的点击
+    /// **穿透到下层**（实测 bug：文件→保存穿透点到左栏“操作历史”条目，
+    /// 因为文件菜单正好盖在历史列表上方；历史面板用 `ui.listItem`（观 hit）
+    /// 先于菜单绘制、当时又未被屏蔽）。
+    pub fn menuIsOpen(self: *const App) bool {
+        return self.rack.menu_open or self.rack.ctx_instrument != null or self.file_menu_open;
     }
 
     /// 设置状态栏提示（覆盖旧的；默认显示约 3 秒）
@@ -3296,6 +3357,89 @@ test "app: 播放中改力度——提交历史时重扫（带新力度）且产
     try std.testing.expectEqual(@as(i32, 100), app.notes.items[0].velocity);
 }
 
+test "app: 播放中非音符编辑不重扫（修“调 EQ 悬挂”的根源之一）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    app.addNote(.{ .step = 16, .len = 4, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.commitHistory("放置音符");
+
+    app.playing = true;
+    app.sel.song_mode = false;
+    app.playback.piano_step = 8;
+    sequencer.reset(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, false, 0, 0);
+    sequencer.scheduleRange(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, false, 0, 0, 32);
+    var out: [8]synth.SchedEvent = undefined;
+    _ = app.sched_events.drain(&out);
+
+    // 非音符编辑（通道声像）：commitHistory 产生历史条目，但**不**重扫调度——
+    // 否则会重发游标附近的 on，音频对过时事件立即触发 → 双声部 → 悬挂。
+    const edit0 = app.scheduler.edit_gen;
+    app.mixer_channels_state.items[0].pan = 0.25;
+    app.commitHistory("调整通道声像");
+    try std.testing.expectEqual(edit0, app.scheduler.edit_gen); // 编辑代不变
+    try std.testing.expectEqual(@as(usize, 0), app.sched_events.drain(&out)); // 无重发
+    try std.testing.expect(app.history.items.len >= 3); // 历史条目照常
+
+    // 对照：音符编辑（改力度）→ 重扫（编辑代递增 + 事件重发）
+    app.notes.items[0].velocity = 40;
+    app.commitHistory("调整力度");
+    try std.testing.expect(app.scheduler.edit_gen != edit0);
+    try std.testing.expect(app.sched_events.drain(&out) > 0);
+}
+
+test "app: 重扫安全界——游标附近已走过的步不重发（防双触发）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    // 两个音符：① [9,10)（(游标, 安全界) 内——不重发）；② [20,24)（重发）
+    app.addNote(.{ .step = 9, .len = 1, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.addNote(.{ .step = 20, .len = 4, .pitch = 62, .pattern = 0, .instrument = 0 });
+    app.commitHistory("放置音符");
+
+    app.playing = true;
+    app.sel.song_mode = false;
+    app.playback.piano_step = 8;
+    // 造“音频已走到 8”：帧数 / 每步帧数（48k、120bpm、分母 4 → 1000 帧/步）
+    app.playback.start_frame = 0;
+    app.playback.start_step = 0;
+    app.params.frames_played.store(8000, .monotonic);
+    sequencer.reset(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, false, 0, 0);
+    sequencer.scheduleRange(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, false, 0, 0, 32);
+    var out: [8]synth.SchedEvent = undefined;
+    _ = app.sched_events.drain(&out);
+
+    // 安全界：bound=8、margin≥2 → 11（游标 8）
+    try std.testing.expectEqual(@as(i32, 11), app.rescanSafeFromStep(8));
+
+    // 改力度提交 → 重扫 [11, 32)：只重发 ②（on@20/off@24）；①的 on@9/off@10
+    // 均 < 11，不重发（旧副本由音频侧保留触发，不漏）
+    app.notes.items[0].velocity = 40;
+    app.notes.items[1].velocity = 40;
+    app.commitHistory("调整力度");
+    const n = app.sched_events.drain(&out);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(@as(i32, 20), out[0].step);
+    try std.testing.expectEqual(synth.EventKind.on, out[0].kind);
+    try std.testing.expectEqual(@as(i32, 24), out[1].step);
+    try std.testing.expectEqual(synth.EventKind.off, out[1].kind);
+    // 发布的安全界与编辑代（音频据此过滤——先界后代的顺序在源码中保证）
+    try std.testing.expectEqual(@as(i32, 11), app.params.sched_rescan_from.load(.monotonic));
+    try std.testing.expectEqual(app.scheduler.edit_gen, app.params.sched_edit_gen.load(.monotonic));
+}
+
 test "app: 撤销/重做——快照式（放置/删除/修改 + redo 截断 + 选区无关）" {
     var app = App{ .allocator = std.testing.allocator };
     defer app.clips.deinit(app.allocator);
@@ -3364,6 +3508,33 @@ test "app: 撤销/重做——快照式（放置/删除/修改 + redo 截断 + �
     try std.testing.expect(app.jumpHistory(0));
     try std.testing.expectEqual(@as(usize, 0), app.notes.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.history_current);
+}
+
+test "app: menuIsOpen——每种菜单都必须计入（漏项会穿透下层）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+
+    // 实测 bug：文件菜单未计入 → 展开时不声明模态层 → 点“保存”
+    // 穿透点到左栏“操作历史”的条目（菜单盖在列表上方）
+    try std.testing.expect(!app.menuIsOpen());
+    app.file_menu_open = true;
+    try std.testing.expect(app.menuIsOpen());
+    app.file_menu_open = false;
+
+    // 机架下拉菜单
+    app.rack.menu_open = true;
+    try std.testing.expect(app.menuIsOpen());
+    app.rack.menu_open = false;
+
+    // 机架右键菜单（乐器）
+    app.rack.ctx_instrument = 0;
+    try std.testing.expect(app.menuIsOpen());
+    app.rack.ctx_instrument = null;
+
+    // 全部关闭 → 无菜单
+    try std.testing.expect(!app.menuIsOpen());
 }
 
 test "app: 导入工程恢复主音量（并同步到音频线程）" {

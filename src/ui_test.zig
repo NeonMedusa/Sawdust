@@ -777,6 +777,20 @@ test "ui: 主动缩放（滚轮）仍受动态下限约束" {
 // ── 拖动数值控件（BPM）的内核：zoomStep + 每步帧数换算 ──
 // 注：dragNumber 的绘制依赖字体（测里没有真字体），故只测其数值内核与换算。
 
+test "ui: roundF——负值取整（修功率推子 -5 松手回 -4）" {
+    // `@intFromFloat(v + 0.5)` 只对非负数是四舍五入；负数下向零截断会读回 +1
+    // （实测 bug：功率推子拉到 -5 → 每帧重读为 -4）
+    try std.testing.expectEqual(@as(i32, -5), Ui.roundF(-5.0));
+    try std.testing.expectEqual(@as(i32, -4), Ui.roundF(-4.0));
+    try std.testing.expectEqual(@as(i32, -5), Ui.roundF(-4.5)); // 远离零取
+    try std.testing.expectEqual(@as(i32, -4), Ui.roundF(-4.4));
+    try std.testing.expectEqual(@as(i32, 5), Ui.roundF(5.0));
+    try std.testing.expectEqual(@as(i32, 4), Ui.roundF(4.4));
+    try std.testing.expectEqual(@as(i32, 5), Ui.roundF(4.5));
+    try std.testing.expectEqual(@as(i32, 0), Ui.roundF(0.0));
+    try std.testing.expectEqual(@as(i32, -37), Ui.roundF(-36.6));
+}
+
 test "ui: BPM 拖动内核——8px/单位、上滑增下滑减、慢拖累积、范围钳制" {
     // 上滑 16px → +2（8px/单位）
     {

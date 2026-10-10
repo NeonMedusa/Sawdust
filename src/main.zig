@@ -629,10 +629,12 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     } else {
         app.params.spec_target_ch.store(-1, .monotonic);
     }
-    // 机架的下拉/右键菜单 = 模态层（全屏屏蔽）。
+    // 机架的下拉/右键菜单、文件菜单 = 模态层（全屏屏蔽）。
     // 注：钢琴卷帘的两个标题栏选单**不在此列**——它们保持轻量语义，
     // 这样两个选单可以单击直接互切（进模态层会让选择器按钮自身被屏蔽）。
-    const menu_open = app.rack.menu_open or app.rack.ctx_instrument != null;
+    // **组合集中在 `App.menuIsOpen`**（漏项会导致点击穿透下层——
+    // 实测 bug：文件→保存穿透点到左栏“操作历史”）。
+    const menu_open = app.menuIsOpen();
 
     // 浮动窗口列表（按 z 升序 = 从下到上）；排序用插入排序（只有 4 个元素）
     var wins: [4]struct { z: i32, draw: enum { rack, synth, mixer, effect } } = undefined;
@@ -754,6 +756,9 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
 
     // 菜单：“文件”带下拉（打开/保存/另存为）；“乐器”开关通道机架
     // 注：下拉项的**动作**由 main 循环处理（需要 window/io）；本函数只置状态
+    // 帧首：清“刚打开”标记（文件菜单；与机架下拉同一模式——必须逐帧做，
+    // 否则“点按钮关闭”失效，且用 `ui.button` 的点击会被模态层屏蔽）
+    util.menuFrameBegin(&app.file_menu_just_opened);
     const menus = [_][]const u8{ "文件", "选项", "视图", "乐器", "混音台" };
     for (menus, 0..) |m, i| {
         const mw: i32 = @as(i32, @intFromFloat(ui.font.measure(m))) + 16;
@@ -763,7 +768,18 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
                 if (i == 3) app.rack.open = false else if (i == 0) app.file_menu_open = false else if (i == 4) app.mixer_win.open = false;
             }
         } else if (ui.button(100 + @as(u64, i), m, x, by, mw, bh)) {
-            if (i == 3) app.rack.open = true else if (i == 0) app.file_menu_open = !app.file_menu_open else if (i == 4) app.mixer_win.open = !app.mixer_win.open;
+            if (i == 3) {
+                app.rack.open = true;
+                app.bringToFront(&app.rack.z); // 刚打开：置顶（否则可能被别的窗口盖住）
+            } else if (i == 0) {
+                app.file_menu_open = !app.file_menu_open;
+                // 刚打开：供 drawFileMenu 区分“打开那一下”（不立即关）
+                if (app.file_menu_open) app.file_menu_just_opened = true;
+            } else if (i == 4) {
+                app.mixer_win.open = !app.mixer_win.open;
+                // 刚打开：置顶（同上；关闭时不动 z）
+                if (app.mixer_win.open) app.bringToFront(&app.mixer_win.z);
+            }
         }
         if (i == 0) {
             file_menu_x = x;
@@ -926,10 +942,14 @@ fn drawFileMenu(ui: *Ui, app: *App) void {
         if (hovered and ui.mouse_pressed) activated = ii;
     }
 
-    // 点击外部关闭（落在“文件”按钮上时不关闭：按钮自己会切换）
+    // 点击外部关闭：落在“文件”按钮上时——
+    // - 若是**打开菜单的那一帧**（just_opened）：那是打开动作本身（按钮已 toggle），
+    //   不关（否则“开了又关”）；
+    // - 否则：菜单展开后按钮被模态层屏蔽（`ui.button` 收不到点击），
+    //   必须由这里响应“再点按钮 = 关闭”——否则只能靠 Esc/点别处。
     if (ui.mouse_pressed and !util.inRect(ui.mouse_x, ui.mouse_y, menu_x, menu_y, menu_w, menu_h)) {
         const on_button = util.inRect(ui.mouse_x, ui.mouse_y, menu_x, 7, menu_w, 26);
-        if (!on_button) app.file_menu_open = false;
+        if (!on_button or !app.file_menu_just_opened) app.file_menu_open = false;
     }
 
     if (activated) |ai| {
@@ -1233,6 +1253,7 @@ test {
     _ = @import("view_note_lane.zig");
     _ = @import("view_rack.zig");
     _ = @import("view_synth.zig");
+    _ = @import("view_mixer.zig");
     _ = @import("view_panels.zig");
     _ = @import("ui_test.zig");
 }

@@ -8,9 +8,11 @@
 //!   「跨起点的长音符」补发 note-on（从音符中间开始播放会触发它）；
 //! - 播放中**编辑提交** → `rescanForEdit`：`edit_gen` 递增（音频线程作废
 //!   **未触发**的旧事件，但**不**打断在响声部），跨游标实例差分补 on/off，
-//!   并按新数据重扫 `[游标+1, 水位线)`。水位线只前进不回头——不重扫的话，
-//!   新增/移动/删除/改值到“已扫过窗口”的音符永远不会被调度
-//!   （实测 bug：播放中放置/克隆/粘贴到游标前方的音符不响；改力度同理）。
+//!   并按新数据重扫 `[安全界, 水位线)`（安全界 = 音频**确定没走到**的步，
+//!   见 `App.rescanSafeFromStep`；从 UI 游标起重发会双触发 → 悬挂）。
+//!   水位线只前进不回头——不重扫的话，新增/移动/删除/改值到“已扫过窗口”
+//!   的音符永远不会被调度（实测 bug：播放中放置/克隆/粘贴到游标前方的
+//!   音符不响；改力度同理）。
 //!
 //! 坐标：全局步（0 = 第 1 小节第 1 步；每小节 16 步）。
 //! - SONG：片段窗口 = `[(bar-1)*16, (bar-1)*16 + len*16)`；音符全局位置 =
@@ -30,6 +32,9 @@ pub const Scheduler = struct {
     /// 但**不**打断在响声部——与 `gen` 的区别（那个会全部释音）。
     /// 见 `rescanForEdit`。
     edit_gen: u32 = 1,
+    /// 最近一次重扫的起点（`rescanForEdit` 写入；调用方发布给音频线程，
+    /// 供其判定“旧事件是否已被重发替换”——见 `audio.schedEventObsolete`）
+    rescan_from: i32 = 0,
 };
 
 /// 单次 gather 上限（超出时截断窗口，剩余下一帧再调度）
@@ -198,9 +203,9 @@ pub fn reset(
 /// **正确性**：推进水位线前，窗口内的事件必须**全部**发出——扫描是
 /// 数组序（≈ note-off 时间序），非步序；缓冲满时数组靠后的音符可能
 /// 尚未扫到（步值可能很小）。旧实现“截断到已收集最大步 + 1”会把这批
-/// 音符的事件**永久跳过**：实测 bug——导入大 MIDI（海阔天空.mid，
-/// 13 通道）后从某些位置起播，“MIDI 通道 #11”（= MIDI 通道 13，
-/// 音符在数组末尾）要么 on 丢失（整段静音）、要么 off 丢失（卡音）。
+/// 音符的事件**永久跳过**：实测 bug——导入音符密集的多通道 MIDI
+///（13 通道）后从某些位置起播，数组中靠后的通道要么 on 丢失
+///（整段静音）、要么 off 丢失（卡音）。
 ///
 /// 做法：把窗口切成**子区间**，完整收集一个子区间才推进水位线；
 /// 溢出时子区间减半重扫（对数收敛；现实数据 1-2 次即可）。
@@ -247,20 +252,26 @@ pub fn scheduleRange(
 
 /// 播放中**编辑提交**后的调度重扫（水位线只前进不回头——见 `scheduleRange`）。
 ///
-/// 已扫过窗口 `[游标, 水位线)` 里的事件早已入队：新增/移动/删除/改值
-/// 都不会反映到它们（表现：播放中放置/克隆/粘贴的音符不响、改力度不生效）。
+/// 已扫过窗口里的事件早已入队：新增/移动/删除/改值都不会反映到它们
+/// （表现：播放中放置/克隆/粘贴的音符不响、改力度不生效）。
 ///
 /// 步骤：
 /// 1. `edit_gen` 递增——音频线程作废**未触发**的旧事件（丢弃），但**不**
 ///    释放声部（在响的音符保持发声；与 `gen` 递增的区别）；
 /// 2. **跨游标差分**（旧数据 vs 新数据，键 = 音高+乐器，按数量）：
 ///    新增实例 → `on@游标`（立即发声）；移除实例 → `off@游标`
-///    （释放正在响的声部；对没在响的是空操作——`noteOff` 找不到声部
-///    就不做任何事）；数量不变（如仅改力度）→ 不补（正在响的声部
-///    无法改值，下次触发生效）；
-/// 3. 重扫 `[游标+1, 水位线)`：旧事件已作废，按新数据补齐。
-///    （从 `游标+1` 起：步 `游标` 的事件音频线程可能已触发，重发会双触发；
-///    边界漏触发是单音符一次不响，比悬挂/重触发轻）
+///    （释放正在响的声部；对没在响的是空操作）；
+/// 3. 重扫 `[rescan_from, 水位线)`：旧事件已作废，按新数据补齐。
+///
+/// **`rescan_from` 必须给音频安全界**（见 `App.rescanSafeFromStep`）——
+/// 即“音频线程**确定还没走到**的第一步”：
+/// - UI 游标来自帧首快照、落后音频线程；从 `游标+1` 重发会把音频
+///   **已经触发过**的 on 再发一次（音频对“已过时”事件立即触发）→
+///   双声部；而 off 只有一份 → 只释放一个 → **个别音悬挂**
+///   （实测 bug：播放中调 EQ（每次提交都重扫）概率出现）；
+/// - `(游标, rescan_from)` 区间的旧副本**不重发**：音频侧对这段
+///   保留旧副本照常触发（见 `audio.schedEventObsolete` 的步号条件），
+///   所以不漏事件；代价是该区间内**新增**的音符首次不响（下一遍会响）。
 ///
 /// `old_*` = 上一历史快照（差分基准）；无快照时传空切片（差分退化为
 /// “全部跨游标实例都算新增”——会重触发跨游标音符，可接受）。
@@ -274,8 +285,12 @@ pub fn rescanForEdit(
     song_mode: bool,
     pattern: i32,
     cur: i32,
+    rescan_from: i32,
 ) void {
     sched.edit_gen +%= 1;
+    // 安全界不许低于 `游标+1`（理论上调用方已保证；钳一下防手滑）
+    const from = @max(cur + 1, rescan_from);
+    sched.rescan_from = from;
 
     var evs: [max_gather]synth.SchedEvent = undefined;
     var n: usize = 0;
@@ -289,10 +304,11 @@ pub fn rescanForEdit(
     std.mem.sort(synth.SchedEvent, evs[0..n], {}, synth.schedEventLess);
     for (evs[0..n]) |ev| queue.push(ev);
 
-    // ── 2) 重扫 [cur+1, 水位线)：补齐被作废的窗口事件 ──
+    // ── 2) 重扫 [from, 水位线)：补齐被作废的窗口事件（`from` 之前的旧副本
+    //        由音频侧保留触发——见函数注释）──
     const watermark = sched.scheduled_upto;
-    if (watermark > cur + 1) {
-        scheduleRange(sched, queue, clips, notes, song_mode, pattern, cur + 1, watermark);
+    if (watermark > from) {
+        scheduleRange(sched, queue, clips, notes, song_mode, pattern, from, watermark);
     }
 }
 
@@ -550,7 +566,7 @@ test "sequencer: 编辑重扫——已扫过窗口内的新增音符补发（带
 
     const gen_before = s.gen;
     const edit_before = s.edit_gen;
-    rescanForEdit(&s, &q, &clips, &new_notes, &clips, &old_notes, false, 0, 8);
+    rescanForEdit(&s, &q, &clips, &new_notes, &clips, &old_notes, false, 0, 8, 9);
 
     try std.testing.expectEqual(gen_before, s.gen); // gen 不变（不释音）
     try std.testing.expect(s.edit_gen != edit_before); // edit_gen 递增
@@ -581,7 +597,7 @@ test "sequencer: 编辑重扫——跨游标新增立即发声；过去/未扫�
     reset(&s, &q, &clips, &old_notes, false, 0, 0);
     scheduleRange(&s, &q, &clips, &old_notes, false, 0, 0, 32); // 水位线 = 32
 
-    rescanForEdit(&s, &q, &clips, &new_notes, &clips, &old_notes, false, 0, 8);
+    rescanForEdit(&s, &q, &clips, &new_notes, &clips, &old_notes, false, 0, 8, 9);
 
     var out: [8]synth.SchedEvent = undefined;
     const n = drainAll(&q, &out);
@@ -617,7 +633,7 @@ test "sequencer: 编辑重扫——跨游标删除补 off@cur（防悬挂）" {
     var out: [8]synth.SchedEvent = undefined;
     _ = drainAll(&q, &out); // 排空初始事件（不干扰断言）
 
-    rescanForEdit(&s, &q, &clips, &new_notes, &clips, &old_notes, false, 0, 8);
+    rescanForEdit(&s, &q, &clips, &new_notes, &clips, &old_notes, false, 0, 8, 9);
 
     const n = drainAll(&q, &out);
     // 差分：off@8（释放正在响的声部）；重扫 [9,32)：无音符 → 无事件
@@ -643,7 +659,7 @@ test "sequencer: 编辑重扫——跨游标改力度不重触发（数量不变
     var out: [8]synth.SchedEvent = undefined;
     _ = drainAll(&q, &out); // 排空初始事件
 
-    rescanForEdit(&s, &q, &clips, &new_notes, &clips, &old_notes, false, 0, 8);
+    rescanForEdit(&s, &q, &clips, &new_notes, &clips, &old_notes, false, 0, 8, 9);
 
     const n = drainAll(&q, &out);
     // 跨游标数量不变 → 无差分事件；重扫 [9,32)：off@12（带新力度；
@@ -669,7 +685,7 @@ test "sequencer: 编辑重扫——窗口内未变化音符重发（带新力度
     var out: [8]synth.SchedEvent = undefined;
     _ = drainAll(&q, &out); // 排空初始事件
 
-    rescanForEdit(&s, &q, &clips, &new_notes, &clips, &old_notes, false, 0, 8);
+    rescanForEdit(&s, &q, &clips, &new_notes, &clips, &old_notes, false, 0, 8, 9);
 
     const n = drainAll(&q, &out);
     // 重扫 [9,32)：on@16/off@20 重发（带新力度 + 新编辑代）
@@ -696,7 +712,7 @@ test "sequencer: 编辑重扫——移动音符（旧位置作废、新位置重
     var out: [8]synth.SchedEvent = undefined;
     _ = drainAll(&q, &out); // 排空初始事件
 
-    rescanForEdit(&s, &q, &clips, &new_notes, &clips, &old_notes, false, 0, 8);
+    rescanForEdit(&s, &q, &clips, &new_notes, &clips, &old_notes, false, 0, 8, 9);
 
     const n = drainAll(&q, &out);
     // 重扫 [9,32)：on@24/off@28（新位置）；旧位置 16/20 不再出现
@@ -718,7 +734,7 @@ test "sequencer: 编辑重扫——不重复补发（off 只在窗口内 gather 
     reset(&s, &q, &clips, &old_notes, false, 0, 0);
     scheduleRange(&s, &q, &clips, &old_notes, false, 0, 0, 32); // 水位线 = 32
 
-    rescanForEdit(&s, &q, &clips, &new_notes, &clips, &old_notes, false, 0, 8);
+    rescanForEdit(&s, &q, &clips, &new_notes, &clips, &old_notes, false, 0, 8, 9);
 
     var out: [8]synth.SchedEvent = undefined;
     const n = drainAll(&q, &out);
@@ -750,7 +766,7 @@ test "sequencer: 编辑重扫——SONG 模式新增片段其样式音符重扫�
     reset(&s, &q, &old_clips, &notes, true, 0, 0);
     scheduleRange(&s, &q, &old_clips, &notes, true, 0, 0, 64); // 水位线 = 64
 
-    rescanForEdit(&s, &q, &added_clips, &notes, &old_clips, &notes, true, 0, 8);
+    rescanForEdit(&s, &q, &added_clips, &notes, &old_clips, &notes, true, 0, 8, 9);
 
     var out: [8]synth.SchedEvent = undefined;
     const n = drainAll(&q, &out);
@@ -761,11 +777,40 @@ test "sequencer: 编辑重扫——SONG 模式新增片段其样式音符重扫�
     try std.testing.expectEqual(@as(i32, 20), out[1].step);
 }
 
+test "sequencer: 编辑重扫——安全界之前的步不重发（防双触发悬挂）" {
+    // 实测 bug：UI 游标来自帧首快照、落后音频线程；从“游标+1”重发会把
+    // 音频**已经触发过**的 on 再发一次（音频对过时事件立即触发）→ 双声部；
+    // off 只有一份 → 单个释放 → 悬挂（播放中调 EQ 概率出现）。
+    // 修法：重扫从**安全界**起；安全界之前的旧副本由音频侧保留触发。
+    var q = synth.SchedQueue{};
+    var s = Scheduler{};
+    const clips = [_]model.Clip{};
+    // 音符 [12, 20)：cur=8、安全界=14 → on@12 在 (cur, 安全界) 内不重发；
+    // off@20（>= 安全界）重发；不跨游标（start 12 > 8）→ 无差分事件
+    const notes = [_]model.Note{
+        .{ .step = 12, .len = 8, .pitch = 60, .pattern = 0 },
+    };
+
+    reset(&s, &q, &clips, &notes, false, 0, 0);
+    scheduleRange(&s, &q, &clips, &notes, false, 0, 0, 32); // 水位线 = 32
+    var out: [8]synth.SchedEvent = undefined;
+    _ = drainAll(&q, &out); // 排空初始事件
+
+    rescanForEdit(&s, &q, &clips, &notes, &clips, &notes, false, 0, 8, 14);
+    try std.testing.expectEqual(@as(i32, 14), s.rescan_from); // 调用方读此值发布
+
+    const n = drainAll(&q, &out);
+    // 只重发 [14, 32)：off@20；on@12（< 14）不重发
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(synth.EventKind.off, out[0].kind);
+    try std.testing.expectEqual(@as(i32, 20), out[0].step);
+}
+
 test "sequencer: 密集窗口不丢事件（gather 溢出子区间收敛）" {
-    // 实测 bug（海阔天空.mid，13 通道）：窗口内事件数 > gather 缓冲（512）时，
+    // 实测 bug（音符密集的多通道 MIDI，13 通道）：窗口内事件数 > 缓冲（512）时，
     // 旧实现把水位线推进到“已收集事件的最大步 + 1”——扫描是**数组序**
     // （≈ note-off 时间序），数组靠后的音符（步值可能很小）被永久跳过：
-    // 某些起始位置“卡音 / 整段静音”（典型：MIDI 通道 #11）。
+    // 某些起始位置“卡音 / 整段静音”（典型：数组中靠后的通道）。
     //
     // 构造：1200 个音符**故意倒序**排列（数组序与步序相反——最坏情况），
     // 全部落在小窗口内。新实现必须把它们全部发出，且水位线只推到 to。

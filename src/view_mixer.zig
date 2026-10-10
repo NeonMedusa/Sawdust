@@ -15,6 +15,7 @@ const Ui = @import("ui.zig").Ui;
 const app_mod = @import("app.zig");
 const App = app_mod.App;
 const util = @import("view_util.zig");
+const model = @import("model.zig");
 
 const win_title_h: i32 = 22;
 /// 窗口最小宽 = 两区最小宽 + 分割条 + 内边距（`left_min_w + fx_panel_min_w + sp_w + pad_x`）
@@ -57,6 +58,30 @@ const value_w: i32 = 34;
 // ── 右区（效果器链）──
 const fx_row_h: i32 = 26;
 const fx_knob: i32 = 18;
+
+// ── 本窗口控件 id（**全应用唯一**——撞 id 会串场，见 docs/pitfalls.md）──
+// 全部控件统一占 **8100-8711 独占段**（避开其它视图：钢琴卷帘
+// 7100/7200/7300/7500、播放列表 7000/7400/7501、效果窗 7600-7809 等）。
+// 实测 bug：旧值 7200+ci 与钢琴卷帘 PAT 标尺 7200 撞车——点主通道声像
+// 旋钮会跳播放游标、点标尺会改声像（7300/7500 两个控件同理）。
+const id_pan_base: u64 = 8100; // 声像旋钮：+ 通道号（0-31）
+const id_vol_base: u64 = 8150; // 音量推子：+ 通道号（0-31）
+const id_fx_mix_base: u64 = 8200; // 干湿旋钮：+ 通道号×16 + 槽位
+
+/// 右键菜单弹出位置：鼠标处 → **鉗制到窗口内**（方案 C）。
+///
+/// 动机（实测隐患）：窗口层只屏蔽窗口矩形——菜单超出窗口的部分
+/// 点击会**穿透到下层**。鉗制后菜单永远在窗口内，现有层矩形已覆盖，
+/// 不必改层系统；顺带避免“右键靠边时菜单探出窗口”的观感问题。
+/// （主流软件的右键菜单也是这么做的：靠边时向内让位。）
+fn ctxMenuPos(mw: *const app_mod.MixerWindow, menu_w: i32, menu_h: i32) [2]i32 {
+    const max_x: i32 = @max(mw.x, mw.x + mw.w - menu_w);
+    const max_y: i32 = @max(mw.y, mw.y + mw.h - menu_h);
+    return .{
+        std.math.clamp(mw.ctx_menu_x, mw.x, max_x),
+        std.math.clamp(mw.ctx_menu_y, mw.y, max_y),
+    };
+}
 
 /// 返回 true = 鼠标被窗口消费
 pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
@@ -273,6 +298,10 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         const items = [_][]const u8{ "重命名", "删除通道", "上移", "下移" };
         drawCtxMenuGeneric(ui, app, cc, null, &items);
     }
+    // ── 声像旋钮右键菜单（恢复默认值）──
+    if (mw.ctx_pan) |pc| {
+        drawPanCtxMenu(ui, app, pc);
+    }
 
     return true;
 }
@@ -295,6 +324,8 @@ fn drawStrip(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32) void
     // **命中区无缝**：向上/下各扩 `row_hit_ext` 盖住行间缝隙（视觉仍留缝，手感无缝）
     const bar_clicked = util.hitUI(ui, x, y - row_hit_ext, w, h + row_hit_ext * 2) and ui.mouse_pressed;
     var consumed = false;
+    // 控件的右键已处理（如声像旋钮菜单）——条级右键不再覆盖
+    var right_consumed = false;
     var cx = x + 5;
 
     // [M] 静音
@@ -328,10 +359,21 @@ fn drawStrip(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32) void
     {
         const ky = y + @divTrunc(h - knob_size, 2);
         var pan = mc.pan;
-        if (ui.knob(7200 + @as(u64, ci), &pan, cx, ky, knob_size)) {
+        if (ui.knob(id_pan_base + @as(u64, ci), &pan, cx, ky, knob_size)) {
             mc.pan = pan;
             app.history_pending = "调整通道声像";
             consumed = true;
+        }
+        // 右键 → 恢复默认值菜单（居中 0.5）。
+        // 注：置 `right_consumed`——否则条级右键（选中/通道菜单）同帧又盖一遍。
+        if (util.hitUI(ui, cx, ky, knob_size, knob_size) and ui.mouse_right_pressed) {
+            app.mixer_win.selected_channel = @intCast(ci);
+            app.mixer_win.ctx_pan = ci;
+            app.mixer_win.ctx_channel = null;
+            app.mixer_win.ctx_effect = null;
+            app.mixer_win.ctx_menu_x = ui.mouse_x;
+            app.mixer_win.ctx_menu_y = ui.mouse_y;
+            right_consumed = true;
         }
         cx += knob_size + 8;
     }
@@ -351,7 +393,7 @@ fn drawStrip(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32) void
         const slider_w = @max(60, val_x - cx - 8);
         const sy = y + @divTrunc(h - 18, 2);
         var vol = mc.volume;
-        if (ui.slider(7300 + @as(u64, ci), &vol, cx, sy, slider_w, 18)) {
+        if (ui.slider(id_vol_base + @as(u64, ci), &vol, cx, sy, slider_w, 18)) {
             mc.volume = vol;
             app.history_pending = "调整通道音量";
             consumed = true;
@@ -367,11 +409,12 @@ fn drawStrip(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32) void
     if (bar_clicked and !consumed) {
         app.mixer_win.selected_channel = @intCast(ci);
     }
-    // 右键 → 通道菜单（删除/上移/下移）
-    if (util.hitUI(ui, x, y, w, h) and ui.mouse_right_pressed) {
+    // 右键 → 通道菜单（删除/上移/下移）；控件的右键菜单优先（`right_consumed`）
+    if (!right_consumed and util.hitUI(ui, x, y, w, h) and ui.mouse_right_pressed) {
         app.mixer_win.selected_channel = @intCast(ci);
         app.mixer_win.ctx_channel = ci;
         app.mixer_win.ctx_effect = null;
+        app.mixer_win.ctx_pan = null;
         app.mixer_win.ctx_menu_x = ui.mouse_x;
         app.mixer_win.ctx_menu_y = ui.mouse_y;
     }
@@ -388,22 +431,9 @@ fn drawEffectPanel(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32
     {
         var buf: [96]u8 = undefined;
         var inst_names_buf: [64]u8 = undefined;
-        var inst_names: []const u8 = "";
-        var first: ?[]const u8 = null;
-        var total: usize = 0;
-        for (app.instruments.items) |inst2| {
-            if (inst2.mixer != @as(i32, @intCast(ci))) continue;
-            if (total == 0) first = inst2.name;
-            total += 1;
-        }
-        if (first) |fname| {
-            inst_names = if (total == 1)
-                fname
-            else
-                std.fmt.bufPrint(&inst_names_buf, "{s} +{d}", .{ fname, total - 1 }) catch fname;
-        }
+        const inst_names = model.routedInstrumentNames(app.instruments.items, ci, &inst_names_buf);
         const title = std.fmt.bufPrint(&buf, "CH {d}{s}{s}", .{
-            ci + 1,
+            ci, // 与标尺/默认通道名同一编号（0 起；曾误用 +1）
             if (inst_names.len > 0) " · " else "",
             inst_names,
         }) catch "";
@@ -478,22 +508,34 @@ fn drawEffectRow(ui: *Ui, app: *App, ci: usize, si: usize, x: i32, y: i32, w: i3
         app.commitHistory("切换效果器开关");
     }
 
-    // 名字（点击 = 打开独立面板）
+    // 名字（**交互与乐器对齐**：单击 = 切换（面板已开时跟随切到此效果——
+    // 同“合成器窗口跟随选中乐器”；不开窗、不抢焦点）；双击 = 打开/切换 + 置顶）。
+    // 注：单击分支排除 `ui.mouse_double`——双击的第二下系统会补发
+    // mouse_down（见 window.zig），不排除则双击的第一下就触发“切换”。
     const name_x = x + 3 + sw + 6;
     const name_avail = w - (name_x - x) - (fx_knob + 22);
     const name_hovered = util.hitUI(ui, name_x, y, @max(1, name_avail), h);
     const open_now = if (app.mixer_win.panel) |p| p.ch == ci and p.slot == si else false;
     ui.labelClipped(es.kind.displayName(), name_x, y + 4, @max(1, name_avail), if (name_hovered or open_now) ui.theme.accent else if (es.enabled) ui.theme.text else ui.theme.text_dim);
-    if (name_hovered and ui.mouse_pressed) {
+    if (name_hovered and ui.mouse_pressed and !ui.mouse_double) {
+        // 单击 = 切换：面板已开时跟随切到这个效果；未开时不开窗（那是双击的职责）
+        if (app.mixer_win.panel != null) {
+            app.mixer_win.panel = .{ .ch = ci, .slot = si };
+        }
+    }
+    if (name_hovered and ui.mouse_double) {
+        // 双击：打开/切换独立面板并**置顶**
         app.mixer_win.panel = .{ .ch = ci, .slot = si };
         app.mixer_win.menu_open = false;
         app.mixer_win.add_effect_ch = null;
         app.mixer_win.ctx_effect = null;
+        app.bringToFront(&app.effect_win.z);
     }
     // 右键 → 删除菜单
     if (name_hovered and ui.mouse_right_pressed) {
         app.mixer_win.ctx_effect = .{ .ch = ci, .slot = si };
         app.mixer_win.ctx_channel = null;
+        app.mixer_win.ctx_pan = null;
         app.mixer_win.ctx_menu_x = ui.mouse_x;
         app.mixer_win.ctx_menu_y = ui.mouse_y;
         app.mixer_win.menu_open = false;
@@ -505,9 +547,9 @@ fn drawEffectRow(ui: *Ui, app: *App, ci: usize, si: usize, x: i32, y: i32, w: i3
         const kx = x + w - fx_knob - 6;
         const ky = y + @divTrunc(h - fx_knob, 2);
         var mix = es.mix;
-        if (ui.knob(7500 + @as(u64, ci) * 16 + @as(u64, si), &mix, kx, ky, fx_knob)) {
+        if (ui.knob(id_fx_mix_base + @as(u64, ci) * 16 + @as(u64, si), &mix, kx, ky, fx_knob)) {
             es.mix = mix;
-            app.history_pending = "调整效果器音量";
+            app.history_pending = "调整效果器干湿";
         }
     }
 }
@@ -534,6 +576,7 @@ fn drawAddEffectMenu(ui: *Ui, app: *App, ci: usize, wx: i32, wy: i32, ww: i32, h
         const chain = app.mixer_channels_state.items[ci].effects;
         if (chain.items.len > 0) {
             app.mixer_win.panel = .{ .ch = ci, .slot = chain.items.len - 1 };
+            app.bringToFront(&app.effect_win.z); // 新开面板：同样置顶
         }
         app.mixer_win.add_effect_ch = null;
         app.commitHistory("添加效果器");
@@ -548,14 +591,16 @@ fn drawCtxMenu(ui: *Ui, app: *App, ctx: app_mod.EffectRef) void {
     drawCtxMenuGeneric(ui, app, ctx.ch, ctx.slot, &items);
 }
 
-/// 通用右键菜单（效果器/通道共用）：位置由**打开时快照**提供。
-/// `slot` 为 `null` 时是**通道菜单**。
+/// 通用右键菜单（效果器/通道共用）：位置由**打开时快照**提供
+/// （绘制时再**鉗制到窗口内**——菜单不得超出窗口，否则超出部分点击会
+/// 穿透到下层；见 `ctxMenuPos`）。`slot` 为 `null` 时是**通道菜单**。
 fn drawCtxMenuGeneric(ui: *Ui, app: *App, ch: usize, slot: ?usize, items: []const []const u8) void {
     const mw_win = &app.mixer_win;
-    const mx = mw_win.ctx_menu_x;
-    const my = mw_win.ctx_menu_y;
     const menu_w: i32 = 130;
     const menu_h: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
+    const pos = ctxMenuPos(mw_win, menu_w, menu_h);
+    const mx = pos[0];
+    const my = pos[1];
     ui.renderer.fillRect(mx, my, menu_w, menu_h, ui.theme.panel);
     ui.renderer.strokeRect(mx, my, menu_w, menu_h, ui.theme.accent);
 
@@ -622,5 +667,104 @@ fn drawCtxMenuGeneric(ui: *Ui, app: *App, ch: usize, slot: ?usize, items: []cons
         mw_win.ctx_channel = null;
         mw_win.ctx_menu_x = 0;
         mw_win.ctx_menu_y = 0;
+    }
+}
+
+/// 声像旋钮右键菜单（单项：恢复默认值 = 居中 0.5）。
+/// 与通用菜单同一套路：位置鉗制到窗口内（`ctxMenuPos`）、点外关闭。
+fn drawPanCtxMenu(ui: *Ui, app: *App, ch: usize) void {
+    const mw_win = &app.mixer_win;
+    const menu_w: i32 = 130;
+    const menu_h: i32 = util.menu_item_h + 4;
+    const pos = ctxMenuPos(mw_win, menu_w, menu_h);
+    const mx = pos[0];
+    const my = pos[1];
+    ui.renderer.fillRect(mx, my, menu_w, menu_h, ui.theme.panel);
+    ui.renderer.strokeRect(mx, my, menu_w, menu_h, ui.theme.accent);
+
+    const item = "恢复默认值";
+    const iy = my + 2;
+    const hovered = util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, menu_w - 2, util.menu_item_h);
+    if (hovered) ui.renderer.fillRect(mx + 1, iy, menu_w - 2, util.menu_item_h, ui.theme.item_hover);
+    ui.label(item, mx + 8, iy + 2, ui.theme.text);
+    if (hovered and ui.mouse_pressed) {
+        if (ch < app.mixer_channels_state.items.len) {
+            const mc = &app.mixer_channels_state.items[ch];
+            if (mc.pan != 0.5) {
+                mc.pan = 0.5; // 居中
+                app.commitHistory("恢复通道声像");
+            }
+        }
+        mw_win.ctx_pan = null;
+    } else if (ui.mouse_pressed and !util.inRect(ui.mouse_x, ui.mouse_y, mx, my, menu_w, menu_h)) {
+        mw_win.ctx_pan = null;
+    }
+}
+
+// ── 测试 ──
+
+test "view_mixer: 控件 id 段——不与其它视图撞车且互不重叠" {
+    // 实测 bug：声像 7200+ci 与钢琴卷帘 PAT 标尺 7200 撞车——点主通道
+    // 声像旋钮会跳播放游标、点标尺会改声像（7300/7500 两个控件同理）。
+    // 本窗口控件统一占 **8100-8711 独占段**（分配表见 ui.zig `active_id`）。
+    const pan_lo = id_pan_base;
+    const pan_hi = id_pan_base + 31;
+    const vol_lo = id_vol_base;
+    const vol_hi = id_vol_base + 31;
+    const fx_lo = id_fx_mix_base;
+    const fx_hi = id_fx_mix_base + 31 * 16 + 15;
+
+    // ① 全在独占段内（避开其它视图：7100-7501 / 7600-7810 / 5000-5499…）
+    try std.testing.expect(pan_lo >= 8100);
+    try std.testing.expect(fx_hi <= 8711);
+
+    // ② 三个子段互不重叠
+    try std.testing.expect(pan_hi < vol_lo);
+    try std.testing.expect(vol_hi < fx_lo);
+
+    // ③ 不落回曾经的撞车 id（回归：7200/7300/7500 均不得再出现）
+    const banned = [_]u64{ 7200, 7300, 7500, 7501 };
+    for (banned) |bad| {
+        try std.testing.expect(bad < pan_lo or bad > fx_hi);
+    }
+}
+
+test "view_mixer: 右键菜单坐标——钳制到窗口内（防超出部分点击穿透）" {
+    var mw = app_mod.MixerWindow{ .x = 100, .y = 100, .w = 400, .h = 300 };
+    const menu_w: i32 = 130;
+    const menu_h: i32 = 100;
+
+    // 鼠标在窗口中部 → 原位弹出
+    mw.ctx_menu_x = 200;
+    mw.ctx_menu_y = 200;
+    {
+        const pos = ctxMenuPos(&mw, menu_w, menu_h);
+        try std.testing.expectEqual(@as(i32, 200), pos[0]);
+        try std.testing.expectEqual(@as(i32, 200), pos[1]);
+    }
+
+    // 鼠标在右下角（窗口外）→ 钳到"右下角 − 菜单尺寸"
+    mw.ctx_menu_x = 460;
+    mw.ctx_menu_y = 380;
+    {
+        const pos = ctxMenuPos(&mw, menu_w, menu_h);
+        try std.testing.expectEqual(@as(i32, 100 + 400 - menu_w), pos[0]);
+        try std.testing.expectEqual(@as(i32, 100 + 300 - menu_h), pos[1]);
+    }
+
+    // 鼠标在左上角（窗口外）→ 钳到窗口原点
+    mw.ctx_menu_x = 20;
+    mw.ctx_menu_y = 30;
+    {
+        const pos = ctxMenuPos(&mw, menu_w, menu_h);
+        try std.testing.expectEqual(@as(i32, 100), pos[0]);
+        try std.testing.expectEqual(@as(i32, 100), pos[1]);
+    }
+
+    // 极端：菜单比窗口还大（当前窗口最小 544×240 不会出现；钳制不能反向翻车）
+    {
+        const pos = ctxMenuPos(&mw, 999, 999);
+        try std.testing.expectEqual(@as(i32, 100), pos[0]); // max_x < min → 退回窗口原点
+        try std.testing.expectEqual(@as(i32, 100), pos[1]);
     }
 }
