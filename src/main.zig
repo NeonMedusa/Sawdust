@@ -251,9 +251,11 @@ pub fn main(init: std.process.Init) !u8 {
                         }
                         continue;
                     }
-                    if (k.code == 0x1B) { // Esc：关闭文件菜单 / 返回播放列表（**不退出程序**）
+                    if (k.code == 0x1B) { // Esc：关闭菜单 / 返回播放列表（**不退出程序**）
                         if (app.file_menu_open) {
                             app.file_menu_open = false;
+                        } else if (app.panels.ctx_pattern != null) {
+                            app.panels.ctx_pattern = null; // 样式右键菜单
                         } else if (app.piano.pattern != null) {
                             app.closePiano();
                             if (ui.active_id == 6000) ui.active_id = 0; // 释放琴键试听拖动标记
@@ -490,6 +492,8 @@ pub fn main(init: std.process.Init) !u8 {
         // 文件菜单：在 UI 之后、endFrame **之前**（endFrame 会清 mouse_pressed——
         // 放在之后则菜单永远收不到点击，实测“点菜单没反应”）
         if (app.file_menu_open) drawFileMenu(&ui, &app);
+        // 样式右键菜单：同上（浮动窗口之后，否则会被盖住）
+        if (app.panels.ctx_pattern != null) view_panels.drawPatternCtxMenu(&ui, &app);
         // 模态确认框（最上层；自绘——避开系统 MessageBox 把鼠标吸到默认按钮）
         if (app.modal != null) drawModal(&ui, &app);
         // 文本输入框（最顶层——跨窗口/菜单，重命名乐器/通道用）

@@ -96,6 +96,12 @@ pub fn drawPatterns(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                     app.sel.pattern = @intCast(i);
                     app.openPiano(@intCast(i));
                 }
+                // 右键样式 → 重命名/删除菜单（位置快照；与机架右键同一模式）
+                if (ui.mouse_right_pressed and ui.hitRect(x + 1, iy, w - 2, item_h)) {
+                    app.panels.ctx_pattern = i;
+                    app.panels.ctx_pat_x = ui.mouse_x;
+                    app.panels.ctx_pat_y = ui.mouse_y;
+                }
             }
             iy += item_h;
             if (iy > list_y + list_h) break;
@@ -146,5 +152,58 @@ pub fn drawStatusBar(ui: *Ui, app: *App, w: i32, h: i32) void {
         ui.label("左键放置/拖动 · Ctrl+拖 框选 · Del 删除 · Ctrl+A 全选 · Ctrl+B 克隆 · Ctrl+C/V · Ctrl+Z 撤销", w - 620, y + 4, ui.theme.text_dim);
     } else {
         ui.label("左键放置/拖动 · Ctrl+拖 框选 · Del 删除 · Ctrl+A 全选 · Ctrl+B 克隆 · Ctrl+C/V · Ctrl+Z 撤销", w - 620, y + 4, ui.theme.text_dim);
+    }
+}
+
+/// 样式右键菜单（重命名/删除）。
+///
+/// 在**所有浮动窗口之后**绘制（main 末尾、与文件菜单同一位置约定——
+/// 否则会被浮动窗口盖住）；`App.menuIsOpen()` 已计入 `panels.ctx_pattern`
+/// → 展开时有全屏模态层屏蔽下层交互。
+pub fn drawPatternCtxMenu(ui: *Ui, app: *App) void {
+    const idx = app.panels.ctx_pattern orelse return;
+    if (idx >= app.pattern_items.items.len) {
+        app.panels.ctx_pattern = null; // 目标已不存在（撤销/删除）→ 关闭
+        return;
+    }
+    const items = [_][]const u8{ "重命名", "删除样式" };
+    const menu_w: i32 = 130;
+    const menu_h: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
+    const mx = app.panels.ctx_pat_x;
+    const my = app.panels.ctx_pat_y;
+    ui.renderer.fillRect(mx, my, menu_w, menu_h, ui.theme.panel);
+    ui.renderer.strokeRect(mx, my, menu_w, menu_h, ui.theme.accent);
+
+    var clicked: ?usize = null;
+    var inside = false;
+    for (items, 0..) |item, ii| {
+        const iy = my + 2 + @as(i32, @intCast(ii)) * util.menu_item_h;
+        const hovered = util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, menu_w - 2, util.menu_item_h);
+        if (hovered) {
+            inside = true;
+            ui.renderer.fillRect(mx + 1, iy, menu_w - 2, util.menu_item_h, ui.theme.item_hover);
+        }
+        ui.label(item, mx + 8, iy + 2, ui.theme.text);
+        if (hovered and ui.mouse_pressed) clicked = ii;
+    }
+    if (clicked) |ci| {
+        switch (ci) {
+            0 => {
+                // 重命名：输入框弹在菜单位置（复用文本输入基建——支持中文 IME）
+                app.beginRenamePattern(idx, mx + 6, my + 4);
+                app.panels.ctx_pattern = null;
+            },
+            1 => {
+                if (app.removePattern(idx)) {
+                    app.commitHistory("删除样式");
+                } else {
+                    app.setToast("至少保留一个样式");
+                }
+                app.panels.ctx_pattern = null;
+            },
+            else => {},
+        }
+    } else if (ui.mouse_pressed and !inside) {
+        app.panels.ctx_pattern = null;
     }
 }

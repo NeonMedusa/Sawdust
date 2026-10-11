@@ -69,7 +69,9 @@ pub const HistoryState = struct {
     instruments: []persist.SavedInstrument,
     /// 调音台通道快照（含效果链；条数 = 快照时的通道数）
     mixer: []persist.SavedMixerChannel,
-    pattern_count: i32 = model.default_pattern_count,
+    /// 样式名字快照（每项堆分配；长度 = 样式数）——重命名/增删样式也要能撤销
+    /// （只存 `pattern_count` 不够：`resetPatterns` 会重建默认名，自定义名丢失）
+    pattern_names: [][]u8,
     bpm: i32 = 120,
     time_num: i32 = 4,
     time_den: i32 = 4,
@@ -347,7 +349,7 @@ pub const Playback = struct {
 /// 交互：字符追加；退格删末尾一个 code point；回车 = 提交；ESC = 取消；
 /// 点击输入框外 = 提交（吞掉该次点击）。
 pub const TextInput = struct {
-    pub const Target = enum { instrument, mixer_channel };
+    pub const Target = enum { instrument, mixer_channel, pattern };
 
     active: bool = false,
     target: Target = .instrument,
@@ -403,6 +405,11 @@ pub const PanelsState = struct {
     pattern_scroll: i32 = 0,
     /// 历史栏：上次跟随的当前条目（**变化时才自动滚动**——否则用户无法手动滚动查看）
     history_follow: usize = 0,
+    /// 样式右键菜单：目标样式序号（null = 未展开）
+    ctx_pattern: ?usize = null,
+    /// 样式右键菜单位置（**打开时快照**——不跟鼠标跑，否则永远点不到）
+    ctx_pat_x: i32 = 0,
+    ctx_pat_y: i32 = 0,
 };
 
 /// 合成器编辑器（浮动窗口）状态
@@ -1498,6 +1505,8 @@ pub const App = struct {
         self.allocator.free(st.mixer);
         for (st.instruments) |si| self.allocator.free(si.name);
         self.allocator.free(st.instruments);
+        for (st.pattern_names) |nm| self.allocator.free(nm);
+        self.allocator.free(st.pattern_names);
     }
 
     /// 把当前调音台通道导出为存档切片（历史快照 / 工程保存共用）
@@ -1613,13 +1622,28 @@ pub const App = struct {
             n += 1;
         }
         const mixer = try self.exportMixerChannels(self.allocator);
+        errdefer {
+            // 后续分配失败时释放（新增 pat_names 带来的失败路径；原代码无后续分配）
+            self.freeSavedMixerChannels(mixer);
+            self.allocator.free(mixer);
+        }
+        const pat_names = try self.allocator.alloc([]u8, self.pattern_items.items.len);
+        var pn: usize = 0;
+        errdefer {
+            for (pat_names[0..pn]) |nm| self.allocator.free(nm);
+            self.allocator.free(pat_names);
+        }
+        for (self.pattern_items.items, 0..) |nm, i| {
+            pat_names[i] = try self.allocator.dupe(u8, nm);
+            pn += 1;
+        }
         return .{
             .label = label_copy,
             .notes = notes,
             .clips = clips,
             .instruments = insts,
             .mixer = mixer,
-            .pattern_count = self.patternCount(),
+            .pattern_names = pat_names,
             .bpm = self.bpm,
             .time_num = self.time_num,
             .time_den = self.time_den,
@@ -1655,7 +1679,11 @@ pub const App = struct {
             if (!std.meta.eql(a.synth, cur)) return false;
         }
         if (st.bpm != self.bpm or st.time_num != self.time_num or st.time_den != self.time_den) return false;
-        if (st.pattern_count != self.patternCount()) return false;
+        // 样式名字（数量 + 内容）——否则重命名会被判“无变化”，静默丢弃历史条目
+        if (st.pattern_names.len != self.pattern_items.items.len) return false;
+        for (st.pattern_names, self.pattern_items.items) |a, b| {
+            if (!std.mem.eql(u8, a, b)) return false;
+        }
         // 调音台通道（数量/增益/声像/静音/效果链）——否则“添加通道/效果器”会被判无变化
         if (st.mixer.len != self.mixer_channels_state.items.len) return false;
         for (st.mixer, self.mixer_channels_state.items) |a, b| {
@@ -1840,10 +1868,10 @@ pub const App = struct {
         }
         self.clips.clearRetainingCapacity();
         for (st.clips) |c| self.clips.append(self.allocator, c) catch {};
-        if (st.pattern_count > 0 and st.pattern_count != self.patternCount()) {
-            const was_dirty = self.dirty;
-            self.resetPatterns(st.pattern_count);
-            self.dirty = was_dirty;
+        if (st.pattern_names.len > 0) {
+            self.restorePatternNames(st.pattern_names);
+        } else if (self.patternCount() == 0) {
+            self.resetPatterns(model.default_pattern_count);
         }
         self.bpm = st.bpm;
         self.time_num = st.time_num;
@@ -1853,6 +1881,10 @@ pub const App = struct {
         self.importMixerChannels(st.mixer);
         // 选择钳制
         if (self.sel.pattern >= self.patternCount()) self.sel.pattern = self.patternCount() - 1;
+        // 钢琴卷帘：目标样式可能已被撤销到不存在 → 钳到有效范围
+        if (self.piano.pattern) |pp| {
+            if (pp >= self.patternCount()) self.piano.pattern = self.patternCount() - 1;
+        }
         if (self.mixer_win.selected_channel >= @as(i32, @intCast(self.mixer_channels_state.items.len))) {
             self.mixer_win.selected_channel = @intCast(@max(0, self.mixer_channels_state.items.len - 1));
         }
@@ -1917,20 +1949,100 @@ pub const App = struct {
         return @intCast(self.pattern_items.items.len);
     }
 
-    /// 添加样式（名字 = “样式 N”；上限 `model.max_patterns`）。
+    /// 添加样式（名字 = 最小可用的“样式 N”；上限 `model.max_patterns`）。
     /// 返回新样式序号（0 起；已达上限返回 -1）。
+    /// 名字要**避开重名**：删掉“样式 2”后再加，应补回“样式 2”（而非一律用
+    /// 数量+1——那样会与现存名字撞车）。
     pub fn addPattern(self: *App) i32 {
         if (self.pattern_items.items.len >= model.max_patterns) return -1;
-        const n = self.pattern_items.items.len + 1;
         var buf: [32]u8 = undefined;
-        const text = std.fmt.bufPrint(&buf, "样式 {d}", .{n}) catch return -1;
-        const name = self.allocator.dupe(u8, text) catch return -1;
+        var name_text: []const u8 = "";
+        var n: i32 = 1;
+        outer: while (n <= @as(i32, model.max_patterns)) : (n += 1) {
+            const text = std.fmt.bufPrint(&buf, "样式 {d}", .{n}) catch return -1;
+            for (self.pattern_items.items) |existing| {
+                if (std.mem.eql(u8, existing, text)) continue :outer;
+            }
+            name_text = text;
+            break;
+        }
+        if (name_text.len == 0) return -1; // 32 个名字全被占用（与上限同构，走不到）
+        const name = self.allocator.dupe(u8, name_text) catch return -1;
         self.pattern_items.append(self.allocator, name) catch {
             self.allocator.free(name);
             return -1;
         };
         self.dirty = true;
         return @intCast(self.pattern_items.items.len - 1);
+    }
+
+    /// 删除样式（**连同其音符/片段**；其余样式序号前移）。
+    /// 返回 false = 拒绝（无此样式 / 仅剩一个——**至少保留一个**）。
+    /// 不弹确认框（与乐器删除一致；可 Ctrl+Z 撤销）。
+    pub fn removePattern(self: *App, idx: usize) bool {
+        if (idx >= self.pattern_items.items.len) return false;
+        if (self.pattern_items.items.len <= 1) return false;
+        const pat_i: i32 = @intCast(idx);
+        // 音符：删除归属者；序号更大的前移（swapRemove——顺序无关）
+        var i: usize = 0;
+        while (i < self.notes.items.len) {
+            const nt = &self.notes.items[i];
+            if (nt.pattern == pat_i) {
+                _ = self.notes.swapRemove(i);
+            } else {
+                if (nt.pattern > pat_i) nt.pattern -= 1;
+                i += 1;
+            }
+        }
+        // 片段同理
+        i = 0;
+        while (i < self.clips.items.len) {
+            const c = &self.clips.items[i];
+            if (c.pattern == pat_i) {
+                _ = self.clips.swapRemove(i);
+            } else {
+                if (c.pattern > pat_i) c.pattern -= 1;
+                i += 1;
+            }
+        }
+        // 名字（释放并移除；其后前移）
+        const name = self.pattern_items.orderedRemove(idx);
+        self.allocator.free(name);
+        // 选择钳制 / 钢琴卷帘跟随
+        if (self.sel.pattern > pat_i) self.sel.pattern -= 1;
+        if (self.sel.pattern >= self.patternCount()) self.sel.pattern = self.patternCount() - 1;
+        if (self.piano.pattern) |pp| {
+            if (pp == pat_i) {
+                self.closePiano(); // 正在编辑的样式被删：内容已不存在 → 关闭
+            } else if (pp > pat_i) {
+                self.piano.pattern = pp - 1;
+            }
+        }
+        // 右键菜单正指向被删项 → 关闭（防悬空索引）
+        if (self.panels.ctx_pattern) |cp| {
+            if (cp == idx) {
+                self.panels.ctx_pattern = null;
+            } else if (cp > idx) {
+                self.panels.ctx_pattern = cp - 1;
+            }
+        }
+        self.dirty = true;
+        return true;
+    }
+
+    /// 用给定名字列表替换样式列表（撤销/重做/加载工程用；**复制每一项**）。
+    /// `names` 接受 `[][]u8`（历史快照）或 `[]const []const u8`（存档）——故用 anytype。
+    /// 兜底：全部复制失败时至少留一个样式（`patternCount() >= 1` 的约定）。
+    fn restorePatternNames(self: *App, names: anytype) void {
+        for (self.pattern_items.items) |nm| self.allocator.free(nm);
+        self.pattern_items.clearRetainingCapacity();
+        for (names) |nm| {
+            const copy = self.allocator.dupe(u8, nm) catch continue;
+            self.pattern_items.append(self.allocator, copy) catch {
+                self.allocator.free(copy);
+            };
+        }
+        if (self.pattern_items.items.len == 0) _ = self.addPattern();
     }
 
     /// 清空样式列表并重建为默认数量（新建/加载工程时用；释放旧名字）
@@ -1980,7 +2092,8 @@ pub const App = struct {
     /// 因为文件菜单正好盖在历史列表上方；历史面板用 `ui.listItem`（观 hit）
     /// 先于菜单绘制、当时又未被屏蔽）。
     pub fn menuIsOpen(self: *const App) bool {
-        return self.rack.menu_open or self.rack.ctx_instrument != null or self.file_menu_open;
+        return self.rack.menu_open or self.rack.ctx_instrument != null or
+            self.file_menu_open or self.panels.ctx_pattern != null;
     }
 
     /// 设置状态栏提示（覆盖旧的；默认显示约 3 秒）
@@ -2044,6 +2157,17 @@ pub const App = struct {
         }
         // 调音台通道（增益/声像/静音/效果链）——共用 `exportMixerChannels`
         const mix = try self.exportMixerChannels(alloc);
+        // 样式名字（自定义名随工程保存；旧版加载方忽略）
+        const pat_names = try alloc.alloc([]const u8, self.pattern_items.items.len);
+        var pn: usize = 0;
+        errdefer {
+            for (pat_names[0..pn]) |nm| alloc.free(nm);
+            alloc.free(pat_names);
+        }
+        for (self.pattern_items.items, 0..) |nm, i| {
+            pat_names[i] = try alloc.dupe(u8, nm);
+            pn += 1;
+        }
         return .{
             .bpm = self.bpm,
             .volume = self.volume, // 主音量（持久化——重开工程恢复）
@@ -2051,6 +2175,7 @@ pub const App = struct {
             .time_den = self.time_den,
             .steps_per_bar = self.steps_per_bar,
             .pattern_count = self.patternCount(),
+            .pattern_names = pat_names,
             .clips = clips,
             .notes = notes,
             .instruments = insts,
@@ -2074,6 +2199,8 @@ pub const App = struct {
         self.allocator.free(p.clips);
         self.allocator.free(p.notes);
         self.allocator.free(p.instruments);
+        for (p.pattern_names) |nm| self.allocator.free(nm);
+        self.allocator.free(p.pattern_names);
         if (p.mixer.len > 0) {
             self.freeSavedMixerChannels(p.mixer);
             self.allocator.free(p.mixer);
@@ -2121,8 +2248,12 @@ pub const App = struct {
         self.steps_per_bar = p.steps_per_bar;
         // 调音台通道：**动态数量**（旧存档无此字段 → 保持默认 2 个）——共用 `importMixerChannels`
         self.importMixerChannels(p.mixer);
-        // 样式列表：恢复到存档数量（旧存档无此字段 → 默认 6）
-        self.resetPatterns(if (p.pattern_count > 0) p.pattern_count else model.default_pattern_count);
+        // 样式列表：优先按名字恢复（含自定义名）；旧存档无名字 → 按数量重建默认名
+        if (p.pattern_names.len > 0) {
+            self.restorePatternNames(p.pattern_names);
+        } else {
+            self.resetPatterns(if (p.pattern_count > 0) p.pattern_count else model.default_pattern_count);
+        }
 
         // 选择/clamp 回有效范围
         self.sel.pattern = 0;
@@ -2557,6 +2688,25 @@ pub const App = struct {
         return i;
     }
 
+    /// 开始重命名样式（预填当前名字）
+    pub fn beginRenamePattern(self: *App, idx: usize, x: i32, y: i32) void {
+        if (idx >= self.pattern_items.items.len) return;
+        const ti = &self.text_input;
+        ti.active = true;
+        ti.target = .pattern;
+        ti.index = idx;
+        ti.x = x;
+        ti.y = y;
+        const name = self.pattern_items.items[idx];
+        const n = @min(name.len, ti.buf.len);
+        @memcpy(ti.buf[0..n], name[0..n]);
+        ti.len = n;
+        ti.cursor = n;
+        ti.sel_anchor = null;
+        ti.drag_active = false;
+        ti.view_off = 0;
+    }
+
     /// 追加一个字符（UTF-8；在**光标处插入**——有选区则先删除选区）
     pub fn textInputAppend(self: *App, cp: u21) void {
         const ti = &self.text_input;
@@ -2698,6 +2848,20 @@ pub const App = struct {
                         @memcpy(mc.name[0..n], val[0..n]);
                         mc.name_len = n;
                         self.commitHistory("重命名通道");
+                    }
+                }
+            },
+            .pattern => {
+                if (ti.index < self.pattern_items.items.len and val.len > 0) {
+                    const old = self.pattern_items.items[ti.index];
+                    if (!std.mem.eql(u8, old, val)) {
+                        const copy = self.allocator.dupe(u8, val) catch null;
+                        if (copy) |c| {
+                            self.allocator.free(old);
+                            self.pattern_items.items[ti.index] = c;
+                            self.dirty = true;
+                            self.commitHistory("重命名样式");
+                        }
                     }
                 }
             },
@@ -4070,4 +4234,198 @@ test "app: 片段批量操作——框选删除 + 批量移动（幂等、轨道
     try std.testing.expectEqual(@as(usize, 2), app.deleteSelectedClips());
     try std.testing.expectEqual(@as(usize, 1), app.clips.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.selectedClipCount());
+}
+
+test "app: 样式——删除（音符/片段随删、序号前移、选择/钢琴卷帘/菜单跟随）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(4);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    // 四个样式各一个音符（音高 60..63 区分）；样式 2/3 各一个片段
+    app.addNote(.{ .step = 0, .len = 8, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.addNote(.{ .step = 0, .len = 8, .pitch = 61, .pattern = 1, .instrument = 0 });
+    app.addNote(.{ .step = 0, .len = 8, .pitch = 62, .pattern = 2, .instrument = 0 });
+    app.addNote(.{ .step = 0, .len = 8, .pitch = 63, .pattern = 3, .instrument = 0 });
+    app.addClip(.{ .track = 0, .start = 0, .len = 96, .pattern = 1 });
+    app.addClip(.{ .track = 0, .start = 96, .len = 96, .pattern = 3 });
+    app.sel.pattern = 3;
+    app.openPiano(2);
+    app.panels.ctx_pattern = 3;
+
+    // 删除中间的“样式 2”（索引 1）
+    try std.testing.expect(app.removePattern(1));
+    try std.testing.expectEqual(@as(i32, 3), app.patternCount());
+    try std.testing.expectEqualStrings("样式 1", app.pattern_items.items[0]);
+    try std.testing.expectEqualStrings("样式 3", app.pattern_items.items[1]);
+    try std.testing.expectEqualStrings("样式 4", app.pattern_items.items[2]);
+
+    // 音符：pitch 61（原样式 2）删了；62 由 2→1；63 由 3→2；60 不变
+    // （swapRemove 打乱数组顺序，故按音高断言而非下标）
+    try std.testing.expectEqual(@as(usize, 3), app.notes.items.len);
+    for (app.notes.items) |nt| {
+        switch (nt.pitch) {
+            60 => try std.testing.expectEqual(@as(i32, 0), nt.pattern),
+            62 => try std.testing.expectEqual(@as(i32, 1), nt.pattern),
+            63 => try std.testing.expectEqual(@as(i32, 2), nt.pattern),
+            else => return error.TestUnexpectedResult, // 61 应已删除
+        }
+    }
+    // 片段：样式 1 的删了；样式 3 的 3→2
+    try std.testing.expectEqual(@as(usize, 1), app.clips.items.len);
+    try std.testing.expectEqual(@as(i32, 2), app.clips.items[0].pattern);
+
+    // 选择/钢琴卷帘/右键菜单跟随
+    try std.testing.expectEqual(@as(i32, 2), app.sel.pattern); // 3 → 2
+    try std.testing.expectEqual(@as(?i32, 1), app.piano.pattern); // 2 → 1
+    try std.testing.expectEqual(@as(?usize, 2), app.panels.ctx_pattern); // 3 → 2
+
+    // 删除钢琴卷帘正在编辑的样式 → 关闭视图（内容已不存在）
+    try std.testing.expect(app.removePattern(1));
+    try std.testing.expectEqual(@as(?i32, null), app.piano.pattern);
+
+    // 最后一个样式不可删
+    try std.testing.expect(app.removePattern(0));
+    try std.testing.expectEqual(@as(i32, 1), app.patternCount());
+    try std.testing.expect(!app.removePattern(0));
+}
+
+test "app: 样式——重命名（预填/提交/历史/撤销/空名拒绝）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(3);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    // 预填当前名
+    app.beginRenamePattern(1, 5, 5);
+    try std.testing.expect(app.text_input.active);
+    try std.testing.expectEqualStrings("样式 2", app.text_input.text());
+
+    // 清空重打 → 提交
+    while (app.text_input.text().len > 0) app.textInputBackspace();
+    app.textInputAppend('主');
+    app.textInputAppend('歌');
+    const hist_before = app.history.items.len;
+    app.textInputCommit();
+    try std.testing.expectEqualStrings("主歌", app.pattern_items.items[1]);
+    try std.testing.expectEqual(hist_before + 1, app.history.items.len); // 产生历史条目
+
+    // 撤销/重做（名字在快照里，能还原）
+    try std.testing.expect(app.undo());
+    try std.testing.expectEqualStrings("样式 2", app.pattern_items.items[1]);
+    try std.testing.expect(app.redo());
+    try std.testing.expectEqualStrings("主歌", app.pattern_items.items[1]);
+
+    // 空名：拒绝（保持原名；与乐器同规则）
+    app.beginRenamePattern(1, 5, 5);
+    while (app.text_input.text().len > 0) app.textInputBackspace();
+    app.textInputCommit();
+    try std.testing.expectEqualStrings("主歌", app.pattern_items.items[1]);
+}
+
+test "app: 样式——添加避开重名（删除后重加）+ 上限拒绝" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(3); // 样式 1..3
+    try std.testing.expect(app.removePattern(1)); // 删“样式 2” → 样式 1、样式 3
+
+    const ni = app.addPattern();
+    try std.testing.expectEqual(@as(i32, 2), ni); // 追加在末尾
+    try std.testing.expectEqualStrings("样式 2", app.pattern_items.items[@intCast(ni)]); // 补最小空号
+
+    // 上限：装满后拒绝
+    app.resetPatterns(model.max_patterns);
+    try std.testing.expectEqual(@as(i32, -1), app.addPattern());
+}
+
+test "app: 样式名随存档导出/导入（自定义名保留）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(3);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    // 改名第 2 个样式 → “流行”
+    app.beginRenamePattern(1, 0, 0);
+    while (app.text_input.text().len > 0) app.textInputBackspace();
+    app.textInputAppend('流');
+    app.textInputAppend('行');
+    app.textInputCommit();
+
+    const proj = try app.exportProject();
+    defer app.freeProject(proj);
+
+    // 导入到另一个 App（先造不同的样式布局：6 个默认名）
+    var app2 = App{ .allocator = std.testing.allocator };
+    defer app2.clips.deinit(app2.allocator);
+    defer app2.notes.deinit(app2.allocator);
+    defer app2.deinitAll();
+    app2.resetPatterns(6);
+    app2.resetMixerChannels(default_mixer_channels);
+    app2.importProject(proj);
+    try std.testing.expectEqual(@as(i32, 3), app2.patternCount());
+    try std.testing.expectEqualStrings("样式 1", app2.pattern_items.items[0]);
+    try std.testing.expectEqualStrings("流行", app2.pattern_items.items[1]);
+    try std.testing.expectEqualStrings("样式 3", app2.pattern_items.items[2]);
+
+    // 旧存档（无 pattern_names）→ 按数量重建默认名
+    var legacy = proj;
+    legacy.pattern_names = &.{};
+    legacy.pattern_count = 5;
+    var app3 = App{ .allocator = std.testing.allocator };
+    defer app3.clips.deinit(app3.allocator);
+    defer app3.notes.deinit(app3.allocator);
+    defer app3.deinitAll();
+    app3.resetPatterns(2);
+    app3.resetMixerChannels(default_mixer_channels);
+    app3.importProject(legacy);
+    try std.testing.expectEqual(@as(i32, 5), app3.patternCount());
+    try std.testing.expectEqualStrings("样式 5", app3.pattern_items.items[4]);
+}
+
+test "app: 样式——删除可撤销（快照含名字/音符，重做再删）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(3);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    app.addNote(.{ .step = 0, .len = 8, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.addNote(.{ .step = 0, .len = 8, .pitch = 61, .pattern = 1, .instrument = 0 });
+    app.addNote(.{ .step = 0, .len = 8, .pitch = 62, .pattern = 2, .instrument = 0 });
+    app.commitHistory("放置音符"); // 快照：3 样式 + 3 音符（供撤销基准）
+
+    try std.testing.expect(app.removePattern(1)); // 删“样式 2”（连其音符）
+    app.commitHistory("删除样式");
+    try std.testing.expectEqual(@as(i32, 2), app.patternCount());
+    try std.testing.expectEqual(@as(usize, 2), app.notes.items.len);
+
+    // 撤销：样式名/数量/音符全还原
+    try std.testing.expect(app.undo());
+    try std.testing.expectEqual(@as(i32, 3), app.patternCount());
+    try std.testing.expectEqualStrings("样式 2", app.pattern_items.items[1]);
+    try std.testing.expectEqual(@as(usize, 3), app.notes.items.len);
+    for (app.notes.items) |nt| {
+        if (nt.pitch == 61) try std.testing.expectEqual(@as(i32, 1), nt.pattern);
+    }
+    // 重做：再删
+    try std.testing.expect(app.redo());
+    try std.testing.expectEqual(@as(i32, 2), app.patternCount());
+    try std.testing.expectEqual(@as(usize, 2), app.notes.items.len);
 }

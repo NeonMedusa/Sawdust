@@ -149,8 +149,10 @@ pub const Project = struct {
     time_den: i32 = 4,
     /// 每小节步数（冗余存储：拍号换算规则若变更仍能正确还原）
     steps_per_bar: i32 = model.units_per_whole,
-    /// 样式数量（旧存档缺失 → 默认 6；加载时重建样式列表）
+    /// 样式数量（旧存档缺失 → 默认 6；仅当 `pattern_names` 为空时用于重建）
     pattern_count: i32 = model.default_pattern_count,
+    /// 样式名字（UTF-8；空 = 旧存档/无自定义名——加载时按 `pattern_count` 重建默认名）
+    pattern_names: []const []const u8 = &.{},
     /// 兼容用：v1 存档的时长单位（小节）。加载 v1 时把 `bar/len` 乘此值转成步。
     legacy_units_per_bar: i32 = model.units_per_whole,
     clips: []SavedClip = &.{},
@@ -554,4 +556,27 @@ test "persist: v2 输出不含 v1 兼容字段（bar/len_bars）" {
     // bar/len_bars 为 null 时不应出现在 JSON 里（避免噪音与误读）
     try std.testing.expect(std.mem.indexOf(u8, json, "\"bar\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, json, "len_bars") == null);
+}
+
+test "persist: 样式名往返（旧存档无字段 → 空列表）" {
+    const allocator = std.testing.allocator;
+    const names = [_][]const u8{ "主歌", "副歌" };
+    const project = Project{ .pattern_names = &names };
+
+    const json = try toJson(allocator, project);
+    defer allocator.free(json);
+    const parsed = try fromJson(allocator, json);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.pattern_names.len);
+    try std.testing.expectEqualStrings("主歌", parsed.value.pattern_names[0]);
+    try std.testing.expectEqualStrings("副歌", parsed.value.pattern_names[1]);
+
+    // 旧存档（v3、无 pattern_names）→ 空列表（加载方按 pattern_count 重建）
+    const legacy =
+        \\{"version":3,"bpm":120,"pattern_count":6}
+    ;
+    const old = try fromJson(allocator, legacy);
+    defer old.deinit();
+    try std.testing.expectEqual(@as(usize, 0), old.value.pattern_names.len);
+    try std.testing.expectEqual(@as(i32, 6), old.value.pattern_count);
 }
