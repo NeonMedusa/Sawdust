@@ -274,10 +274,30 @@ pub fn drawTimelineGrid(
     drawLayer(ren, clip_x, view_w, lane_x, scroll_s, scroll_steps, step_ws, y, h, steps_per_bar, 3.0, 1, theme.grid_bar);
 }
 
-/// 网格选择器按钮文本（"网格 1/4 ▾"；`buf` 由调用方提供——栈上格式化）。
+/// 网格选择器按钮文本（"网格 1/4"；`buf` 由调用方提供——栈上格式化）。
+/// 注：**不再拼 `▾`**——字体缺该码点（U+25BE）会显示为空心方块豆腐块；
+/// 下拉箭头由 `menuArrow` 自绘（见下）。
 pub fn snapLabel(buf: []u8, snap: i32) []const u8 {
     const idx = std.math.clamp(snap, 0, @as(i32, @intCast(model.snap_denoms.len - 1)));
-    return std.fmt.bufPrint(buf, "网格 1/{d} ▾", .{model.snap_denoms[@intCast(idx)]}) catch "网格 ▾";
+    return std.fmt.bufPrint(buf, "网格 1/{d}", .{model.snap_denoms[@intCast(idx)]}) catch "网格";
+}
+
+// ── 自绘下拉箭头（替代字体缺字的 `▾`）──
+
+/// 箭头尺寸（宽 × 高；实心向下小三角）
+pub const menu_arrow_w: i32 = 7;
+pub const menu_arrow_h: i32 = 4;
+
+/// 下拉小三角（自绘）。字体缺 `▾`（U+25BE）——直接拼进文本会渲染成
+/// 空心方块（实测；长期存在的观感问题）。所有“下拉”UI 统一用它：
+/// `(x, y)` = 三角包围盒**左上角**（行宽 7/5/3/1，逐行收窄）。
+pub fn menuArrow(ui: *Ui, x: i32, y: i32, color: u32) void {
+    var i: i32 = 0;
+    while (i < menu_arrow_h) : (i += 1) {
+        const w = menu_arrow_w - i * 2;
+        if (w <= 0) break;
+        ui.renderer.fillRect(x + i, y + i, w, 1, color);
+    }
 }
 
 // ── 文件名式**中略**（省略中间、保留两边）──
@@ -345,9 +365,10 @@ pub fn middleEllipsis(ui: *Ui, buf: []u8, text: []const u8, max_px: i32) []const
     return buf[0 .. hb + 3 + tb];
 }
 
-/// 标题栏选择器按钮宽度（文本宽 + 内边距；供调用方定位相邻控件/可见性判断）
+/// 标题栏选择器按钮宽度（文本宽 + 左右内边距 + **自绘箭头**空间；
+/// 供调用方定位相邻控件/可见性判断）
 pub fn titleSelectorButtonWidth(ui: *Ui, label: []const u8) i32 {
-    return @as(i32, @intFromFloat(ui.font.measure(label))) + 16;
+    return @as(i32, @intFromFloat(ui.font.measure(label))) + 8 + 5 + menu_arrow_w + 6;
 }
 
 /// 标题栏下拉选择器——按钮（网格/乐器共用：交互与视觉一致）。
@@ -360,7 +381,11 @@ pub fn titleSelectorButton(ui: *Ui, btn_x: i32, y: i32, bar_h: i32, label: []con
     const bw = titleSelectorButtonWidth(ui, label);
     const hovered = ui.hitRect(btn_x, btn_y, bw, btn_h);
     ui.renderer.fillRect(btn_x, btn_y, bw, btn_h, if (open.*) ui.theme.accent else if (hovered) ui.theme.item_hover else ui.theme.toolbar);
-    ui.labelClipped(label, btn_x + 8, btn_y, bw - 12, ui.theme.text);
+    const text_avail = bw - 8 - 5 - menu_arrow_w - 6;
+    ui.labelClipped(label, btn_x + 8, btn_y, text_avail, ui.theme.text);
+    // 自绘下拉箭头（字体缺 `▾`；见 menuArrow 注释）
+    const tw: i32 = @intFromFloat(ui.font.measure(label));
+    menuArrow(ui, btn_x + 8 + @min(tw, text_avail) + 5, btn_y + @divTrunc(btn_h - menu_arrow_h, 2), ui.theme.text_dim);
     if (hovered and ui.mouse_pressed) open.* = !open.*;
     return hovered and ui.mouse_pressed;
 }

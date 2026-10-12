@@ -876,7 +876,7 @@ fn addLayerChoice(app: *App, ref: PresetIntent.KitPadRef, patch: ?*const persist
     }
     app.commitHistory("添加乐器");
     openKitLayerWindow(app, ref.instrument, ref.pitch);
-    app.setToast("已添加乐器 — 在窗口里点「预设 ▾」换音色");
+                app.setToast("已添加乐器 — 在窗口里点「预设」换音色");
 }
 
 /// 应用到**已有鼓组层**（层窗口「预设 ▾」）：换音色/默认 + 更新来源名

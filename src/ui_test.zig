@@ -15,6 +15,30 @@ fn makeUi(fb: *r_mod.Framebuffer) Ui {
     return Ui.init(r_mod.Renderer.init(fb), fake_font);
 }
 
+test "ui: 自绘下拉箭头——逐行收窄、不越界（替代缺字的 ▾）" {
+    var buf: [20 * 10]u32 = undefined;
+    @memset(&buf, 0);
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 20, .height = 10 };
+    var ui = makeUi(&fb);
+    const col: u32 = 0xFF112233;
+    view_util.menuArrow(&ui, 2, 2, col);
+    // 行宽 7/5/3/1，逐行缩进 1（x=2, y=2 起）
+    try std.testing.expectEqual(col, buf[2 * 20 + 2]);
+    try std.testing.expectEqual(col, buf[2 * 20 + 8]); // 首行最右
+    const outside_row0 = buf[2 * 20 + 9]; // 首行之外
+    try std.testing.expect(outside_row0 != col);
+    try std.testing.expectEqual(col, buf[3 * 20 + 3]);
+    try std.testing.expectEqual(col, buf[5 * 20 + 5]); // 末行宽 1
+    try std.testing.expect(buf[6 * 20 + 2] != col); // 不越到第 5 行以下
+}
+
+test "view_util: 网格标签不带 ▾（字体缺字；箭头自绘）" {
+    var buf: [24]u8 = undefined;
+    try std.testing.expectEqualStrings("网格 1/2", view_util.snapLabel(&buf, 1));
+    try std.testing.expectEqualStrings("网格 1/12", view_util.snapLabel(&buf, 8));
+    try std.testing.expect(std.mem.indexOf(u8, view_util.snapLabel(&buf, 3), "▾") == null);
+}
+
 test "ui: 旋钮值域——超出 0..1 的值也能拖回（Q 值卡最大值事故）" {
     // 实测事故：Q 旋钮（0.1..4.0）误用 `knob`（内部 clamp 到 0..1）→
     // 拖一下就被压到 1.0，之后再怎么拖都回不去（“拧不动/卡在最大值”）。

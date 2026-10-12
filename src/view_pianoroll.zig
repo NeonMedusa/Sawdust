@@ -37,7 +37,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             app.instruments.items[@intCast(app.sel.instrument)].name
         else
             "无乐器";
-        break :blk std.fmt.bufPrint(&inst_buf, "{s} ▾", .{iname}) catch iname;
+        break :blk std.fmt.bufPrint(&inst_buf, "{s}", .{iname}) catch iname;
     };
     const inst_btn_x: i32 = blk: {
         var sbuf: [24]u8 = undefined;

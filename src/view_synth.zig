@@ -101,7 +101,15 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
             const h1 = util.hitUI(ui, bx1, by2, menu_w, bh2);
             ui.renderer.fillRect(bx1, by2, menu_w, bh2, if (app.preset_browser.open) ui.theme.accent else if (h1) ui.theme.item_hover else ui.theme.slider_track);
             ui.renderer.strokeRect(bx1, by2, menu_w, bh2, ui.theme.panel_border);
-            ui.label("预设 ▾", bx1 + 5, by2 + 2, ui.theme.text);
+            {
+                // “预设” + 自绘下拉箭头（字体缺 `▾`；居中成组）
+                const tw: i32 = @intFromFloat(ui.font.measure("预设"));
+                const arrow_gap: i32 = 4;
+                const total = tw + arrow_gap + util.menu_arrow_w;
+                const tx = bx1 + @divTrunc(menu_w - total, 2);
+                ui.label("预设", tx, by2 + 2, ui.theme.text);
+                util.menuArrow(ui, tx + tw + arrow_gap, by2 + @divTrunc(bh2 - util.menu_arrow_h, 2), ui.theme.text);
+            }
             if (h1 and ui.mouse_pressed) {
                 if (app.preset_browser.open) {
                     app.preset_browser.open = false;
