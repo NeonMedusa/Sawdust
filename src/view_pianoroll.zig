@@ -1007,7 +1007,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // （有选区时 → 全部选中整体增减；见 `view_note_lane.altWheelAdjust`）。
     // 在编辑轨上的 Alt+滚轮由 `view_note_lane.draw` 自己处理（“最近”
     // 标准不同：柱条末端而非音符矩形）——这里用 `lane_y..lane_y+lane_h` 避开。
-    if (ui.wheel != 0 and ui.wheel_alt and ui.hitRect(lane_x, lane_y, view_w, lane_h - 3)) {
+    if (ui.wheel != 0 and ui.wheel_alt and !app.piano.nav_active and ui.hitRect(lane_x, lane_y, view_w, lane_h - 3)) {
         const mode = app.piano.lane_mode;
         const near = view_note_lane.nearestNoteInPiano(app, ui.mouse_x, ui.mouse_y, lane_x, lane_y, step_ws, scroll_s, app.piano.key_h, app.piano.scroll, pattern);
         if (view_note_lane.altWheelAdjust(app, mode, ui.wheel, near)) {
@@ -1015,7 +1015,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         }
         ui.wheel = 0; // 消费
     }
-    if (!ui.wheel_alt and ui.hitRect(main_x, lane_y, main_w, lane_h + splitter_h + editor_h)) {
+    // 中键拖动中：屏蔽滚轮（含 Ctrl/Shift 缩放）——缩放会让锚定比例失准、
+    // 拖动跟随抽动（用户约定：拖动期间只平移，不缩放）
+    if (!app.piano.nav_active and !ui.wheel_alt and ui.hitRect(main_x, lane_y, main_w, lane_h + splitter_h + editor_h)) {
         if (ui.wheel_ctrl) {
             // Ctrl+滚轮：横向缩放（锚定鼠标下的内容）+ 内容区拉回
             // 注：拉回**无条件执行**（不只在 zoom 变化时）——
@@ -1032,8 +1034,42 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             // 缩小/已到下限：把视口右缘拉回内容跨度内（全装得下 → 贴左）
             const vcw: i32 = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(view_w)) / app.piano.zoom)));
             app.piano.scroll_x = Ui.clampScrollToSpan(app.piano.scroll_x, vcw, content_span);
+        } else if (ui.wheel_shift) {
+            // Shift+滚轮：**纵向缩放**（音高行高；锚定鼠标下的行）
+            const old_k = app.piano.key_h;
+            const new_k = std.math.clamp(old_k + ui.wheel * 2, util.piano_key_h_min, util.piano_key_h_max);
+            if (new_k != old_k) {
+                app.piano.key_h = new_k;
+                const ch_new: i32 = 128 * new_k;
+                app.piano.scroll = Ui.zoomAnchoredScrollY(app.piano.scroll, lane_h, ui.mouse_y - lane_y, old_k, new_k, ch_new);
+            }
         } else {
             app.piano.scroll = std.math.clamp(app.piano.scroll - util.scrollDelta(ui), 0, @max(0, content_h - lane_h));
+        }
+    }
+    // ── 中键拖动：平移视口（仅音符网格区；抓画布：内容跟手）──
+    {
+        const p = &app.piano;
+        if (!p.nav_active and ui.mouse_middle_pressed and
+            util.hitUI(ui, lane_x, lane_y, view_w, lane_h))
+        {
+            p.nav_active = true;
+            p.nav_mx = ui.mouse_x;
+            p.nav_my = ui.mouse_y;
+            p.nav_scroll_x0 = p.scroll_x;
+            p.nav_scroll_y0 = p.scroll;
+        }
+        if (p.nav_active) {
+            if (!ui.mouse_middle_down) {
+                p.nav_active = false;
+            } else {
+                // 从**原点**重算（拖出范围后回拖立即响应，不会积累死区）
+                const vcw: i32 = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(view_w)) / p.zoom)));
+                // 屏幕位移 → 内容像素（/zoom）——“鼠标移 1px、内容移 1px”的 1:1
+                const dx_c = util.screenToContentPx(ui.mouse_x - p.nav_mx, p.zoom);
+                p.scroll_x = Ui.clampScrollToSpan(p.nav_scroll_x0 - dx_c, vcw, content_span);
+                p.scroll = std.math.clamp(p.nav_scroll_y0 - (ui.mouse_y - p.nav_my), 0, @max(0, content_h - lane_h));
+            }
         }
     }
     _ = ui.scrollbarV(11, sb_x, lane_y, ruler_h, lane_h, &app.piano.scroll, content_h, lane_h);
@@ -1084,6 +1120,20 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             },
         }
         app.pending_edit_op = null;
+    }
+
+    // ── 键盘移动选中音符（Shift/Ctrl+方向键；main 登记，钳制在 App 侧）──
+    // Shift（细移）：部分钳制（同拖动）；Ctrl（粗移）：全有或全无（防拍位/级数漂移）
+    // 连按合并为一条历史（与滚轮同一机制：静默 0.6s 后提交）
+    if (app.pending_move) |mv| {
+        const changed = if (mv.exact)
+            app.nudgeSelectedNotesExact(mv.d_step, mv.d_pitch)
+        else
+            app.nudgeSelectedNotes(mv.d_step, mv.d_pitch);
+        if (changed) {
+            app.markWheelHistory("移动音符");
+        }
+        app.pending_move = null;
     }
 
     // 吸附网格下拉（在**全部内容之后** → 绘制在最上层，不会被标尺/音符区盖住）

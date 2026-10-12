@@ -16,6 +16,7 @@ const PresetTarget = @import("app.zig").PresetTarget;
 const PresetIntent = @import("app.zig").PresetIntent;
 const PresetChoice = @import("app.zig").PresetChoice;
 const PresetSaveSource = @import("app.zig").PresetSaveSource;
+const MoveReq = @import("app.zig").MoveReq;
 const QuitChoice = @import("app.zig").QuitChoice;
 const synth = @import("synth.zig");
 const sequencer = @import("sequencer.zig");
@@ -209,10 +210,12 @@ pub fn main(init: std.process.Init) !u8 {
         ui_input.mouse_pressed = false;
         ui_input.mouse_released = false;
         ui_input.mouse_right_pressed = false;
+        ui_input.mouse_middle_pressed = false;
         ui_input.mouse_double = false;
         ui_input.wheel = 0;
         ui_input.wheel_ctrl = false;
         ui_input.wheel_alt = false;
+        ui_input.wheel_shift = false;
 
         // 1) 输入
         const events = try win.pollEvents();
@@ -247,7 +250,10 @@ pub fn main(init: std.process.Init) !u8 {
                             ui_input.mouse_right_down = true;
                             ui_input.mouse_right_pressed = true;
                         },
-                        else => {},
+                        .middle => {
+                            ui_input.mouse_middle_down = true;
+                            ui_input.mouse_middle_pressed = true;
+                        },
                     }
                 },
                 .mouse_up => |m| {
@@ -257,13 +263,14 @@ pub fn main(init: std.process.Init) !u8 {
                             ui_input.mouse_released = true;
                         },
                         .right => ui_input.mouse_right_down = false,
-                        else => {},
+                        .middle => ui_input.mouse_middle_down = false,
                     }
                 },
                 .mouse_wheel => |m| {
                     ui_input.wheel += m.delta;
                     ui_input.wheel_ctrl = m.ctrl;
                     ui_input.wheel_alt = m.alt;
+                    ui_input.wheel_shift = m.shift;
                     ui_input.mouse_x = m.x;
                     ui_input.mouse_y = m.y;
                 },
@@ -336,6 +343,25 @@ pub fn main(init: std.process.Init) !u8 {
                     // ── 编辑快捷键（框选/批量操作；只登记，由当前视图按上下文执行）──
                     // Del（VK_DELETE = 0x2E）：删除选中
                     if (k.code == 0x2E) app.pending_edit_op = .delete_selected;
+                    // Shift+方向键：移动选中音符（上下半音 / 左右当前网格）；
+                    // Ctrl+方向键：八度 / 一小节；两者同按 → Ctrl 优先。
+                    // 仅钢琴窗（有当前样式）有效；钳制在 App.moveSelectedNotes 侧。
+                    if (app.piano.pattern != null and (k.ctrl or k.shift) and
+                        (k.code == 0x25 or k.code == 0x26 or k.code == 0x27 or k.code == 0x28))
+                    {
+                        const big = k.ctrl;
+                        var mv = app.pending_move orelse MoveReq{};
+                        const grid: i32 = @max(1, model.snapSteps(app.piano.snap));
+                        mv.exact = mv.exact or big; // Ctrl 粗移 = 全有或全无（见 App.nudgeSelectedNotesExact）
+                        switch (k.code) {
+                            0x26 => mv.d_pitch += if (big) 12 else 1,
+                            0x28 => mv.d_pitch -= if (big) 12 else 1,
+                            0x25 => mv.d_step -= if (big) app.steps_per_bar else grid,
+                            0x27 => mv.d_step += if (big) app.steps_per_bar else grid,
+                            else => {},
+                        }
+                        app.pending_move = mv;
+                    }
                     if (k.ctrl and (k.code == 'B' or k.code == 'b')) app.pending_edit_op = .clone_right;
                     if (k.ctrl and (k.code == 'C' or k.code == 'c')) app.pending_edit_op = .copy;
                     if (k.ctrl and (k.code == 'V' or k.code == 'v')) app.pending_edit_op = .paste;
@@ -390,8 +416,9 @@ pub fn main(init: std.process.Init) !u8 {
                     app.textInputPointerUp();
                 }
             }
-            // 右键：同样吞掉（不让下层弹右键菜单，也不取消输入）
+            // 右键：同样吞掉（不让下层弹右键菜单，也不取消输入）；中键同理
             ui_input.mouse_right_pressed = false;
+            ui_input.mouse_middle_pressed = false;
         }
         // 同步乐器指针/增益到音频线程（成本极低；删除乐器后自动变 null）
         for (0..synth.max_instruments) |i| {
@@ -540,10 +567,13 @@ pub fn main(init: std.process.Init) !u8 {
         ui.mouse_released = ui_input.mouse_released;
         ui.mouse_right_pressed = ui_input.mouse_right_pressed;
         ui.mouse_right_down = ui_input.mouse_right_down;
+        ui.mouse_middle_pressed = ui_input.mouse_middle_pressed;
+        ui.mouse_middle_down = ui_input.mouse_middle_down;
         ui.mouse_double = ui_input.mouse_double;
         ui.wheel = ui_input.wheel;
         ui.wheel_ctrl = ui_input.wheel_ctrl;
         ui.wheel_alt = ui_input.wheel_alt;
+        ui.wheel_shift = ui_input.wheel_shift;
         ui.mods_ctrl = ui_input.mods_ctrl;
         ui.mods_shift = ui_input.mods_shift;
 
@@ -1047,10 +1077,13 @@ const InputState = struct {
     mouse_released: bool = false,
     mouse_right_pressed: bool = false,
     mouse_right_down: bool = false,
+    mouse_middle_pressed: bool = false,
+    mouse_middle_down: bool = false,
     mouse_double: bool = false,
     wheel: i32 = 0,
     wheel_ctrl: bool = false,
     wheel_alt: bool = false,
+    wheel_shift: bool = false,
     mods_ctrl: bool = false,
     mods_shift: bool = false,
 };

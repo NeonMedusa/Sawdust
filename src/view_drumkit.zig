@@ -340,6 +340,10 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
                     ui.labelClipped(shown, rx + 24, rry + 3, @max(40, rw - 216), if (pdisp.len > 0) ui.theme.text else ui.theme.text_dim);
                 }
 
+                // **双击层行**（名称区；排除右侧增益/编辑/×）→ 打开该层乐器面板
+                // ——与机架“双击乐器名”同一习惯（`[编辑]` 按钮仍保留）
+                if (util.hitUI(ui, rx, rry, @max(40, rw - 192), layer_row_h - 2) and ui.mouse_double) edit_req = li;
+
                 // 增益（上下拖动；松手时 coalesce 提交）
                 const gx = rx + rw - 158;
                 ui.labelCentered("增益", gx - 34, rry, layer_row_h - 2, ui.theme.text_dim);

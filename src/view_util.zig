@@ -302,6 +302,17 @@ pub fn menuArrow(ui: *Ui, x: i32, y: i32, color: u32) void {
 
 // ── 文件名式**中略**（省略中间、保留两边）──
 
+/// 屏幕位移 → **内容像素**位移（中键拖动 1:1 用）：
+/// `scroll_x` 系的滚动量存的是内容像素（屏幕 = 内容 × zoom），
+/// 所以屏幕上移 1px = 内容上 1/zoom。不换算时拖动比例会差 zoom 倍
+/// （实测 bug：缩放到非 1 后中键拖动“不跟手”）。
+/// 注：内容像素是整数——高倍缩放（zoom 大）下水平拖动会有
+/// ⌈zoom⌉ 像素级颗粒；zoom=1 时严格 1:1。
+pub fn screenToContentPx(dx: i32, zoom: f32) i32 {
+    const z = @max(0.01, zoom);
+    return @intFromFloat(@round(@as(f32, @floatFromInt(dx)) / z));
+}
+
 /// 中略拆分结果：保留头部 `head` 码点 + 省略号 + 尾部 `tail` 码点
 pub const EllipsisSplit = struct { head: usize, tail: usize };
 
@@ -366,9 +377,18 @@ pub fn middleEllipsis(ui: *Ui, buf: []u8, text: []const u8, max_px: i32) []const
 }
 
 /// 标题栏选择器按钮宽度（文本宽 + 左右内边距 + **自绘箭头**空间；
-/// 供调用方定位相邻控件/可见性判断）
+/// 供调用方定位相邻控件/可见性判断）。
+/// 注：文本宽**向上取整 +1**——`labelClipped` 内部是 f32 比较，
+/// 袪截断（intFromFloat）会让最后一字形差零点几像素被判越界丢掉
+/// （实测 bug：“网格 1/8”只显示到 “网格 1/”）。
 pub fn titleSelectorButtonWidth(ui: *Ui, label: []const u8) i32 {
-    return @as(i32, @intFromFloat(ui.font.measure(label))) + 8 + 5 + menu_arrow_w + 6;
+    const tw = titleSelectorTextW(ui, label);
+    return tw + 8 + 5 + menu_arrow_w + 6;
+}
+
+/// 选择器按钮文本宽（向上取整 +1 的安全余量；见 `titleSelectorButtonWidth` 注释）
+fn titleSelectorTextW(ui: *Ui, label: []const u8) i32 {
+    return @as(i32, @intFromFloat(@ceil(ui.font.measure(label)))) + 1;
 }
 
 /// 标题栏下拉选择器——按钮（网格/乐器共用：交互与视觉一致）。
@@ -379,13 +399,12 @@ pub fn titleSelectorButton(ui: *Ui, btn_x: i32, y: i32, bar_h: i32, label: []con
     const btn_h: i32 = bar_h - 8;
     const btn_y = y + 4;
     const bw = titleSelectorButtonWidth(ui, label);
+    const tw = titleSelectorTextW(ui, label);
     const hovered = ui.hitRect(btn_x, btn_y, bw, btn_h);
     ui.renderer.fillRect(btn_x, btn_y, bw, btn_h, if (open.*) ui.theme.accent else if (hovered) ui.theme.item_hover else ui.theme.toolbar);
-    const text_avail = bw - 8 - 5 - menu_arrow_w - 6;
-    ui.labelClipped(label, btn_x + 8, btn_y, text_avail, ui.theme.text);
+    ui.labelClipped(label, btn_x + 8, btn_y, tw, ui.theme.text);
     // 自绘下拉箭头（字体缺 `▾`；见 menuArrow 注释）
-    const tw: i32 = @intFromFloat(ui.font.measure(label));
-    menuArrow(ui, btn_x + 8 + @min(tw, text_avail) + 5, btn_y + @divTrunc(btn_h - menu_arrow_h, 2), ui.theme.text_dim);
+    menuArrow(ui, btn_x + 8 + tw + 5, btn_y + @divTrunc(btn_h - menu_arrow_h, 2), ui.theme.text_dim);
     if (hovered and ui.mouse_pressed) open.* = !open.*;
     return hovered and ui.mouse_pressed;
 }

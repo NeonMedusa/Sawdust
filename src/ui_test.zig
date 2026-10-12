@@ -921,3 +921,27 @@ test "fmt: 增量拼接要把上一个结果留在**别的**缓冲（自别名�
     const n3 = try std.fmt.bufPrint(&buf_a, "{s}", .{n2});
     try std.testing.expectEqualStrings("减法合成器 +1", n3);
 }
+
+test "ui: 垂直缩放锚定（Shift+滚轮）——鼠标下的行保持不动" {
+    // 放大 ×2：鼠标处内容单位 = (100+50)/20 = 7.5 → 7.5×40−50 = 250
+    try std.testing.expectEqual(@as(i32, 250), Ui.zoomAnchoredScrollY(100, 200, 50, 20, 40, 1280));
+    // 缩小 ×0.5：回原位（与上一步互逆）
+    try std.testing.expectEqual(@as(i32, 100), Ui.zoomAnchoredScrollY(250, 200, 50, 40, 20, 640));
+    // 尾界钳制：内容变矮 → 滚动拉到 max(0, content−view)
+    try std.testing.expectEqual(@as(i32, 100), Ui.zoomAnchoredScrollY(100, 200, 50, 20, 40, 300));
+    // 头界：已经在顶且鼠标在顶缘 → 0
+    try std.testing.expectEqual(@as(i32, 0), Ui.zoomAnchoredScrollY(0, 200, 0, 40, 20, 640));
+}
+
+test "view_util: 屏幕→内容像素换算（中键拖动 1:1；zoom≠1 不差倍）" {
+    // zoom=1：原样
+    try std.testing.expectEqual(@as(i32, 80), view_util.screenToContentPx(80, 1.0));
+    // zoom=2：屏幕 80px = 内容 40px（内容×2 → 屏幕 80，严格 1:1）
+    try std.testing.expectEqual(@as(i32, 40), view_util.screenToContentPx(80, 2.0));
+    // zoom=0.5：屏幕 80px = 内容 160px
+    try std.testing.expectEqual(@as(i32, 160), view_util.screenToContentPx(80, 0.5));
+    // 负方向
+    try std.testing.expectEqual(@as(i32, -40), view_util.screenToContentPx(-80, 2.0));
+    // zoom≈0 防御（不除零）
+    try std.testing.expectEqual(@as(i32, 1000), view_util.screenToContentPx(10, 0));
+}

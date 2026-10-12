@@ -989,6 +989,12 @@ const ns = snap.step + d_step_c;
 逐个钳制会把“整体平移”退化成“挤压”。判断准则：变换后**相对间距
 是否保持**。
 
+**续（键盘粗移）**：组级钳制仍会“部分位移”——粗移（Ctrl：八度/小节）
+必须**全有或全无**：完整位移不可行（如最左音在“第一小节第三拍”，左移
+一小节会把它压到第一拍）就**整组拒不动**，否则拍位/级数漂移会破坏
+强弱拍律动与调内级数（用户约定）。实现：`App.nudgeSelectedNotesExact`
+（粗移，拒）vs `App.nudgeSelectedNotes`（细移/拖动，部分钳）。
+
 ### 快照式撤销：拖动类操作必须 coalesce，且恢复时清拖动状态
 
 实现撤销/重做时，**拖动类操作每帧都在改数据**（拖动/拉伸/擦除）。若每帧提交
@@ -1067,3 +1073,33 @@ const names = if (total == 1) first.? else
 **教训**：`bufPrint` 的目标只能是“与所有源都无重叠”的缓冲。
 “把上次结果接上后缀”这种增量拼接尤其危险（看起来对，第二帧/第二个元素才炸）。
 更稳的直觉：**要拼接就先收集再格式化**，别在同一个栈缓冲上反复写读。
+
+## Git / 开发环境（Windows）
+
+### 行尾：全仓库约定 LF；scoop 的 system gitconfig 带 `core.autocrlf=true`
+
+- **scoop 安装的 Git** 在 system 级 gitconfig（`scoop/apps/git/*/etc/gitconfig`）
+  写入了 `core.autocrlf = true`——不是“默认值”，是 scoop 带的。它让 git
+  双向变形：`git add` 时 CRLF→LF 入库、checkout/restore 时 LF→CRLF 写盘。
+- 后果（实测）：工作区混着 CRLF/LF（20+21 个）时，`stash` 往返、
+  `read-tree -u`、`restore` 等操作会在行尾层面打架——**stash pop 假冲突**。
+- 处理：`git config --global core.autocrlf false` 覆盖它；用
+  `git config --show-origin --get-all core.autocrlf` 看各层来源与有效值。
+  设置后需**一次性把工作区存量 CRLF 统一成 LF**（从 index/HEAD 重写），
+  否则那些文件会立刻显示为“假 modified”，一旦误 `git add` 会把 CRLF 写进库。
+
+### 行尾/假 modified 排查三连（内容、行尾、缓存分开看）
+
+1. `git ls-files --eol <file>` —— i/ 与 w/ 各自的行尾；
+2. `git hash-object <file>` vs `git rev-parse :<file>` —— 内容是否真差异；
+3. `git cat-file blob :<file> > tmp\b.bin` + `fc /b tmp\b.bin <file>` ——
+   字节级铁证（二进制比较务必走 `cmd /c` 重定向；PowerShell 管道会碰编码）。
+
+若 2/3 都一致而 `git status` 仍报 M：是 index 的 **stat 缓存**陈旧，
+`git add -u <file>` 刷新即可（内容不变 → staged 为空，只是缓存更新）。
+
+### `restore` 没写盘？touch 一下让 stat 缓存失效
+
+`git restore --worktree`（含 `-c core.autocrlf=false`）可能因 stat 缓存命中
+而**跳过写盘**（命令成功、文件行尾/大小原样不动）。把目标文件 mtime 改掉
+（`(Get-Item f).LastWriteTime = Get-Date`）再 restore，才会真正重写。

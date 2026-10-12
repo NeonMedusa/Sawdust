@@ -116,10 +116,14 @@ pub const Ui = struct {
     mouse_released: bool = false, // 本帧抬起
     mouse_right_pressed: bool = false, // 本帧右键按下
     mouse_right_down: bool = false, // 右键按住（拖动擦除用）
+    mouse_middle_pressed: bool = false, // 本帧中键按下（视口平移用）
+    mouse_middle_down: bool = false, // 中键按住
     mouse_double: bool = false, // 本帧双击（左键）
     wheel: i32 = 0,
     /// 本帧滚轮是否按着 Ctrl（横向缩放）
     wheel_ctrl: bool = false,
+    /// 本帧滚轮是否按着 Shift（纵向缩放）
+    wheel_shift: bool = false,
     /// 本帧滚轮是否按着 Alt（微调力度/声像——见 `view_pianoroll`/`view_note_lane`）
     wheel_alt: bool = false,
     /// 本帧修饰键状态（每帧由 main 从窗口读取；框选/批量操作用）
@@ -258,10 +262,12 @@ pub const Ui = struct {
         self.mouse_pressed = false;
         self.mouse_released = false;
         self.mouse_right_pressed = false;
+        self.mouse_middle_pressed = false;
         self.mouse_double = false;
         self.wheel = 0;
         self.wheel_ctrl = false;
         self.wheel_alt = false;
+        self.wheel_shift = false;
     }
 
     // ── 文本工具 ──
@@ -889,6 +895,20 @@ pub const Ui = struct {
         const center_units = (@as(f32, @floatFromInt(scroll)) + half) / o;
         const new_scroll = center_units * n - half;
         return std.math.clamp(@as(i32, @intFromFloat(@round(new_scroll))), 0, @max(0, content_h_new - view_h));
+    }
+
+    /// 垂直缩放（Shift+滚轮）时保持「鼠标下的内容行」不动：返回新的纵向滚动偏移。
+    /// - `view_h` = 可视高；`mouse_off` = 鼠标相对内容区顶缘的像素；
+    /// - `old_unit_h`/`new_unit_h` = 单位行高（轨道行高 / 音高行高）；
+    /// - `content_h_new` = 缩放后的内容总高（尾界钳制）。
+    /// 与 `zoomAnchoredScroll`（视口中心锚定，□ 缩放用）同族，区别是锚在鼠标。
+    pub fn zoomAnchoredScrollY(scroll: i32, view_h: i32, mouse_off: i32, old_unit_h: i32, new_unit_h: i32, content_h_new: i32) i32 {
+        const o: f32 = @floatFromInt(@max(1, old_unit_h));
+        const n: f32 = @floatFromInt(@max(1, new_unit_h));
+        // 鼠标下的“单位坐标”（缩放前后保持一致）
+        const units = (@as(f32, @floatFromInt(scroll)) + @as(f32, @floatFromInt(mouse_off))) / o;
+        const ns = units * n - @as(f32, @floatFromInt(mouse_off));
+        return std.math.clamp(@as(i32, @intFromFloat(@round(ns))), 0, @max(0, content_h_new - view_h));
     }
 
     /// 把横向滚动钳制到“内容跨度”内（缩放时的拉回）：视口右缘不越过 `span`

@@ -41,6 +41,15 @@ pub const FileAction = enum { open, save, save_as, import_midi, export_midi };
 /// 编辑操作（框选/批量操作快捷键 → 由**当前视图**在帧内按上下文执行）
 pub const EditOp = enum { delete_selected, clone_right, copy, paste, select_all };
 
+/// 键盘移动选中音符的请求（Shift/Ctrl+方向键；main 登记、音符视图消费）
+pub const MoveReq = struct {
+    d_step: i32 = 0,
+    d_pitch: i32 = 0,
+    /// 粗移（Ctrl：八度/小节）＝**全有或全无**：完整位移不可行 → 拒不动
+    /// （部分鉗制会让音高级数/拍位漂移；见 `nudgeSelectedNotesExact`）
+    exact: bool = false,
+};
+
 /// 剪贴板音符（step 存为**相对**最左音符的偏移；粘贴时加到锚点）
 /// ——力度/声像随复制粘贴携带（默认值兜底旧数据）
 pub const ClipboardNote = struct {
@@ -256,6 +265,13 @@ pub const PlaylistState = struct {
     /// 吸附网格下拉选单：展开中
     snap_menu_open: bool = false,
 
+    // ── 中键拖动平移视口（抓画布：内容跟手）──
+    nav_active: bool = false,
+    nav_mx: i32 = 0,
+    nav_my: i32 = 0,
+    nav_scroll_x0: i32 = 0,
+    nav_scroll_y0: i32 = 0,
+
     /// 片段拖动状态（下标 + 抓取点在小节内的偏移）
     drag_clip: ?usize = null,
     drag_grab: i32 = 0,
@@ -318,6 +334,13 @@ pub const PianoState = struct {
     content_w: i32 = 0,
     /// 横向缩放（屏幕像素 / 内容像素）
     zoom: f32 = 1.0,
+
+    // ── 中键拖动平移视口（音符网格区；抓画布：内容跟手）──
+    nav_active: bool = false,
+    nav_mx: i32 = 0,
+    nav_my: i32 = 0,
+    nav_scroll_x0: i32 = 0,
+    nav_scroll_y0: i32 = 0,
 
     /// 音符拖动状态（下标 + 抓取偏移：步 / 音高）
     drag_note: ?usize = null,
@@ -739,6 +762,8 @@ pub const App = struct {
     // ── 选区与批量操作（框选/剪贴板；瞬态，不存档）──
     /// 待执行的编辑操作（键盘快捷键只登记；由当前视图按上下文执行并清除）
     pending_edit_op: ?EditOp = null,
+    /// 键盘移动选中音符（Shift/Ctrl+方向键；本帧累加、音符视图消费）
+    pending_move: ?MoveReq = null,
     /// 音符剪贴板（step 为相对最左音符的偏移）
     clipboard_notes: std.ArrayListUnmanaged(ClipboardNote) = .{ .items = &.{}, .capacity = 0 },
     /// 片段剪贴板（绝对坐标；粘贴时整体平移）
@@ -1317,6 +1342,47 @@ pub const App = struct {
         }
         if (changed) self.dirty = true;
         return changed;
+    }
+
+    /// 键盘微调**选中音符**（Shift/Ctrl+方向键 = 半音/网格/八度/小节）。
+    /// 实现：以“即时快照”复用拖动版 `moveSelectedNotes`——**钳制语义与拖动
+    /// 完全同源**（整组：最左碰 step 0 / 音高碰 0·127 → 全组停）。
+    /// 返回是否有变化（无选中 / 钳到不动 → false）。
+    pub fn nudgeSelectedNotes(self: *App, d_step: i32, d_pitch: i32) bool {
+        self.beginBatchSnap();
+        const changed = self.moveSelectedNotes(d_step, d_pitch);
+        self.batch_snap.clearRetainingCapacity(); // 非拖动上下文：用完即清
+        return changed;
+    }
+
+    /// 键盘**粗移**（Ctrl：八度/小节）——**全有或全无**（用户约定）：
+    /// 整组位移必须 100% 可行（不越 step 0 / 音高 0·127），否则**一律不动**。
+    /// 理由：部分钳制会让拍位（如“第一小节第三拍”被部分左移变成第一拍）
+    /// 或音高级数（八度变非整八度）漂移，破坏强弱拍律动与调内级数。
+    /// 返回是否有变化。
+    pub fn nudgeSelectedNotesExact(self: *App, d_step: i32, d_pitch: i32) bool {
+        if (d_step == 0 and d_pitch == 0) return false;
+        var min_pitch: i32 = std.math.maxInt(i32);
+        var max_pitch: i32 = std.math.minInt(i32);
+        var min_step: i32 = std.math.maxInt(i32);
+        var n: usize = 0;
+        for (self.notes.items) |nt| {
+            if (!nt.selected) continue;
+            min_pitch = @min(min_pitch, nt.pitch);
+            max_pitch = @max(max_pitch, nt.pitch);
+            min_step = @min(min_step, nt.step);
+            n += 1;
+        }
+        if (n == 0) return false;
+        if (min_step + d_step < 0) return false; // 左移抭不动 → 整组拒
+        if (min_pitch + d_pitch < 0 or max_pitch + d_pitch > 127) return false; // 音高越界 → 整组拒
+        for (self.notes.items) |*nt| {
+            if (!nt.selected) continue;
+            nt.step += d_step;
+            nt.pitch += d_pitch;
+        }
+        self.dirty = true;
+        return true;
     }
 
     /// 开始批量操作快照（拖选中音符/拉伸前调用；顺序 = 音符数组顺序）
@@ -2173,6 +2239,8 @@ pub const App = struct {
 
     /// 滚轮类操作的 coalesce：设置待提交名 + 记录本次变动时间。
     /// （滚轮无“松开”事件——用**静默间隔**判定：见 `pollWheelHistory`）
+    /// 标记“连续微调”的 pending 历史（滚轮调值 / 键盘连按移动音符共用）：
+    /// 帧末 `pollWheelHistory` 静默 ≥ 0.6s 后合并提交**一条**。
     pub fn markWheelHistory(self: *App, label: []const u8) void {
         self.history_pending = label;
         self.history_pending_wheel = true;
@@ -5939,4 +6007,128 @@ test "app: 预设文件重命名/删除——文本输入排队 + 删除确认�
     try std.testing.expectEqual(ModalKind.preset_delete, app.modal.?);
     try std.testing.expectEqualStrings("Snare", app.delete_req.?.name[0..app.delete_req.?.name_len]);
     try std.testing.expect(app.pending_preset == null);
+}
+
+test "app: 键盘微调选中音符——半音/八度/网格/小节 + 整组钳制（复用拖动版语义）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+
+    // 未选中 → false、不动
+    try app.notes.append(app.allocator, .{ .step = 10, .len = 4, .pitch = 60, .pattern = 0 });
+    try std.testing.expect(!app.nudgeSelectedNotes(0, 1));
+    try std.testing.expectEqual(@as(i32, 60), app.notes.items[0].pitch);
+
+    // 选中两个音（step 10/13、pitch 60/64）：半音上移
+    app.notes.items[0].selected = true;
+    try app.notes.append(app.allocator, .{ .step = 13, .len = 4, .pitch = 64, .pattern = 0, .selected = true });
+    try std.testing.expect(app.nudgeSelectedNotes(0, 1));
+    try std.testing.expectEqual(@as(i32, 61), app.notes.items[0].pitch);
+    try std.testing.expectEqual(@as(i32, 65), app.notes.items[1].pitch);
+
+    // 上移八度 → 73/77
+    try std.testing.expect(app.nudgeSelectedNotes(0, 12));
+    try std.testing.expectEqual(@as(i32, 73), app.notes.items[0].pitch);
+    try std.testing.expectEqual(@as(i32, 77), app.notes.items[1].pitch);
+
+    // 大幅上移（60 半音）：顶端 77 碰 127 → 位移钳到 +50 → 123/127
+    try std.testing.expect(app.nudgeSelectedNotes(0, 60));
+    try std.testing.expectEqual(@as(i32, 123), app.notes.items[0].pitch);
+    try std.testing.expectEqual(@as(i32, 127), app.notes.items[1].pitch);
+    // 顶格后再上移 → 整组停
+    try std.testing.expect(!app.nudgeSelectedNotes(0, 1));
+    try std.testing.expectEqual(@as(i32, 123), app.notes.items[0].pitch);
+    try std.testing.expectEqual(@as(i32, 127), app.notes.items[1].pitch);
+
+    // 下端钳制：最低音 0 时整组下移无效
+    app.notes.items[0].pitch = 0;
+    app.notes.items[1].pitch = 5;
+    try std.testing.expect(!app.nudgeSelectedNotes(0, -1));
+    try std.testing.expectEqual(@as(i32, 0), app.notes.items[0].pitch);
+    try std.testing.expectEqual(@as(i32, 5), app.notes.items[1].pitch);
+    // 部分下移：3/5 下移 9 → 位移钳到 -3 → 0/2
+    app.notes.items[0].pitch = 3;
+    app.notes.items[1].pitch = 5;
+    try std.testing.expect(app.nudgeSelectedNotes(0, -9));
+    try std.testing.expectEqual(@as(i32, 0), app.notes.items[0].pitch);
+    try std.testing.expectEqual(@as(i32, 2), app.notes.items[1].pitch);
+
+    // 左移钳制：最左音 step 10、另一音 13；左移 8 → 位移 -8 → 2/5
+    try std.testing.expect(app.nudgeSelectedNotes(-8, 0));
+    try std.testing.expectEqual(@as(i32, 2), app.notes.items[0].step);
+    try std.testing.expectEqual(@as(i32, 5), app.notes.items[1].step);
+    // 继续左移 8 → 最左音贴 0（位移 -2）→ 0/3
+    try std.testing.expect(app.nudgeSelectedNotes(-8, 0));
+    try std.testing.expectEqual(@as(i32, 0), app.notes.items[0].step);
+    try std.testing.expectEqual(@as(i32, 3), app.notes.items[1].step);
+    // 再左移 → 整组停
+    try std.testing.expect(!app.nudgeSelectedNotes(-8, 0));
+    try std.testing.expectEqual(@as(i32, 0), app.notes.items[0].step);
+
+    // 右移一小节（96 步）无上限
+    try std.testing.expect(app.nudgeSelectedNotes(model.units_per_whole, 0));
+    try std.testing.expectEqual(@as(i32, 96), app.notes.items[0].step);
+    try std.testing.expectEqual(@as(i32, 99), app.notes.items[1].step);
+}
+
+test "app: 键盘粗移（Ctrl：全有或全无）——拍位/级数不漂移" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+
+    // 用户场景：最左音在第一小节**第三拍**（step 48）——Ctrl+左（一小节）
+    // 会把它压到 0（第一拍）→ 必须**整组拒不动**
+    try app.notes.append(app.allocator, .{ .step = 48, .len = 4, .pitch = 60, .pattern = 0, .selected = true });
+    try app.notes.append(app.allocator, .{ .step = 60, .len = 4, .pitch = 64, .pattern = 0, .selected = true });
+    try std.testing.expect(!app.nudgeSelectedNotesExact(-model.units_per_whole, 0));
+    try std.testing.expectEqual(@as(i32, 48), app.notes.items[0].step);
+    try std.testing.expectEqual(@as(i32, 60), app.notes.items[1].step);
+
+    // 整体绰绰有余（≥ 一小节）→ 完整位移
+    app.notes.items[0].step = 100;
+    app.notes.items[1].step = 120;
+    try std.testing.expect(app.nudgeSelectedNotesExact(-model.units_per_whole, 0));
+    try std.testing.expectEqual(@as(i32, 4), app.notes.items[0].step);
+    try std.testing.expectEqual(@as(i32, 24), app.notes.items[1].step);
+    // 再左移一小节 → 抭不动 → 拒（4/24 保持拍内位置）
+    try std.testing.expect(!app.nudgeSelectedNotesExact(-model.units_per_whole, 0));
+    try std.testing.expectEqual(@as(i32, 4), app.notes.items[0].step);
+
+    // 右移一小节无上限
+    try std.testing.expect(app.nudgeSelectedNotesExact(model.units_per_whole, 0));
+    try std.testing.expectEqual(@as(i32, 100), app.notes.items[0].step);
+
+    // 八度同理：高音 120 + 12 = 132 越顶 → **整组拒**（部分鉗制会变成 +7——非整八度，级数漂移）
+    app.notes.items[0].pitch = 108;
+    app.notes.items[1].pitch = 120;
+    try std.testing.expect(!app.nudgeSelectedNotesExact(0, 12));
+    try std.testing.expectEqual(@as(i32, 108), app.notes.items[0].pitch);
+    try std.testing.expectEqual(@as(i32, 120), app.notes.items[1].pitch);
+    // 完整八度可行：96/108 + 12 → 108/120
+    app.notes.items[0].pitch = 96;
+    app.notes.items[1].pitch = 108;
+    try std.testing.expect(app.nudgeSelectedNotesExact(0, 12));
+    try std.testing.expectEqual(@as(i32, 108), app.notes.items[0].pitch);
+    try std.testing.expectEqual(@as(i32, 120), app.notes.items[1].pitch);
+
+    // 下端：最低音 5 + (-12) → 越底 → 拒；换 15/30 → 3/18
+    app.notes.items[0].pitch = 5;
+    app.notes.items[1].pitch = 20;
+    try std.testing.expect(!app.nudgeSelectedNotesExact(0, -12));
+    try std.testing.expectEqual(@as(i32, 5), app.notes.items[0].pitch);
+    app.notes.items[0].pitch = 15;
+    try std.testing.expect(app.nudgeSelectedNotesExact(0, -12));
+    try std.testing.expectEqual(@as(i32, 3), app.notes.items[0].pitch);
+    try std.testing.expectEqual(@as(i32, 8), app.notes.items[1].pitch);
+
+    // 未选中 / 零位移 → false
+    app.clearNoteSelection();
+    try std.testing.expect(!app.nudgeSelectedNotesExact(0, 12));
+    try std.testing.expect(!app.nudgeSelectedNotesExact(0, 0));
 }

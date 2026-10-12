@@ -752,7 +752,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
 
     // 纵向滚动：滚轮（主区）+ 右侧纵向滚动条
     const content_h: i32 = @intCast(app.track_items.len * @as(usize, @intCast(track_h)));
-    if (ui.hitRect(main_x, tracks_y, main_w, tracks_h)) {
+    // 中键拖动中：屏蔽滚轮（含 Ctrl/Shift 缩放）——缩放会让锚定比例失准、
+    // 拖动跟随抽动（用户约定：拖动期间只平移，不缩放）
+    if (!app.playlist.nav_active and ui.hitRect(main_x, tracks_y, main_w, tracks_h)) {
         if (ui.wheel_ctrl) {
             // Ctrl+滚轮：横向缩放（锚定鼠标下的内容）+ 内容区拉回
             // 注：拉回**无条件执行**（不只在 zoom 变化时）——
@@ -769,8 +771,43 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             // 缩小/已到下限：把视口右缘拉回内容跨度内（全装得下 → 贴左）
             const vcw: i32 = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(view_w)) / app.playlist.zoom)));
             app.playlist.scroll_x = Ui.clampScrollToSpan(app.playlist.scroll_x, vcw, content_span);
+        } else if (ui.wheel_shift) {
+            // Shift+滚轮：**纵向缩放**（轨道行高；锚定鼠标下的轨道）
+            const old_h = app.playlist.track_h;
+            const new_h = std.math.clamp(old_h + ui.wheel * 2, util.track_h_min, util.track_h_max);
+            if (new_h != old_h) {
+                app.playlist.track_h = new_h;
+                const content_h_new: i32 = @intCast(app.track_items.len * @as(usize, @intCast(new_h)));
+                app.playlist.scroll = Ui.zoomAnchoredScrollY(app.playlist.scroll, tracks_h, ui.mouse_y - tracks_y, old_h, new_h, content_h_new);
+            }
         } else {
             app.playlist.scroll = std.math.clamp(app.playlist.scroll - util.scrollDelta(ui), 0, @max(0, content_h - tracks_h));
+        }
+    }
+    // ── 中键拖动：平移视口（抓画布：内容跟手；标尺/轨道区均可起手）──
+    {
+        const pl = &app.playlist;
+        if (!pl.nav_active and ui.mouse_middle_pressed and
+            util.hitUI(ui, lane_x, ruler_y, view_w, tracks_y + tracks_h - ruler_y))
+        {
+            pl.nav_active = true;
+            pl.nav_mx = ui.mouse_x;
+            pl.nav_my = ui.mouse_y;
+            pl.nav_scroll_x0 = pl.scroll_x;
+            pl.nav_scroll_y0 = pl.scroll;
+        }
+        if (pl.nav_active) {
+            if (!ui.mouse_middle_down) {
+                pl.nav_active = false;
+            } else {
+                // 从**原点**重算（拖出范围后回拖立即响应，不会积累死区）；
+                // 钳制与各自的滚轮/缩放路径同一公式。
+                const vcw: i32 = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(view_w)) / pl.zoom)));
+                // 屏幕位移 → 内容像素（/zoom）——“鼠标移 1px、内容移 1px”的 1:1
+                const dx_c = util.screenToContentPx(ui.mouse_x - pl.nav_mx, pl.zoom);
+                pl.scroll_x = Ui.clampScrollToSpan(pl.nav_scroll_x0 - dx_c, vcw, content_span);
+                pl.scroll = std.math.clamp(pl.nav_scroll_y0 - (ui.mouse_y - pl.nav_my), 0, @max(0, content_h - tracks_h));
+            }
         }
     }
     _ = ui.scrollbarV(9, sb_x, tracks_y, ruler_h, tracks_h, &app.playlist.scroll, content_h, tracks_h);
