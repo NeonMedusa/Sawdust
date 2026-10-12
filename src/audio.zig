@@ -26,6 +26,10 @@ pub const mixer_channels = 32;
 pub const effect_slots = 16;
 /// 每槽 EQ 段数（与 eq.band_count 一致）
 pub const eq_bands = eq.band_count;
+/// 鼓组每乐器的**层槽位上限**（槽位 = 一份合成器参数 + 绑定的音高；
+/// 一个垫的多层占多个槽位；见 `docs/drumkit.md` §3.2/3.3）。
+/// 内存：层声部池 32 声部 ≈ 9.6KB/层 → 16 层 ≈ 155KB/套（预分配大块）。
+pub const kit_max_layers = 16;
 
 /// UI ↔ 音频线程共享的参数（原子，无锁）
 pub const Params = struct {
@@ -73,6 +77,40 @@ pub const Params = struct {
     },
     /// 每乐器路由到的调音台通道（0..mixer_channels-1；UI 每帧同步）
     instrument_channel: [synth.max_instruments]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** synth.max_instruments,
+
+    // ── 鼓组（每乐器：类型 + 层列表；UI 每帧同步）──
+    /// 乐器类型（0 = synth / 1 = drumkit）
+    instrument_kind: [synth.max_instruments]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** synth.max_instruments,
+    /// 鼓组层数（≤ kit_max_layers）
+    kit_layer_count: [synth.max_instruments]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** synth.max_instruments,
+    /// 鼓组层 → 音高（on 事件按音高分发到匹配层）。
+    /// 注：off **不查它**——直接对全部层 noteOff（防“响着改映射”漏 off 悬挂）。
+    kit_layer_pitch: [synth.max_instruments][kit_max_layers]std.atomic.Value(u32) = blk: {
+        @setEvalBranchQuota(10000);
+        var a: [synth.max_instruments][kit_max_layers]std.atomic.Value(u32) = undefined;
+        for (&a) |*row| {
+            for (row) |*v| v.* = std.atomic.Value(u32).init(0);
+        }
+        break :blk a;
+    },
+    /// 鼓组层增益（多层叠加的配比）
+    kit_layer_gain: [synth.max_instruments][kit_max_layers]std.atomic.Value(f32) = blk: {
+        @setEvalBranchQuota(10000);
+        var a: [synth.max_instruments][kit_max_layers]std.atomic.Value(f32) = undefined;
+        for (&a) |*row| {
+            for (row) |*v| v.* = std.atomic.Value(f32).init(1.0);
+        }
+        break :blk a;
+    },
+    /// 鼓组层合成器参数指针（层本体；UI 持有并保证地址稳定）
+    kit_layer_params: [synth.max_instruments][kit_max_layers]std.atomic.Value(?*synth.SynthParams) = blk: {
+        @setEvalBranchQuota(10000);
+        var a: [synth.max_instruments][kit_max_layers]std.atomic.Value(?*synth.SynthParams) = undefined;
+        for (&a) |*row| {
+            for (row) |*v| v.* = std.atomic.Value(?*synth.SynthParams).init(null);
+        }
+        break :blk a;
+    },
 
     // ── 调音台：每通道参数（UI 写、音频线程读）──
     /// 通道增益（0-1）
@@ -141,6 +179,12 @@ pub const Engine = struct {
     initialized: bool = false,
     /// 每乐器一个声部池（**仅音频线程访问**；堆分配——32 池 × 256 声部体积可观）
     synths: []synth.Synth = &.{},
+    /// 鼓组层声部池（**预分配大块**：max_instruments × kit_max_layers；
+    /// 索引 = `i * kit_max_layers + l`）。启动一次分配——无生命周期管理
+    /// （层槽位复用：层数/参数变时旧声部自然 release，无需释放池）。
+    kit_synths: []synth.KitLayerSynth = &.{},
+    /// 每乐器上一帧的类型（类型切换边沿 → 两个池都全释音，防悬挂）
+    last_kind: [synth.max_instruments]u32 = [_]u32{0} ** synth.max_instruments,
     /// 已取但未到时的调度事件（stash；按步序保留，到时再触发）
     stash: [synth.sched_drain_max]synth.SchedEvent = undefined,
     stash_n: usize = 0,
@@ -173,6 +217,9 @@ pub const Engine = struct {
         self.allocator = allocator;
         self.synths = try allocator.alloc(synth.Synth, synth.max_instruments);
         for (self.synths) |*s| s.* = .{};
+        // 鼓组层声部池（预分配大块；≈32×16 × 9.6KB ≈ 5MB，一次分配）
+        self.kit_synths = try allocator.alloc(synth.KitLayerSynth, synth.max_instruments * kit_max_layers);
+        for (self.kit_synths) |*s| s.* = .{};
         // 调音台缓冲（堆分配——体积大不能放栈）
         self.chan_bufs = try allocator.alloc(f32, mixer_channels * 2 * 4096);
         @memset(self.chan_bufs, 0);
@@ -209,6 +256,10 @@ pub const Engine = struct {
             self.allocator.free(self.synths);
             self.synths = &.{};
         }
+        if (self.kit_synths.len > 0) {
+            self.allocator.free(self.kit_synths);
+            self.kit_synths = &.{};
+        }
         if (self.chan_bufs.len > 0) {
             self.allocator.free(self.chan_bufs);
             self.chan_bufs = &.{};
@@ -220,13 +271,22 @@ pub const Engine = struct {
     }
 };
 
-/// 传输边沿处理：**暂停时释放全部声部**。
+/// 释放**两个声部池**的全部声部（合成器 + 鼓组层）——暂停下降沿/跳转作废/
+/// 全体释音（all_off）共用。
+/// 注：漏掉 `kit_synths` 是实测 bug——暂停后鼓组的音会一直响到停止
+/// （旧代码只遍历了 `synths`）。
+fn releaseAllVoices(engine: *Engine) void {
+    for (engine.synths) |*s| synth.allOff(s);
+    for (engine.kit_synths) |*s| synth.allOff(s);
+}
+
+/// 传输边沿处理：**暂停时释放全部声部**（两个池）。
 /// 否则已发声的声部会永远停在 ADSR 的 sustain 段（实测 bug：暂停后音符一直响）。
 /// 放在音频层（而非 UI）——任何把 playing 置 false 的路径都会生效。
 /// 释音后的尾音仍会被渲染（非播放路径照常 render）。
 pub fn transportEdge(engine: *Engine, playing: bool) void {
     if (!playing and engine.was_playing) {
-        for (engine.synths) |*s| synth.allOff(s);
+        releaseAllVoices(engine);
     }
     engine.was_playing = playing;
 }
@@ -247,7 +307,7 @@ fn handleGenChange(engine: *Engine, gen: u32, was_playing: bool) void {
     engine.stash_n = 0;
     engine.stash_gen = gen;
     if (was_playing) {
-        for (engine.synths) |*s| synth.allOff(s);
+        releaseAllVoices(engine);
     }
 }
 
@@ -295,7 +355,8 @@ fn schedEventObsolete(ev: synth.SchedEvent, gen: u32, edit_gen: u32, rescan_from
     return ev.edit_gen < edit_gen and ev.step >= rescan_from;
 }
 
-/// 回传“正在发声的音高”（位掩码；UI 用于播放/试听高亮）
+/// 回传“正在发声的音高”（位掩码；UI 用于播放/试听高亮）。
+/// 鼓组：各层池的并集（层与垫多对一，并集即该组当前发声的音高）。
 fn publishSounding(engine: *Engine, params: *Params) void {
     for (0..synth.max_instruments) |i| {
         if (params.synth_ptrs[i].load(.monotonic) == null) {
@@ -315,18 +376,59 @@ fn publishSounding(engine: *Engine, params: *Params) void {
                 hi |= @as(u64, 1) << @intCast(p - 64);
             }
         }
+        // 鼓组层池（未用到的池全空闲，扫描成本低）
+        const kbase = i * kit_max_layers;
+        for (0..kit_max_layers) |l| {
+            for (engine.kit_synths[kbase + l].voices) |v| {
+                if (!synth.isSounding(&v)) continue;
+                const p = v.pitch;
+                if (p < 0 or p > 127) continue;
+                if (p < 64) {
+                    lo |= @as(u64, 1) << @intCast(p);
+                } else {
+                    hi |= @as(u64, 1) << @intCast(p - 64);
+                }
+            }
+        }
         params.sounding_lo[i].store(lo, .monotonic);
         params.sounding_hi[i].store(hi, .monotonic);
     }
 }
 
-/// 触发一个调度事件（音频线程）
-fn fireSched(engine: *Engine, ev: synth.SchedEvent) void {
+/// 触发一个音符事件（音频线程；`SchedEvent` / `NoteEvent` 均可——字段兼容）。
+/// **鼓组分支**：on 按音高分发到匹配层；off **不查映射**直接对所有层——
+/// 防“响着时改映射”漏 off → 悬挂（与调音台教训一致）。
+fn dispatchNote(engine: *Engine, ev: anytype) void {
     if (ev.instrument >= synth.max_instruments) return;
+    const params = engine.params;
+    const is_kit = params.instrument_kind[ev.instrument].load(.monotonic) == 1;
+    const base = @as(usize, ev.instrument) * kit_max_layers;
     switch (ev.kind) {
-        .on => synth.noteOn(&engine.synths[ev.instrument], ev.pitch, ev.velocity, ev.pan),
-        .off => synth.noteOff(&engine.synths[ev.instrument], ev.pitch),
-        .all_off => for (engine.synths) |*s| synth.allOff(s),
+        .on => {
+            if (is_kit) {
+                const n_layers = @min(params.kit_layer_count[ev.instrument].load(.monotonic), kit_max_layers);
+                for (0..n_layers) |l| {
+                    if (params.kit_layer_pitch[ev.instrument][l].load(.monotonic) != ev.pitch) continue;
+                    synth.noteOn(&engine.kit_synths[base + l], ev.pitch, ev.velocity, ev.pan);
+                }
+            } else {
+                synth.noteOn(&engine.synths[ev.instrument], ev.pitch, ev.velocity, ev.pan);
+            }
+        },
+        .off => {
+            if (is_kit) {
+                // 全部层都收 off（无关层空转——防漏 off）
+                const n_layers = @min(params.kit_layer_count[ev.instrument].load(.monotonic), kit_max_layers);
+                for (0..n_layers) |l| synth.noteOff(&engine.kit_synths[base + l], ev.pitch);
+                // 类型刚切走的边角：synth 池也发一份（空转无害）
+                synth.noteOff(&engine.synths[ev.instrument], ev.pitch);
+            } else {
+                synth.noteOff(&engine.synths[ev.instrument], ev.pitch);
+            }
+        },
+        .all_off => {
+            releaseAllVoices(engine);
+        },
     }
 }
 
@@ -362,7 +464,19 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
         const sp = params.synth_ptrs[i].load(.monotonic) orelse continue;
         const ch: usize = @min(params.instrument_channel[i].load(.monotonic), if (n_ch > 0) n_ch - 1 else 0);
         const g = params.instrument_gain[i].load(.monotonic); // 乐器音量×静音（推子前）
-        synth.render(sp, &engine.synths[i], @ptrCast(&engine.chan_bufs[ch * buf_stride]), frames, sr, g, true);
+        const cbuf: [*]f32 = @ptrCast(&engine.chan_bufs[ch * buf_stride]);
+        if (params.instrument_kind[i].load(.monotonic) == 1) {
+            // 鼓组：逐层渲染叠加进同一通道缓冲（整组走同一调音台链）
+            const n_layers = @min(params.kit_layer_count[i].load(.monotonic), kit_max_layers);
+            const base = i * kit_max_layers;
+            for (0..n_layers) |l| {
+                const lp = params.kit_layer_params[i][l].load(.monotonic) orelse continue;
+                const lg = params.kit_layer_gain[i][l].load(.monotonic);
+                synth.render(lp, &engine.kit_synths[base + l], cbuf, frames, sr, g * lg, true);
+            }
+        } else {
+            synth.render(sp, &engine.synths[i], cbuf, frames, sr, g, true);
+        }
     }
 
     // 3) 逐通道：效果链 → 增益（含通道静音）→ 等功率声像 → 累加到主输出
@@ -497,6 +611,20 @@ fn analyzeSpectrum(engine: *Engine, params: *Params, sr: f32) void {
     params.spec_version.store(ver +% 1, .monotonic);
 }
 
+/// 乐器**类型切换边沿**：两个声部池都全释音
+/// （切 synth ⇄ drumkit 时旧类型的声部不能继续响——防悬挂）
+fn applyKindEdges(engine: *Engine) void {
+    const params = engine.params;
+    for (0..synth.max_instruments) |i| {
+        const k = params.instrument_kind[i].load(.monotonic);
+        if (k == engine.last_kind[i]) continue;
+        engine.last_kind[i] = k;
+        synth.allOff(&engine.synths[i]);
+        const kbase = i * kit_max_layers;
+        for (0..kit_max_layers) |l| synth.allOff(&engine.kit_synths[kbase + l]);
+    }
+}
+
 /// 音频回调（实时线程）：多乐器合成 + 序列器精确触发。
 /// 严格约束：无分配、无锁、无阻塞。
 fn dataCallback(
@@ -513,19 +641,16 @@ fn dataCallback(
     const sr: f32 = @floatFromInt(device.?.sampleRate);
     const sr_u64: u64 = device.?.sampleRate;
 
-    // 1) 立即事件（试听 / all_off）
+    // 1) 立即事件（试听 / all_off）——与调度事件共用分发（含鼓组分支）
     var evbuf: [synth.drain_max]synth.NoteEvent = undefined;
     const n_imm = params.events.drain(&evbuf);
-    for (evbuf[0..n_imm]) |ev| {
-        switch (ev.kind) {
-            .on => if (ev.instrument < synth.max_instruments) synth.noteOn(&engine.synths[ev.instrument], ev.pitch, ev.velocity, ev.pan),
-            .off => if (ev.instrument < synth.max_instruments) synth.noteOff(&engine.synths[ev.instrument], ev.pitch),
-            .all_off => for (engine.synths) |*s| synth.allOff(s),
-        }
-    }
+    for (evbuf[0..n_imm]) |ev| dispatchNote(engine, ev);
 
     // 2) 清空输出（之后按分段叠加渲染）
     @memset(out[0 .. @as(usize, frames) * 2], 0);
+
+    // 2.1) 乐器**类型切换边沿**：两个声部池都全释音
+    applyKindEdges(engine);
 
     const master = params.volume.load(.monotonic);
     const playing = params.playing.load(.monotonic);
@@ -586,7 +711,7 @@ fn dataCallback(
             (@as(i64, ev.step) - @as(i64, start_step)) * @as(i64, @intCast(step_frames));
         const cur: i64 = @as(i64, @intCast(abs0)) + @as(i64, done);
         if (ev_frame <= cur) {
-            fireSched(engine, ev); // 已到时（含“起播前就应触发”的补发事件）
+            dispatchNote(engine, ev); // 已到时（含“起播前就应触发”的补发事件）
             si += 1;
             continue;
         }
@@ -798,6 +923,34 @@ test "audio: 暂停边沿释放全部声部（修“暂停后音符一直响”�
     try std.testing.expectEqual(@as(usize, 0), synth.activeCount(&engine.synths[0]));
 }
 
+test "audio: 暂停/跳转边沿也释放鼓组层池（修“暂停后鼓声一直响到停止”）" {
+    const alloc = std.testing.allocator;
+    var env: KitTestEnv = undefined;
+    try env.init(alloc, false);
+    defer env.deinit(alloc);
+    const engine = &env.engine;
+
+    var lp0 = synth.SynthParams{};
+    lp0.release.store(0.0, .monotonic); // 1ms 释音
+    env.setLayers(&.{35}, &.{&lp0});
+    var buf: [4800 * 2]f32 = undefined; // 0.1s @ 48k
+
+    // ① 暂停下降沿：鼓组层进入释音（旧代码只释放 synths → 鼓声悬挂）
+    dispatchNote(engine, synth.NoteEvent{ .kind = .on, .pitch = 35, .instrument = 0 });
+    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(&engine.kit_synths[0]));
+    engine.was_playing = true;
+    transportEdge(engine, false);
+    synth.render(&lp0, &engine.kit_synths[0], &buf, 4800, 48000, 1.0, false);
+    try std.testing.expectEqual(@as(usize, 0), synth.activeCount(&engine.kit_synths[0]));
+
+    // ② 跳转（gen 变化且播放中）：同样释放层池
+    dispatchNote(engine, synth.NoteEvent{ .kind = .on, .pitch = 35, .instrument = 0 });
+    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(&engine.kit_synths[0]));
+    handleGenChange(engine, engine.stash_gen + 1, true);
+    synth.render(&lp0, &engine.kit_synths[0], &buf, 4800, 48000, 1.0, false);
+    try std.testing.expectEqual(@as(usize, 0), synth.activeCount(&engine.kit_synths[0]));
+}
+
 test "audio: 频谱取自目标效果器输入（非主输出全混）" {
     const alloc = std.testing.allocator;
     var params = Params{};
@@ -887,4 +1040,219 @@ test "audio: 频谱取自目标效果器输入（非主输出全混）" {
     @memset(&out, 0);
     renderSegment(&engine, &params, &out, 8, 48000, 1.0);
     try std.testing.expectEqual(@as(usize, 1), engine.spec_pos); // 8/8（新目标从头开始）
+}
+
+// ── 鼓组（阶段 2）──
+
+/// 鼓组测试的公共搭建：分配两个声部池 + 最小引擎缓冲。
+/// **必须原地初始化**（`env.init(...)`）——`engine.params` 指向 `env` 自身，
+/// 按值返回会让指针悬空到已死的栈帧（实测：所有断言读不到参数）。
+const KitTestEnv = struct {
+    params: Params = .{},
+    engine: Engine = undefined,
+
+    fn init(self: *KitTestEnv, alloc: std.mem.Allocator, with_bufs: bool) !void {
+        self.* = .{};
+        self.engine = Engine{ .params = &self.params };
+        self.engine.synths = try alloc.alloc(synth.Synth, 1);
+        self.engine.synths[0] = .{};
+        self.engine.kit_synths = try alloc.alloc(synth.KitLayerSynth, synth.max_instruments * kit_max_layers);
+        for (self.engine.kit_synths) |*s| s.* = .{};
+        if (with_bufs) {
+            self.engine.chan_bufs = try alloc.alloc(f32, mixer_channels * 2 * 4096);
+            self.engine.slot_eq = try alloc.alloc(eq.Biquad, mixer_channels * effect_slots * eq_bands * 2);
+            @memset(self.engine.slot_eq, .{});
+        }
+    }
+
+    fn deinit(self: *KitTestEnv, alloc: std.mem.Allocator) void {
+        alloc.free(self.engine.synths);
+        alloc.free(self.engine.kit_synths);
+        if (self.engine.chan_bufs.len > 0) alloc.free(self.engine.chan_bufs);
+        if (self.engine.slot_eq.len > 0) alloc.free(self.engine.slot_eq);
+    }
+
+    /// 组 0 设为鼓组；槽位按 (音高, 参数) 逐对写入
+    fn setLayers(self: *KitTestEnv, pitches: []const u32, lps: []const *synth.SynthParams) void {
+        self.params.instrument_kind[0].store(1, .monotonic);
+        self.params.kit_layer_count[0].store(@intCast(lps.len), .monotonic);
+        for (pitches, 0..) |p, i| {
+            self.params.kit_layer_pitch[0][i].store(p, .monotonic);
+            self.params.kit_layer_gain[0][i].store(1.0, .monotonic);
+            self.params.kit_layer_params[0][i].store(lps[i], .monotonic);
+        }
+    }
+};
+
+test "audio: 鼓组——on 按音高分发（同音多层全触发）、off 全层、高亮并集" {
+    const alloc = std.testing.allocator;
+    var env: KitTestEnv = undefined;
+    try env.init(alloc, false);
+    defer env.deinit(alloc);
+
+    var lp0 = synth.SynthParams{};
+    var lp1 = synth.SynthParams{};
+    var lp2 = synth.SynthParams{};
+    var gate = synth.SynthParams{};
+    env.setLayers(&.{ 35, 35, 38 }, &.{ &lp0, &lp1, &lp2 });
+    env.params.synth_ptrs[0].store(&gate, .monotonic); // 高亮回传的门槛
+
+    // on 35 → 槽位 0/1（同音高两层）都触发；槽位 2（38）不动
+    dispatchNote(&env.engine, synth.NoteEvent{ .kind = .on, .pitch = 35, .instrument = 0 });
+    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(&env.engine.kit_synths[0]));
+    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(&env.engine.kit_synths[1]));
+    try std.testing.expectEqual(@as(usize, 0), synth.activeCount(&env.engine.kit_synths[2]));
+
+    // 高亮并集：35；再响 38 → 两位都置
+    publishSounding(&env.engine, &env.params);
+    try std.testing.expect(env.params.sounding_lo[0].load(.monotonic) & (@as(u64, 1) << 35) != 0);
+    dispatchNote(&env.engine, synth.NoteEvent{ .kind = .on, .pitch = 38, .instrument = 0 });
+    publishSounding(&env.engine, &env.params);
+    try std.testing.expect(env.params.sounding_lo[0].load(.monotonic) & (@as(u64, 1) << 38) != 0);
+
+    // off 35：**全层**都收到（不查映射）——槽位 0/1 释放、槽位 2 不受影响
+    dispatchNote(&env.engine, synth.NoteEvent{ .kind = .off, .pitch = 35, .instrument = 0 });
+    var buf: [4800 * 2]f32 = undefined;
+    synth.render(&lp0, &env.engine.kit_synths[0], &buf, 4800, 48000, 1.0, false);
+    synth.render(&lp1, &env.engine.kit_synths[1], &buf, 4800, 48000, 1.0, false);
+    try std.testing.expectEqual(@as(usize, 0), synth.activeCount(&env.engine.kit_synths[0]));
+    try std.testing.expectEqual(@as(usize, 0), synth.activeCount(&env.engine.kit_synths[1]));
+    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(&env.engine.kit_synths[2])); // 38 仍在响
+}
+
+test "audio: 鼓组——响着时改映射，off 仍全层下发（防漏 off 悬挂）" {
+    const alloc = std.testing.allocator;
+    var env: KitTestEnv = undefined;
+    try env.init(alloc, false);
+    defer env.deinit(alloc);
+
+    var lp0 = synth.SynthParams{};
+    var lp1 = synth.SynthParams{};
+    env.setLayers(&.{ 35, 38 }, &.{ &lp0, &lp1 });
+
+    // on 35 → 槽位 0 发声
+    dispatchNote(&env.engine, synth.NoteEvent{ .kind = .on, .pitch = 35, .instrument = 0 });
+    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(&env.engine.kit_synths[0]));
+
+    // 响着时改映射：槽位 0 改成 36（模拟用户编辑）——old 35 声部还在响
+    env.params.kit_layer_pitch[0][0].store(36, .monotonic);
+
+    // off 35：不查映射 → 槽位 0 的 35 声部照常收到 noteOff → 释放
+    // （若 off 查映射，这里会漏 → 悬挂，正是实测教训的模式）
+    dispatchNote(&env.engine, synth.NoteEvent{ .kind = .off, .pitch = 35, .instrument = 0 });
+    var buf: [4800 * 2]f32 = undefined;
+    synth.render(&lp0, &env.engine.kit_synths[0], &buf, 4800, 48000, 1.0, false);
+    try std.testing.expectEqual(@as(usize, 0), synth.activeCount(&env.engine.kit_synths[0]));
+}
+
+test "audio: 鼓组——类型切换边沿释放两个池（防切类型悬挂）" {
+    const alloc = std.testing.allocator;
+    var env: KitTestEnv = undefined;
+    try env.init(alloc, false);
+    defer env.deinit(alloc);
+    const engine = &env.engine;
+    const params = &env.params;
+
+    var sp = synth.SynthParams{};
+    var lp0 = synth.SynthParams{};
+    var buf: [4800 * 2]f32 = undefined;
+
+    // synth 池发声 → kind 0 → 1（合成器切成鼓组）→ 边沿释放 synth 池
+    synth.noteOn(&engine.synths[0], 60, synth.default_velocity, synth.default_pan);
+    params.instrument_kind[0].store(1, .monotonic);
+    applyKindEdges(engine);
+    synth.render(&sp, &engine.synths[0], &buf, 4800, 48000, 1.0, false);
+    try std.testing.expectEqual(@as(usize, 0), synth.activeCount(&engine.synths[0]));
+
+    // 鼓组层发声 → kind 1 → 0（鼓组切回合成器）→ 边沿释放层池
+    var gate = synth.SynthParams{};
+    env.setLayers(&.{35}, &.{&lp0});
+    params.synth_ptrs[0].store(&gate, .monotonic);
+    dispatchNote(engine, synth.NoteEvent{ .kind = .on, .pitch = 35, .instrument = 0 });
+    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(&engine.kit_synths[0]));
+    params.instrument_kind[0].store(0, .monotonic);
+    applyKindEdges(engine);
+    synth.render(&lp0, &engine.kit_synths[0], &buf, 4800, 48000, 1.0, false);
+    try std.testing.expectEqual(@as(usize, 0), synth.activeCount(&engine.kit_synths[0]));
+
+    // **只处理边沿**：kind 未变时重复调用不误杀试听声部
+    synth.noteOn(&engine.synths[0], 64, synth.default_velocity, synth.default_pan);
+    applyKindEdges(engine);
+    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(&engine.synths[0]));
+}
+
+test "audio: 鼓组——渲染进通道缓冲（绑定音高有声、未绑定全静音）" {
+    const alloc = std.testing.allocator;
+    const energy = struct {
+        fn run(alloc_: std.mem.Allocator, pitch: u8) !f64 {
+            var env: KitTestEnv = undefined;
+            try env.init(alloc_, true);
+            defer env.deinit(alloc_);
+            const engine = &env.engine;
+            const params = &env.params;
+
+            var lp0 = synth.SynthParams{};
+            var gate = synth.SynthParams{};
+            params.channel_count.store(1, .monotonic);
+            params.volume.store(1.0, .monotonic);
+            params.synth_ptrs[0].store(&gate, .monotonic);
+            params.instrument_channel[0].store(0, .monotonic);
+            params.instrument_gain[0].store(1.0, .monotonic);
+            env.setLayers(&.{35}, &.{&lp0});
+
+            dispatchNote(engine, synth.NoteEvent{ .kind = .on, .pitch = pitch, .instrument = 0 });
+            var out: [1024 * 2]f32 = undefined;
+            var total: f64 = 0;
+            var i: usize = 0;
+            while (i < 8) : (i += 1) {
+                @memset(&out, 0);
+                renderSegment(engine, params, &out, 1024, 48000, 1.0);
+                for (out) |s| total += @as(f64, s) * s;
+            }
+            return total;
+        }
+    }.run;
+
+    try std.testing.expect(try energy(alloc, 35) > 1.0); // 绑定音高 → 有声
+    try std.testing.expectEqual(@as(f64, 0), try energy(alloc, 60)); // 未绑定 → 全静音
+}
+
+test "audio: 鼓组——层增益生效（渲染能量随 gain 放大）" {
+    const alloc = std.testing.allocator;
+    const energy = struct {
+        fn run(alloc_: std.mem.Allocator, gain: f32) !f64 {
+            var env: KitTestEnv = undefined;
+            try env.init(alloc_, true);
+            defer env.deinit(alloc_);
+            const engine = &env.engine;
+            const params = &env.params;
+
+            var lp0 = synth.SynthParams{};
+            var gate = synth.SynthParams{};
+            params.channel_count.store(1, .monotonic);
+            params.volume.store(1.0, .monotonic);
+            params.synth_ptrs[0].store(&gate, .monotonic);
+            params.instrument_channel[0].store(0, .monotonic);
+            params.instrument_gain[0].store(1.0, .monotonic);
+            env.setLayers(&.{35}, &.{&lp0});
+            params.kit_layer_gain[0][0].store(gain, .monotonic);
+
+            dispatchNote(engine, synth.NoteEvent{ .kind = .on, .pitch = 35, .instrument = 0 });
+            var out: [1024 * 2]f32 = undefined;
+            var total: f64 = 0;
+            var i: usize = 0;
+            while (i < 8) : (i += 1) {
+                @memset(&out, 0);
+                renderSegment(engine, params, &out, 1024, 48000, 1.0);
+                for (out) |s| total += @as(f64, s) * s;
+            }
+            return total;
+        }
+    }.run;
+
+    const e_full = try energy(alloc, 1.0);
+    const e_half = try energy(alloc, 0.5);
+    // 能量 ∝ gain²（0.5² = 0.25）——软削波引入少量偏差，放宽到 ±20%
+    try std.testing.expect(e_full > 1.0);
+    try std.testing.expect(@abs(e_half / e_full - 0.25) < 0.05);
 }

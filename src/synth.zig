@@ -246,16 +246,28 @@ pub const Voice = struct {
     rng: u32 = 0x9E3779B9,
 };
 
-/// 声部池 + 渲染状态（**每乐器一个**；仅音频线程访问）
-pub const Synth = struct {
-    voices: [max_voices]Voice = [_]Voice{.{}} ** max_voices,
-    /// 主音量平滑（防 zipper 噪声）
-    smoothed_master: f32 = 0,
-    /// 声部分配的轮转起点（避免每次从头扫描）
-    next_voice: usize = 0,
-    /// 音符序号（声部偷取时的年龄依据）
-    note_counter: u64 = 0,
-};
+/// 声部池 + 渲染状态（**每乐器一个**；仅音频线程访问）。
+///
+/// **泛型化**：声部数作为编译期参数——普通乐器用 `Synth`（256 声部），
+/// 鼓组层用 `KitLayerSynth`（32 声部，每层一池——池小才能堆多层）。
+/// 泛型化动机：`Voice` 含 `phase[4][16]f32` ≈ 300B/声部；256 声部 ≈ 85KB
+/// 每池，16 层鼓组按整池算 1.36MB；小池 → 9.6KB/层。
+pub fn SynthN(comptime voice_count: usize) type {
+    return struct {
+        voices: [voice_count]Voice = [_]Voice{.{}} ** voice_count,
+        /// 主音量平滑（防 zipper 噪声）
+        smoothed_master: f32 = 0,
+        /// 声部分配的轮转起点（避免每次从头扫描）
+        next_voice: usize = 0,
+        /// 音符序号（声部偷取时的年龄依据）
+        note_counter: u64 = 0,
+    };
+}
+
+/// 普通乐器声部池（复音数见 `max_voices`）
+pub const Synth = SynthN(max_voices);
+/// 鼓组层声部池（每层一个；击奏类同时发声少，32 足够）
+pub const KitLayerSynth = SynthN(32);
 
 /// MIDI 音高 → 频率（Hz）；A4 = 440Hz
 pub fn pitchHz(pitch: i32) f32 {
@@ -301,13 +313,15 @@ inline fn waveAt(w: Waveform, phase: f32, rng: *u32) f32 {
     };
 }
 
-/// 找空闲声部（轮转扫描）；无空闲时偷取最旧的声部
-fn allocVoice(state: *Synth) *Voice {
+/// 找空闲声部（轮转扫描）；无空闲时偷取最旧的声部。
+/// `state` 泛型（`Synth` / `KitLayerSynth` 均可——声部数从类型推导）
+fn allocVoice(state: anytype) *Voice {
+    const n = state.voices.len;
     var k: usize = 0;
-    while (k < max_voices) : (k += 1) {
-        const idx = (state.next_voice + k) % max_voices;
+    while (k < n) : (k += 1) {
+        const idx = (state.next_voice + k) % n;
         if (state.voices[idx].env_stage == .idle) {
-            state.next_voice = (idx + 1) % max_voices;
+            state.next_voice = (idx + 1) % n;
             return &state.voices[idx];
         }
     }
@@ -322,7 +336,7 @@ fn allocVoice(state: *Synth) *Voice {
 /// 音符开（分配声部）——公开：音频回调按事件路由调用。
 /// `velocity`：1-127（钳制；0 按 1 处理——力度 0 = 静音是 MIDI 的 note-on
 /// 退化语义，本项目不做）；`pan`：0-127（64 = 居中）。
-pub fn noteOn(state: *Synth, pitch: u8, velocity: u8, pan: u8) void {
+pub fn noteOn(state: anytype, pitch: u8, velocity: u8, pan: u8) void {
     state.note_counter += 1;
     const v = allocVoice(state);
     v.pitch = pitch;
@@ -355,7 +369,7 @@ pub fn noteOn(state: *Synth, pitch: u8, velocity: u8, pan: u8) void {
 /// 动机（重叠音符支持）：同音高允许重叠（与 MIDI 一致）。若这里释放**所有**
 /// 同音高声部，第一个 note-off 会把后一个音也掉（实测：重叠时断音）。
 /// MIDI 接收端的标准语义：note-off 匹配最早的未释放 note-on。
-pub fn noteOff(state: *Synth, pitch: u8) void {
+pub fn noteOff(state: anytype, pitch: u8) void {
     var best: ?usize = null;
     for (state.voices, 0..) |v, vi| {
         if (v.pitch != pitch or v.env_stage == .idle or v.env_stage == .release) continue;
@@ -369,7 +383,7 @@ pub fn noteOff(state: *Synth, pitch: u8) void {
 }
 
 /// 全部释音
-pub fn allOff(state: *Synth) void {
+pub fn allOff(state: anytype) void {
     for (state.voices, 0..) |_, vi| {
         const v = &state.voices[vi];
         if (v.env_stage != .idle and v.env_stage != .release) {
@@ -385,7 +399,7 @@ pub fn isSounding(v: *const Voice) bool {
 }
 
 /// 活跃声部数（供测试/调试）
-pub fn activeCount(state: *const Synth) usize {
+pub fn activeCount(state: anytype) usize {
     var n: usize = 0;
     for (state.voices) |v| {
         if (v.env_stage != .idle) n += 1;
@@ -399,7 +413,7 @@ pub fn activeCount(state: *const Synth) usize {
 /// 空闲时：`add=false` 写零，`add=true` 不动 out。
 pub fn render(
     params: *const SynthParams,
-    state: *Synth,
+    state: anytype,
     out: [*]f32,
     frames: u32,
     sample_rate: f32,

@@ -40,7 +40,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
     // （否则菜单项点击会穿透到下面的行/按钮）。
     // 注意：**不覆盖**“被上层窗口屏蔽”的状态（那是 beginLayer 算的；
     // 上面用 or 合幷而不直接赋值）。
-    const menu_modal = menu_was_open or app.rack.menu_open or app.rack.ctx_instrument != null;
+    const menu_modal = menu_was_open or app.rack.ctx_instrument != null;
     if (menu_modal) ui.input_blocked = true;
 
     // 窗口阴影 + 背景 + 边框
@@ -59,7 +59,6 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
     ui.label("×", close_x + 6, title_y + 4, ui.theme.text);
     if (close_hovered and ui.mouse_pressed) {
         rk.open = false;
-        app.rack.menu_open = false;
         app.rack.ctx_instrument = null;
         return true;
     }
@@ -128,36 +127,27 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
         }
     }
 
-    // 帧首：清“刚打开”标记（共享下拉控件；必须逐帧做）
-    util.menuFrameBegin(&app.rack.menu_just_opened);
-
-    // ── 添加按钮（共享下拉控件：按钮 + 菜单）──
+    // ── 添加按钮：直接打开**预设面板**（统一插件+预设选择器）──
     // 左右各留 5px 边距（原 1px）
     const add_pad: i32 = 5;
     const add_x = x + add_pad;
     const add_y = y + hh - add_btn_h - add_pad;
     const add_w = ww - add_pad * 2;
-    util.menuButton(ui, "+ 添加乐器", add_x, add_y, add_w, add_btn_h, &app.rack.menu_open, &app.rack.menu_just_opened);
-
-    // 下拉菜单（插件列表；菜单层：展开时取消屏蔽——菜单项用直接坐标命中）
-    if (app.rack.menu_open) {
-        ui.input_blocked = false;
-        const menu_items = [_][]const u8{ "减法合成器 (Subtractive)", "采样器 (Sampler)", "FM 合成器" };
-        const ok = [_]bool{ true, false, false };
-        if (util.menuPanel(ui, &app.rack.menu_x, &app.rack.menu_y, &app.rack.menu_open, app.rack.menu_just_opened, .{ .button = .{ .x = add_x + 8, .y = add_y, .w = add_w, .h = add_btn_h } }, .{ .x = x, .y = y, .w = ww, .h = hh }, &menu_items, 240, &ok)) |mi| {
-            if (mi == 0) {
-                _ = app.addInstrument("减法合成器");
-                app.commitHistory("添加乐器"); // 原子操作：立即提交
-            }
-        }
+    {
+        const hovered = util.hitUI(ui, add_x, add_y, add_w, add_btn_h);
+        ui.renderer.fillRect(add_x, add_y, add_w, add_btn_h, if (hovered) ui.theme.item_hover else ui.theme.slider_track);
+        ui.renderer.strokeRect(add_x, add_y, add_w, add_btn_h, ui.theme.panel_border);
+        const tw: i32 = @intFromFloat(ui.font.measure("+ 添加乐器"));
+        ui.label("+ 添加乐器", add_x + @divTrunc(add_w - tw, 2), add_y + @divTrunc(add_btn_h - 10, 2), ui.theme.text);
+        if (hovered and ui.mouse_pressed) app.openPresetBrowser(.create_instrument);
     }
 
-    // 右键菜单（重命名 / 删除乐器）——同理：仅在展开时取消屏蔽
+    // 右键菜单（重命名 / 更换乐器… / 删除乐器）——同理：仅在展开时取消屏蔽
     if (app.rack.ctx_instrument != null) ui.input_blocked = false;
     if (app.rack.ctx_instrument) |ci| {
         if (ci < app.instruments.items.len) {
-            const items = [_][]const u8{ "重命名", "删除乐器" };
-            const mw: i32 = 140;
+            const items = [_][]const u8{ "重命名", "更换乐器…", "删除乐器" };
+            const mw: i32 = 160;
             const mh: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
             const mx = app.rack.ctx_x; // 固定位置（打开时记录，不跟鼠标跑）
             const my = app.rack.ctx_y;
@@ -182,6 +172,10 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
                         app.beginRenameInstrument(ci, mx + 4, my + 4);
                     },
                     1 => {
+                        // 更换乐器 → 打开预设面板（任意插件；选中即换，保留属性）
+                        app.openPresetBrowser(.{ .change_instrument = @intCast(ci) });
+                    },
+                    2 => {
                         app.removeInstrument(ci);
                         app.commitHistory("删除乐器"); // 原子操作：立即提交
                     },
@@ -288,7 +282,8 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, x: i32, y: i32, w: i32, clip_top: i32
     }
     cx += util.rack_mix_w + 8;
 
-    // 名称（点击选中；双击打开合成器；右键删除）
+    // 名称（点击选中；双击打开编辑器；右键删除）
+    const is_kit = inst.kind == .drumkit;
     const name_w = @min(util.rack_name_w, w - (cx - x) - 10);
     const name_hovered = util.hitUI(ui, cx, y + 2, name_w, util.rack_row_h - 4);
     ui.labelClipped(inst.name, cx + 4, y + @divTrunc(util.rack_row_h - 10, 2), name_w - 8, if (selected) ui.theme.text else ui.theme.text_dim);
@@ -296,12 +291,16 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, x: i32, y: i32, w: i32, clip_top: i32
         app.setInstrument(@intCast(idx)); // 切换清选区（防跨乐器孤儿选区）
         app.rack.ctx_instrument = null;
     }
-    // 双击名称 → 打开合成器编辑器（编辑该乐器），并**置顶**（最上层）
+    // 双击名称 → 打开编辑器（合成器 → 合成器窗口；鼓组 → 鼓组编辑器）
     if (ui.mouse_double and name_hovered) {
         app.setInstrument(@intCast(idx));
-        app.synth_win.instrument = @intCast(idx);
-        app.synth_win.open = true;
-        app.bringToFront(&app.synth_win.z); // 即时反馈：打开即置顶
+        if (is_kit) {
+            app.openDrumKit(@intCast(idx)); // 含同步选择/置顶
+        } else {
+            app.synth_win.target = .{ .instrument = @intCast(idx) };
+            app.synth_win.open = true;
+            app.bringToFront(&app.synth_win.z); // 即时反馈：打开即置顶
+        }
     }
     if (name_hovered and ui.mouse_right_pressed) {
         app.rack.ctx_instrument = idx;

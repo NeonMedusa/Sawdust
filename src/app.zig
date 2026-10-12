@@ -12,6 +12,7 @@ const sequencer = @import("sequencer.zig");
 const persist = @import("persist.zig");
 const midi = @import("midi.zig");
 const eq = @import("eq.zig");
+const preset_mod = @import("preset.zig");
 
 pub const Clip = model.Clip;
 pub const Note = model.Note;
@@ -86,6 +87,107 @@ pub const PendingIntent = enum {
     open,
 };
 
+/// 预设操作的**目标**：哪个“合成器参数槽”（乐器本体 / 鼓组层 / 以新层加入垫）。
+/// 这是“合成器窗口当前编辑谁”与“预设浏览器加载到哪”的统一坐标。
+pub const PresetTarget = union(enum) {
+    /// 乐器的合成器参数（synth 类型乐器）
+    instrument: i32,
+    /// **替换**指定鼓组层的参数（合成器窗口打开该层时）
+    kit_layer_replace: KitLayerRef,
+
+    /// 鼓组层引用（乐器槽位 + 垫音高 + 层下标）
+    pub const KitLayerRef = struct { instrument: i32, pitch: u8, layer: usize };
+
+    /// 与另一个目标是否指向同一参数槽（窗口刷新/防误关用）
+    pub fn eql(a: PresetTarget, b: PresetTarget) bool {
+        if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+        return switch (a) {
+            .instrument => |i| b.instrument == i,
+            .kit_layer_replace => |r| b.kit_layer_replace.instrument == r.instrument and
+                b.kit_layer_replace.pitch == r.pitch and
+                b.kit_layer_replace.layer == r.layer,
+        };
+    }
+};
+
+/// 预设浏览器弹窗状态（**统一的插件+预设选择器**；见 `docs/drumkit.md` §5.2）
+pub const PresetBrowser = struct {
+    open: bool = false,
+    /// 选中分类序号（指向 `preset_lib.categories`；越界时锚 0）
+    cat: usize = 0,
+    /// 右栏滚动位置（px）
+    scroll: i32 = 0,
+    /// 本帧刚打开（打开的那一下点击不能马上关闭/选中条目——与菜单 `just_opened` 同一模式；
+    /// 实测 bug：点「预设 ▾」→ 同一帧被判定“点击面板外” → 面板一闪就没）
+    just_opened: bool = false,
+    /// 本次面板的意图（打开时设定；点击条目时随 `pending_preset` 排队）
+    intent: PresetIntent = .create_instrument,
+    /// 锚插件（分类 id）：replace → 要求的插件；create/change → 初始选中分类的依据
+    plugin: []const u8 = preset_mod.plugin_subtractive,
+    /// 右键菜单：右键的预设行下标（null = 未展开；仅对当前分类的预设文件行）
+    ctx: ?usize = null,
+    ctx_x: i32 = 0,
+    ctx_y: i32 = 0,
+};
+
+    /// 预设面板的**意图**（同一面板服务四条路：选预设 / 新建 / 更换 / 加层）——
+/// 决定左栏分类的可选性（`presetCategorySelectable`）与选中后的动作。
+pub const PresetIntent = union(enum) {
+    /// **替换音色**（乐器窗口「预设 ▾」）：同一面板——点其它插件 = 顺带换插件；
+    /// 层目标 = 只换该层音色（层目前仅减法，UI 已拦鼓组）
+    replace: PresetTarget,
+    /// 机架「＋ 添加乐器」：选中即新建
+    create_instrument,
+    /// 机架右键「更换乐器」：选中即换（保留乐器属性）
+    change_instrument: i32,
+    /// 鼓组垫「＋ 添加乐器」：选中即在垫上加一个该插件的乐器
+    create_kit_layer: KitPadRef,
+
+    /// 鼓垫引用（乐器槽位 + 垫音高）
+    pub const KitPadRef = struct { instrument: i32, pitch: u8 };
+};
+
+/// 面板里选中的条目：置顶默认伪预设 / 第 N 个预设文件
+pub const PresetChoice = union(enum) { default, preset: usize };
+
+/// 预设“保存为…”的**源**：参数槽（乐器本体/鼓组层）或**整组套鼓**
+pub const PresetSaveSource = union(enum) {
+    params: PresetTarget,
+    /// 整组套鼓（乐器槽位；plugin = drumkit）
+    kit: i32,
+};
+
+/// 帧末执行的预设操作（文件 IO 需 io——main 消费；分类/名字用库内索引，
+/// 不持有字符串所有权）
+pub const PresetAction = union(enum) {
+    /// 重新扫描 `data/presets/`
+    scan,
+    /// 加载（按意图落点）
+    load: struct { intent: PresetIntent, cat: usize, choice: PresetChoice },
+    /// 把指定源存为新预设（名字为原文；main 清洗后落盘）；
+    /// `overwrite` = 同名时直接替换（预填名 + 回车 → 覆写确认后重排）
+    save: struct {
+        source: PresetSaveSource,
+        name_buf: [preset_mod.max_name_len]u8,
+        name_len: usize,
+        overwrite: bool = false,
+    },
+    /// 重命名预设文件（同分类内；旧/新名都带干净副本）
+    rename: struct {
+        cat: usize,
+        old_buf: [preset_mod.max_name_len]u8,
+        old_len: usize,
+        new_buf: [preset_mod.max_name_len]u8,
+        new_len: usize,
+    },
+    /// 删除预设文件
+    delete: struct {
+        cat: usize,
+        name_buf: [preset_mod.max_name_len]u8,
+        name_len: usize,
+    },
+};
+
 /// 脏确认流程状态（拦截动作 → 自绘模态确认 → 执行）
 /// 共用场景：退出程序 / 打开其他工程（都会丢失未保存修改）
 pub const DirtyFlow = enum {
@@ -98,7 +200,28 @@ pub const DirtyFlow = enum {
 };
 
 /// 模态对话框种类（自绘；避开系统 MessageBox 的“鼠标跳默认按钮”）
-pub const ModalKind = enum { dirty_confirm };
+pub const ModalKind = enum {
+    /// 脏确认（保存/不保存/取消——退出或打开其它工程前）
+    dirty_confirm,
+    /// 预设重名 → 是否覆写（覆写/取消）
+    preset_overwrite,
+    /// 删除预设 → 确认（删除/取消）
+    preset_delete,
+};
+
+/// 待确认的覆写保存请求（确认后重新排队；取消即丢弃）
+pub const OverwriteReq = struct {
+    source: PresetSaveSource,
+    name: [preset_mod.max_name_len]u8 = undefined,
+    name_len: usize = 0,
+};
+
+/// 待确认的预设删除请求（确认后重新排队；取消即丢弃）
+pub const DeleteReq = struct {
+    cat: usize = 0,
+    name: [preset_mod.max_name_len]u8 = undefined,
+    name_len: usize = 0,
+};
 
 /// 脏确认框的用户选择
 pub const QuitChoice = enum { save, discard, cancel };
@@ -179,6 +302,9 @@ pub const PlaylistState = struct {
 };
 
 /// 钢琴卷帘视图状态
+/// 钢琴卷帘键列模式（**每乐器独立**、随工程保存；定义在 `model`）
+pub const KeyMode = model.KeyMode;
+
 pub const PianoState = struct {
     /// 当前编辑的样式序号（null = 在播放列表视图）
     pattern: ?i32 = null,
@@ -295,13 +421,8 @@ pub const RackState = struct {
     ctx_x: i32 = 0,
     ctx_y: i32 = 0,
 
-    // ── 下拉菜单 ──
-    /// 添加乐器的下拉菜单（共享控件 view_util.menu*）：四个平铺字段
-    menu_open: bool = false,
-    menu_just_opened: bool = false,
-    menu_x: i32 = 0,
-    menu_y: i32 = 0,
-    /// 右键菜单中的乐器（删除用；null = 未展开）
+    // ── 右键菜单 ──
+    /// 右键菜单中的乐器（重命名/更换/删除用；null = 未展开）
     ctx_instrument: ?usize = null,
 };
 
@@ -349,12 +470,17 @@ pub const Playback = struct {
 /// 交互：字符追加；退格删末尾一个 code point；回车 = 提交；ESC = 取消；
 /// 点击输入框外 = 提交（吞掉该次点击）。
 pub const TextInput = struct {
-    pub const Target = enum { instrument, mixer_channel, pattern };
+    pub const Target = enum { instrument, mixer_channel, pattern, preset_name, kit_pad_name, preset_rename };
 
     active: bool = false,
     target: Target = .instrument,
-    /// 目标下标（乐器槽位 / 通道序号）
+    /// 目标下标（乐器槽位 / 通道序号 / **鼓垫音高** / **预设分类序号**）
     index: usize = 0,
+    /// 目标乐器槽位（`kit_pad_name` 用；音高在 `index`）
+    instrument: i32 = -1,
+    /// 附加固定载荷（`preset_rename` 的**旧名字**；固定缓冲避免生命周期问题）
+    aux_buf: [64]u8 = [_]u8{0} ** 64,
+    aux_len: usize = 0,
     /// UTF-8 缓冲（64 字节 ≈ 21 个汉字）
     buf: [64]u8 = [_]u8{0} ** 64,
     len: usize = 0,
@@ -375,9 +501,11 @@ pub const TextInput = struct {
         return self.buf[0..self.len];
     }
 
-    /// 选区字节区间 `[lo, hi)`（null = 无选区；锚点 == 光标时也视为无选区）
+    /// 选区字节区间 `[lo, hi)`（null = 无选区；锚点 == 光标时也视为无选区）。
+    /// **防御**：锚点先鉗到 `len` 内——任何路径留下的陈旧锚点都不能让
+    /// 渲染（`textField` 用 `text[0..hi]`）越界（实测 bug 的第二道防线）。
     pub fn selection(self: *const TextInput) ?[2]usize {
-        const a = self.sel_anchor orelse return null;
+        const a = @min(self.sel_anchor orelse return null, self.len);
         if (a == self.cursor) return null;
         return .{ @min(a, self.cursor), @max(a, self.cursor) };
     }
@@ -427,8 +555,35 @@ pub const SynthWindow = struct {
     resize_h0: i32 = 0,
     resize_mx: i32 = 0,
     resize_my: i32 = 0,
-    /// 当前编辑的乐器槽位（0 起）
+    /// 当前编辑的**目标**（乐器合成器 / 鼓组层）；点击机架/鼓组编辑器设定
+    target: PresetTarget = .{ .instrument = 0 },
+};
+
+/// 鼓组编辑器（浮动窗口）状态——左音高列表 + 右垫详情（`docs/drumkit.md` §7）
+pub const DrumKitWindow = struct {
+    open: bool = false,
+    x: i32 = 400,
+    y: i32 = 150,
+    w: i32 = 680,
+    h: i32 = 460,
+    /// Z 序（见 `RackState.z` 注释）
+    z: i32 = 35,
+    grab_dx: i32 = 0,
+    grab_dy: i32 = 0,
+    resize_w0: i32 = 0,
+    resize_h0: i32 = 0,
+    resize_mx: i32 = 0,
+    resize_my: i32 = 0,
+    /// 绑定的乐器槽位（打开时设定；删除/类型变→自动关闭）
     instrument: i32 = 0,
+    /// 选中垫的音高（-1 = 未选）
+    sel_pitch: i32 = -1,
+    /// 左音高列表滚动（px）
+    scroll: i32 = 0,
+    /// 层列表滚动（px）
+    layer_scroll: i32 = 0,
+    /// 试听按住中的音高（松开 → 释音）
+    audition_pitch: ?i32 = null,
 };
 
 /// 调音台通道数：**默认 2**（主通道 + 通道#1），可添加；上限见 `max_mixer_channels`
@@ -635,11 +790,30 @@ pub const App = struct {
     file_menu_x: i32 = 8,
     file_menu_w: i32 = 140,
 
+    // ── 预设库（合成器音色；`data/presets/<插件类型>/`）──
+    /// 数据根目录（启动时由 `preset.resolveDataRoot` 解析；相对或绝对路径）
+    data_root_buf: [512]u8 = [_]u8{0} ** 512,
+    data_root_len: usize = 0,
+    /// 预设库（扫描结果；启动/保存后刷新）
+    preset_lib: preset_mod.Library = .{},
+    /// 预设浏览器弹窗（合成器窗口的“预设 ▾”）
+    preset_browser: PresetBrowser = .{},
+    /// 预设“保存为…”的源（`beginRenamePreset` 记录；提交时排队）。
+    /// 会话态——不随工程保存。
+    preset_save_source: PresetSaveSource = .{ .params = .{ .instrument = 0 } },
+    /// 帧末执行的预设操作（App 无 io——文件 IO 在 main）
+    pending_preset: ?PresetAction = null,
+
     // ── 模态对话框与脏确认流程 ──
     /// 当前模态框（null = 无）
     modal: ?ModalKind = null,
-    /// 模态框的用户选择（鼠标点击 / 键盘 Enter/Esc 均写入这里）
+    /// 模态框的用户选择（鼠标点击 / 键盘 Enter/Esc 均写入这里；
+    /// 语义按 `modal` 而定：脏确认 = 保存/不保存/取消；覆写/删除确认 = 确认(.save)/取消）
     modal_choice: ?QuitChoice = null,
+    /// 待确认的覆写保存请求（`modal == .preset_overwrite` 时有效；取消即丢弃）
+    overwrite_req: ?OverwriteReq = null,
+    /// 待确认的删除请求（`modal == .preset_delete` 时有效；取消即丢弃）
+    delete_req: ?DeleteReq = null,
     /// 脏确认流程状态（拦截动作 → 确认 → 执行）
     dirty_flow: DirtyFlow = .none,
     /// 脏确认流程的目标动作（quit / open）
@@ -680,6 +854,7 @@ pub const App = struct {
     synth_win: SynthWindow = .{},
     mixer_win: MixerWindow = .{},
     effect_win: EffectWindow = .{},
+    drumkit_win: DrumKitWindow = .{},
     /// 浮动窗口 Z 序的**全局计数器**（点窗口置顶时 +1，见 `bringToFront`）
     z_top: i32 = 50,
     /// 调音台通道（**动态**；默认 2 个，可添加；乐器通过 `Instrument.mixer` 路由到其中之一）
@@ -1213,6 +1388,194 @@ pub const App = struct {
         return applied;
     }
 
+    /// 合成器参数指针进**退役列表**（音频线程可能仍持有它——异步读取；
+    /// 不立即 free：流程退出时统一释放。分配失败时宁可不记录也不 free——
+    /// 泄漏优于 use-after-free）
+    fn retireSynth(self: *App, sp: *synth.SynthParams) void {
+        self.retired_synths.append(self.allocator, sp) catch {};
+    }
+
+    /// 释放鼓垫内容（层参数进退役、名字/预设名释放；不含 pad 自身）
+    fn deinitPadContents(self: *App, pad: *model.DrumPad) void {
+        for (pad.layers.items) |ly| {
+            self.retireSynth(ly.params);
+            self.allocator.free(ly.source_preset);
+        }
+        pad.layers.deinit(self.allocator);
+        self.allocator.free(pad.name);
+    }
+
+    /// 释放鼓组全部内容 + 本体
+    fn deinitDrumKit(self: *App, kit: *model.DrumKit) void {
+        for (kit.pads.items) |*pad| self.deinitPadContents(pad);
+        kit.pads.deinit(self.allocator);
+        self.allocator.destroy(kit);
+    }
+
+    /// 导出单个乐器为存档（深拷贝：名字/鼓组/合成器参数——供历史快照与工程保存共用）
+    fn exportInstrument(self: *App, inst: *const model.Instrument) !persist.SavedInstrument {
+        var si = persist.SavedInstrument{
+            .name = try self.allocator.dupe(u8, inst.name),
+            .volume = inst.volume,
+            .pan = inst.pan,
+            .muted = inst.muted,
+            .mixer = inst.mixer,
+            .midi_channel = inst.midi_channel,
+            .kind = @intFromEnum(inst.kind),
+            .key_mode = @intFromEnum(inst.key_mode),
+            .synth = persist.exportSynth(inst.synth),
+        };
+        errdefer self.allocator.free(si.name);
+        si.preset_name = try self.allocator.dupe(u8, inst.preset_name);
+        errdefer self.allocator.free(si.preset_name);
+        if (inst.kit) |kit| si.kit = try self.exportDrumKit(kit);
+        return si;
+    }
+
+    fn exportDrumKit(self: *App, kit: *const model.DrumKit) !persist.SavedDrumKit {
+        const pads = try self.allocator.alloc(persist.SavedDrumPad, kit.pads.items.len);
+        var np: usize = 0;
+        errdefer {
+            for (pads[0..np]) |p| {
+                for (p.layers) |ly| self.allocator.free(ly.source_preset);
+                self.allocator.free(p.layers);
+                self.allocator.free(p.name);
+            }
+            self.allocator.free(pads);
+        }
+        for (kit.pads.items, 0..) |pad, i| {
+            const layers = try self.allocator.alloc(persist.SavedDrumLayer, pad.layers.items.len);
+            var nl: usize = 0;
+            errdefer {
+                for (layers[0..nl]) |ly| self.allocator.free(ly.source_preset);
+                self.allocator.free(layers);
+            }
+            for (pad.layers.items, 0..) |layer, li| {
+                layers[li] = .{
+                    .kind = @intFromEnum(layer.kind),
+                    .synth = persist.exportSynth(layer.params),
+                    .gain = layer.gain,
+                    .source_preset = try self.allocator.dupe(u8, layer.source_preset),
+                };
+                nl += 1;
+            }
+            pads[i] = .{
+                .pitch = pad.pitch,
+                .name = try self.allocator.dupe(u8, pad.name),
+                .layers = layers,
+            };
+            np += 1;
+        }
+        return .{ .pads = pads };
+    }
+
+    /// 释放存档乐器（与 `exportInstrument` 对称；历史快照/工程释放共用）
+    fn freeSavedInstrument(self: *App, si: *const persist.SavedInstrument) void {
+        self.allocator.free(si.name);
+        self.allocator.free(si.preset_name);
+        self.freeSavedKit(&si.kit);
+    }
+
+    /// 释放套鼓快照（导出/保存路径用；与 `exportDrumKit` 对称）
+    pub fn freeSavedKit(self: *App, sk: *const persist.SavedDrumKit) void {
+        for (sk.pads) |pad| {
+            self.allocator.free(pad.name);
+            for (pad.layers) |ly| self.allocator.free(ly.source_preset);
+            self.allocator.free(pad.layers);
+        }
+        self.allocator.free(sk.pads);
+    }
+
+    /// 导出整组套鼓快照（深拷贝；调用方用 `freeSavedKit` 释放）；
+    /// 非鼓组/越界/分配失败 → null
+    pub fn exportKitForSave(self: *App, idx: usize) ?persist.SavedDrumKit {
+        if (idx >= self.instruments.items.len) return null;
+        const kit = self.instruments.items[idx].kit orelse return null;
+        return self.exportDrumKit(kit) catch null;
+    }
+
+    /// 把套鼓快照载入乐器（**替换**现有套鼓内容；非鼓组也允许——先建空 kit）。
+    /// 一条历史的调用方负责提交。返回是否成功。
+    pub fn loadKitInto(self: *App, idx: usize, sk: *const persist.SavedDrumKit) bool {
+        if (idx >= self.instruments.items.len) return false;
+        const inst = &self.instruments.items[idx];
+        if (inst.kit == null) {
+            const kit = self.allocator.create(model.DrumKit) catch return false;
+            kit.* = .{};
+            inst.kit = kit;
+        }
+        self.importDrumKit(sk, inst.kit.?);
+        self.dirty = true;
+        return true;
+    }
+
+    /// 把存档鼓组恢复到 `kit`（清空重建；失败时尽量保留已恢复部分——
+    /// 宁可部分丢也不 use-after-free）
+    fn importDrumKit(self: *App, sk: *const persist.SavedDrumKit, kit: *model.DrumKit) void {
+        for (kit.pads.items) |*pad| self.deinitPadContents(pad);
+        kit.pads.clearRetainingCapacity();
+        for (sk.pads) |sp| {
+            var pad = model.DrumPad{
+                .pitch = @intCast(@min(sp.pitch, 127)),
+                .name = self.allocator.dupe(u8, sp.name) catch continue,
+            };
+            for (sp.layers) |sl| {
+                const lp = self.allocator.create(synth.SynthParams) catch continue;
+                lp.* = .{};
+                persist.importSynth(&sl.synth, lp);
+                const src: []u8 = self.allocator.dupe(u8, sl.source_preset) catch &.{};
+                // 未知类型（未来存档）→ 退回减法（现阶段唯一引擎；参数照常载入）
+                const kind = std.enums.fromInt(model.LayerKind, sl.kind) orelse model.LayerKind.subtractive;
+                pad.layers.append(self.allocator, .{ .kind = kind, .params = lp, .gain = sl.gain, .source_preset = src }) catch {
+                    self.retireSynth(lp);
+                };
+            }
+            kit.pads.append(self.allocator, pad) catch {
+                self.deinitPadContents(&pad);
+            };
+        }
+        std.mem.sort(model.DrumPad, kit.pads.items, {}, struct {
+            fn less(_: void, a: model.DrumPad, b: model.DrumPad) bool {
+                return a.pitch < b.pitch;
+            }
+        }.less);
+    }
+
+    /// 把存档乐器恢复到已存在的 `target`（名字除外——由调用方处理；
+    /// 历史恢复/工程导入共用，防两处逻辑分叉）
+    fn applySavedInstrument(self: *App, si: *const persist.SavedInstrument, target: *model.Instrument) void {
+        target.volume = si.volume;
+        target.pan = si.pan;
+        target.muted = si.muted;
+        target.mixer = si.mixer;
+        target.midi_channel = si.midi_channel;
+        target.key_mode = if (si.key_mode == 1) .drum else .piano;
+        // 关联预设名（快照往返：撤销/重做也能回到当时的名字）
+        if (!std.mem.eql(u8, target.preset_name, si.preset_name)) {
+            if (self.allocator.dupe(u8, si.preset_name)) |d| {
+                self.allocator.free(target.preset_name);
+                target.preset_name = d;
+            } else |_| {}
+        }
+        persist.importSynth(&si.synth, target.synth);
+        if (si.kind == 1) {
+            // 鼓组：确保 kit 存在并重建内容
+            if (target.kit == null) {
+                const kit = self.allocator.create(model.DrumKit) catch return;
+                kit.* = .{};
+                target.kit = kit;
+            }
+            self.importDrumKit(&si.kit, target.kit.?);
+            target.kind = .drumkit;
+        } else {
+            if (target.kit) |kit| {
+                self.deinitDrumKit(kit);
+                target.kit = null;
+            }
+            target.kind = .synth;
+        }
+    }
+
     /// 添加乐器（自动分配名字与合成器参数）；返回新槽位序号（失败 -1）
     /// `base_name`：基础名（如 "减法合成器"）；同名自动追加 #2、#3…
     pub fn addInstrument(self: *App, base_name: []const u8) i32 {
@@ -1235,13 +1598,145 @@ pub const App = struct {
         };
         sp.* = .{};
 
-        self.instruments.append(self.allocator, .{ .name = name, .synth = sp }) catch {
+        const pname = self.allocator.dupe(u8, "") catch {
             self.allocator.free(name);
+            self.allocator.destroy(sp);
+            return -1;
+        };
+        self.instruments.append(self.allocator, .{
+            .name = name,
+            .preset_name = pname,
+            .synth = sp,
+        }) catch {
+            self.allocator.free(name);
+            self.allocator.free(pname);
             self.allocator.destroy(sp);
             return -1;
         };
         self.dirty = true;
         return @intCast(self.instruments.items.len - 1);
+    }
+
+    /// 添加鼓组乐器（kind = drumkit + 空 kit）
+    pub fn addDrumkit(self: *App, base_name: []const u8) i32 {
+        const idx = self.addInstrument(base_name);
+        if (idx < 0) return -1;
+        const inst = &self.instruments.items[@intCast(idx)];
+        const kit = self.allocator.create(model.DrumKit) catch return idx;
+        kit.* = .{};
+        inst.kit = kit;
+        inst.kind = .drumkit;
+        inst.key_mode = .drum; // 鼓组默认键列就是鼓名（用户可切回）
+        return idx;
+    }
+
+    /// 当前选中乐器的键列模式（**每乐器独立**；无乐器 → 钢琴）
+    pub fn currentKeyMode(self: *const App) KeyMode {
+        const i = self.sel.instrument;
+        if (i < 0 or i >= @as(i32, @intCast(self.instruments.items.len))) return .piano;
+        return self.instruments.items[@intCast(i)].key_mode;
+    }
+
+    /// 设置当前选中乐器的键列模式（无乐器时无操作；会话态，不入历史）
+    pub fn setCurrentKeyMode(self: *App, m: KeyMode) void {
+        const i = self.sel.instrument;
+        if (i < 0 or i >= @as(i32, @intCast(self.instruments.items.len))) return;
+        self.instruments.items[@intCast(i)].key_mode = m;
+    }
+
+    // ── 鼓组编辑（鼓组编辑器用；每个操作后由调用方 commitHistory）──
+
+    /// 找或建垫（升序插入）；无乐器/非鼓组 → null
+    pub fn kitPadEnsure(self: *App, inst_idx: i32, pitch: u8) ?*model.DrumPad {
+        if (inst_idx < 0 or inst_idx >= @as(i32, @intCast(self.instruments.items.len))) return null;
+        const inst = &self.instruments.items[@intCast(inst_idx)];
+        const kit = inst.kit orelse return null;
+        if (kit.find(pitch)) |pad| return pad;
+        const pad = model.DrumPad{
+            .pitch = pitch,
+            .name = self.allocator.dupe(u8, "") catch return null,
+        };
+        kit.pads.append(self.allocator, pad) catch {
+            self.allocator.free(pad.name);
+            return null;
+        };
+        // 升序插入（刚 append 的可能是乱序 → 冒泡到位置）
+        var i: usize = kit.pads.items.len - 1;
+        while (i > 0 and kit.pads.items[i - 1].pitch > kit.pads.items[i].pitch) : (i -= 1) {
+            std.mem.swap(model.DrumPad, &kit.pads.items[i - 1], &kit.pads.items[i]);
+        }
+        self.dirty = true;
+        return &kit.pads.items[i];
+    }
+
+    /// 删除垫（含其层；层参数进退役）
+    pub fn kitPadRemove(self: *App, inst_idx: i32, pitch: u8) bool {
+        if (inst_idx < 0 or inst_idx >= @as(i32, @intCast(self.instruments.items.len))) return false;
+        const inst = &self.instruments.items[@intCast(inst_idx)];
+        const kit = inst.kit orelse return false;
+        for (kit.pads.items, 0..) |*pad, i| {
+            if (pad.pitch != pitch) continue;
+            self.deinitPadContents(pad);
+            _ = kit.pads.orderedRemove(i);
+            self.dirty = true;
+            return true;
+        }
+        return false;
+    }
+
+    /// 给垫加一层（从预设副本或空层）。`saved` = 层参数（null = 默认空音色）。
+    /// `source` = 来源预设名（`分类/名字`；空 = 手调）。返回 false = 失败。
+    /// 注：上限是**全组总层数**（音频侧槽位数 `audio.kit_max_layers`）——
+    /// 一个垫的多层占多个槽位。
+    pub fn kitLayerAdd(self: *App, inst_idx: i32, pitch: u8, saved: ?*const persist.SavedSynth, source: []const u8) bool {
+        if (inst_idx < 0 or inst_idx >= @as(i32, @intCast(self.instruments.items.len))) return false;
+        const inst = &self.instruments.items[@intCast(inst_idx)];
+        const kit0 = inst.kit orelse return false;
+        if (kit0.totalLayers() >= @import("audio.zig").kit_max_layers) return false;
+        const pad = self.kitPadEnsure(inst_idx, pitch) orelse return false;
+        const lp = self.allocator.create(synth.SynthParams) catch return false;
+        lp.* = .{};
+        if (saved) |s| persist.importSynth(s, lp);
+        const src: []u8 = self.allocator.dupe(u8, source) catch &.{};
+        pad.layers.append(self.allocator, .{ .params = lp, .gain = 1.0, .source_preset = src }) catch {
+            self.retireSynth(lp);
+            return false;
+        };
+        self.dirty = true;
+        return true;
+    }
+
+    /// 清空后的**无名空垫**清理：无层且无名 = 无信息可保留 → 移除
+    /// （有名空垫保留——名字是用户信息；用户反馈：清空层后不应留“幽灵垫”）。
+    /// 返回是否清理了。可撤销（快照含垫本身）。
+    fn pruneEmptyPad(self: *App, kit: *model.DrumKit, pitch: u8) bool {
+        var i: usize = 0;
+        while (i < kit.pads.items.len) : (i += 1) {
+            const pp = &kit.pads.items[i];
+            if (pp.pitch != pitch) continue;
+            if (pp.layers.items.len != 0 or pp.name.len != 0) return false;
+            self.deinitPadContents(pp);
+            _ = kit.pads.orderedRemove(i);
+            self.dirty = true;
+            return true;
+        }
+        return false;
+    }
+
+    /// 删除垫的第 `layer_idx` 层（参数进退役）；`layer_idx` 越界 → false
+    pub fn kitLayerRemove(self: *App, inst_idx: i32, pitch: u8, layer_idx: usize) bool {
+        if (inst_idx < 0 or inst_idx >= @as(i32, @intCast(self.instruments.items.len))) return false;
+        const inst = &self.instruments.items[@intCast(inst_idx)];
+        const kit = inst.kit orelse return false;
+        const pad = kit.find(pitch) orelse return false;
+        if (layer_idx >= pad.layers.items.len) return false;
+        const ly = pad.layers.orderedRemove(layer_idx);
+        self.retireSynth(ly.params);
+        self.allocator.free(ly.source_preset);
+        // 清空后的无名空垫一并移除（见 pruneEmptyPad）
+        _ = self.pruneEmptyPad(kit, pitch);
+        self.dirty = true;
+        return true;
     }
 
     /// 删除乐器槽位（同时删除其音符；合成器参数延迟释放；其余音符的槽位序号前移）
@@ -1250,9 +1745,11 @@ pub const App = struct {
         self.dirty = true;
         const inst = self.instruments.items[idx];
         self.allocator.free(inst.name); // 名字只被 UI 线程使用，可立即释放
+        self.allocator.free(inst.preset_name);
         // 合成器参数：音频线程可能仍持有该指针（异步读取）→ 移入退役列表，进程退出时释放。
         // （分配失败时宁可不记录也不 free——泄漏优于 use-after-free）
-        self.retired_synths.append(self.allocator, inst.synth) catch {};
+        self.retireSynth(inst.synth);
+        if (inst.kit) |kit| self.deinitDrumKit(kit); // 鼓组内容同样退役层参数
         _ = self.instruments.orderedRemove(idx);
         var i: usize = 0;
         while (i < self.notes.items.len) {
@@ -1267,8 +1764,15 @@ pub const App = struct {
         if (self.sel.instrument >= @as(i32, @intCast(self.instruments.items.len))) {
             self.sel.instrument = @as(i32, @intCast(self.instruments.items.len)) - 1;
         }
-        if (self.synth_win.instrument >= @as(i32, @intCast(self.instruments.items.len))) {
-            self.synth_win.instrument = @as(i32, @intCast(self.instruments.items.len)) - 1;
+        // 合成器窗口：`.instrument` 目标每帧跟随选择（无需在此修正）；
+        // `.kit_layer_replace` 目标由层查找自然失效（窗口自行关闭）
+        // 鼓组编辑器：删除的正是绑定乐器 → 关闭；删除在其前 → 索引前移
+        if (self.drumkit_win.open) {
+            if (self.drumkit_win.instrument == @as(i32, @intCast(idx))) {
+                self.drumkit_win.open = false;
+            } else if (self.drumkit_win.instrument > @as(i32, @intCast(idx))) {
+                self.drumkit_win.instrument -= 1;
+            }
         }
     }
 
@@ -1301,23 +1805,365 @@ pub const App = struct {
         self.deinitHistory();
         self.deinitPatterns();
         self.deinitInstruments();
+        self.preset_lib.deinit(self.allocator);
+    }
+
+    // ── 预设库（数据根目录 / 扫描结果 / 弹窗状态）──
+
+    /// 设置数据根目录（拷贝；由 main 启动时解析）
+    pub fn setDataRoot(self: *App, path: []const u8) void {
+        const n = @min(path.len, self.data_root_buf.len);
+        @memcpy(self.data_root_buf[0..n], path[0..n]);
+        self.data_root_len = n;
+    }
+
+    /// 当前数据根目录（相对或绝对路径；空串 = 未设置——预设功能禁用）
+    pub fn dataRoot(self: *const App) []const u8 {
+        return self.data_root_buf[0..self.data_root_len];
+    }
+
+    /// 打开预设面板（统一入口）：`intent` 决定分类可选性与选中后的动作
+    pub fn openPresetBrowser(self: *App, intent: PresetIntent) void {
+        // 护栏：库不可用（数据目录未就绪/未建分类）→ 面板无从选择，不开
+        if (self.preset_lib.categories.items.len == 0) {
+            self.setToast("预设库不可用（数据目录未就绪）");
+            return;
+        }
+        const pb = &self.preset_browser;
+        pb.open = true;
+        pb.just_opened = true;
+        pb.intent = intent;
+        // 锚插件：replace → 要求的插件；change → 乐器当前插件；其余 → 减法（初始分类）
+        pb.plugin = switch (intent) {
+            .replace => |t| self.presetTargetPlugin(t),
+            .create_instrument, .create_kit_layer => preset_mod.plugin_subtractive,
+            .change_instrument => |i| blk: {
+                if (i < 0 or i >= @as(i32, @intCast(self.instruments.items.len))) break :blk preset_mod.plugin_subtractive;
+                break :blk if (self.instruments.items[@intCast(i)].kind == .drumkit)
+                    preset_mod.plugin_drumkit
+                else
+                    preset_mod.plugin_subtractive;
+            },
+        };
+        // 定位锚插件的分类（找不到 → 0；库可空）
+        var idx: usize = 0;
+        for (self.preset_lib.categories.items, 0..) |cat, i| {
+            if (std.mem.eql(u8, cat.name, pb.plugin)) {
+                idx = i;
+                break;
+            }
+        }
+        pb.cat = idx;
+        pb.scroll = 0;
+        pb.ctx = null; // 右键菜单不跨次残留
+    }
+
+    /// 该插件是否可作为**乐器本体**（新建/更换/预设面板选中 → 建或换）：
+    /// 减法合成器 / 鼓组（已实装）；FM/VST3 将来。
+    pub fn pluginSupportedAsInstrument(plugin: []const u8) bool {
+        return std.mem.eql(u8, plugin, preset_mod.plugin_subtractive) or
+            std.mem.eql(u8, plugin, preset_mod.plugin_drumkit);
+    }
+
+    /// 该插件是否可作为**鼓垫层**：目前仅减法（**不含鼓组**——禁自嵌套）。
+    pub fn pluginSupportedAsLayer(plugin: []const u8) bool {
+        return std.mem.eql(u8, plugin, preset_mod.plugin_subtractive);
+    }
+
+    /// 该意图下此分类是否**可选**（否则左栏置灰、点击只提示）：
+    /// **面板已统一**——任何入口都能选任意已实装插件（跨插件即换插件）；
+    /// 仅两类被拦：未实装插件（FM/VST3）与层上下文的鼓组（禁自嵌套）。
+    pub fn presetCategorySelectable(self: *const App, intent: PresetIntent, plugin: []const u8) bool {
+        _ = self;
+        return switch (intent) {
+            .replace => |t| switch (t) {
+                .instrument => pluginSupportedAsInstrument(plugin),
+                .kit_layer_replace => pluginSupportedAsLayer(plugin),
+            },
+            .create_instrument, .change_instrument => pluginSupportedAsInstrument(plugin),
+            .create_kit_layer => pluginSupportedAsLayer(plugin),
+        };
+    }
+
+    /// 预设目标所需的插件类型（分类 id）——浏览器的限定依据。
+    /// 目前乐器本体（synth）/鼓组层都是减法合成器；鼓组乐器本体留给
+    /// 将来的“整组套预设”（`drumkit` 分类，阶段 4）。
+    pub fn presetTargetPlugin(self: *const App, target: PresetTarget) []const u8 {
+        switch (target) {
+            .instrument => |i| {
+                if (i >= 0 and i < @as(i32, @intCast(self.instruments.items.len))) {
+                    if (self.instruments.items[@intCast(i)].kind == .drumkit) return preset_mod.plugin_drumkit;
+                }
+                return preset_mod.plugin_subtractive;
+            },
+            .kit_layer_replace => return preset_mod.plugin_subtractive,
+        }
+    }
+
+    /// 更换乐器类型（**保留**名字/音量/声像/路由/MIDI 通道）：
+    /// synth→鼓组 = 建空套鼓 + 键列模式切鼓组；鼓组→synth = 释放鼓组层
+    /// （层参数入退役）。`commit` = 是否立即提交历史
+    /// （预设面板“更换乐器”要“换类型+载音色”一条历史 → 传 false，调用方合并提交）。
+    /// 返回是否发生了更换。
+    pub fn changeInstrumentKind(self: *App, idx: usize, kind: model.InstrumentKind, commit: bool) bool {
+        if (idx >= self.instruments.items.len) return false;
+        const inst = &self.instruments.items[idx];
+        if (inst.kind == kind) return false;
+        switch (kind) {
+            .synth => {
+                if (inst.kit) |kit| {
+                    self.deinitDrumKit(kit); // 层参数入退役
+                    inst.kit = null;
+                }
+                inst.kind = .synth;
+                inst.key_mode = .piano; // 键列模式随类型回默认（与下方 .drumkit 对称）
+            },
+            .drumkit => {
+                if (inst.kit == null) {
+                    const kit = self.allocator.create(model.DrumKit) catch return false;
+                    kit.* = .{};
+                    inst.kit = kit;
+                }
+                inst.kind = .drumkit;
+                inst.key_mode = .drum;
+            },
+        }
+        self.dirty = true;
+        if (commit) self.commitHistory("更换乐器");
+        return true;
+    }
+
+    /// 开始“保存为…”命名（`source` = 保存源；`prefill` = 预填名——通常为当前关联
+    /// 的预设名，直接回车 = 覆写确认流程；预填**全选**，直接输入即替换）
+    pub fn beginRenamePreset(self: *App, x: i32, y: i32, source: PresetSaveSource, prefill: []const u8) void {
+        self.preset_save_source = source;
+        const ti = &self.text_input;
+        ti.active = true;
+        ti.target = .preset_name;
+        ti.index = 0;
+        ti.x = x;
+        ti.y = y;
+        ti.len = @min(prefill.len, ti.buf.len);
+        @memcpy(ti.buf[0..ti.len], prefill[0..ti.len]);
+        ti.cursor = ti.len;
+        ti.sel_anchor = if (ti.len > 0) 0 else null; // 预填 → 全选（输入即替换）
+        ti.drag_active = false;
+        ti.view_off = 0;
+    }
+
+    /// 保存遇到重名 → 弹“是否覆写”确认框（暂存请求；确认后重新排队保存，
+    /// 取消即丢弃）。`clean_name` = 已清洗后的名字（与碰重的那份一致）。
+    pub fn setOverwritePrompt(self: *App, source: PresetSaveSource, clean_name: []const u8) void {
+        var req = OverwriteReq{ .source = source };
+        const n = @min(clean_name.len, req.name.len);
+        @memcpy(req.name[0..n], clean_name[0..n]);
+        req.name_len = n;
+        self.overwrite_req = req;
+        self.modal = .preset_overwrite;
+        self.modal_choice = null;
+    }
+
+    /// 删除预设 → 弹“确认删除”模态（确认后重新排队删除，取消即丢弃）。
+    /// 注：文件操作**不进操作历史**（历史 = 工程编辑；预设库是外部资源，
+    /// 与“打开/保存工程”同类；误删防护 = 确认框 + 副本语义）。
+    pub fn setDeletePrompt(self: *App, cat: usize, name: []const u8) void {
+        var req = DeleteReq{ .cat = cat };
+        const n = @min(name.len, req.name.len);
+        @memcpy(req.name[0..n], name[0..n]);
+        req.name_len = n;
+        self.delete_req = req;
+        self.modal = .preset_delete;
+        self.modal_choice = null;
+    }
+
+    /// 开始重命名预设文件（文本输入；预填旧名 + 全选；`cat` 存 `index`，
+    /// 旧名存 `aux_buf`）
+    pub fn beginRenamePresetFile(self: *App, cat: usize, name_idx: usize, x: i32, y: i32) void {
+        if (cat >= self.preset_lib.categories.items.len) return;
+        const c = &self.preset_lib.categories.items[cat];
+        if (name_idx >= c.presets.items.len) return;
+        const old = c.presets.items[name_idx];
+        const ti = &self.text_input;
+        ti.active = true;
+        ti.target = .preset_rename;
+        ti.index = cat;
+        ti.x = x;
+        ti.y = y;
+        ti.w = 160;
+        const n = @min(old.len, ti.buf.len);
+        @memcpy(ti.buf[0..n], old[0..n]);
+        ti.len = n;
+        ti.cursor = n;
+        ti.sel_anchor = if (n > 0) 0 else null; // 全选（输入即替换）
+        ti.drag_active = false;
+        ti.view_off = 0;
+        ti.aux_len = @min(old.len, ti.aux_buf.len);
+        @memcpy(ti.aux_buf[0..ti.aux_len], old[0..ti.aux_len]);
+    }
+
+    /// 设置乐器的“关联预设名”（加载/保存预设时维护；展示/预填用）
+    pub fn setInstrumentPresetName(self: *App, idx: usize, name: []const u8) bool {
+        if (idx >= self.instruments.items.len) return false;
+        const inst = &self.instruments.items[idx];
+        if (std.mem.eql(u8, inst.preset_name, name)) return false;
+        const dup = self.allocator.dupe(u8, name) catch return false;
+        self.allocator.free(inst.preset_name);
+        inst.preset_name = dup;
+        return true;
+    }
+
+    /// 乐器的关联预设名（越界 → ""）
+    pub fn instrumentPresetName(self: *const App, idx: i32) []const u8 {
+        if (idx < 0 or idx >= @as(i32, @intCast(self.instruments.items.len))) return "";
+        return self.instruments.items[@intCast(idx)].preset_name;
+    }
+
+    /// 鼓组层的来源预设串（`分类/名字`；空 = 手调/无）
+    pub fn kitLayerSource(self: *const App, inst_idx: i32, pitch: u8, layer: usize) []const u8 {
+        if (inst_idx < 0 or inst_idx >= @as(i32, @intCast(self.instruments.items.len))) return "";
+        const kit = self.instruments.items[@intCast(inst_idx)].kit orelse return "";
+        const pad = kit.find(pitch) orelse return "";
+        if (layer >= pad.layers.items.len) return "";
+        return pad.layers.items[layer].source_preset;
+    }
+
+    /// 保存对话框的预填名（= 当前关联的预设名；层目标取来源串的名字部分）
+    pub fn presetPrefillName(self: *const App, source: PresetSaveSource) []const u8 {
+        return switch (source) {
+            .params => |t| switch (t) {
+                .instrument => |i| self.instrumentPresetName(i),
+                .kit_layer_replace => |ref| preset_mod.nameFromSource(self.kitLayerSource(ref.instrument, ref.pitch, ref.layer)),
+            },
+            .kit => |i| self.instrumentPresetName(i),
+        };
     }
 
     /// 释放全部乐器（名字 + 合成器参数，含退役的）——进程退出时调用
     pub fn deinitInstruments(self: *App) void {
         for (self.instruments.items) |inst| {
             self.allocator.free(inst.name);
+            self.allocator.free(inst.preset_name);
             self.allocator.destroy(inst.synth);
+            // 鼓组内容（垫/层）：层参数进退役列表，由下面的统一释放处理
+            if (inst.kit) |kit| self.deinitDrumKit(kit);
         }
         self.instruments.deinit(self.allocator);
         for (self.retired_synths.items) |sp| self.allocator.destroy(sp);
         self.retired_synths.deinit(self.allocator);
     }
 
-    /// 当前选中乐器的合成器参数（无乐器时返回 null）
+    /// 当前选中乐器的合成器参数（无乐器 / **鼓组** → null——合成器窗口自动隐藏）
     pub fn selectedSynth(self: *App) ?*synth.SynthParams {
         if (self.sel.instrument < 0 or self.sel.instrument >= @as(i32, @intCast(self.instruments.items.len))) return null;
-        return self.instruments.items[@intCast(self.sel.instrument)].synth;
+        const inst = &self.instruments.items[@intCast(self.sel.instrument)];
+        if (inst.kind == .drumkit) return null;
+        return inst.synth;
+    }
+
+    // ── 鼓组编辑（编辑器窗口 + 合成器窗口的层目标）──
+
+    /// 打开鼓组编辑器（绑定乐器；非鼓组/越界 → 无操作）。
+    /// 自动选中**第一个已映射垫**（无 → 36 = GM 底鼓），并同步选择（试听路由）。
+    pub fn openDrumKit(self: *App, idx: i32) void {
+        if (idx < 0 or idx >= @as(i32, @intCast(self.instruments.items.len))) return;
+        const inst = &self.instruments.items[@intCast(idx)];
+        if (inst.kind != .drumkit) return;
+        const dw = &self.drumkit_win;
+        dw.open = true;
+        dw.instrument = idx;
+        dw.sel_pitch = if (inst.kit) |k|
+            (if (k.pads.items.len > 0) @as(i32, k.pads.items[0].pitch) else 36)
+        else
+            36;
+        dw.scroll = 0;
+        dw.layer_scroll = 0;
+        dw.audition_pitch = null;
+        self.sel.instrument = idx; // 试听/键列跟随
+        self.bringToFront(&dw.z);
+    }
+
+    /// 鼓组编辑器绑定的鼓组（乐器被删/类型变更 → null；调用方应关闭窗口）
+    pub fn drumKitWindowKit(self: *App) ?*model.DrumKit {
+        const i = self.drumkit_win.instrument;
+        if (i < 0 or i >= @as(i32, @intCast(self.instruments.items.len))) return null;
+        const inst = &self.instruments.items[@intCast(i)];
+        if (inst.kind != .drumkit) return null;
+        return inst.kit;
+    }
+
+    /// 解析预设目标 → 参数指针（无效 → null）
+    pub fn resolvePresetTarget(self: *App, target: PresetTarget) ?*synth.SynthParams {
+        return switch (target) {
+            .instrument => |i| blk: {
+                if (i < 0 or i >= @as(i32, @intCast(self.instruments.items.len))) break :blk null;
+                const inst = &self.instruments.items[@intCast(i)];
+                if (inst.kind == .drumkit) break :blk null; // 鼓组没有可编辑的本体合成器
+                break :blk inst.synth;
+            },
+            .kit_layer_replace => |ref| self.kitLayerParams(ref.instrument, ref.pitch, ref.layer),
+        };
+    }
+
+    /// 取鼓组层参数（乐器/垫/层任一无效 → null）
+    pub fn kitLayerParams(self: *App, inst_idx: i32, pitch: u8, layer: usize) ?*synth.SynthParams {
+        if (inst_idx < 0 or inst_idx >= @as(i32, @intCast(self.instruments.items.len))) return null;
+        const inst = &self.instruments.items[@intCast(inst_idx)];
+        const kit = inst.kit orelse return null;
+        const pad = kit.find(pitch) orelse return null;
+        if (layer >= pad.layers.items.len) return null;
+        return pad.layers.items[layer].params;
+    }
+
+    /// 更新鼓组层的来源预设名（展示用）；返回是否改动
+    pub fn kitLayerSetSource(self: *App, inst_idx: i32, pitch: u8, layer: usize, src: []const u8) bool {
+        if (inst_idx < 0 or inst_idx >= @as(i32, @intCast(self.instruments.items.len))) return false;
+        const inst = &self.instruments.items[@intCast(inst_idx)];
+        const kit = inst.kit orelse return false;
+        const pad = kit.find(pitch) orelse return false;
+        if (layer >= pad.layers.items.len) return false;
+        const ly = &pad.layers.items[layer];
+        if (std.mem.eql(u8, ly.source_preset, src)) return false;
+        const copy = self.allocator.dupe(u8, src) catch return false;
+        self.allocator.free(ly.source_preset);
+        ly.source_preset = copy;
+        self.dirty = true;
+        return true;
+    }
+
+    /// 重命名鼓垫（空名 = 清除自定义名，回退 GM/音名）；返回是否改动
+    /// 重命名鼓垫（空名 = 清除自定义名，回退 GM/音名）；返回是否改动。
+    /// 清成空名且无层 → 垫本身也没信息，一并清理（见 pruneEmptyPad）
+    pub fn kitPadRename(self: *App, inst_idx: i32, pitch: u8, name: []const u8) bool {
+        const pad = self.kitPadEnsure(inst_idx, pitch) orelse return false;
+        if (std.mem.eql(u8, pad.name, name)) return false;
+        const copy = self.allocator.dupe(u8, name) catch return false;
+        self.allocator.free(pad.name);
+        pad.name = copy;
+        if (name.len == 0) {
+            const kit = self.instruments.items[@intCast(inst_idx)].kit.?;
+            _ = self.pruneEmptyPad(kit, pitch);
+        }
+        self.commitHistory("重命名鼓垫");
+        return true;
+    }
+
+    /// 开始重命名鼓垫（文本输入；预填当前自定义名）
+    pub fn beginRenameKitPad(self: *App, inst_idx: i32, pitch: u8, x: i32, y: i32) void {
+        const pad = self.kitPadEnsure(inst_idx, pitch) orelse return;
+        const ti = &self.text_input;
+        ti.active = true;
+        ti.target = .kit_pad_name;
+        ti.instrument = inst_idx;
+        ti.index = pitch;
+        ti.x = x;
+        ti.y = y;
+        ti.w = 160;
+        ti.len = @min(pad.name.len, ti.buf.len);
+        @memcpy(ti.buf[0..ti.len], pad.name[0..ti.len]);
+        ti.cursor = ti.len;
+        ti.sel_anchor = null;
+        ti.drag_active = false;
+        ti.view_off = 0;
     }
 
     /// 标记脏（任何编辑操作调用）
@@ -1503,7 +2349,7 @@ pub const App = struct {
         // （测试分配器会把 0 长度分配记为泄漏）
         self.freeSavedMixerChannels(st.mixer);
         self.allocator.free(st.mixer);
-        for (st.instruments) |si| self.allocator.free(si.name);
+        for (st.instruments) |*si| self.freeSavedInstrument(si);
         self.allocator.free(st.instruments);
         for (st.pattern_names) |nm| self.allocator.free(nm);
         self.allocator.free(st.pattern_names);
@@ -1606,19 +2452,11 @@ pub const App = struct {
         const insts = try self.allocator.alloc(persist.SavedInstrument, self.instruments.items.len);
         var n: usize = 0;
         errdefer {
-            for (insts[0..n]) |si| self.allocator.free(si.name);
+            for (insts[0..n]) |*si| self.freeSavedInstrument(si);
             self.allocator.free(insts);
         }
-        for (self.instruments.items, 0..) |inst, i| {
-            insts[i] = .{
-                .name = try self.allocator.dupe(u8, inst.name),
-                .volume = inst.volume,
-                .pan = inst.pan,
-                .muted = inst.muted,
-                .mixer = inst.mixer,
-                .midi_channel = inst.midi_channel,
-                .synth = persist.exportSynth(inst.synth),
-            };
+        for (self.instruments.items, 0..) |*inst, i| {
+            insts[i] = try self.exportInstrument(inst);
             n += 1;
         }
         const mixer = try self.exportMixerChannels(self.allocator);
@@ -1673,6 +2511,23 @@ pub const App = struct {
             if (a.volume != b.volume or a.pan != b.pan or a.muted != b.muted or
                 a.mixer != b.mixer or a.midi_channel != b.midi_channel) return false;
             if (!std.mem.eql(u8, a.name, b.name)) return false;
+            if (!std.mem.eql(u8, a.preset_name, b.preset_name)) return false; // 关联预设名（否则加载同名同参预设会被判“无变化”）
+            // 乐器类型/鼓组内容也要比较（否则鼓组编辑被判“无变化”）
+            if (a.kind != @intFromEnum(b.kind)) return false;
+            if (a.kit.pads.len != (if (b.kit) |k| k.pads.items.len else 0)) return false;
+            if (b.kit) |k| {
+                for (a.kit.pads, k.pads.items) |sa, ba| {
+                    if (sa.pitch != ba.pitch) return false;
+                    if (!std.mem.eql(u8, sa.name, ba.name)) return false;
+                    if (sa.layers.len != ba.layers.items.len) return false;
+                    for (sa.layers, ba.layers.items) |sl, bl| {
+                        if (sl.gain != bl.gain) return false;
+                        if (!std.mem.eql(u8, sl.source_preset, bl.source_preset)) return false;
+                        const cur = persist.exportSynth(bl.params);
+                        if (!std.meta.eql(sl.synth, cur)) return false;
+                    }
+                }
+            }
             // **合成器参数也要比较**——否则 ADSR/滤波等改动会被判为“无变化”，
             // 静默丢弃历史条目（实测 bug：调 ADSR 不产生历史）
             const cur = persist.exportSynth(b.synth);
@@ -1827,34 +2682,24 @@ pub const App = struct {
         // 乐器：数量相同 → **原位更新**（指针身份不变——音频线程安全）；
         // 数量不同 → 重建（removeInstrument 会把旧指针送入退役列表，不释放）
         if (st.instruments.len == self.instruments.items.len) {
-            for (st.instruments, 0..) |si, i| {
+            for (st.instruments, 0..) |*si, i| {
                 const target = &self.instruments.items[i];
                 if (!std.mem.eql(u8, target.name, si.name)) {
                     const dup = self.allocator.dupe(u8, si.name) catch continue;
                     self.allocator.free(target.name);
                     target.name = dup;
                 }
-                target.volume = si.volume;
-                target.pan = si.pan;
-                target.muted = si.muted;
-                target.mixer = si.mixer;
-                target.midi_channel = si.midi_channel;
-                persist.importSynth(&si.synth, target.synth);
+                self.applySavedInstrument(si, target);
             }
         } else {
             while (self.instruments.items.len > 0) {
                 self.removeInstrument(self.instruments.items.len - 1);
             }
-            for (st.instruments) |si| {
+            for (st.instruments) |*si| {
                 const idx = self.addInstrument(si.name);
                 if (idx < 0) continue;
                 const target = &self.instruments.items[@intCast(idx)];
-                target.volume = si.volume;
-                target.pan = si.pan;
-                target.muted = si.muted;
-                target.mixer = si.mixer;
-                target.midi_channel = si.midi_channel;
-                persist.importSynth(&si.synth, target.synth);
+                self.applySavedInstrument(si, target);
             }
         }
         // 音符/片段
@@ -2092,8 +2937,9 @@ pub const App = struct {
     /// 因为文件菜单正好盖在历史列表上方；历史面板用 `ui.listItem`（观 hit）
     /// 先于菜单绘制、当时又未被屏蔽）。
     pub fn menuIsOpen(self: *const App) bool {
-        return self.rack.menu_open or self.rack.ctx_instrument != null or
-            self.file_menu_open or self.panels.ctx_pattern != null;
+        return self.rack.ctx_instrument != null or
+            self.file_menu_open or self.panels.ctx_pattern != null or
+            self.preset_browser.open;
     }
 
     /// 设置状态栏提示（覆盖旧的；默认显示约 3 秒）
@@ -2142,18 +2988,14 @@ pub const App = struct {
             notes[i] = .{ .step = n.step, .len = n.len, .pitch = n.pitch, .pattern = n.pattern, .instrument = n.instrument, .velocity = n.velocity, .pan = n.pan };
         }
         const insts = try alloc.alloc(persist.SavedInstrument, self.instruments.items.len);
-        errdefer alloc.free(insts);
-        for (self.instruments.items, 0..) |inst, i| {
-            const name_copy = try alloc.dupe(u8, inst.name);
-            insts[i] = .{
-                .name = name_copy,
-                .volume = inst.volume,
-                .pan = inst.pan,
-                .muted = inst.muted,
-                .mixer = inst.mixer,
-                .midi_channel = inst.midi_channel,
-                .synth = persist.exportSynth(inst.synth),
-            };
+        var ni: usize = 0;
+        errdefer {
+            for (insts[0..ni]) |*si| self.freeSavedInstrument(si);
+            alloc.free(insts);
+        }
+        for (self.instruments.items, 0..) |*inst, i| {
+            insts[i] = try self.exportInstrument(inst);
+            ni += 1;
         }
         // 调音台通道（增益/声像/静音/效果链）——共用 `exportMixerChannels`
         const mix = try self.exportMixerChannels(alloc);
@@ -2195,7 +3037,7 @@ pub const App = struct {
     }
 
     pub fn freeProject(self: *App, p: persist.Project) void {
-        for (p.instruments) |inst| self.allocator.free(inst.name);
+        for (p.instruments) |*si| self.freeSavedInstrument(si);
         self.allocator.free(p.clips);
         self.allocator.free(p.notes);
         self.allocator.free(p.instruments);
@@ -2227,16 +3069,11 @@ pub const App = struct {
         for (p.notes) |n| {
             self.addNote(.{ .step = n.step, .len = n.len, .pitch = n.pitch, .pattern = n.pattern, .instrument = n.instrument, .velocity = n.velocity, .pan = n.pan });
         }
-        for (p.instruments) |inst| {
+        for (p.instruments) |*inst| {
             const idx = self.addInstrument(inst.name);
             if (idx < 0) continue;
             const target = &self.instruments.items[@intCast(idx)];
-            target.volume = inst.volume;
-            target.pan = inst.pan;
-            target.muted = inst.muted;
-            target.mixer = inst.mixer;
-            target.midi_channel = inst.midi_channel;
-            persist.importSynth(&inst.synth, target.synth);
+            self.applySavedInstrument(inst, target);
         }
 
         // 全局设置
@@ -2547,14 +3384,26 @@ pub const App = struct {
 
     /// 试听音符（路由到**当前乐器**）
     pub fn auditionOn(self: *App, pitch: i32) void {
-        if (self.sel.instrument < 0 or self.sel.instrument >= synth.max_instruments) return;
-        self.events.push(.{ .kind = .on, .pitch = @intCast(pitch), .instrument = @intCast(self.sel.instrument) });
+        self.auditionOnInst(self.sel.instrument, pitch);
     }
 
     /// 试听释音（路由到**当前乐器**）
     pub fn auditionOff(self: *App, pitch: i32) void {
-        if (self.sel.instrument < 0 or self.sel.instrument >= synth.max_instruments) return;
-        self.events.push(.{ .kind = .off, .pitch = @intCast(pitch), .instrument = @intCast(self.sel.instrument) });
+        self.auditionOffInst(self.sel.instrument, pitch);
+    }
+
+    /// 试听音符（**指定乐器**——鼓组编辑器绑定窗口时不依赖当前选择）
+    pub fn auditionOnInst(self: *App, inst: i32, pitch: i32) void {
+        if (inst < 0 or inst >= synth.max_instruments) return;
+        if (pitch < 0 or pitch > 127) return;
+        self.events.push(.{ .kind = .on, .pitch = @intCast(pitch), .instrument = @intCast(inst) });
+    }
+
+    /// 试听释音（**指定乐器**）
+    pub fn auditionOffInst(self: *App, inst: i32, pitch: i32) void {
+        if (inst < 0 or inst >= synth.max_instruments) return;
+        if (pitch < 0 or pitch > 127) return;
+        self.events.push(.{ .kind = .off, .pitch = @intCast(pitch), .instrument = @intCast(inst) });
     }
 
     /// 跳转播放位置（播放中拖动游标 / 设置起点）：
@@ -2737,6 +3586,13 @@ pub const App = struct {
         const tail = ti.len - ti.cursor;
         std.mem.copyForwards(u8, ti.buf[prev .. prev + tail], ti.buf[ti.cursor..ti.len]);
         ti.len -= cut;
+        // **锚点维护**：无选区时 anchor == cursor（“点一下定位光标”后就是这种状态）——
+        // 光标前移时锚点必须跟着走，否则锚点滞留旧位置 > 新 len，下一帧
+        // `text[0..sel_hi]` 越界 panic（实测：重命名 "Lead1" → 点尾 → 退格删 "1"
+        // → "index 5, len 4"；脚本复现同族 "index 4, len 3"）。
+        if (ti.sel_anchor) |a| {
+            ti.sel_anchor = if (a == ti.cursor) prev else @min(a, ti.len);
+        }
         ti.cursor = prev;
     }
 
@@ -2863,6 +3719,42 @@ pub const App = struct {
                             self.commitHistory("重命名样式");
                         }
                     }
+                }
+            },
+            .preset_name => {
+                // “保存为…”：空名 → 忽略；否则排队等 main 落盘（源 = 预设保存源）
+                if (val.len > 0) {
+                    var act = PresetAction{ .save = .{
+                        .source = self.preset_save_source,
+                        .name_buf = undefined,
+                        .name_len = 0,
+                    } };
+                    const n = @min(val.len, act.save.name_buf.len);
+                    @memcpy(act.save.name_buf[0..n], val[0..n]);
+                    act.save.name_len = n;
+                    self.pending_preset = act;
+                }
+            },
+            .kit_pad_name => {
+                // 鼓垫重命名（空名 = 清除——回到默认 GM/音名显示）
+                if (ti.instrument >= 0 and ti.index <= 127) {
+                    _ = self.kitPadRename(ti.instrument, @intCast(ti.index), val);
+                }
+            },
+            .preset_rename => {
+                // 预设文件重命名（旧名存 `aux_buf`；空名/旧名缺失 → 忽略）
+                if (val.len > 0 and ti.aux_len > 0) {
+                    var act = PresetAction{ .rename = .{
+                        .cat = ti.index,
+                        .old_buf = ti.aux_buf,
+                        .old_len = ti.aux_len,
+                        .new_buf = undefined,
+                        .new_len = 0,
+                    } };
+                    const n = @min(val.len, act.rename.new_buf.len);
+                    @memcpy(act.rename.new_buf[0..n], val[0..n]);
+                    act.rename.new_len = n;
+                    self.pending_preset = act;
                 }
             },
         }
@@ -3687,15 +4579,15 @@ test "app: menuIsOpen——每种菜单都必须计入（漏项会穿透下层�
     try std.testing.expect(app.menuIsOpen());
     app.file_menu_open = false;
 
-    // 机架下拉菜单
-    app.rack.menu_open = true;
-    try std.testing.expect(app.menuIsOpen());
-    app.rack.menu_open = false;
-
     // 机架右键菜单（乐器）
     app.rack.ctx_instrument = 0;
     try std.testing.expect(app.menuIsOpen());
     app.rack.ctx_instrument = null;
+
+    // 预设面板（统一选择器：模态）
+    app.preset_browser.open = true;
+    try std.testing.expect(app.menuIsOpen());
+    app.preset_browser.open = false;
 
     // 全部关闭 → 无菜单
     try std.testing.expect(!app.menuIsOpen());
@@ -3871,6 +4763,48 @@ test "app: 重命名——光标定位/插入/Del/选区/Ctrl+A" {
     try std.testing.expectEqual(@as(?[2]usize, .{ 0, 1 }), app.text_input.selection());
     app.textInputMoveCursor(1, false); // 无 Shift → 折叠并清锚点
     app.textInputMoveCursor(-2, false); // Home
+}
+
+test "app: 文本输入——点尾定位后退格不越界（修“Lead1 退格删 1”事故）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+
+    // 预填 + 全选（与保存/重命名一致）；用事故里的名字 "Lead1"（5 字节）
+    app.beginRenamePreset(0, 0, .{ .params = .{ .instrument = 0 } }, "Lead1");
+    try std.testing.expectEqual(@as(usize, 5), app.text_input.len);
+    try std.testing.expectEqual(@as(?[2]usize, .{ 0, 5 }), app.text_input.selection());
+
+    // 点输入框尾部（定位光标：anchor = cursor = 5，无选区）——用户实际动作
+    app.textInputPointerDown(5);
+    app.textInputPointerUp();
+    try std.testing.expect(app.text_input.selection() == null);
+
+    // 退格删掉 "1"：旧代码锚点滞留 5 > 新 len 4 → 下一帧 text[0..5] 越界 panic
+    app.textInputBackspace();
+    try std.testing.expectEqual(@as(usize, 4), app.text_input.len);
+    try std.testing.expectEqual(@as(usize, 4), app.text_input.cursor);
+    try std.testing.expectEqualStrings("Lead", app.text_input.text());
+    if (app.text_input.selection()) |sel| {
+        try std.testing.expect(sel[1] <= app.text_input.len); // 渲染不变式
+    }
+
+    // 多字节名同理（“键” 3 字节 + 尾字符）
+    app.beginRenamePreset(0, 0, .{ .params = .{ .instrument = 0 } }, "大鼓X");
+    app.textInputPointerDown(app.text_input.len);
+    app.textInputPointerUp();
+    app.textInputBackspace();
+    try std.testing.expectEqualStrings("大鼓", app.text_input.text());
+    if (app.text_input.selection()) |sel| {
+        try std.testing.expect(sel[1] <= app.text_input.len);
+    }
+
+    // 防御：就算钆点被人为弄脏，selection() 也不越界
+    app.text_input.sel_anchor = 99;
+    if (app.text_input.selection()) |sel| {
+        try std.testing.expect(sel[1] <= app.text_input.len);
+    }
 }
 
 test "app: 重命名调音台通道——空串恢复默认占位名" {
@@ -4428,4 +5362,581 @@ test "app: 样式——删除可撤销（快照含名字/音符，重做再删�
     try std.testing.expect(app.redo());
     try std.testing.expectEqual(@as(i32, 2), app.patternCount());
     try std.testing.expectEqual(@as(usize, 2), app.notes.items.len);
+}
+
+test "app: 鼓组——层增删/来源名、撤销恢复、存档往返（含 JSON）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(3);
+    app.resetMixerChannels(default_mixer_channels);
+    const inst = app.addDrumkit("鼓组");
+    try std.testing.expectEqual(@as(i32, 0), inst);
+    app.resetHistory("初始状态");
+
+    // 加层：kick 两层（第二层带预设来源 + 非默认音色）、snare 一层
+    var saved = persist.SavedSynth{};
+    saved.attack = 0.005; // 非默认值（验证内嵌副本真的带过来了）
+    try std.testing.expect(app.kitLayerAdd(inst, 35, null, ""));
+    try std.testing.expect(app.kitLayerAdd(inst, 35, &saved, "subtractive/Kick808"));
+    try std.testing.expect(app.kitLayerAdd(inst, 38, null, ""));
+    app.commitHistory("添加层");
+
+    // 垫按音高升序；层数/来源/音色
+    const kit = app.instruments.items[0].kit.?;
+    try std.testing.expectEqual(@as(usize, 2), kit.pads.items.len);
+    try std.testing.expectEqual(@as(u8, 35), kit.pads.items[0].pitch);
+    try std.testing.expectEqual(@as(u8, 38), kit.pads.items[1].pitch);
+    try std.testing.expectEqual(@as(usize, 3), kit.totalLayers());
+    try std.testing.expectEqualStrings("subtractive/Kick808", kit.find(35).?.layers.items[1].source_preset);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.005), kit.find(35).?.layers.items[1].params.attack.load(.monotonic), 0.0001);
+
+    // 改名 → 撤销 → 重做
+    {
+        const pad = kit.find(35).?;
+        app.allocator.free(pad.name);
+        pad.name = try app.allocator.dupe(u8, "大鼓");
+        app.commitHistory("改名");
+    }
+    try std.testing.expect(app.undo());
+    try std.testing.expectEqualStrings("", app.instruments.items[0].kit.?.find(35).?.name);
+    try std.testing.expect(app.redo());
+    try std.testing.expectEqualStrings("大鼓", app.instruments.items[0].kit.?.find(35).?.name);
+
+    // 删层 → 撤销（层回来且参数/来源还原）
+    try std.testing.expect(app.kitLayerRemove(inst, 35, 1));
+    app.commitHistory("删除层");
+    try std.testing.expectEqual(@as(usize, 2), app.instruments.items[0].kit.?.totalLayers());
+    try std.testing.expect(app.undo());
+    try std.testing.expectEqual(@as(usize, 3), app.instruments.items[0].kit.?.totalLayers());
+    try std.testing.expectEqualStrings("subtractive/Kick808", app.instruments.items[0].kit.?.find(35).?.layers.items[1].source_preset);
+
+    // 存档导出 → 真实 JSON 往返 → 导入另一个 App
+    const proj = try app.exportProject();
+    defer app.freeProject(proj);
+    const json = try persist.toJson(std.testing.allocator, proj);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kit\"") != null); // 字段确实写出
+    var parsed = try persist.fromJson(std.testing.allocator, json);
+    defer parsed.deinit();
+
+    var app2 = App{ .allocator = std.testing.allocator };
+    defer app2.clips.deinit(app2.allocator);
+    defer app2.notes.deinit(app2.allocator);
+    defer app2.deinitAll();
+    app2.resetPatterns(1);
+    app2.resetMixerChannels(default_mixer_channels);
+    app2.importProject(parsed.value);
+
+    try std.testing.expectEqual(@as(usize, 1), app2.instruments.items.len);
+    const inst2 = &app2.instruments.items[0];
+    try std.testing.expectEqual(model.InstrumentKind.drumkit, inst2.kind);
+    const kit2 = inst2.kit.?;
+    try std.testing.expectEqual(@as(usize, 2), kit2.pads.items.len);
+    try std.testing.expectEqual(@as(usize, 3), kit2.totalLayers());
+    try std.testing.expectEqualStrings("大鼓", kit2.find(35).?.name);
+    try std.testing.expectEqualStrings("subtractive/Kick808", kit2.find(35).?.layers.items[1].source_preset);
+    try std.testing.expectEqual(model.LayerKind.subtractive, kit2.find(35).?.layers.items[1].kind); // 层乐器类型往返
+    try std.testing.expectApproxEqAbs(@as(f32, 0.005), kit2.find(35).?.layers.items[1].params.attack.load(.monotonic), 0.0001);
+
+    // 旧存档（无 kind/kit 字段）→ 默认合成器（向后兼容）
+    // 注：用**栈上副本**改，不能直接改 proj.instruments——那是共享数组，
+    // 改它会盖掉 proj 里的 kit 指针（实测：freeProject 漏释放 → 测试报泄漏）
+    var legacy_insts = [_]persist.SavedInstrument{proj.instruments[0]};
+    legacy_insts[0].kind = 0;
+    legacy_insts[0].kit = .{};
+    var legacy = proj;
+    legacy.instruments = &legacy_insts;
+    var app3 = App{ .allocator = std.testing.allocator };
+    defer app3.clips.deinit(app3.allocator);
+    defer app3.notes.deinit(app3.allocator);
+    defer app3.deinitAll();
+    app3.resetPatterns(1);
+    app3.resetMixerChannels(default_mixer_channels);
+    app3.importProject(legacy);
+    try std.testing.expectEqual(model.InstrumentKind.synth, app3.instruments.items[0].kind);
+    try std.testing.expect(app3.instruments.items[0].kit == null);
+}
+
+test "app: 鼓组——层数上限（全组 16 槽位）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    const inst = app.addDrumkit("鼓组");
+
+    // 16 层全给同一垫（同一音高）：第 17 个被拒绝
+    var i: usize = 0;
+    while (i < @import("audio.zig").kit_max_layers) : (i += 1) {
+        try std.testing.expect(app.kitLayerAdd(inst, 36, null, ""));
+    }
+    try std.testing.expectEqual(@as(usize, @import("audio.zig").kit_max_layers), app.instruments.items[0].kit.?.totalLayers());
+    try std.testing.expect(!app.kitLayerAdd(inst, 36, null, "")); // 满 → 拒绝
+    try std.testing.expect(!app.kitLayerAdd(inst, 50, null, "")); // 别的音高也拒绝（槽位是**全组**共享）
+
+    // 删一层后又能加
+    try std.testing.expect(app.kitLayerRemove(inst, 36, 0));
+    try std.testing.expect(app.kitLayerAdd(inst, 50, null, ""));
+}
+
+test "app: 鼓组编辑器——垫重命名（含空名清除）、文本输入提交、来源名更新" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    const inst = app.addDrumkit("鼓组");
+    app.resetHistory("初始状态");
+    _ = app.kitLayerAdd(inst, 35, null, "");
+    app.commitHistory("添加层");
+
+    // 直接改名 / 清除（空名 = 回退 GM/音名）
+    try std.testing.expect(app.kitPadRename(inst, 35, "底鼓"));
+    try std.testing.expectEqualStrings("底鼓", app.instruments.items[0].kit.?.find(35).?.name);
+    try std.testing.expect(!app.kitPadRename(inst, 35, "底鼓")); // 无变化 → false
+    try std.testing.expect(app.undo());
+    try std.testing.expectEqualStrings("", app.instruments.items[0].kit.?.find(35).?.name);
+    try std.testing.expect(app.redo());
+    try std.testing.expectEqualStrings("底鼓", app.instruments.items[0].kit.?.find(35).?.name);
+
+    // 文本输入路径（“名称”字段就地点改）：预填 + 提交
+    app.beginRenameKitPad(inst, 35, 10, 10);
+    try std.testing.expect(app.text_input.active);
+    try std.testing.expectEqual(TextInput.Target.kit_pad_name, app.text_input.target);
+    try std.testing.expectEqualStrings("底鼓", app.text_input.text()); // 预填当前名字
+    while (app.text_input.text().len > 0) app.textInputBackspace();
+    app.textInputAppend('K');
+    app.textInputCommit();
+    try std.testing.expectEqualStrings("K", app.instruments.items[0].kit.?.find(35).?.name);
+
+    // 空名提交 = 清除自定义名（回到默认）
+    app.beginRenameKitPad(inst, 35, 10, 10);
+    while (app.text_input.text().len > 0) app.textInputBackspace();
+    app.textInputCommit();
+    try std.testing.expectEqualStrings("", app.instruments.items[0].kit.?.find(35).?.name);
+
+    // 来源预设名（加载/保存预设后由 main 调）；无变化返 false
+    try std.testing.expect(app.kitLayerSetSource(inst, 35, 0, "subtractive/Kick808"));
+    try std.testing.expectEqualStrings("subtractive/Kick808", app.instruments.items[0].kit.?.find(35).?.layers.items[0].source_preset);
+    try std.testing.expect(!app.kitLayerSetSource(inst, 35, 0, "subtractive/Kick808"));
+    try std.testing.expect(!app.kitLayerSetSource(inst, 35, 9, "subtractive/X")); // 层越界
+    try std.testing.expect(!app.kitLayerSetSource(inst, 60, 0, "subtractive/X")); // 垫不存在
+}
+
+test "app: 鼓组编辑器——打开时选中首个已映射垫；删除乐器时关闭/前移" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    const a = app.addDrumkit("鼓组 A");
+    _ = app.addDrumkit("鼓组 B");
+    _ = app.addInstrument("减法合成器");
+
+    // 空套 → 默认 36；非鼓组 → 不开
+    app.openDrumKit(2);
+    try std.testing.expect(!app.drumkit_win.open);
+    app.openDrumKit(a);
+    try std.testing.expect(app.drumkit_win.open);
+    try std.testing.expectEqual(@as(i32, 36), app.drumkit_win.sel_pitch);
+    try std.testing.expectEqual(@as(i32, 0), app.sel.instrument); // 同步选择（试听路由）
+
+    // 有垫 → 选首个（升序最小音高）
+    _ = app.kitLayerAdd(a, 44, null, "");
+    _ = app.kitLayerAdd(a, 35, null, "");
+    app.openDrumKit(a);
+    try std.testing.expectEqual(@as(i32, 35), app.drumkit_win.sel_pitch);
+
+    // 改打开 B（空套）→ 默认 36；删除其前的 A → 窗口不关、索引前移
+    app.openDrumKit(1);
+    try std.testing.expectEqual(@as(i32, 36), app.drumkit_win.sel_pitch);
+    app.removeInstrument(0);
+    try std.testing.expect(app.drumkit_win.open);
+    try std.testing.expectEqual(@as(i32, 0), app.drumkit_win.instrument); // B 前移到 0
+
+    // 删除绑定乐器 → 关闭
+    app.removeInstrument(0);
+    try std.testing.expect(!app.drumkit_win.open);
+}
+
+test "app: 键列模式——每乐器独立（默认钢琴；鼓组默认鼓）；随存档往返" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    const syn = app.addInstrument("减法合成器");
+    const kit = app.addDrumkit("鼓组");
+    try std.testing.expectEqual(model.KeyMode.piano, app.instruments.items[0].key_mode);
+    try std.testing.expectEqual(model.KeyMode.drum, app.instruments.items[1].key_mode); // 鼓组默认
+
+    // 按当前选择切换：只动选中乐器
+    app.sel.instrument = syn;
+    app.setCurrentKeyMode(.drum);
+    app.sel.instrument = kit;
+    app.setCurrentKeyMode(.piano);
+    app.sel.instrument = syn;
+    try std.testing.expectEqual(model.KeyMode.drum, app.currentKeyMode());
+    app.sel.instrument = kit;
+    try std.testing.expectEqual(model.KeyMode.piano, app.currentKeyMode());
+    app.sel.instrument = -1;
+    try std.testing.expectEqual(model.KeyMode.piano, app.currentKeyMode()); // 无乐器 → 钢琴
+
+    // 存档往返（kind/key_mode/kit 一起走）
+    const proj = try app.exportProject();
+    defer app.freeProject(proj);
+    var app2 = App{ .allocator = std.testing.allocator };
+    defer app2.clips.deinit(app2.allocator);
+    defer app2.notes.deinit(app2.allocator);
+    defer app2.deinitAll();
+    app2.resetPatterns(1);
+    app2.resetMixerChannels(default_mixer_channels);
+    app2.importProject(proj);
+    try std.testing.expectEqual(model.KeyMode.drum, app2.instruments.items[0].key_mode);
+    try std.testing.expectEqual(model.KeyMode.piano, app2.instruments.items[1].key_mode);
+}
+
+test "app: 预设目标——eql/解析（乐器/鼓组层/失效目标）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    const inst = app.addDrumkit("鼓组");
+    _ = app.kitLayerAdd(inst, 35, null, "");
+
+    const ref = PresetTarget.KitLayerRef{ .instrument = inst, .pitch = 35, .layer = 0 };
+    const t1 = PresetTarget{ .kit_layer_replace = ref };
+    const t2 = PresetTarget{ .kit_layer_replace = ref };
+    const t3 = PresetTarget{ .kit_layer_replace = .{ .instrument = inst, .pitch = 35, .layer = 1 } };
+    try std.testing.expect(t1.eql(t2));
+    try std.testing.expect(!t1.eql(t3));
+    try std.testing.expect(!t1.eql(PresetTarget{ .instrument = inst }));
+    const ta = PresetTarget{ .instrument = 1 };
+    const tb = PresetTarget{ .instrument = 2 };
+    try std.testing.expect(ta.eql(PresetTarget{ .instrument = 1 }));
+    try std.testing.expect(!ta.eql(tb));
+
+    // 解析：层目标 → 层参数指针；乐器目标（鼓组）→ null；越界 → null
+    const lp = app.resolvePresetTarget(t1).?;
+    try std.testing.expect(lp == app.instruments.items[0].kit.?.find(35).?.layers.items[0].params);
+    try std.testing.expect(app.resolvePresetTarget(PresetTarget{ .instrument = inst }) == null);
+    try std.testing.expect(app.resolvePresetTarget(PresetTarget{ .kit_layer_replace = .{ .instrument = 99, .pitch = 35, .layer = 0 } }) == null);
+
+    // 目标所需插件：鼓组层 → 减法（层就是减法合成器音色）；
+    // 鼓组乐器本体 → drumkit（将来“整组套预设”）；普通减法乐器 → subtractive
+    try std.testing.expectEqualStrings("drumkit", app.presetTargetPlugin(PresetTarget{ .instrument = inst }));
+    try std.testing.expectEqualStrings("subtractive", app.presetTargetPlugin(PresetTarget{ .kit_layer_replace = ref }));
+    const syn2 = app.addInstrument("减法合成器");
+    try std.testing.expectEqualStrings("subtractive", app.presetTargetPlugin(PresetTarget{ .instrument = syn2 }));
+
+    // 层被删后目标失效（合成器窗口自动关闭的依据）
+    _ = app.kitLayerRemove(inst, 35, 0);
+    try std.testing.expect(app.resolvePresetTarget(t1) == null);
+}
+
+test "app: 预设面板分类可选性——统一面板（任意入口可选任意已实装插件；层不列鼓组）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    const syn = app.addInstrument("减法合成器");
+    const kit = app.addDrumkit("鼓组");
+
+    // replace + **乐器本体**：面板已统一——减法与鼓组都可选（点别的插件 = 顺带换插件）；
+    // 未实装插件（fm/vst3）不可选
+    try std.testing.expect(app.presetCategorySelectable(.{ .replace = .{ .instrument = syn } }, preset_mod.plugin_subtractive));
+    try std.testing.expect(app.presetCategorySelectable(.{ .replace = .{ .instrument = syn } }, preset_mod.plugin_drumkit));
+    try std.testing.expect(!app.presetCategorySelectable(.{ .replace = .{ .instrument = syn } }, "fm"));
+    try std.testing.expect(app.presetCategorySelectable(.{ .replace = .{ .instrument = kit } }, preset_mod.plugin_drumkit));
+
+    // replace + **鼓组层**：仅减法（层目前只支持减法；鼓组禁自嵌套）
+    const layer_ref = PresetTarget.KitLayerRef{ .instrument = kit, .pitch = 35, .layer = 0 };
+    try std.testing.expect(app.presetCategorySelectable(.{ .replace = .{ .kit_layer_replace = layer_ref } }, preset_mod.plugin_subtractive));
+    try std.testing.expect(!app.presetCategorySelectable(.{ .replace = .{ .kit_layer_replace = layer_ref } }, preset_mod.plugin_drumkit));
+
+    // 新建/更换乐器：减法 + 鼓组（已实装）；fm/vst3 不可选
+    try std.testing.expect(app.presetCategorySelectable(.create_instrument, preset_mod.plugin_subtractive));
+    try std.testing.expect(app.presetCategorySelectable(.create_instrument, preset_mod.plugin_drumkit));
+    try std.testing.expect(!app.presetCategorySelectable(.create_instrument, "fm"));
+    try std.testing.expect(!app.presetCategorySelectable(.{ .change_instrument = syn }, "vst3"));
+
+    // 鼓垫加乐器：仅减法（**禁止自嵌套**——鼓组不可选）
+    const layer_intent = PresetIntent{ .create_kit_layer = .{ .instrument = kit, .pitch = 35 } };
+    try std.testing.expect(app.presetCategorySelectable(layer_intent, preset_mod.plugin_subtractive));
+    try std.testing.expect(!app.presetCategorySelectable(layer_intent, preset_mod.plugin_drumkit));
+}
+
+test "app: 更换乐器——synth⇄鼓组（保留属性、可撤销/重做）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    const inst = app.addInstrument("减法合成器");
+    app.instruments.items[@intCast(inst)].volume = 0.42;
+    app.resetHistory("初始状态");
+
+    // 同类型 → false（无操作）
+    try std.testing.expect(!app.changeInstrumentKind(@intCast(inst), .synth, true));
+
+    // 减法 → 鼓组：建空套鼓 + 键列模式切鼓组；名字/音量保留
+    try std.testing.expect(app.changeInstrumentKind(@intCast(inst), .drumkit, true));
+    {
+        const it = &app.instruments.items[@intCast(inst)];
+        try std.testing.expectEqual(model.InstrumentKind.drumkit, it.kind);
+        try std.testing.expect(it.kit != null);
+        try std.testing.expectEqual(model.KeyMode.drum, it.key_mode);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.42), it.volume, 0.001);
+        try std.testing.expectEqualStrings("减法合成器", it.name);
+    }
+
+    // 加一层后换回减法：套鼓被释放；键列模式回钢琴；撤销 → 套鼓与层、类型/模式都回来
+    _ = app.kitLayerAdd(inst, 35, null, "subtractive/Kick");
+    app.commitHistory("添加层");
+    try std.testing.expect(app.changeInstrumentKind(@intCast(inst), .synth, true));
+    try std.testing.expect(app.instruments.items[@intCast(inst)].kit == null);
+    try std.testing.expectEqual(model.KeyMode.piano, app.instruments.items[@intCast(inst)].key_mode);
+    try std.testing.expect(app.undo()); // → 鼓组 + 1 层（键列模式也回到鼓组）
+    {
+        const it = &app.instruments.items[@intCast(inst)];
+        try std.testing.expectEqual(model.InstrumentKind.drumkit, it.kind);
+        try std.testing.expectEqual(model.KeyMode.drum, it.key_mode);
+        try std.testing.expectEqual(@as(usize, 1), it.kit.?.totalLayers());
+        try std.testing.expectEqualStrings("subtractive/Kick", it.kit.?.find(35).?.layers.items[0].source_preset);
+        try std.testing.expectEqual(model.LayerKind.subtractive, it.kit.?.find(35).?.layers.items[0].kind);
+    }
+    try std.testing.expect(app.undo()); // → 鼓组、无层
+    try std.testing.expect(app.undo()); // → 初始（减法、无套鼓）
+    {
+        const it = &app.instruments.items[@intCast(inst)];
+        try std.testing.expectEqual(model.InstrumentKind.synth, it.kind);
+        try std.testing.expect(it.kit == null);
+    }
+    // 重做两次 → 又回到鼓组 + 一层
+    try std.testing.expect(app.redo());
+    try std.testing.expect(app.redo());
+    {
+        const it = &app.instruments.items[@intCast(inst)];
+        try std.testing.expectEqual(model.InstrumentKind.drumkit, it.kind);
+        try std.testing.expectEqual(@as(usize, 1), it.kit.?.totalLayers());
+    }
+}
+
+test "app: 鼓组——清空后的无名空垫自动移除（有名垫保留）；蓝点/强调条语义" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    const inst = app.addDrumkit("鼓组");
+    app.resetHistory("初始状态");
+
+    // 无名垫：加两层，删一层 → 还在；删最后一层 → 垫本身也没信息了，移除
+    try std.testing.expect(app.kitLayerAdd(inst, 35, null, ""));
+    try std.testing.expect(app.kitLayerAdd(inst, 35, null, ""));
+    app.commitHistory("添加层");
+    try std.testing.expect(app.instruments.items[0].kit.?.isMapped(35));
+    try std.testing.expect(app.kitLayerRemove(inst, 35, 0));
+    app.commitHistory("删除层");
+    try std.testing.expect(app.instruments.items[0].kit.?.find(35) != null); // 还剩一层
+    try std.testing.expect(app.kitLayerRemove(inst, 35, 0));
+    app.commitHistory("删除层");
+    try std.testing.expect(app.instruments.items[0].kit.?.find(35) == null); // 无名空垫被移除
+    try std.testing.expect(!app.instruments.items[0].kit.?.isMapped(35));
+
+    // 有名垫：清空层后保留（名字是用户信息）；但 isMapped 为 false（蓝点/强调条熄）
+    try std.testing.expect(app.kitLayerAdd(inst, 38, null, ""));
+    try std.testing.expect(app.kitPadRename(inst, 38, "小军鼓"));
+    app.commitHistory("重命名鼓垫");
+    try std.testing.expect(app.instruments.items[0].kit.?.isMapped(38));
+    try std.testing.expect(app.kitLayerRemove(inst, 38, 0));
+    app.commitHistory("删除层");
+    try std.testing.expect(app.instruments.items[0].kit.?.find(38) != null);
+    try std.testing.expectEqualStrings("小军鼓", app.instruments.items[0].kit.?.find(38).?.name);
+    try std.testing.expect(!app.instruments.items[0].kit.?.isMapped(38));
+
+    // 有名垫清成空名 → 此时无层无名 → 一并移除
+    try std.testing.expect(app.kitPadRename(inst, 38, ""));
+    try std.testing.expect(app.instruments.items[0].kit.?.find(38) == null);
+
+    // 撤销链完整回放：最后一步撤销 → 名字/垫回来；一直撤销到底 → 套鼓回到空（但套鼓还在）
+    try std.testing.expect(app.undo());
+    try std.testing.expectEqualStrings("小军鼓", app.instruments.items[0].kit.?.find(38).?.name);
+    try std.testing.expect(app.undo()); // 撤销“删除层” → 层 + 蓝点回来
+    try std.testing.expect(app.instruments.items[0].kit.?.isMapped(38));
+}
+
+test "app: 套鼓快照——导出/载入/释放（自包含副本；替换现有内容）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    const a = app.addDrumkit("鼓组 A");
+    _ = app.kitLayerAdd(a, 35, null, "subtractive/Kick");
+    _ = app.kitPadRename(a, 35, "底鼓");
+    _ = app.kitLayerAdd(a, 44, null, "");
+
+    // 导出快照（深拷贝）
+    const snap = app.exportKitForSave(@intCast(a)).?;
+    defer app.freeSavedKit(&snap);
+    try std.testing.expectEqual(@as(usize, 2), snap.pads.len);
+    try std.testing.expectEqual(@as(u32, 35), snap.pads[0].pitch);
+    try std.testing.expectEqualStrings("底鼓", snap.pads[0].name);
+    try std.testing.expectEqualStrings("subtractive/Kick", snap.pads[0].layers[0].source_preset);
+
+    // 载入到另一个套（替换旧内容：旧墴 38 消失，新墴 35/44 到位）
+    const b = app.addDrumkit("鼓组 B");
+    _ = app.kitLayerAdd(b, 38, null, "subtractive/Snare");
+    try std.testing.expect(app.loadKitInto(@intCast(b), &snap));
+    {
+        const kb = app.instruments.items[@intCast(b)].kit.?;
+        try std.testing.expect(kb.find(38) == null);
+        try std.testing.expectEqualStrings("底鼓", kb.find(35).?.name);
+        try std.testing.expect(kb.isMapped(44));
+        // 层参数是真副本（改源不影响目标——地址不同）
+        try std.testing.expect(kb.find(35).?.layers.items[0].params != app.instruments.items[@intCast(a)].kit.?.find(35).?.layers.items[0].params);
+    }
+
+    // 空快照 = 清空（不变式：总层数归零）
+    try std.testing.expect(app.loadKitInto(@intCast(b), &persist.SavedDrumKit{}));
+    try std.testing.expectEqual(@as(usize, 0), app.instruments.items[@intCast(b)].kit.?.totalLayers());
+
+    // 非鼓组乐器也能载入（先建空 kit）
+    const syn = app.addInstrument("减法合成器");
+    try std.testing.expect(app.loadKitInto(@intCast(syn), &snap));
+    try std.testing.expectEqual(@as(usize, 2), app.instruments.items[@intCast(syn)].kit.?.pads.items.len);
+    // 注：kind 未变（仍是 synth）——载入套鼓数据不等于换类型
+}
+
+test "app: 关联预设名——设置/读取/预填/存档往返/撤销恢复" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    const syn = app.addInstrument("减法合成器");
+    const kit = app.addDrumkit("鼓组");
+    app.resetHistory("初始状态");
+
+    // 初始为空；设置/读取
+    try std.testing.expectEqualStrings("", app.instrumentPresetName(syn));
+    try std.testing.expect(app.setInstrumentPresetName(@intCast(syn), "Kick808"));
+    try std.testing.expectEqualStrings("Kick808", app.instrumentPresetName(syn));
+    try std.testing.expect(!app.setInstrumentPresetName(@intCast(syn), "Kick808")); // 无变化
+    app.commitHistory("加载预设");
+    try std.testing.expect(app.setInstrumentPresetName(@intCast(syn), "Snare"));
+    app.commitHistory("加载预设");
+
+    // 预填名：乐器本体 / 鼓组整组 / 鼓组层（取来源名的名字部分）
+    try std.testing.expectEqualStrings("Snare", app.presetPrefillName(.{ .params = .{ .instrument = syn } }));
+    try std.testing.expectEqualStrings("Snare", app.presetPrefillName(.{ .kit = syn }));
+    _ = app.kitLayerAdd(kit, 35, null, "subtractive/Kick808");
+    const layer_ref = PresetTarget.KitLayerRef{ .instrument = kit, .pitch = 35, .layer = 0 };
+    try std.testing.expectEqualStrings("Kick808", app.presetPrefillName(.{ .params = .{ .kit_layer_replace = layer_ref } }));
+    try std.testing.expectEqualStrings("subtractive/Kick808", app.kitLayerSource(kit, 35, 0));
+    try std.testing.expectEqualStrings("", app.kitLayerSource(kit, 36, 0)); // 无垫
+    try std.testing.expectEqualStrings("", app.kitLayerSource(kit, 35, 9)); // 层越界
+
+    // 撤销 → 名字回到当时的快照（“加载 Snare”前是 Kick808）
+    try std.testing.expect(app.undo());
+    try std.testing.expectEqualStrings("Kick808", app.instrumentPresetName(syn));
+    try std.testing.expect(app.redo());
+    try std.testing.expectEqualStrings("Snare", app.instrumentPresetName(syn));
+
+    // 存档往返（工程文件里也带预设名）
+    const proj = try app.exportProject();
+    defer app.freeProject(proj);
+    var app2 = App{ .allocator = std.testing.allocator };
+    defer app2.clips.deinit(app2.allocator);
+    defer app2.notes.deinit(app2.allocator);
+    defer app2.deinitAll();
+    app2.resetPatterns(1);
+    app2.resetMixerChannels(default_mixer_channels);
+    app2.importProject(proj);
+    try std.testing.expectEqualStrings("Snare", app2.instrumentPresetName(0));
+}
+
+test "app: 保存对话框预填——全选当前名（输入即替换）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    const syn = app.addInstrument("减法合成器");
+    _ = app.setInstrumentPresetName(@intCast(syn), "Kick808");
+
+    const src = PresetSaveSource{ .params = .{ .instrument = syn } };
+    app.beginRenamePreset(100, 100, src, app.presetPrefillName(src));
+    try std.testing.expect(app.text_input.active);
+    try std.testing.expectEqualStrings("Kick808", app.text_input.text());
+    try std.testing.expectEqual(@as(?usize, 0), app.text_input.sel_anchor); // 全选
+    // 无预填时：空 + 无选区
+    app.beginRenamePreset(100, 100, src, "");
+    try std.testing.expectEqualStrings("", app.text_input.text());
+    try std.testing.expect(app.text_input.sel_anchor == null);
+}
+
+test "app: 预设文件重命名/删除——文本输入排队 + 删除确认状态" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+
+    // 假库：一个分类 + 两个预设名（deinitAll 会释放 preset_lib）
+    {
+        var cat = preset_mod.Category{ .name = try app.allocator.dupe(u8, preset_mod.plugin_subtractive) };
+        try cat.presets.append(app.allocator, try app.allocator.dupe(u8, "Kick808"));
+        try cat.presets.append(app.allocator, try app.allocator.dupe(u8, "Snare"));
+        try app.preset_lib.categories.append(app.allocator, cat);
+    }
+
+    // 重命名：预填旧名 + 全选；提交 → 排队 `.rename`（旧名在 aux，新名在 buf）
+    app.beginRenamePresetFile(0, 0, 10, 10);
+    try std.testing.expect(app.text_input.active);
+    try std.testing.expectEqual(TextInput.Target.preset_rename, app.text_input.target);
+    try std.testing.expectEqualStrings("Kick808", app.text_input.text());
+    try std.testing.expectEqual(@as(?usize, 0), app.text_input.sel_anchor);
+    try std.testing.expectEqualStrings("Kick808", app.text_input.aux_buf[0..app.text_input.aux_len]);
+    while (app.text_input.text().len > 0) app.textInputBackspace();
+    app.textInputAppend('K');
+    app.textInputAppend('9');
+    app.textInputCommit();
+    try std.testing.expect(app.pending_preset != null);
+    switch (app.pending_preset.?) {
+        .rename => |r| {
+            try std.testing.expectEqual(@as(usize, 0), r.cat);
+            try std.testing.expectEqualStrings("Kick808", r.old_buf[0..r.old_len]);
+            try std.testing.expectEqualStrings("K9", r.new_buf[0..r.new_len]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    app.pending_preset = null;
+
+    // 越界（分类/行）→ 不开输入框
+    app.beginRenamePresetFile(9, 0, 10, 10);
+    try std.testing.expect(!app.text_input.active);
+    app.beginRenamePresetFile(0, 9, 10, 10);
+    try std.testing.expect(!app.text_input.active);
+
+    // 删除：弹确认态（modal + delete_req）；未确认前不排队
+    app.setDeletePrompt(0, "Snare");
+    try std.testing.expectEqual(ModalKind.preset_delete, app.modal.?);
+    try std.testing.expectEqualStrings("Snare", app.delete_req.?.name[0..app.delete_req.?.name_len]);
+    try std.testing.expect(app.pending_preset == null);
 }

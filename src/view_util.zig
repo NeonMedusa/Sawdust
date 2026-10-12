@@ -280,6 +280,71 @@ pub fn snapLabel(buf: []u8, snap: i32) []const u8 {
     return std.fmt.bufPrint(buf, "网格 1/{d} ▾", .{model.snap_denoms[@intCast(idx)]}) catch "网格 ▾";
 }
 
+// ── 文件名式**中略**（省略中间、保留两边）──
+
+/// 中略拆分结果：保留头部 `head` 码点 + 省略号 + 尾部 `tail` 码点
+pub const EllipsisSplit = struct { head: usize, tail: usize };
+
+/// 中略拆分纯逻辑：`widths` = 每个码点宽度、`ellipsis_w` = 省略号宽度、
+/// `max_px` = 可用宽度。
+/// - 全文放得下 → `{ .head = n, .tail = 0 }`（不省略的记号）；
+/// - 否则在“两端保留、中间省略”下选**保留最多**的拆分（头略多：
+///   `Acous…Drum` 风格）；
+/// - 连最小形式（1 码点 + … + 1 码点）都放不下 → null（调用方不画）。
+pub fn ellipsisSplit(widths: []const f32, ellipsis_w: f32, max_px: f32) ?EllipsisSplit {
+    const n = widths.len;
+    if (n == 0) return null;
+    var total: f32 = 0;
+    for (widths) |w| total += w;
+    if (total <= max_px) return .{ .head = n, .tail = 0 };
+    if (n < 2) return null;
+    var k: usize = n - 1;
+    while (k >= 2) : (k -= 1) {
+        const head = (k + 1) / 2;
+        const tail = k - head;
+        var hw: f32 = 0;
+        for (widths[0..head]) |w| hw += w;
+        var tw: f32 = 0;
+        for (widths[n - tail ..]) |w| tw += w;
+        if (hw + ellipsis_w + tw <= max_px) return .{ .head = head, .tail = tail };
+    }
+    return null;
+}
+
+/// 文本超宽时**中略**（`docs/drumkit.md` §6）：写进 `buf` 返回切片（需
+/// 容纳全文 + 省略号）；放得下原文时**直接返回 `text`**（不拷贝、不用 buf）；
+/// 连最小形式都放不下 → 返回空（不画）。
+pub fn middleEllipsis(ui: *Ui, buf: []u8, text: []const u8, max_px: i32) []const u8 {
+    if (text.len == 0 or max_px <= 0) return "";
+    if (ui.font.measure(text) <= @as(f32, @floatFromInt(max_px))) return text;
+
+    // 码点边界与宽度（最多 128 码点——键列标签都是短文本；超出则截断看待）
+    var offs: [129]usize = undefined;
+    var wid: [128]f32 = undefined;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < text.len and n < 128) {
+        const cl = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        const j = @min(i + cl, text.len);
+        const cp = std.unicode.utf8Decode(text[i..j]) catch 0xFFFD;
+        offs[n] = i;
+        wid[n] = if (ui.font.getGlyph(cp)) |g| g.advance else ui.font.size_px * 0.5;
+        n += 1;
+        i = j;
+    }
+    offs[n] = text.len;
+    const sp = ellipsisSplit(wid[0..n], ui.font.measure("…"), @as(f32, @floatFromInt(max_px))) orelse return "";
+    if (sp.tail == 0) return text[0..offs[sp.head]]; // 放得下（与上面等价的兼底）
+    const hb = offs[sp.head];
+    const ts = offs[n - sp.tail];
+    const tb = text.len - ts;
+    if (hb + 3 + tb > buf.len) return "";
+    @memcpy(buf[0..hb], text[0..hb]);
+    @memcpy(buf[hb..][0..3], "…");
+    @memcpy(buf[hb + 3 ..][0..tb], text[ts..]);
+    return buf[0 .. hb + 3 + tb];
+}
+
 /// 标题栏选择器按钮宽度（文本宽 + 内边距；供调用方定位相邻控件/可见性判断）
 pub fn titleSelectorButtonWidth(ui: *Ui, label: []const u8) i32 {
     return @as(i32, @intFromFloat(ui.font.measure(label))) + 16;
@@ -439,4 +504,27 @@ test "网格：拍线因太密隐藏时，拍位置上的网格线仍画（不�
     gridTestRow(&fb, &theme, 48, 1.0, 0.1);
     try std.testing.expectEqual(theme.grid_snap, buf[4]); // step 48 → x=4.8→4：网格线补上
     try std.testing.expectEqual(theme.grid_bar, buf[9]); // step 96 → x=9.6→9：小节线
+}
+
+test "中略：放得下不省略、超宽省略中间保留两边、太窄返回 null" {
+    const w = [_]f32{10} ** 10; // 10 个码点、每个宽 10
+    const ell: f32 = 12;
+
+    // 放得下 → 不省略（记号：head = n、tail = 0）
+    try std.testing.expectEqual(EllipsisSplit{ .head = 10, .tail = 0 }, ellipsisSplit(&w, ell, 150).?);
+
+    // 宽 60：k=4 → 20+12+20=52≤60；k=5 → 30+12+20=62>60 → 取 k=4（头 2 尾 2）
+    try std.testing.expectEqual(EllipsisSplit{ .head = 2, .tail = 2 }, ellipsisSplit(&w, ell, 60).?);
+    // 头略多（与 `Acous…Drum` 风格一致）：20 码点、宽 102 时取 k=9 → head 5 / tail 4
+    const w20 = [_]f32{10} ** 20; // 全文 200 > 102
+    try std.testing.expectEqual(EllipsisSplit{ .head = 5, .tail = 4 }, ellipsisSplit(&w20, ell, 102).?);
+
+    // 四舍五入边界：恰好等于可用宽 → 算放得下（≤）
+    try std.testing.expectEqual(EllipsisSplit{ .head = 2, .tail = 1 }, ellipsisSplit(&w, ell, 42).?);
+
+    // 连最小形式（1+…+1 = 32）都放不下 → null（不画）
+    try std.testing.expect(ellipsisSplit(&w, ell, 31) == null);
+    // 单码点文本 + 放不下 → null（无“中间”可省）
+    try std.testing.expect(ellipsisSplit(w[0..1], ell, 5) == null);
+    try std.testing.expect(ellipsisSplit(&[_]f32{}, ell, 100) == null);
 }

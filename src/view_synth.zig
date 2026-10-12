@@ -13,7 +13,9 @@ const std = @import("std");
 const r_mod = @import("render.zig");
 const Ui = @import("ui.zig").Ui;
 const App = @import("app.zig").App;
+const PresetSaveSource = @import("app.zig").PresetSaveSource;
 const synth = @import("synth.zig");
+const model = @import("model.zig");
 const util = @import("view_util.zig");
 
 const win_title_h: i32 = 22;
@@ -41,9 +43,13 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     const ww = sw.w;
     const hh = sw.h;
     const body_y = y + win_title_h;
-    // 编辑当前选中乐器的参数（切换乐器时窗口跟随；无乐器时自动关闭）
-    sw.instrument = app.sel.instrument;
-    const p = app.selectedSynth() orelse {
+    // 乐器目标：**跟随当前选择**（旧行为）；鼓组层目标：固定绑定（不跟随）。
+    // 目标失效（乐器被删/变成鼓组/层被删）→ 自动关闭。
+    switch (sw.target) {
+        .instrument => sw.target = .{ .instrument = app.sel.instrument },
+        else => {},
+    }
+    const p = app.resolvePresetTarget(sw.target) orelse {
         sw.open = false;
         return true;
     };
@@ -55,13 +61,70 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
 
     // 标题栏
     ui.renderer.fillRect(x + 1, y + 1, ww - 2, win_title_h - 1, ui.theme.toolbar);
-    var tbuf: [64]u8 = undefined;
-    const iname: []const u8 = if (sw.instrument >= 0 and sw.instrument < @as(i32, @intCast(app.instruments.items.len)))
-        app.instruments.items[@intCast(sw.instrument)].name
-    else
-        "（无乐器）";
-    const title = std.fmt.bufPrint(&tbuf, "减法合成器 — {s}", .{iname}) catch "减法合成器";
+    var tbuf: [192]u8 = undefined;
+    const title: []const u8 = switch (sw.target) {
+        .instrument => |ii| blk: {
+            const iname: []const u8 = if (ii >= 0 and ii < @as(i32, @intCast(app.instruments.items.len)))
+                app.instruments.items[@intCast(ii)].name
+            else
+                "（无乐器）";
+            break :blk std.fmt.bufPrint(&tbuf, "减法合成器 — {s}", .{iname}) catch "减法合成器";
+        },
+        .kit_layer_replace => |ref| blk: {
+            const iname: []const u8 = if (ref.instrument >= 0 and ref.instrument < @as(i32, @intCast(app.instruments.items.len)))
+                app.instruments.items[@intCast(ref.instrument)].name
+            else
+                "（无乐器）";
+            var nb: [48]u8 = undefined;
+            const kit: ?*const model.DrumKit = if (ref.instrument >= 0 and ref.instrument < @as(i32, @intCast(app.instruments.items.len)))
+                app.instruments.items[@intCast(ref.instrument)].kit
+            else
+                null;
+            const pname = model.drumKeyLabel(&nb, kit, ref.pitch);
+            break :blk std.fmt.bufPrint(&tbuf, "减法合成器 — {s} · {s} 层{d}", .{ iname, pname, ref.layer + 1 }) catch "减法合成器";
+        },
+    };
     ui.label(title, x + 8, y + 4, ui.theme.text);
+
+    // 预设按钮（标题栏右侧）：[预设 ▾] [保存为…]
+    // 仅减法合成器有预设库（`plugin_subtractive`）
+    {
+        const save_w: i32 = 62;
+        const menu_w: i32 = 58;
+        const gap: i32 = 6;
+        const bx2 = x + ww - 22 - 6 - save_w;
+        const bx1 = bx2 - gap - menu_w;
+        const bh2: i32 = win_title_h - 6;
+        const by2 = y + 3;
+        if (bx1 > x + 180) { // 标题放不下就不画（窄窗）
+            // [预设 ▾]
+            const h1 = util.hitUI(ui, bx1, by2, menu_w, bh2);
+            ui.renderer.fillRect(bx1, by2, menu_w, bh2, if (app.preset_browser.open) ui.theme.accent else if (h1) ui.theme.item_hover else ui.theme.slider_track);
+            ui.renderer.strokeRect(bx1, by2, menu_w, bh2, ui.theme.panel_border);
+            ui.label("预设 ▾", bx1 + 5, by2 + 2, ui.theme.text);
+            if (h1 and ui.mouse_pressed) {
+                if (app.preset_browser.open) {
+                    app.preset_browser.open = false;
+                } else {
+                    app.openPresetBrowser(.{ .replace = sw.target }); // 同插件限定
+                }
+                ui.active_id = 0; // 防误触发标题拖动（同一位置按下）
+            }
+            // [保存为…]
+            const h2 = util.hitUI(ui, bx2, by2, save_w, bh2);
+            ui.renderer.fillRect(bx2, by2, save_w, bh2, if (h2) ui.theme.item_hover else ui.theme.slider_track);
+            ui.renderer.strokeRect(bx2, by2, save_w, bh2, ui.theme.panel_border);
+            ui.label("保存为…", bx2 + 4, by2 + 2, ui.theme.text);
+            if (h2 and ui.mouse_pressed) {
+                // 输入框弹在按钮下方（复用文本输入基建：支持中文 IME）；
+                // **预填当前关联预设名**（直接回车 → 覆写确认）
+                const save_src = PresetSaveSource{ .params = sw.target };
+                app.beginRenamePreset(bx2 - 60, y + win_title_h + 4, save_src, app.presetPrefillName(save_src));
+                app.preset_browser.open = false;
+                ui.active_id = 0; // 防误触发标题拖动
+            }
+        }
+    }
 
     // 关闭按钮
     const close_x = x + ww - 22;
@@ -78,8 +141,8 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         app.bringToFront(&sw.z);
     }
 
-    // 标题拖动
-    if (util.hitUI(ui, x, y, ww - 24, win_title_h) and ui.mouse_pressed) {
+    // 标题拖动（**排除右侧按钮区**：预设/保存为/关闭——否则按按钮也会启动拖动）
+    if (util.hitUI(ui, x, y, ww - 160, win_title_h) and ui.mouse_pressed) {
         ui.active_id = 5000;
         sw.grab_dx = ui.mouse_x - x;
         sw.grab_dy = ui.mouse_y - y;

@@ -96,6 +96,30 @@ pub const SavedSynth = struct {
     lpf: SavedFilter = .{},
 };
 
+/// 存档中的鼓组层（每垫一份内嵌合成器参数；见 `docs/drumkit.md` §8）
+pub const SavedDrumLayer = struct {
+    /// 乐器类型（0 = 减法合成器；旧存档缺失 → 0）
+    kind: u32 = 0,
+    synth: SavedSynth = .{},
+    /// 层内增益（多层叠加的配比）
+    gain: f32 = 1.0,
+    /// 来源预设名（`分类/名字`；展示用，空 = 手调/空层）
+    source_preset: []const u8 = "",
+};
+
+/// 存档中的鼓垫（一个音高 + 名字 + 层列表）
+pub const SavedDrumPad = struct {
+    pitch: u32 = 0,
+    /// 自定义名（空 = 用 GM 标准名/音名）
+    name: []const u8 = "",
+    layers: []SavedDrumLayer = &.{},
+};
+
+/// 存档中的鼓组
+pub const SavedDrumKit = struct {
+    pads: []SavedDrumPad = &.{},
+};
+
 /// 存档中的乐器
 pub const SavedInstrument = struct {
     name: []const u8 = "",
@@ -106,6 +130,15 @@ pub const SavedInstrument = struct {
     mixer: i32 = 0,
     /// MIDI 通道（0-15；-1 = 无；旧存档缺失 → -1）
     midi_channel: i32 = -1,
+    /// 乐器类型（0 = synth / 1 = drumkit；旧存档缺失 → 0）
+    kind: u32 = 0,
+    /// 键盘列模式（0 = 钢琴/1 = 鼓组；每乐器独立；旧存档缺失 → 0）
+    key_mode: u32 = 0,
+    /// 关联预设名（最近加载/保存的预设；展示/保存预填用；空 = 无）
+    preset_name: []const u8 = "",
+    /// 鼓组数据（`kind == 1` 时有效；空 = 无）
+    kit: SavedDrumKit = .{},
+    /// 合成器参数（synth 类型用；鼓组类型的“本体”不使用）
     synth: SavedSynth = .{},
 };
 
@@ -218,7 +251,10 @@ pub fn toJson(allocator: std.mem.Allocator, project: Project) ![]u8 {
 /// **向后兼容**：v1 存档的片段坐标为“小节”（`bar`/`len`），
 /// 自动按 `legacy_units_per_bar` 换算为步（v2 起统一用步）。
 pub fn fromJson(allocator: std.mem.Allocator, data: []const u8) !std.json.Parsed(Project) {
-    var parsed = try std.json.parseFromSlice(Project, allocator, data, .{ .ignore_unknown_fields = true });
+    // **`.alloc_always` 必须**：默认的 `alloc_if_needed` 会让无转义字符串借用
+    // `data` 缓冲——调用方习惯性 `defer free(data)`，一旦生命周期估算错误
+    // （或被改写）就悬空。全拷进 arena 后，返回值自包含（见 preset.load 同注）。
+    var parsed = try std.json.parseFromSlice(Project, allocator, data, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
     errdefer parsed.deinit();
     if (parsed.value.version < 2) {
         // v1：`bar`（1 起小节）与 `len`（小节）都是**小节单位**——
@@ -248,6 +284,23 @@ pub fn fromJson(allocator: std.mem.Allocator, data: []const u8) !std.json.Parsed
 }
 
 // ── 测试 ──
+
+/// 乐器/Layer 的**默认音色基准**（预设面板“重置音色”与新建乐器共用同一份）——
+/// **不能用 `SavedSynth{}`**：它的字段默认是“全振荡器关闭”（静音），与
+/// `SynthParams{}`（振荡器 1 开启、音量 0.6）不一致（实测被测试戳穿）；
+/// 这里由 `SynthParams{}` 导出 → 与新建必然一致（两处一分叉，测试就报）。
+pub fn defaultSavedSynth() SavedSynth {
+    var p = synth.SynthParams{};
+    return exportSynth(&p);
+}
+
+test "persist: 默认音色基准——重置 ≠ 静音，与新建乐器一致" {
+    const d = defaultSavedSynth();
+    try std.testing.expect(d.osc[0].enabled); // 会出声
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), d.osc[0].volume, 1e-6);
+    var p = synth.SynthParams{};
+    try std.testing.expect(std.meta.eql(d, exportSynth(&p))); // 同一基准
+}
 
 test "persist: 合成器参数往返（导出 → 导入）" {
     var p = synth.SynthParams{};

@@ -64,7 +64,90 @@ pub const Instrument = struct {
     /// MIDI 通道（0-15；-1 = 无）——MIDI 导入时记住来源通道，
     /// 导出时优先按它写通道号（保证往返稳定）；手动建的乐器 = -1（导出用序号 mod 16）
     midi_channel: i32 = -1,
-    synth: *synth.SynthParams, // 每乐器独立的合成器参数
+    /// 乐器类型（synth = 普通合成器；drumkit = 鼓组——按音高分发到各垫）
+    kind: InstrumentKind = .synth,
+    /// 钢琴卷帘键列模式（**每乐器独立**，随工程保存；无 UI 时不受影响）
+    key_mode: KeyMode = .piano,
+    /// 关联预设名（最近加载/保存的预设名；**保存预填/展示用**；空 = 无）。
+    /// 注：仅是一个标签——参数始终是**内嵌副本**，不引用预设文件（见 §5.3）
+    preset_name: []u8,
+    /// 鼓组数据（`kind == .drumkit` 时非空；由 App 管理生命周期）
+    kit: ?*DrumKit = null,
+    /// 合成器参数（synth 类型用；鼓组类型的“本体”不使用但保留——
+    /// 类型切换/存档兼容都靠它）
+    synth: *synth.SynthParams,
+};
+
+/// 钢琴卷帘键列模式：琴键（音名）/ 鼓组（GM 鼓名、垫名）
+/// （定义在 model：跟随 `Instrument` 存活——每乐器独立、随工程保存）
+pub const KeyMode = enum(u8) { piano = 0, drum = 1 };
+
+/// 乐器类型
+pub const InstrumentKind = enum(u8) { synth = 0, drumkit = 1 };
+
+/// 鼓组层的乐器类型（层 = 乐器槽）：目前仅减法合成器；
+/// 采样器/FM 将来实装。**不含鼓组**——禁止自嵌套（`docs/drumkit.md` §7）。
+/// 将来按它分派渲染引擎与预设分类（现在单引擎 → 无分派）。
+pub const LayerKind = enum(u8) {
+    subtractive = 0,
+
+    pub fn displayName(self: LayerKind) []const u8 {
+        return switch (self) {
+            .subtractive => "减法合成器",
+        };
+    }
+};
+
+/// 鼓组层：一份内嵌合成器参数（源自某预设或手调）+ 层内增益。
+/// **内嵌副本**（非按名引用）：鼓组自包含——工程不依赖 data 目录、
+/// 预设删改不悬空（见 `docs/drumkit.md` §5.3）。
+pub const DrumLayer = struct {
+    /// 乐器类型（层 = 乐器槽；目前仅减法合成器）
+    kind: LayerKind = .subtractive,
+    /// 合成器参数（堆分配、地址稳定——音频线程读）
+    params: *synth.SynthParams,
+    /// 层内增益（多层叠加的配比；0-1）
+    gain: f32 = 1.0,
+    /// 来源预设名（展示用；`分类/名字` 格式；空 = 手调/空层）
+    source_preset: []u8,
+};
+
+/// 鼓垫：一个音高 → 一或多个层
+pub const DrumPad = struct {
+    /// MIDI 音高（0-127）
+    pitch: u8,
+    /// 自定义名（空 = 用 GM 标准名/音名）
+    name: []u8,
+    /// 层列表（空 = 已建垫但无音源）
+    layers: std.ArrayListUnmanaged(DrumLayer) = .{ .items = &.{}, .capacity = 0 },
+};
+
+/// 一套鼓（按音高升序存放 pads）
+pub const DrumKit = struct {
+    pads: std.ArrayListUnmanaged(DrumPad) = .{ .items = &.{}, .capacity = 0 },
+
+    /// 按音高找垫（未建垫返回 null）
+    pub fn find(self: *const DrumKit, pitch: u8) ?*DrumPad {
+        for (self.pads.items) |*pad| {
+            if (pad.pitch == pitch) return pad;
+        }
+        return null;
+    }
+
+    /// 全组总层数（音频槽位占用数；上限 `audio.kit_max_layers`）
+    pub fn totalLayers(self: *const DrumKit) usize {
+        var n: usize = 0;
+        for (self.pads.items) |pad| n += pad.layers.items.len;
+        return n;
+    }
+
+    /// 该音高是否**已映射**（有垫且**至少有一层**——会发声）。
+    /// 空垫（无层）不算：键列 2px 强调条 / 编辑器 ● 都用这个语义
+    /// （用户反馈：清空层后不该还亮着蓝点）。
+    pub fn isMapped(self: *const DrumKit, pitch: u8) bool {
+        const pad = self.find(pitch) orelse return false;
+        return pad.layers.items.len > 0;
+    }
 };
 
 /// 路由到混音通道 `ch`（**0 起**——与调音台标尺名、`Instrument.mixer`
@@ -440,10 +523,99 @@ pub fn pitchName(buf: []u8, pitch: i32) []const u8 {
     return std.fmt.bufPrint(buf, "{s}{d}", .{ names[@intCast(pc)], octave }) catch "";
 }
 
+/// 鼓组模式键列标签（`docs/drumkit.md` §6）：
+/// 1) 该音高**已映射**（当前鼓组有垫）且垫有自定义名 → 垫名；
+/// 2) 35-81 → GM 标准名（已映射但无自定义名也走这里）；
+/// 3) 其余 → 音名（**仅 C 行**，与琴键视图同一规则）；
+/// 返回空 = 该行不画标签。`kit` = 当前乐器的鼓组（非鼓组乐器传 null）。
+pub fn drumKeyLabel(buf: []u8, kit: ?*const DrumKit, pitch: i32) []const u8 {
+    if (kit) |k| {
+        if (pitch >= 0 and pitch <= 127) {
+            if (k.find(@intCast(pitch))) |pad| {
+                if (pad.name.len > 0) return pad.name;
+            }
+        }
+    }
+    const gm = gmDrumName(pitch);
+    if (gm.len > 0) return gm;
+    const nm = pitchName(buf, pitch);
+    if (nm.len > 0 and nm[0] == 'C') return nm;
+    return "";
+}
+
 /// 是否为黑键（C#/D#/F#/G#/A#）
 pub fn isBlackKey(pitch: i32) bool {
     const pc = @mod(pitch, 12);
     return pc == 1 or pc == 3 or pc == 6 or pc == 8 or pc == 10;
+}
+
+/// GM 鼓表（35-81）标准名（MIDI 真源 = 编号；名字用于键列/编辑器显示）。
+/// 超出范围 → ""。
+pub fn gmDrumName(pitch: i32) []const u8 {
+    if (pitch < 35 or pitch > 81) return "";
+    const names = [_][]const u8{
+        "Acoustic Bass Drum", // 35
+        "Bass Drum 1",        // 36
+        "Side Stick",         // 37
+        "Acoustic Snare",     // 38
+        "Hand Clap",          // 39
+        "Electric Snare",     // 40
+        "Low Floor Tom",      // 41
+        "Closed Hi-Hat",      // 42
+        "High Floor Tom",     // 43
+        "Pedal Hi-Hat",       // 44
+        "Low Tom",            // 45
+        "Open Hi-Hat",        // 46
+        "Low-Mid Tom",        // 47
+        "Hi-Mid Tom",         // 48
+        "Crash Cymbal 1",     // 49
+        "High Tom",           // 50
+        "Ride Cymbal 1",      // 51
+        "Chinese Cymbal",     // 52
+        "Ride Bell",          // 53
+        "Tambourine",         // 54
+        "Splash Cymbal",      // 55
+        "Cowbell",            // 56
+        "Crash Cymbal 2",     // 57
+        "Vibraslap",          // 58
+        "Ride Cymbal 2",      // 59
+        "Hi Bongo",           // 60
+        "Low Bongo",          // 61
+        "Mute Hi Conga",      // 62
+        "Open Hi Conga",      // 63
+        "Low Conga",          // 64
+        "High Timbale",       // 65
+        "Low Timbale",        // 66
+        "High Agogo",         // 67
+        "Low Agogo",          // 68
+        "Cabasa",             // 69
+        "Maracas",            // 70
+        "Short Whistle",      // 71
+        "Long Whistle",       // 72
+        "Short Guiro",        // 73
+        "Long Guiro",         // 74
+        "Claves",             // 75
+        "Hi Wood Block",      // 76
+        "Low Wood Block",     // 77
+        "Mute Cuica",         // 78
+        "Open Cuica",         // 79
+        "Mute Triangle",      // 80
+        "Open Triangle",      // 81
+    };
+    return names[@intCast(pitch - 35)];
+}
+
+/// GM 鼓表短记（紧凑场景备用；键列用标准名 + 中略——见 `docs/drumkit.md` §2）
+pub fn gmDrumShortName(pitch: i32) []const u8 {
+    if (pitch < 35 or pitch > 81) return "";
+    const names = [_][]const u8{
+        "Kick",  "Kick2", "Stick", "Snare", "Clap",  "Snare2", "Tom1", "CHH",  "Tom2",  "PHH",
+        "Tom3",  "OHH",   "Tom4",  "Tom5",  "Crash1", "Tom6",   "Ride1", "China", "Bell",  "Tamb",
+        "Splash", "Cowbell", "Crash2", "Vibra", "Ride2", "BongoH", "BongoL", "CongaH", "CongaM", "CongaL",
+        "TimbH", "TimbL",  "AgogoH", "AgogoL", "Cabasa", "Maracas", "WhistS", "WhistL", "GuiroS", "GuiroL",
+        "Claves", "WoodH",  "WoodL",  "CuicaM", "CuicaO", "TriM",   "TriO",
+    };
+    return names[@intCast(pitch - 35)];
 }
 
 /// 片段是否与其它片段重叠（排除 exclude 下标；exclude == len 表示不排除任何）。
@@ -624,8 +796,8 @@ test "model: routedInstrumentNames——0 起基准（修效果器标题显示�
     // 实测场景：Bass → 通道 1，Key → 通道 2。效果器标题曾误用
     // `mixer == ch + 1`：打开通道 1 的 EQ 显示成通道 2 的 Key（应显示 Bass）。
     const insts = [_]Instrument{
-        .{ .name = "Bass", .mixer = 1, .synth = &sp },
-        .{ .name = "Key", .mixer = 2, .synth = &sp },
+        .{ .name = @constCast("Bass"), .mixer = 1, .synth = &sp, .preset_name = @constCast("") },
+        .{ .name = @constCast("Key"), .mixer = 2, .synth = &sp, .preset_name = @constCast("") },
     };
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("Bass", routedInstrumentNames(&insts, 1, &buf));
@@ -636,8 +808,70 @@ test "model: routedInstrumentNames——0 起基准（修效果器标题显示�
 
     // 多乐器同通道：首个 + N
     const two = [_]Instrument{
-        .{ .name = "Bass", .mixer = 1, .synth = &sp },
-        .{ .name = "Key", .mixer = 1, .synth = &sp },
+        .{ .name = @constCast("Bass"), .mixer = 1, .synth = &sp, .preset_name = @constCast("") },
+        .{ .name = @constCast("Key"), .mixer = 1, .synth = &sp, .preset_name = @constCast("") },
     };
     try std.testing.expectEqualStrings("Bass +1", routedInstrumentNames(&two, 1, &buf));
+}
+
+test "model: GM 鼓表——范围/抽查/边界" {
+    // 抽查标准名（实测工程常用）
+    try std.testing.expectEqualStrings("Acoustic Bass Drum", gmDrumName(35));
+    try std.testing.expectEqualStrings("Acoustic Snare", gmDrumName(38));
+    try std.testing.expectEqualStrings("Pedal Hi-Hat", gmDrumName(44));
+    try std.testing.expectEqualStrings("Open Triangle", gmDrumName(81));
+    // 超出 GM 鼓范围 → 空串
+    try std.testing.expectEqualStrings("", gmDrumName(34));
+    try std.testing.expectEqualStrings("", gmDrumName(82));
+    try std.testing.expectEqualStrings("", gmDrumName(0));
+
+    // 短记表与标准名表同样 47 项且都非空（防表格错位）
+    var p: i32 = 35;
+    while (p <= 81) : (p += 1) {
+        try std.testing.expect(gmDrumName(p).len > 0);
+        try std.testing.expect(gmDrumShortName(p).len > 0);
+    }
+    try std.testing.expectEqualStrings("Kick", gmDrumShortName(35));
+    try std.testing.expectEqualStrings("CHH", gmDrumShortName(42));
+    try std.testing.expectEqualStrings("TriO", gmDrumShortName(81));
+    try std.testing.expectEqualStrings("", gmDrumShortName(34));
+}
+
+test "model: 鼓组键列标签——垫名 > GM 名 > 音名（仅 C 行）" {
+    const alloc = std.testing.allocator;
+    var kit = DrumKit{ .pads = .{ .items = &.{}, .capacity = 0 } };
+    defer kit.pads.deinit(alloc);
+    var buf: [16]u8 = undefined;
+
+    // 空套：GM 范围 → GM 名；范围外 → 仅 C 行给音名
+    try std.testing.expectEqualStrings("Acoustic Snare", drumKeyLabel(&buf, &kit, 38));
+    try std.testing.expectEqualStrings("", drumKeyLabel(&buf, &kit, 30)); // 范围外非 C
+    try std.testing.expectEqualStrings("C1", drumKeyLabel(&buf, &kit, 24)); // 范围外 C 行
+    try std.testing.expectEqualStrings("", drumKeyLabel(&buf, null, 30)); // 非鼓组乐器
+
+    // 有垫：自定义名优先；空名 → GM 名；范围外空名 → 音名规则
+    try kit.pads.append(alloc, .{ .pitch = 38, .name = @constCast("小军鼓") });
+    try kit.pads.append(alloc, .{ .pitch = 40, .name = @constCast("") });
+    try kit.pads.append(alloc, .{ .pitch = 24, .name = @constCast("") });
+    try std.testing.expectEqualStrings("小军鼓", drumKeyLabel(&buf, &kit, 38));
+    try std.testing.expectEqualStrings("Electric Snare", drumKeyLabel(&buf, &kit, 40));
+    try std.testing.expectEqualStrings("C1", drumKeyLabel(&buf, &kit, 24));
+}
+
+test "model: isMapped——有垫且至少一层才算已映射（空垫不亮）" {
+    const alloc = std.testing.allocator;
+    var kit = DrumKit{ .pads = .{ .items = &.{}, .capacity = 0 } };
+    defer kit.pads.deinit(alloc);
+
+    try std.testing.expect(!kit.isMapped(35)); // 无垫
+    try kit.pads.append(alloc, .{ .pitch = 35, .name = @constCast("底鼓") });
+    try std.testing.expect(!kit.isMapped(35)); // 有垫无名层（空垫）→ 不算
+
+    // 加一层 → 已映射；清空层列表 → 又不算（用户反馈的场景）
+    var dummy_params: synth.SynthParams = .{};
+    try kit.pads.items[0].layers.append(alloc, .{ .params = &dummy_params, .source_preset = @constCast("") });
+    defer kit.pads.items[0].layers.deinit(alloc);
+    try std.testing.expect(kit.isMapped(35));
+    kit.pads.items[0].layers.clearRetainingCapacity();
+    try std.testing.expect(!kit.isMapped(35));
 }

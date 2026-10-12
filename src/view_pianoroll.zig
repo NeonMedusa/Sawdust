@@ -6,11 +6,13 @@
 const std = @import("std");
 const r_mod = @import("render.zig");
 const Ui = @import("ui.zig").Ui;
+const Theme = @import("ui.zig").Theme;
 const App = @import("app.zig").App;
 const model = @import("model.zig");
 const synth = @import("synth.zig");
 const util = @import("view_util.zig");
 const view_note_lane = @import("view_note_lane.zig");
+const KeyMode = @import("app.zig").KeyMode;
 
 pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     const pattern = app.piano.pattern orelse return;
@@ -230,6 +232,36 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     ui.renderer.vline(lane_x, ruler_y, ruler_h, ui.theme.panel_border); // 琴键列分界
     ui.renderer.hline(x + 1, lane_y, w - 2, ui.theme.panel_border);
 
+    // ── 键列模式切换（琴键/鼓组；`docs/drumkit.md` §6）──
+    // 位置 = 琴键列上方、标尺行左侧的 90×20 空格（与琴键列同宽）。
+    // 分段式：左半「琴键」右半「鼓组」，当前模式用强调色；单击任一半即切到该模式。
+    // 会话态（不入历史）；菜单展开时让位（menu_click 吞掉本帧点击）。
+    {
+        const seg_w = util.piano_header_w;
+        const seg_h = ruler_h;
+        const half = @divTrunc(seg_w, 2);
+        const labels = [_][]const u8{ "琴键", "鼓组" };
+        const modes = [_]KeyMode{ .piano, .drum };
+        const cur_mode = app.currentKeyMode();
+        const hovered = !ui.input_blocked and !menu_click and
+            util.inRect(ui.mouse_x, ui.mouse_y, keys_x, ruler_y, seg_w, seg_h);
+        ui.renderer.fillRect(keys_x, ruler_y, seg_w, seg_h, ui.theme.toolbar);
+        for (labels, modes, 0..) |lb, mode, k| {
+            const sx = keys_x + @as(i32, @intCast(k)) * half;
+            const on = cur_mode == mode;
+            const hov = hovered and ui.mouse_x >= sx and ui.mouse_x < sx + half;
+            if (on) {
+                ui.renderer.fillRect(sx + 1, ruler_y + 1, half - 2, seg_h - 2, ui.theme.accent);
+            } else if (hov) {
+                ui.renderer.fillRect(sx + 1, ruler_y + 1, half - 2, seg_h - 2, ui.theme.item_hover);
+            }
+            const tw2: i32 = @intFromFloat(ui.font.measure(lb));
+            ui.labelCentered(lb, sx + @divTrunc(half - tw2, 2), ruler_y + 1, seg_h - 2, if (on) ui.theme.text else ui.theme.text_dim);
+            if (hov and ui.mouse_pressed) app.setCurrentKeyMode(mode);
+        }
+        ui.renderer.hline(keys_x, ruler_y + seg_h - 1, seg_w, ui.theme.panel_border);
+    }
+
 
     // □ 缺口：按住上下拖 = 音高行高缩放（方块本身固定不动；视口中心音高保持不动）
     {
@@ -248,7 +280,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     {
         const kh = app.piano.key_h;
         // 菜单展开中 → 琴键不响应（机架的下拉/右键菜单，以及卷帘自己的两个选单）
-        const menu_blocks = app.rack.menu_open or app.rack.ctx_instrument != null or
+        const menu_blocks = app.rack.ctx_instrument != null or
             app.piano.inst_menu_open or app.piano.snap_menu_open;
         const in_keys = !menu_blocks and ui.hitRect(keys_x, lane_y, util.piano_header_w, lane_h);
         const over_other_drag = ui.active_id != 0 and ui.active_id != 6000;
@@ -297,6 +329,14 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             }
         }.f;
         const first_pitch: i32 = 127 - @divFloor(app.piano.scroll, kh);
+        const drum_mode = app.currentKeyMode() == .drum;
+        // 当前乐器的鼓组（鼓组模式用；非鼓组/无乐器 → null）
+        const cur_kit: ?*const model.DrumKit = blk: {
+            if (app.sel.instrument < 0 or app.sel.instrument >= @as(i32, @intCast(app.instruments.items.len))) break :blk null;
+            const inst = &app.instruments.items[@intCast(app.sel.instrument)];
+            if (inst.kind != .drumkit) break :blk null;
+            break :blk inst.kit;
+        };
         const rows: i32 = @divFloor(lane_h, kh) + 2;
         var i: i32 = 0;
         while (i < rows) : (i += 1) {
@@ -306,22 +346,38 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             if (py + kh < lane_y or py > lane_y + lane_h) continue;
             const black = model.isBlackKey(p);
             const pressed = lit(app, p); // 按下/发声中高亮（与行高亮联动）
-            const key_color = if (pressed)
-                ui.theme.accent
-            else if (black)
-                ui.theme.key_black
-            else
-                ui.theme.key_white;
-            ui.renderer.fillRect(keys_x + 1, py, util.piano_header_w - 1, kh - 1, key_color);
-            if (!black) {
+            // 已映射（该音高**有垫且有层**）→ 左侧 2px 强调条（仅鼓组模式）
+            const mapped = drum_mode and cur_kit != null and
+                p >= 0 and p <= 127 and cur_kit.?.isMapped(@intCast(p));
+            // 键底色 + 文字色（鼓组模式**不用钢琴黑白键**——见 keyRowStyle）
+            const st = keyRowStyle(&ui.theme, drum_mode, black, pressed, mapped);
+            ui.renderer.fillRect(keys_x + 1, py, util.piano_header_w - 1, kh - 1, st.bg);
+            if (drum_mode) {
+                // 鼓组模式键列：垫名 > GM 标准名 > 音名（C 行）
+                // 行高太小（< 12px）时不画文字（会串行）——只留强调条。
+                if (mapped) ui.renderer.fillRect(keys_x, py, 2, kh - 1, ui.theme.accent);
+                if (kh >= 12) {
+                    var dbuf: [48]u8 = undefined;
+                    const lbl = model.drumKeyLabel(&dbuf, cur_kit, p);
+                    if (lbl.len > 0) {
+                        var ebuf: [160]u8 = undefined;
+                        const shown = util.middleEllipsis(ui, &ebuf, lbl, util.piano_header_w - 10);
+                        if (shown.len > 0) {
+                            // 行内**垂直居中**（label 的 y 是基线锚点，行高变化时会偏上）
+                            ui.labelCentered(shown, keys_x + 5, py, kh - 1, st.text);
+                        }
+                    }
+                }
+            } else if (!black) {
                 var buf: [8]u8 = undefined;
                 const nm = model.pitchName(&buf, p);
                 if (nm.len > 0 and nm[0] == 'C') {
-                    ui.labelClipped(nm, keys_x + util.piano_header_w - 34, py - 2, 30, if (pressed) ui.theme.text else ui.theme.key_label);
+                    ui.labelClipped(nm, keys_x + util.piano_header_w - 34, py - 2, 30, st.text);
                 }
             }
-            // 黑键行背景加深（音符区；与琴键列的黑白层次呼应——扫视时更容易对上行）。
-            // 半透明叠加（不会盖过行线/网格：它们在后面画）
+            // 黑键行背景加深（音符区）。半透明叠加（不会盖过行线/网格：它们在后面画）。
+            // 注：**鼓组模式也画**——与键列的黑白无关，纯粋是“深浅交错的行定位
+            // 参考线”（用户反馈：它有帮助，不只是钢琴语义）。
             if (black) ui.renderer.fillRect(lane_x, py, view_w, kh - 1, ui.theme.lane_black_key);
             // 行线（每八度加强）
             ui.renderer.hline(lane_x, py, view_w, if (@mod(p, 12) == 0) ui.theme.panel_border else ui.theme.grid);
@@ -439,10 +495,10 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                     const pname = model.pitchName(&pbuf, n.pitch);
                     const text_w: i32 = @intFromFloat(ui.font.measure(pname));
                     if (nw >= text_w + 8) {
-                        const ty = ny + @divTrunc(kh - 1 - 10, 2);
-                        const tx = nx + 4;
-                        // 白字（黑键行上也清楚）；拖动中反色以保持对比度
-                        ui.label(pname, tx, ty, if (active) ui.theme.bg else r_mod.rgb(16, 18, 22));
+                        // 行内**垂直居中**：用全 app 同一算法（键列/按钮同款）。
+                        // 不用 `ui.label` 手算 ty——它假定文字高 10px，而字体
+                        // 实际约 16px → 文字整体偏下（用户反馈实测）。
+                        ui.labelCentered(pname, nx + 4, ny, kh - 1, if (active) ui.theme.bg else r_mod.rgb(16, 18, 22));
                     }
                 }
             }
@@ -1044,4 +1100,48 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         // 切换乐器 → 清选区（防跨乐器孤儿选区；见 App.setInstrument）
         if (app.sel.instrument != inst_before) app.clearNoteSelection();
     }
+}
+
+// ── 键列行配色（纯函数；便于测试）──
+
+/// 键列一行的“底色 + 文字色”
+pub const KeyRowStyle = struct { bg: u32, text: u32 };
+
+/// 决定键列一行怎么画：
+/// - 钢琴模式：黑白键底色 + `key_label` 字（C 行音名），不变；
+/// - **鼓组模式：不用钢琴黑白键**（用户反馈：白键底 + 已映射垫的亮字对比度
+///   太低）——改成“槽位列表”样式（与鼓组编辑器左列表一致）：普通行用底色
+///   + 暗字（GM 名可读）、**已映射行**提亮（`slider_track`）+ 亮字 + 强调条；
+///   发声中/试听统一用强调色底。
+pub fn keyRowStyle(theme: *const Theme, drum: bool, black: bool, pressed: bool, mapped: bool) KeyRowStyle {
+    if (pressed) return .{ .bg = theme.accent, .text = theme.text };
+    if (drum) {
+        return if (mapped)
+            .{ .bg = theme.slider_track, .text = theme.text }
+        else
+            .{ .bg = theme.bg, .text = theme.text_dim };
+    }
+    return .{ .bg = if (black) theme.key_black else theme.key_white, .text = theme.key_label };
+}
+
+test "pianoroll: 键列配色——鼓组模式不用钢琴黑白键（修白底亮字对比度）" {
+    const theme = Theme{};
+    // 鼓组 + 已映射：暗底、亮字、不出现白键底
+    const m = keyRowStyle(&theme, true, false, false, true);
+    try std.testing.expectEqual(theme.slider_track, m.bg);
+    try std.testing.expectEqual(theme.text, m.text);
+    try std.testing.expect(m.bg != theme.key_white);
+    // 鼓组 + 未映射：底色 + 暗字（可读）
+    const u = keyRowStyle(&theme, true, false, false, false);
+    try std.testing.expectEqual(theme.bg, u.bg);
+    try std.testing.expectEqual(theme.text_dim, u.text);
+    // 鼓组下“黑键行”与白键行一视同仁（不再有黑白之分）
+    try std.testing.expectEqual(m.bg, keyRowStyle(&theme, true, true, false, true).bg);
+    try std.testing.expectEqual(u.bg, keyRowStyle(&theme, true, true, false, false).bg);
+    // 钢琴模式保持黑白键
+    try std.testing.expectEqual(theme.key_white, keyRowStyle(&theme, false, false, false, false).bg);
+    try std.testing.expectEqual(theme.key_black, keyRowStyle(&theme, false, true, false, false).bg);
+    // 发声中（两种模式）优先 = 强调色底
+    try std.testing.expectEqual(theme.accent, keyRowStyle(&theme, true, false, true, true).bg);
+    try std.testing.expectEqual(theme.accent, keyRowStyle(&theme, false, false, true, false).bg);
 }
