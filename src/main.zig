@@ -34,6 +34,8 @@ const view_effect = @import("view_effect.zig");
 const view_panels = @import("view_panels.zig");
 const view_presets = @import("view_presets.zig");
 const view_drumkit = @import("view_drumkit.zig");
+const view_help = @import("view_help.zig");
+const view_settings = @import("view_settings.zig");
 const eq = @import("eq.zig");
 const audio = @import("audio.zig");
 
@@ -65,6 +67,7 @@ pub fn main(init: std.process.Init) !u8 {
         if (preset_mod.resolveDataRoot(io, edir, &root_buf)) |root| app.setDataRoot(root);
         app.pending_preset = .scan;
     }
+    loadSettings(&app, io); // 设置（settings.json；缺失 = 默认）+ 启动打开上次工程
     // 初始片段（空基线）：样式 1 放在 Track 1 的最左边（长度 = 样式有效长度）
     app.addClip(.{
         .track = 0,
@@ -88,16 +91,17 @@ pub fn main(init: std.process.Init) !u8 {
     var ui_input = InputState{};
     var ui = Ui.init(r_mod.Renderer.init(&win.fb), &font);
 
-    // 帧率上限：120fps（帧预算 8.33ms）。
+    // 帧率上限：默认 120fps（帧预算 8.33ms；现由设置窗口可调，见 `App.fps_limit`）。
     // 历史：原为固定 `sleep(16ms)`（名义 60fps），但 Windows 默认计时器
     // 粒度 ≈ 15.6ms → 实测 sleep(16ms) 睡成 ~26ms，加上渲染耗时实际仅
     // ~30 多帧，表现为“UI 不流畅/操作滞后”。修法：
     //   ① window.init 里 timeBeginPeriod(1) 提高计时器精度；
     //   ② 改为**帧预算**：睡到“帧开始 + 预算”截止，而非固定睡眠
     //      （固定睡眠会与渲染耗时叠加，帧率随内容复杂度浮动）。
-    const frame_budget_ns: i64 = 8_333_333; // 120fps
 
     while (true) {
+        // 帧率上限：取设置值（30..240fps；帧预算 = 1e9 / fps——改设置即时生效）
+        const frame_budget_ns: i64 = @divTrunc(1_000_000_000, @as(i64, std.math.clamp(app.fps_limit, 30, 240)));
         const frame_start_ns: i64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
         defer {
             // 5) 帧预算：睡完本帧剩余时间（渲染耗时已扣掉）
@@ -310,9 +314,13 @@ pub fn main(init: std.process.Init) !u8 {
                         continue;
                     }
                     if (k.code == 0x1B) { // Esc：关闭菜单 / 返回播放列表（**不退出程序**）
-                        if (app.file_menu_open) {
-                            app.file_menu_open = false;
-                        } else if (app.preset_browser.open) {
+        if (app.file_menu_open) {
+            app.file_menu_open = false;
+        } else if (app.help_win.open) {
+            app.help_win.open = false;
+        } else if (app.settings_win.open) {
+            app.settings_win.open = false;
+        } else if (app.preset_browser.open) {
                             app.preset_browser.open = false; // 预设浏览器
                         } else if (app.panels.ctx_pattern != null) {
                             app.panels.ctx_pattern = null; // 样式右键菜单
@@ -685,9 +693,15 @@ pub fn main(init: std.process.Init) !u8 {
                 .load => |l| loadPreset(&app, io, l.intent, l.cat, l.choice),
                 .save => |s| savePreset(&app, io, s.source, s.name_buf[0..s.name_len], s.overwrite),
                 .rename => |r| renamePreset(&app, io, r.cat, r.old_buf[0..r.old_len], r.new_buf[0..r.new_len]),
-                .delete => |d| deletePreset(&app, io, d.cat, d.name_buf[0..d.name_len]),
-            }
+            .delete => |d| deletePreset(&app, io, d.cat, d.name_buf[0..d.name_len]),
         }
+    }
+
+    // 4.4) 设置落盘（脏 → 写 settings.json；IO 在帧末）
+    if (app.settings_dirty) {
+        app.settings_dirty = false;
+        saveSettings(&app, io);
+    }
 
         // 4.5) 同步窗口标题（脏标记 `*` + 工程名；仅在变化时刷 Win32）
         const cur_name = app.projectName();
@@ -1144,8 +1158,8 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     // 实测 bug：文件→保存穿透点到左栏“操作历史”）。
     const menu_open = app.menuIsOpen();
 
-    // 浮动窗口列表（按 z 升序 = 从下到上）；排序用插入排序（只有 5 个元素）
-    var wins: [5]struct { z: i32, draw: enum { rack, synth, mixer, effect, drumkit } } = undefined;
+    // 浮动窗口列表（按 z 升序 = 从下到上）；排序用插入排序（元素很少）
+    var wins: [7]struct { z: i32, draw: enum { rack, synth, mixer, effect, drumkit, help, settings } } = undefined;
     var nwin: usize = 0;
     if (rack_open) {
         wins[nwin] = .{ .z = app.rack.z, .draw = .rack };
@@ -1165,6 +1179,14 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     }
     if (effect_open) {
         wins[nwin] = .{ .z = app.effect_win.z, .draw = .effect };
+        nwin += 1;
+    }
+    if (app.help_win.open) {
+        wins[nwin] = .{ .z = app.help_win.z, .draw = .help };
+        nwin += 1;
+    }
+    if (app.settings_win.open) {
+        wins[nwin] = .{ .z = app.settings_win.z, .draw = .settings };
         nwin += 1;
     }
     {
@@ -1193,6 +1215,8 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
             .mixer => .{ .x = app.mixer_win.x, .y = app.mixer_win.y, .w = app.mixer_win.w, .h = app.mixer_win.h },
             .effect => .{ .x = app.effect_win.x, .y = app.effect_win.y, .w = app.effect_win.w, .h = app.effect_win.h },
             .drumkit => .{ .x = app.drumkit_win.x, .y = app.drumkit_win.y, .w = app.drumkit_win.w, .h = app.drumkit_win.h },
+            .help => .{ .x = app.help_win.x, .y = app.help_win.y, .w = app.help_win.w, .h = app.help_win.h },
+            .settings => .{ .x = app.settings_win.x, .y = app.settings_win.y, .w = app.settings_win.w, .h = app.settings_win.h },
         };
         _ = ui.declare(.{ .prio = 1 + @as(i32, @intCast(wi)), .rect = r });
     }
@@ -1252,6 +1276,8 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
             .mixer => _ = view_mixer.draw(ui, app, w, h),
             .effect => _ = view_effect.draw(ui, app, w, h),
             .drumkit => _ = view_drumkit.draw(ui, app, w, h),
+            .help => _ = view_help.draw(ui, app, w, h),
+            .settings => _ = view_settings.draw(ui, app, w, h),
         }
         ui.endLayer();
     }
@@ -1276,15 +1302,26 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
     const menus = [_][]const u8{ "文件", "选项", "视图", "乐器", "混音台" };
     for (menus, 0..) |m, i| {
         const mw: i32 = @as(i32, @intFromFloat(ui.font.measure(m))) + 16;
-        const active = (i == 3 and app.rack.open) or (i == 0 and app.file_menu_open) or (i == 4 and app.mixer_win.open);
+        const active = (i == 3 and app.rack.open) or (i == 0 and app.file_menu_open) or (i == 4 and app.mixer_win.open) or (i == 1 and app.settings_win.open);
         if (active) {
             if (ui.buttonEx(100 + @as(u64, i), m, x, by, mw, bh, true)) {
-                if (i == 3) app.rack.open = false else if (i == 0) app.file_menu_open = false else if (i == 4) app.mixer_win.open = false;
+                if (i == 3) {
+                    app.rack.open = false;
+                } else if (i == 0) {
+                    app.file_menu_open = false;
+                } else if (i == 4) {
+                    app.mixer_win.open = false;
+                } else if (i == 1) {
+                    app.settings_win.open = false;
+                }
             }
         } else if (ui.button(100 + @as(u64, i), m, x, by, mw, bh)) {
             if (i == 3) {
                 app.rack.open = true;
                 app.bringToFront(&app.rack.z); // 刚打开：置顶（否则可能被别的窗口盖住）
+            } else if (i == 1) {
+                app.settings_win.open = true;
+                app.bringToFront(&app.settings_win.z);
             } else if (i == 0) {
                 app.file_menu_open = !app.file_menu_open;
                 // 刚打开：供 drawFileMenu 区分“打开那一下”（不立即关）
@@ -1303,6 +1340,18 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
     }
     app.file_menu_x = file_menu_x;
     app.file_menu_w = file_menu_w;
+
+    // “帮助”按钮（无下拉）：单击**切换**帮助页可见性（同“乐器/混音台”）
+    {
+        const hw2: i32 = @as(i32, @intFromFloat(ui.font.measure("帮助"))) + 16;
+        if (app.help_win.open) {
+            if (ui.buttonEx(110, "帮助", x, by, hw2, bh, true)) app.help_win.open = false;
+        } else if (ui.button(110, "帮助", x, by, hw2, bh)) {
+            app.help_win.open = true;
+            app.bringToFront(&app.help_win.z); // 刚打开：置顶
+        }
+        x += hw2 + 2;
+    }
 
     // 视图切换：播放列表 / 钢琴卷帘（两段式，像 SONG/PAT）
     {
@@ -1588,6 +1637,42 @@ fn newProject(app: *App) void {
     app.resetToDefaultProject(); // 内部：停播 + 重建 + resetHistory("新建") + markSaved
     app.clearProjectPath();
     app.setToast("已新建空工程");
+}
+
+/// 设置文件路径（数据根下 `settings.json`）；无数据根/分配失败 → null。
+/// 返回的路径归调用方释放。
+fn settingsPath(app: *const App) ?[]u8 {
+    if (app.data_root_len == 0) return null;
+    return std.fs.path.join(app.allocator, &.{ app.data_root_buf[0..app.data_root_len], "settings.json" }) catch null;
+}
+
+/// 读取设置（缺失/损坏 → 默认值，静默）。“启动打开上次工程”走既有
+/// `pending_open_path` 机制（首帧末自动执行；启动时 dirty=false 无确认弹窗）。
+fn loadSettings(app: *App, io: std.Io) void {
+    const spath = settingsPath(app) orelse return;
+    defer app.allocator.free(spath);
+    const data = std.Io.Dir.cwd().readFileAlloc(io, spath, app.allocator, .unlimited) catch return;
+    defer app.allocator.free(data);
+    var parsed = persist.settingsFromJson(app.allocator, data) catch return;
+    defer parsed.deinit();
+    app.settings_open_last = parsed.value.open_last;
+    app.fps_limit = std.math.clamp(parsed.value.fps, 30, 240);
+    if (parsed.value.open_last and parsed.value.last_project.len > 0) {
+        app.setPendingOpen(parsed.value.last_project);
+    }
+}
+
+/// 写入设置（静默失败；下一步变更会重试）
+fn saveSettings(app: *App, io: std.Io) void {
+    const spath = settingsPath(app) orelse return;
+    defer app.allocator.free(spath);
+    const json = persist.settingsToJson(app.allocator, .{
+        .open_last = app.settings_open_last,
+        .fps = app.fps_limit,
+        .last_project = app.project_path orelse "",
+    }) catch return;
+    defer app.allocator.free(json);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = spath, .data = json }) catch return;
 }
 
 /// 从指定路径加载并替换当前工程（失败时保留当前工程不变）

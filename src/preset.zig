@@ -571,3 +571,90 @@ test "preset: 重命名/删除（真实文件；重名/空名/仅大小写）" {
     try std.testing.expectEqual(@as(usize, 1), lib.categories.items[ci].presets.items.len);
     try std.testing.expectEqualStrings("占用", lib.categories.items[ci].presets.items[0]);
 }
+
+test "preset：data 为 junction（scoop persist）时解析/建骨架/保存/扫描均穿透到目标" {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    // 目录布局：<tmp>/app（模拟 exe 旁）+ <tmp>/target（模拟 scoop persist）
+    // <tmp>/app/data = 指到 target 的 junction。tmpDir 的 random 子路径保证可重入
+    // （不清理也不影响下次运行）
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.dir.close(io);
+    const base = try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer allocator.free(base);
+    const app = try std.fs.path.join(allocator, &.{ base, "app" });
+    defer allocator.free(app);
+    const target = try std.fs.path.join(allocator, &.{ base, "target" });
+    defer allocator.free(target);
+    const link = try std.fs.path.join(allocator, &.{ app, "data" });
+    defer allocator.free(link);
+
+    std.Io.Dir.cwd().createDirPath(io, app) catch {};
+    std.Io.Dir.cwd().createDirPath(io, target) catch {};
+    // mklink 用**绝对路径 + 反斜杠**（实测：相对路径报 "cannot find the path"；
+    // 正斜杠会被 cmd 当选项开关："无效参数 - tmp"）
+    const cwd = std.process.currentPathAlloc(io, allocator) catch return error.SkipZigTest;
+    defer allocator.free(cwd);
+    const link_abs = std.fs.path.join(allocator, &.{ cwd, link }) catch return error.SkipZigTest;
+    defer allocator.free(link_abs);
+    const target_abs = std.fs.path.join(allocator, &.{ cwd, target }) catch return error.SkipZigTest;
+    defer allocator.free(target_abs);
+    const link_win = allocator.dupe(u8, link_abs) catch return error.SkipZigTest;
+    defer allocator.free(link_win);
+    const target_win = allocator.dupe(u8, target_abs) catch return error.SkipZigTest;
+    defer allocator.free(target_win);
+    for (link_win) |*c| {
+        if (c.* == '/') c.* = '\\';
+    }
+    for (target_win) |*c| {
+        if (c.* == '/') c.* = '\\';
+    }
+    const mk = std.process.run(allocator, io, .{
+        .argv = &.{ "cmd.exe", "/c", "mklink", "/J", link_win, target_win },
+    }) catch return error.SkipZigTest;
+    defer allocator.free(mk.stdout);
+    defer allocator.free(mk.stderr);
+    switch (mk.term) {
+        .exited => |code| if (code != 0) return error.SkipZigTest,
+        else => return error.SkipZigTest,
+    }
+
+    // 1) 解析：data 是 junction（access 跟随）→ 应返回 <app>/data（而不是退 cwd）
+    //    （分隔符按实现自拼的写法比较：resolveDataRoot 用 "{s}/data" 拼接）
+    var root_buf: [512]u8 = undefined;
+    const root = resolveDataRoot(io, app, &root_buf) orelse return error.TestUnexpectedResult;
+    var exp_buf: [512]u8 = undefined;
+    const expect_root = try std.fmt.bufPrint(&exp_buf, "{s}/data", .{app});
+    try std.testing.expectEqualStrings(expect_root, root);
+
+    // 2) 建骨架穿透 junction：presets/<分类> 出现在 target 内（而非 Link 表层）
+    var skel_buf: [512]u8 = undefined;
+    ensureSkeleton(io, root, &skel_buf);
+    var chk_buf: [512]u8 = undefined;
+    for (skeleton_dirs) |d| {
+        const p = try std.fmt.bufPrint(&chk_buf, "{s}/presets/{s}", .{ target, d });
+        std.Io.Dir.cwd().access(io, p, .{}) catch return error.TestUnexpectedResult;
+    }
+
+    // 3) 保存穿透：预设文件实际落在 target 里
+    var p = @import("synth.zig").SynthParams{};
+    p.attack.store(0.42, .monotonic);
+    const saved = persist.exportSynth(&p);
+    try save(io, allocator, root, plugin_subtractive, "JunctionTest", plugin_subtractive, saved);
+    const fp = try std.fmt.bufPrint(&chk_buf, "{s}/presets/{s}/JunctionTest{s}", .{ target, plugin_subtractive, extension });
+    std.Io.Dir.cwd().access(io, fp, .{}) catch return error.TestUnexpectedResult;
+
+    // 4) 扫描穿透：通过 junction 能读到刚写的预设，且参数往返一致
+    var lib = try scan(io, allocator, root);
+    defer lib.deinit(allocator);
+    const ci = lib.findCategory(plugin_subtractive) orelse return error.NoCategory;
+    try std.testing.expectEqual(@as(usize, 1), lib.categories.items[ci].presets.items.len);
+    try std.testing.expectEqualStrings("JunctionTest", lib.categories.items[ci].presets.items[0]);
+    var parsed = try load(io, allocator, root, plugin_subtractive, "JunctionTest", plugin_subtractive);
+    defer parsed.deinit();
+    var q = @import("synth.zig").SynthParams{};
+    persist.importSynth(&parsed.value.synth, &q);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.42), q.attack.load(.monotonic), 1e-6);
+}

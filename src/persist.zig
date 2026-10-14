@@ -249,7 +249,47 @@ pub fn toJson(allocator: std.mem.Allocator, project: Project) ![]u8 {
     return out.toOwnedSlice();
 }
 
-/// 从 JSON 字符串解析工程（返回的 `Project` 内切片归调用方释放）。
+/// 应用设置（数据目录下 `settings.json`；缺失/损坏 → 默认值）
+pub const Settings = struct {
+    /// 启动时打开上次工程（false = 新建空工程）
+    open_last: bool = false,
+    /// 最高帧率（30..240）
+    fps: i32 = 120,
+    /// 上次打开/保存的工程路径（仅落盘；运行时真身在 `App.project_path`）
+    last_project: []const u8 = "",
+};
+
+/// 设置 → JSON（归调用方释放）
+pub fn settingsToJson(allocator: std.mem.Allocator, s: Settings) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    var jw = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .indent_2 } };
+    try jw.write(s);
+    return out.toOwnedSlice();
+}
+
+/// JSON → 设置（自包含；`parsed` 释放前拷出 `last_project`）
+pub fn settingsFromJson(allocator: std.mem.Allocator, data: []const u8) !std.json.Parsed(Settings) {
+    return std.json.parseFromSlice(Settings, allocator, data, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
+}
+
+test "persist: 设置 JSON 往返（含路径转义；未知字段忽略、缺字段补齐）" {
+    const allocator = std.testing.allocator;
+    const json = try settingsToJson(allocator, .{ .open_last = true, .fps = 90, .last_project = "C:\\Music\\曲.saw" });
+    defer allocator.free(json);
+    var parsed = try settingsFromJson(allocator, json);
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.open_last);
+    try std.testing.expectEqual(@as(i32, 90), parsed.value.fps);
+    try std.testing.expectEqualStrings("C:\\Music\\曲.saw", parsed.value.last_project);
+
+    // 未知字段忽略；缺字段 → 默认值
+    var parsed2 = try settingsFromJson(allocator, "{\"fps\":60,\"future\":123}");
+    defer parsed2.deinit();
+    try std.testing.expectEqual(@as(i32, 60), parsed2.value.fps);
+    try std.testing.expect(!parsed2.value.open_last);
+    try std.testing.expectEqualStrings("", parsed2.value.last_project);
+}
 /// **向后兼容**：v1 存档的片段坐标为“小节”（`bar`/`len`），
 /// 自动按 `legacy_units_per_bar` 换算为步（v2 起统一用步）。
 pub fn fromJson(allocator: std.mem.Allocator, data: []const u8) !std.json.Parsed(Project) {

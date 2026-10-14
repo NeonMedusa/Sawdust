@@ -736,6 +736,32 @@ pub const MixerWindow = struct {
 pub const EffectRef = struct { ch: usize, slot: usize };
 
 /// 效果器独立面板（像合成器窗口一样可拖动/缩放）
+/// 帮助窗口（基本操作速查；工具栏“帮助”按钮打开）
+pub const HelpWindow = struct {
+    open: bool = false,
+    x: i32 = 420,
+    y: i32 = 110,
+    w: i32 = 500,
+    h: i32 = 470,
+    /// Z 序（越大越靠上；点窗口即置顶）——见 `RackState.z` 注释
+    z: i32 = 26,
+    grab_dx: i32 = 0,
+    grab_dy: i32 = 0,
+};
+
+/// 设置窗口（启动行为 / 最高帧率；工具栏“选项”打开）
+pub const SettingsWindow = struct {
+    open: bool = false,
+    x: i32 = 460,
+    y: i32 = 130,
+    w: i32 = 440,
+    h: i32 = 240,
+    /// Z 序（越大越靠上；点窗口即置顶）——见 `RackState.z` 注释
+    z: i32 = 27,
+    grab_dx: i32 = 0,
+    grab_dy: i32 = 0,
+};
+
 pub const EffectWindow = struct {
     x: i32 = 260,
     y: i32 = 130,
@@ -893,6 +919,15 @@ pub const App = struct {
     synth_win: SynthWindow = .{},
     mixer_win: MixerWindow = .{},
     effect_win: EffectWindow = .{},
+    help_win: HelpWindow = .{},
+    settings_win: SettingsWindow = .{},
+    /// 应用设置（settings.json；IO 由 main 帧末执行）
+    /// - `settings_open_last`：启动时打开上次工程（false = 新建空工程）
+    /// - `fps_limit`：最高帧率（帧预算 = 1e9 / fps；30..240）
+    settings_open_last: bool = false,
+    fps_limit: i32 = 120,
+    /// 设置需要落盘（变更 / 工程路径变化时置位）
+    settings_dirty: bool = false,
     drumkit_win: DrumKitWindow = .{},
     /// 浮动窗口 Z 序的**全局计数器**（点窗口置顶时 +1，见 `bringToFront`）
     z_top: i32 = 50,
@@ -3115,12 +3150,14 @@ pub const App = struct {
         @memcpy(buf[0..len], path[0..len]); // 先复制出别名区
         if (self.project_path) |old| self.allocator.free(old);
         self.project_path = self.allocator.dupe(u8, buf[0..len]) catch null;
+        self.settings_dirty = true; // “上次工程”落盘
     }
 
     /// 清除工程路径（新建空工程：标题回到“未命名”）
     pub fn clearProjectPath(self: *App) void {
         if (self.project_path) |old| self.allocator.free(old);
         self.project_path = null;
+        self.settings_dirty = true; // “上次工程”落盘
     }
 
     /// 当前工程名（无路径或异常时 = null）
