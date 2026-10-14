@@ -40,7 +40,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
     // （否则菜单项点击会穿透到下面的行/按钮）。
     // 注意：**不覆盖**“被上层窗口屏蔽”的状态（那是 beginLayer 算的；
     // 上面用 or 合幷而不直接赋值）。
-    const menu_modal = menu_was_open or app.rack.ctx_instrument != null;
+    const menu_modal = menu_was_open or app.rack.ctx_instrument != null or app.rack.ctx_pan != null;
     if (menu_modal) ui.input_blocked = true;
 
     // 窗口阴影 + 背景 + 边框
@@ -143,7 +143,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
     }
 
     // 右键菜单（重命名 / 更换乐器… / 删除乐器）——同理：仅在展开时取消屏蔽
-    if (app.rack.ctx_instrument != null) ui.input_blocked = false;
+    if (app.rack.ctx_instrument != null or app.rack.ctx_pan != null) ui.input_blocked = false;
     if (app.rack.ctx_instrument) |ci| {
         if (ci < app.instruments.items.len) {
             const items = [_][]const u8{ "重命名", "更换乐器…", "删除乐器" };
@@ -190,6 +190,35 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
         }
     }
 
+    // 声像旋钮右键菜单（恢复默认值）——单项，与调音台一致
+    if (app.rack.ctx_pan) |pi| {
+        if (pi < app.instruments.items.len) {
+            const item = "恢复默认值";
+            const mw2: i32 = 130;
+            const mh2: i32 = util.menu_item_h + 4;
+            const mx = app.rack.ctx_x; // 固定位置（打开时记录，不跟鼠标跑）
+            const my = app.rack.ctx_y;
+            ui.renderer.fillRect(mx, my, mw2, mh2, ui.theme.panel);
+            ui.renderer.strokeRect(mx, my, mw2, mh2, ui.theme.accent);
+            const iy = my + 2;
+            const hovered = util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, mw2 - 2, util.menu_item_h);
+            if (hovered) ui.renderer.fillRect(mx + 1, iy, mw2 - 2, util.menu_item_h, ui.theme.item_hover);
+            ui.label(item, mx + 8, iy + 2, ui.theme.text);
+            if (hovered and ui.mouse_pressed) {
+                const inst = &app.instruments.items[pi];
+                if (inst.pan != 0.5) {
+                    inst.pan = 0.5; // 居中
+                    app.commitHistory("恢复乐器声像");
+                }
+                app.rack.ctx_pan = null;
+            } else if (ui.mouse_pressed and !util.inRect(ui.mouse_x, ui.mouse_y, mx, my, mw2, mh2)) {
+                app.rack.ctx_pan = null;
+            }
+        } else {
+            app.rack.ctx_pan = null;
+        }
+    }
+
     // 鼠标在窗口内：屏蔽底层控件
     return util.inRect(ui.mouse_x, ui.mouse_y, x, y, ww, hh);
 }
@@ -231,7 +260,15 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, x: i32, y: i32, w: i32, clip_top: i32
 
     // 声像旋钮 / 音量旋钮（拖动中 coalesce，松手时提交）
     const ky = y + @divTrunc(util.rack_row_h - util.rack_knob_size, 2);
+    const pan_kx = cx;
     if (ui.knob(4000 + @as(u64, idx) * 2, &inst.pan, cx, ky, util.rack_knob_size)) app.history_pending = "调整声像";
+    // 声像旋钮右键 → “恢复默认值”菜单（与调音台一致；名称右键另有乐器菜单）
+    if (util.hitUI(ui, pan_kx, ky, util.rack_knob_size, util.rack_knob_size) and ui.mouse_right_pressed) {
+        app.rack.ctx_pan = idx;
+        app.rack.ctx_instrument = null; // 互斥
+        app.rack.ctx_x = ui.mouse_x;
+        app.rack.ctx_y = ui.mouse_y;
+    }
     cx += util.rack_knob_size + 6;
     if (ui.knob(4000 + @as(u64, idx) * 2 + 1, &inst.volume, cx, ky, util.rack_knob_size)) app.history_pending = "调整乐器音量";
     cx += util.rack_knob_size + 10;
@@ -304,6 +341,7 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, x: i32, y: i32, w: i32, clip_top: i32
     }
     if (name_hovered and ui.mouse_right_pressed) {
         app.rack.ctx_instrument = idx;
+        app.rack.ctx_pan = null; // 互斥（声像旋钮菜单）
         app.rack.ctx_x = ui.mouse_x; // 固定菜单位置
         app.rack.ctx_y = ui.mouse_y;
     }

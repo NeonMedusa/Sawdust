@@ -75,15 +75,16 @@ pub const ParsedNote = struct {
     channel: u8,
     /// 力度（1-127）——note-on 的力度字节
     velocity: u8 = 100,
-    /// 声像（0-127；64 = 居中）——音符开始时该通道的 CC10 值
-    /// （无 CC10 则 64；同通道同时响的多音符会互相覆盖，best-effort）
-    pan: u8 = 64,
 };
 
 pub const Parsed = struct {
     /// 文件声明的每四分音符 tick 数
     ticks_per_quarter: i32,
     notes: []ParsedNote,
+    /// 每通道**首个** CC10（声像）事件值（0-127；无 → 64）。
+    /// 语义：MIDI 声像是**通道级**的（没有音符级声像）——导入时映射到乐器声像；
+    /// 音符级声像一律居中（动态曲线以后再做）。
+    channel_pan: [16]u8 = @splat(64),
 
     pub fn deinit(self: *Parsed, allocator: std.mem.Allocator) void {
         allocator.free(self.notes);
@@ -91,7 +92,7 @@ pub const Parsed = struct {
     }
 };
 
-const Pending = struct { channel: u8, pitch: u8, start: i64, velocity: u8, pan: u8 };
+const Pending = struct { channel: u8, pitch: u8, start: i64, velocity: u8 };
 
 /// 关闭最早的 (channel, pitch) 配对（FIFO——同 MIDI 接收端语义）
 fn closeNote(
@@ -111,7 +112,6 @@ fn closeNote(
                 .pitch = pitch,
                 .channel = channel,
                 .velocity = p.velocity,
-                .pan = p.pan,
             });
             return;
         }
@@ -124,6 +124,8 @@ fn parseTrack(
     allocator: std.mem.Allocator,
     data: []const u8,
     notes: *std.ArrayListUnmanaged(ParsedNote),
+    chan_pan: *[16]u8,
+    chan_pan_set: *[16]bool,
 ) !void {
     var pending: std.ArrayListUnmanaged(Pending) = .{ .items = &.{}, .capacity = 0 };
     defer pending.deinit(allocator);
@@ -131,8 +133,7 @@ fn parseTrack(
     var i: usize = 0;
     var abs: i64 = 0;
     var running: u8 = 0; // running status（上一个事件状态字节）
-    // 每通道当前 CC10（声像）值——音符开始时快照进音符（还原导入前听感）
-    var chan_pan = [_]u8{64} ** 16;
+    // CC10（声像）不在音符级落地——只记每通道“首个”值（见 `Parsed.channel_pan`）
     while (i < data.len) {
         const delta = readVlq(data, &i) orelse return; // 损坏：宽容停止
         abs += delta;
@@ -156,7 +157,7 @@ fn parseTrack(
                 const vel = data[i + 1];
                 i += 2;
                 if (kind == 0x90 and vel > 0) {
-                    try pending.append(allocator, .{ .channel = ch, .pitch = key, .start = abs, .velocity = vel, .pan = chan_pan[ch & 0x0F] });
+                    try pending.append(allocator, .{ .channel = ch, .pitch = key, .start = abs, .velocity = vel });
                 } else {
                     try closeNote(allocator, notes, &pending, ch, key, abs);
                 }
@@ -167,7 +168,11 @@ fn parseTrack(
                 const cc = data[i];
                 const val = data[i + 1];
                 i += 2;
-                if (cc == 10) chan_pan[ch & 0x0F] = val;
+                // 只记**首个** CC10（该通道的静态声像基准；动态曲线以后再做）
+                if (cc == 10 and !chan_pan_set[ch & 0x0F]) {
+                    chan_pan[ch & 0x0F] = val;
+                    chan_pan_set[ch & 0x0F] = true;
+                }
             },
             0xA0, 0xE0 => i += 2, // 触后 / 弯音：跳过
             0xC0, 0xD0 => i += 1, // 音色 / 通道触后：跳过
@@ -198,7 +203,6 @@ fn parseTrack(
             .pitch = p.pitch,
             .channel = p.channel,
             .velocity = p.velocity,
-            .pan = p.pan,
         });
     }
 }
@@ -220,16 +224,19 @@ pub fn parse(allocator: std.mem.Allocator, data: []const u8) !Parsed {
 
     var pos: usize = 8 + header_len;
     var track_i: usize = 0;
+    // CC10 跨轨全局（format 1 多轨共享同一声像状态）
+    var chan_pan = [_]u8{64} ** 16;
+    var chan_pan_set = [_]bool{false} ** 16;
     while (track_i < ntrks and pos + 8 <= data.len) : (track_i += 1) {
         if (!std.mem.eql(u8, data[pos .. pos + 4], "MTrk")) break; // 结构异常：宽容停止
         const tlen = std.mem.readInt(u32, data[pos + 4 .. pos + 8][0..4], .big);
         pos += 8;
         const end = @min(data.len, pos + tlen);
-        try parseTrack(allocator, data[pos..end], &notes);
+        try parseTrack(allocator, data[pos..end], &notes, &chan_pan, &chan_pan_set);
         pos = end;
     }
 
-    return .{ .ticks_per_quarter = tpq, .notes = try notes.toOwnedSlice(allocator) };
+    return .{ .ticks_per_quarter = tpq, .notes = try notes.toOwnedSlice(allocator), .channel_pan = chan_pan };
 }
 
 // ── 写出 ──
@@ -242,9 +249,6 @@ pub const ExportNote = struct {
     channel: u8,
     /// 力度（1-127；默认 100）
     velocity: u8 = 100,
-    /// 声像（0-127；64 = 居中）——导出时在音符前插 CC10（best-effort：
-    /// 同通道同时响的多音符会互相覆盖，MIDI 协议限制）
-    pan: u8 = 64,
 };
 
 pub const ExportSong = struct {
@@ -252,11 +256,14 @@ pub const ExportSong = struct {
     time_num: u8 = 4,
     time_den: u8 = 4,
     notes: []const ExportNote,
+    /// 每通道声像（0-127）= 该通道乐器的声像——**轨首一次性 CC10**。
+    /// 音符级声像（Sawdust 特色）不导出：MIDI 只有通道级声像。
+    channel_pan: [16]u8 = @splat(64),
 };
 
 const Event = struct { tick: i64, pitch: u8, is_on: bool, velocity: u8 = 100 };
 
-/// CC10（声像）事件（导出声像 ≠ 64 的音符时插入）
+/// CC10（声像）事件（每通道轨首一条）
 const CcEvent = struct { tick: i64, value: u8 };
 
 fn evLess(_: void, a: Event, b: Event) bool {
@@ -299,7 +306,7 @@ fn writeConductorTrack(
     try out.appendSlice(allocator, &.{ 0xFF, 0x2F, 0x00 });
 }
 
-/// 写一条音符轨（固定通道；力度用音符自身的；声像 CC10 已在事件前插入）
+/// 写一条音符轨（固定通道；力度用音符自身的；CC10 在轨首一次性写入）
 fn writeNoteTrack(
     allocator: std.mem.Allocator,
     out: *std.ArrayListUnmanaged(u8),
@@ -312,7 +319,7 @@ fn writeNoteTrack(
     var ei: usize = 0;
     var ci: usize = 0;
     while (ei < evs.len or ci < ccs.len) {
-        // 同 tick：CC 先于音符事件（声像在音符开之前就位）
+        // 同 tick：CC 先于音符事件（轨首 CC10 在有音符前就位）
         const take_cc = ci < ccs.len and (ei >= evs.len or ccs[ci].tick <= evs[ei].tick);
         if (take_cc) {
             const c = ccs[ci];
@@ -355,10 +362,10 @@ pub fn write(allocator: std.mem.Allocator, song: ExportSong) ![]u8 {
         const off_tick = stepToTick(n.start_step + @max(1, n.len_steps), tpq);
         try evs[ch].append(allocator, .{ .tick = on_tick, .pitch = n.pitch, .is_on = true, .velocity = @max(1, n.velocity) });
         try evs[ch].append(allocator, .{ .tick = off_tick, .pitch = n.pitch, .is_on = false });
-        // 声像 ≠ 居中 → 在音符起点前插 CC10
-        if (n.pan != 64) {
-            try ccs[ch].append(allocator, .{ .tick = on_tick, .value = @min(127, n.pan) });
-        }
+    }
+    // 每通道轨首一条 CC10：通道声像（= 乐器声像——音符级声像不导出）
+    for (&ccs, 0..) |*c, ch| {
+        if (used[ch]) try c.append(allocator, .{ .tick = 0, .value = @min(127, song.channel_pan[ch]) });
     }
     for (&evs, 0..) |*e, ch| {
         if (used[ch]) std.mem.sort(Event, e.items, {}, evLess);
@@ -561,35 +568,32 @@ test "midi: 导出 → 解析往返（音高/时值/通道）" {
     }
 }
 
-test "midi: 力度/声像（CC10）导出 → 解析往返" {
+test "midi: 力度/通道声像（CC10）导出 → 解析往返" {
     const allocator = std.testing.allocator;
     const notes = [_]ExportNote{
-        .{ .start_step = 0, .len_steps = 24, .pitch = 60, .channel = 0, .velocity = 40, .pan = 20 },
-        .{ .start_step = 24, .len_steps = 24, .pitch = 64, .channel = 0, .velocity = 127, .pan = 100 },
-        .{ .start_step = 48, .len_steps = 24, .pitch = 67, .channel = 1 }, // 默认 100 / 64（不写 CC10）
+        .{ .start_step = 0, .len_steps = 24, .pitch = 60, .channel = 0, .velocity = 40 },
+        .{ .start_step = 24, .len_steps = 24, .pitch = 64, .channel = 0, .velocity = 127 },
+        .{ .start_step = 48, .len_steps = 24, .pitch = 67, .channel = 1 }, // 通道 1：默认力度 / 声像
     };
-    const bytes = try write(allocator, .{ .notes = &notes });
+    var cpan = [_]u8{64} ** 16;
+    cpan[0] = 20; // 模拟乐器声像：通道 0 偏左
+    const bytes = try write(allocator, .{ .notes = &notes, .channel_pan = cpan });
     defer allocator.free(bytes);
 
     var parsed = try parse(allocator, bytes);
     defer parsed.deinit(allocator);
     try std.testing.expectEqual(@as(usize, 3), parsed.notes.len);
 
-    // 力度逐音符还原；声像：音符开始时该通道的 CC10（同通道后一个音符覆盖前值）
+    // 通道声像：轨首一次性 CC10 → 解析为通道级值（导入时映射到乐器）
+    try std.testing.expectEqual(@as(u8, 20), parsed.channel_pan[0]);
+    try std.testing.expectEqual(@as(u8, 64), parsed.channel_pan[1]);
+
+    // 力度逐音符还原；音符级声像一律居中（Sawdust 语义：声像在乐器/通道级）
     for (parsed.notes) |got| {
         switch (got.pitch) {
-            60 => {
-                try std.testing.expectEqual(@as(u8, 40), got.velocity);
-                try std.testing.expectEqual(@as(u8, 20), got.pan);
-            },
-            64 => {
-                try std.testing.expectEqual(@as(u8, 127), got.velocity);
-                try std.testing.expectEqual(@as(u8, 100), got.pan);
-            },
-            67 => {
-                try std.testing.expectEqual(@as(u8, 100), got.velocity);
-                try std.testing.expectEqual(@as(u8, 64), got.pan); // 无 CC10 → 默认居中
-            },
+            60 => try std.testing.expectEqual(@as(u8, 40), got.velocity),
+            64 => try std.testing.expectEqual(@as(u8, 127), got.velocity),
+            67 => try std.testing.expectEqual(@as(u8, 100), got.velocity),
             else => unreachable,
         }
     }

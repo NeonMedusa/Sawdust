@@ -55,7 +55,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer app.clips.deinit(allocator);
     defer app.notes.deinit(allocator);
     defer app.deinitAll();
-    app.resetPatterns(model.default_pattern_count); // 默认样式 1..6
+    app.resetPatterns(1); // 空工程基线：只有样式 1（不再铺 6 个演示样式）
     app.resetMixerChannels(@import("app.zig").default_mixer_channels); // 默认调音台通道（主通道 + 通道#1）
     // 数据目录（预设库）+ 首次扫描（IO 统一在帧末 pending 处理）
     {
@@ -65,29 +65,17 @@ pub fn main(init: std.process.Init) !u8 {
         if (preset_mod.resolveDataRoot(io, edir, &root_buf)) |root| app.setDataRoot(root);
         app.pending_preset = .scan;
     }
-    // 初始片段（演示）：前 12 轨铺一些样式，每 16 小节重复（只铺 2 轮——
-    // 避免演示内容把时间轴行程撑得过长，行程应贴合最右内容）
-    {
-        const B: i32 = model.units_per_whole; // 4/4 一小节 = 96 步
-        var t: i32 = 0;
-        while (t < 12) : (t += 1) {
-            var rep: i32 = 0;
-            while (rep < 2) : (rep += 1) {
-                app.addClip(.{
-                    .track = t,
-                    .start = @mod(t, 6) * 2 * B + rep * 16 * B,
-                    .len = (2 + @mod(t, 3)) * B,
-                    .pattern = @mod(t, 6),
-                });
-            }
-        }
-    }
-    // 初始乐器（演示）：两个减法合成器（各自独立参数）
-    // **必须在 engine.init 之前**：音频回调启动后会解引用参数/队列指针
+    // 初始片段（空基线）：样式 1 放在 Track 1 的最左边（长度 = 样式有效长度）
+    app.addClip(.{
+        .track = 0,
+        .start = 0,
+        .len = app.patternEffectiveLen(0),
+        .pattern = 0,
+    });
+    // 初始乐器：1 个减法合成器（**必须在 engine.init 之前**——
+    // 音频回调启动后会解引用参数/队列指针）
     _ = app.addInstrument("减法合成器");
-    _ = app.addInstrument("减法合成器");
-    app.resetHistory("初始状态"); // 演示数据 = 历史基线
-    app.dirty = false; // 演示数据不算“未保存的修改”
+    app.resetHistory("初始状态"); // 空基线 = 历史基线（脏标记由历史派生）
     app.params.events = &app.events;
     app.params.sched_events = &app.sched_events;
 
@@ -149,9 +137,10 @@ pub fn main(init: std.process.Init) !u8 {
                             if (app.dirty_intent == .quit) break;
                         },
                         .cancel => {
-                            // 取消：放弃目标动作（清掉待打开的工程）
+                            // 取消：放弃目标动作（清掉待打开的工程 / 待新建意图）
                             app.dirty_flow = .none;
                             app.clearPendingOpen();
+                            app.dirty_intent = null;
                         },
                     }
                 }
@@ -163,10 +152,20 @@ pub fn main(init: std.process.Init) !u8 {
                     if (!app.dirty) {
                         // 保存成功 → 执行目标动作
                         if (app.dirty_intent == .quit) break;
-                        app.pending_file_action = .open; // 执行待定的打开
+                        // 执行目标动作：打开走帧末（需路径/对话框）；新建直接执行
+                        // （脏已由本流程处理，不能再走带确认的帧末 `.new` 入口）
+                        if (app.dirty_intent == .new) {
+                            newProject(&app);
+                        } else {
+                            app.pending_file_action = .open;
+                        }
+                        app.dirty_intent = null;
                     } else {
                         // 保存失败 / 用户在保存对话框里取消 → 放弃目标动作
+                        // （等同确认框里的“取消”：**也要清掉意图**——否则 206 区会
+                        // 拿残留的 `.new` 意图直接执行新建，实测 bug：取消保存却新建了）
                         app.clearPendingOpen();
+                        app.dirty_intent = null;
                     }
                 }
             },
@@ -205,6 +204,13 @@ pub fn main(init: std.process.Init) !u8 {
         // 脏确认已结束（且意图为打开）：执行待定的打开
         if (app.dirty_flow == .none and app.pending_open_path != null and app.pending_file_action == null) {
             app.pending_file_action = .open;
+            app.dirty_intent = null;
+        }
+        // 脏确认已结束（且意图为新建）：直接执行——**不再走 `.new` 帧末分支**
+        // （那里带脏检查；discard 后仍脏，会二次弹窗死循环）
+        if (app.dirty_flow == .none and app.dirty_intent == .new and app.pending_file_action == null) {
+            newProject(&app);
+            app.dirty_intent = null;
         }
 
         ui_input.mouse_pressed = false;
@@ -431,6 +437,8 @@ pub fn main(init: std.process.Init) !u8 {
             else
                 0.0;
             app.params.instrument_gain[i].store(g, .monotonic);
+            // 乐器声像（0-1）；空槽位 → 0.5（居中，防旧值残留）
+            app.params.instrument_pan[i].store(if (has) app.instruments.items[i].pan else 0.5, .monotonic);
             // 混音通道路由（`mixer` 已是 0 起；**按实际通道数**钳制——
             // 否则通道数减少后旧值会指向不存在的通道，实测 bug）
             const n_ch: u32 = @intCast(app.mixer_channels_state.items.len);
@@ -496,6 +504,13 @@ pub fn main(init: std.process.Init) !u8 {
             if (chain_changed) {
                 const v = app.params.effect_chain_version[ci].load(.monotonic);
                 app.params.effect_chain_version[ci].store(v +% 1, .monotonic);
+            }
+            // 新效果器参数（混响/延迟/压缩器）：逐槽直接同步（store 廉价）
+            for (0..eff_n) |slot| {
+                const es = mc.effects.items[slot];
+                for (0..@import("effects.zig").max_params) |pi| {
+                    app.params.effect_p[ci][slot][pi].store(es.p[pi], .monotonic);
+                }
             }
             // EQ 参数（取**首个 EQ** 的参数——当前 EQ 参数由链上 EQ 共享）
             var eq_bands: ?[eq.band_count]eq.BandParams = null;
@@ -644,6 +659,7 @@ pub fn main(init: std.process.Init) !u8 {
             ui.active_id = 0; // 对话框会抢走鼠标：清掉拖动状态
             win.setDragCapture(false);
             switch (act) {
+                .new => newProjectWithConfirm(&app), // 新建（空）：脏 → 先走确认
                 .open => {
                     // 已有待定路径（脏确认后继续打开）→ 直接加载；
                     // 否则弹对话框选文件
@@ -1107,9 +1123,17 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     const effect_open = app.mixer_win.panel != null;
     // 频谱目标（EQ 背景 = **该效果器的输入信号**）：每帧发布（关窗 → -1：
     // 音频线程停止捕获，省 CPU）。见 audio.captureSpectrum。
+    // 注：只有 **EQ** 面板画频谱背景——其它效果器面板不发目标（不白算 FFT）
     if (app.mixer_win.panel) |p| {
-        app.params.spec_target_ch.store(@intCast(@min(p.ch, audio.mixer_channels - 1)), .monotonic);
-        app.params.spec_target_slot.store(@intCast(@min(p.slot, audio.effect_slots - 1)), .monotonic);
+        const is_eq = p.ch < app.mixer_channels_state.items.len and
+            p.slot < app.mixer_channels_state.items[p.ch].effects.items.len and
+            app.mixer_channels_state.items[p.ch].effects.items[p.slot].kind == .eq;
+        if (is_eq) {
+            app.params.spec_target_ch.store(@intCast(@min(p.ch, audio.mixer_channels - 1)), .monotonic);
+            app.params.spec_target_slot.store(@intCast(@min(p.slot, audio.effect_slots - 1)), .monotonic);
+        } else {
+            app.params.spec_target_ch.store(-1, .monotonic);
+        }
     } else {
         app.params.spec_target_ch.store(-1, .monotonic);
     }
@@ -1401,6 +1425,7 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
 /// 命中项只登记 `pending_file_action`（真正的对话框在帧末执行——见主循环）。
 fn drawFileMenu(ui: *Ui, app: *App) void {
     const items = [_]struct { label: []const u8, shortcut: []const u8 }{
+        .{ .label = "新建（空）", .shortcut = "" },
         .{ .label = "打开...", .shortcut = "Ctrl+O" },
         .{ .label = "保存", .shortcut = "Ctrl+S" },
         .{ .label = "另存为...", .shortcut = "Ctrl+Shift+S" },
@@ -1445,11 +1470,12 @@ fn drawFileMenu(ui: *Ui, app: *App) void {
     if (activated) |ai| {
         app.file_menu_open = false;
         app.pending_file_action = switch (ai) {
-            0 => .open,
-            1 => .save,
-            2 => .save_as,
-            3 => .import_midi,
-            4 => .export_midi,
+            0 => .new,
+            1 => .open,
+            2 => .save,
+            3 => .save_as,
+            4 => .import_midi,
+            5 => .export_midi,
             else => null,
         };
     }
@@ -1543,6 +1569,27 @@ fn openProjectWithDialog(app: *App, win: *window.Window, io: std.Io) void {
     loadProjectFromPath(app, io, path);
 }
 
+/// 新建（空）工程（文件菜单入口）：**脏则先弹确认**（与“打开...”同一套流程，
+/// 保存/丢弃/取消三态）——确认后由状态机直接执行 `newProject`。
+fn newProjectWithConfirm(app: *App) void {
+    if (app.dirty) {
+        app.dirty_flow = .confirming;
+        app.dirty_intent = .new;
+        app.modal = .dirty_confirm;
+        app.modal_choice = null;
+        return;
+    }
+    newProject(app);
+}
+
+/// 新建（空）工程（已确认 / 无需确认时）：重置为默认内容（1 样式 + Track 1
+/// 最左 1 片段 + 1 个减法合成器）并清路径（标题回到“未命名”）。
+fn newProject(app: *App) void {
+    app.resetToDefaultProject(); // 内部：停播 + 重建 + resetHistory("新建") + markSaved
+    app.clearProjectPath();
+    app.setToast("已新建空工程");
+}
+
 /// 从指定路径加载并替换当前工程（失败时保留当前工程不变）
 fn loadProjectFromPath(app: *App, io: std.Io, path: []const u8) void {
     const data = std.Io.Dir.cwd().readFileAlloc(io, path, app.allocator, .unlimited) catch |e| {
@@ -1631,6 +1678,7 @@ fn exportMidiWithDialog(app: *App, win: *window.Window, io: std.Io) void {
         .time_num = @intCast(std.math.clamp(app.time_num, 1, 255)),
         .time_den = @intCast(std.math.clamp(app.time_den, 1, 64)),
         .notes = notes,
+        .channel_pan = app.exportChannelPans(), // 通道声像 = 乐器声像（音符级不导出）
     }) catch |e| {
         app.setToastWith("导出失败：生成失败（{s}）", .{@errorName(e)});
         return;
@@ -1668,7 +1716,11 @@ fn drawModal(ui: *Ui, app: *App) void {
 /// 脏确认框（保存/不保存/取消）——退出或打开其它工程前
 fn drawDirtyConfirm(ui: *Ui, app: *App, w: i32, h: i32) void {
     // 文案随场景变化（退出 vs 打开其他工程）
-    const line2 = if (app.dirty_intent == .open) "是否保存后再打开其他工程？" else "是否保存后再退出？";
+    const line2 = switch (app.dirty_intent orelse .quit) {
+        .open => "是否保存后再打开其他工程？",
+        .new => "是否保存后再新建空工程？",
+        .quit => "是否保存后再退出？",
+    };
     const line1 = "当前工程有未保存的修改。";
     const tw1: i32 = @intFromFloat(ui.font.measure(line1));
     const tw2: i32 = @intFromFloat(ui.font.measure(line2));

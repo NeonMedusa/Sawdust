@@ -150,14 +150,16 @@ pub const SavedEqBand = struct {
     q: f32 = 1.0,
 };
 
-/// 存档中的一个效果器（`kind`：1 = EQ；0 = 无效——旧存档空槽）
+/// 存档中的一个效果器（`kind`：1 = EQ / 2 = 混响 / 3 = 延迟 / 4 = 压缩器；0 = 无效）
 pub const SavedEffectSlot = struct {
-    kind: u32 = 0, // 1 = EQ（与 app.EffectKind 对应；0 = 无效）
+    kind: u32 = 0, // 与 app.EffectKind 对应；0 = 无效
     enabled: bool = true,
     /// 干湿比（0 = 干声、1 = 完全效果）
     mix: f32 = 1.0,
     /// EQ 段（**只读切片**：兼容旧存档的 4 段；加载时按需截断/补齐）
     bands: []const SavedEqBand = &.{},
+    /// 通用参数位（混响/延迟/压缩器；含义见 `effects.paramInfos`；旧档缺失 → 全 0）
+    p: [5]f32 = .{ 0, 0, 0, 0, 0 },
 };
 
 /// 存档中的一个调音台通道

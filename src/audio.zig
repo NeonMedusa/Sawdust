@@ -15,6 +15,7 @@
 const std = @import("std");
 const synth = @import("synth.zig");
 const eq = @import("eq.zig");
+const fx = @import("effects.zig");
 const ma = @cImport({
     @cInclude("miniaudio.h");
 });
@@ -73,6 +74,13 @@ pub const Params = struct {
     instrument_gain: [synth.max_instruments]std.atomic.Value(f32) = blk: {
         var a: [synth.max_instruments]std.atomic.Value(f32) = undefined;
         for (&a) |*g| g.* = std.atomic.Value(f32).init(0.8);
+        break :blk a;
+    },
+    /// 每乐器声像（0-1；0.5 居中；UI 每帧同步）——音符级声像的**基准**：
+    /// 播放时合成有效声像（基准 + 音符偏移），见 `effectivePan`
+    instrument_pan: [synth.max_instruments]std.atomic.Value(f32) = blk: {
+        var a: [synth.max_instruments]std.atomic.Value(f32) = undefined;
+        for (&a) |*p| p.* = std.atomic.Value(f32).init(0.5);
         break :blk a;
     },
     /// 每乐器路由到的调音台通道（0..mixer_channels-1；UI 每帧同步）
@@ -151,6 +159,18 @@ pub const Params = struct {
     effect_chain_version: [mixer_channels]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** mixer_channels,
     /// 效果链长度（每通道：有效效果器数；UI 每帧同步）
     effect_count: [mixer_channels]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** mixer_channels,
+    /// 效果器参数位（每槽 5 个；含义按 kind 见 `effects.paramInfos`——
+    /// 2 = 混响 / 3 = 延迟 / 4 = 压缩器；1 = EQ 用 `channel_eq`）
+    effect_p: [mixer_channels][effect_slots][fx.max_params]std.atomic.Value(f32) = blk: {
+        @setEvalBranchQuota(20000);
+        var a: [mixer_channels][effect_slots][fx.max_params]std.atomic.Value(f32) = undefined;
+        for (&a) |*ch| {
+            for (ch) |*slot| {
+                for (slot) |*v| v.* = std.atomic.Value(f32).init(0);
+            }
+        }
+        break :blk a;
+    },
     /// 实际通道数（UI 每帧同步；音频线程只处理 0..channel_count）
     channel_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(2),
 
@@ -200,6 +220,12 @@ pub const Engine = struct {
     slot_eq: []eq.Biquad = &.{},
     /// 每通道已应用的 EQ 版本（与 params.channel_eq_version 对比）
     chan_eq_ver: [mixer_channels]u32 = [_]u32{0} ** mixer_channels,
+    /// 混响状态（**每通道一份**：16 × ≈134KB ≈ 2.1MB；堆分配）
+    reverbs: []fx.Reverb = &.{},
+    /// 延迟状态（每通道一份：16 × ≈384KB ≈ 6.1MB；1s 上限立体声）
+    delays: []fx.Delay = &.{},
+    /// 压缩器状态（每通道一份；状态极小）
+    comps: []fx.Compressor = &.{},
     /// 每通道渲染缓冲（**堆分配**：32 通道 × 32KB = 1MB，不能放栈）
     chan_bufs: []f32 = &.{},
     /// 频谱分析：滑窗样本（单声道混合）——滑窗取自
@@ -226,6 +252,13 @@ pub const Engine = struct {
         const n_eq = mixer_channels * effect_slots * eq_bands * 2;
         self.slot_eq = try allocator.alloc(eq.Biquad, n_eq);
         @memset(self.slot_eq, .{});
+        // 新效果器状态（每通道一份；体积大 → 堆分配）
+        self.reverbs = try allocator.alloc(fx.Reverb, mixer_channels);
+        for (self.reverbs) |*r| r.* = .{};
+        self.delays = try allocator.alloc(fx.Delay, mixer_channels);
+        for (self.delays) |*d| d.* = .{};
+        self.comps = try allocator.alloc(fx.Compressor, mixer_channels);
+        for (self.comps) |*c| c.* = .{};
 
         var config = ma.ma_device_config_init(ma.ma_device_type_playback);
         config.playback.format = ma.ma_format_f32;
@@ -263,6 +296,18 @@ pub const Engine = struct {
         if (self.chan_bufs.len > 0) {
             self.allocator.free(self.chan_bufs);
             self.chan_bufs = &.{};
+        }
+        if (self.reverbs.len > 0) {
+            self.allocator.free(self.reverbs);
+            self.reverbs = &.{};
+        }
+        if (self.delays.len > 0) {
+            self.allocator.free(self.delays);
+            self.delays = &.{};
+        }
+        if (self.comps.len > 0) {
+            self.allocator.free(self.comps);
+            self.comps = &.{};
         }
         if (self.slot_eq.len > 0) {
             self.allocator.free(self.slot_eq);
@@ -395,6 +440,15 @@ fn publishSounding(engine: *Engine, params: *Params) void {
     }
 }
 
+/// 合成有效声像：乐器声像（0-1）为**基准**，音符级声像（0-127）是**偏移**
+/// （Sawdust 特色：MIDI 本身无音符级声像；导入的音符居中 → 完全跟随乐器）。
+/// 合成后走**单次**等功率渲染——避免两次声像串行（乐器偏左会“挡住”想上右的音符）。
+pub fn effectivePan(inst_pan: f32, note_pan: u8) u8 {
+    const base: f32 = std.math.clamp(inst_pan, 0.0, 1.0) * 127.0;
+    const v: f32 = base + @as(f32, @floatFromInt(note_pan)) - 64.0;
+    return @intFromFloat(@round(std.math.clamp(v, 0.0, 127.0)));
+}
+
 /// 触发一个音符事件（音频线程；`SchedEvent` / `NoteEvent` 均可——字段兼容）。
 /// **鼓组分支**：on 按音高分发到匹配层；off **不查映射**直接对所有层——
 /// 防“响着时改映射”漏 off → 悬挂（与调音台教训一致）。
@@ -405,14 +459,16 @@ fn dispatchNote(engine: *Engine, ev: anytype) void {
     const base = @as(usize, ev.instrument) * kit_max_layers;
     switch (ev.kind) {
         .on => {
+            // **有效声像** = 乐器声像（基准）+ 音符级偏移（Sawdust 特色）
+            const pan = effectivePan(params.instrument_pan[ev.instrument].load(.monotonic), ev.pan);
             if (is_kit) {
                 const n_layers = @min(params.kit_layer_count[ev.instrument].load(.monotonic), kit_max_layers);
                 for (0..n_layers) |l| {
                     if (params.kit_layer_pitch[ev.instrument][l].load(.monotonic) != ev.pitch) continue;
-                    synth.noteOn(&engine.kit_synths[base + l], ev.pitch, ev.velocity, ev.pan);
+                    synth.noteOn(&engine.kit_synths[base + l], ev.pitch, ev.velocity, pan);
                 }
             } else {
-                synth.noteOn(&engine.synths[ev.instrument], ev.pitch, ev.velocity, ev.pan);
+                synth.noteOn(&engine.synths[ev.instrument], ev.pitch, ev.velocity, pan);
             }
         },
         .off => {
@@ -479,78 +535,33 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
         }
     }
 
-    // 3) 逐通道：效果链 → 增益（含通道静音）→ 等功率声像 → 累加到主输出
-    var ch_i: usize = 0;
+    // 3) **子通道（1..）**：效果链 → 增益（含静音）→ 等功率声像 → **汇入主通道缓冲**
+    // 注：此处**不含 master**——master 只在主通道出口乘一次（否则会重复相乘）
+    var ch_i: usize = 1;
     while (ch_i < n_ch) : (ch_i += 1) {
         const buf = engine.chan_bufs[ch_i * buf_stride ..][0..n];
+        processChannelChain(engine, params, ch_i, buf, frames, sr, tgt_ch, tgt_slot);
 
-        // EQ 系数重建：参数变化版本号驱动（多槽共享同一份 EQ 参数对象）
-        const ver = params.channel_eq_version[ch_i].load(.monotonic);
-        if (ver != engine.chan_eq_ver[ch_i]) {
-            engine.chan_eq_ver[ch_i] = ver;
-            for (0..effect_slots) |slot| {
-                for (0..eq_bands) |b| {
-                    const p = params.channel_eq[ch_i][b];
-                    eqBiquadAt(engine, ch_i, slot, b, 0).setPeak(sr, p.freq, p.q, p.gain_db);
-                    eqBiquadAt(engine, ch_i, slot, b, 1).setPeak(sr, p.freq, p.q, p.gain_db);
-                }
-            }
-        }
-        // 本通道无乐器路由时也可跳过（但 EQ 尾音无意义——直接跳）
-        var used = false;
-        for (0..synth.max_instruments) |i| {
-            if (params.synth_ptrs[i].load(.monotonic) != null and
-                @min(params.instrument_channel[i].load(.monotonic), if (n_ch > 0) n_ch - 1 else 0) == ch_i)
-            {
-                used = true;
-                break;
-            }
-        }
-
-        // 效果器链长度（以 `effect_count` 为准）
-        const eff_n: usize = @min(params.effect_count[ch_i].load(.monotonic), effect_slots);
-
-        if (!used) {
-            // 目标在本通道时：输入实际是静音（缓冲已清零）→ 照常捕获，
-            // 频谱自然衰减到 0（不捕获会停在旧值）。
-            if (@as(i32, @intCast(ch_i)) == tgt_ch and tgt_slot >= 0 and @as(usize, @intCast(tgt_slot)) < eff_n) {
-                captureSpectrum(engine, buf, frames);
-            }
-            continue;
-        }
-
-        // ── 效果器链（插件式；按槽顺序）──
-        // 干湿比：效果信号与干声逐样本混合（mix = 0 为完全干声）
-        var slot: usize = 0;
-        while (slot < eff_n) : (slot += 1) {
-            // 频谱捕获点 = 目标效果器的**输入**（本槽处理之前）。
-            // 注：与本槽是否 EQ/启用无关——“进入该效果器的声音”与旁通态无关。
-            if (@as(i32, @intCast(ch_i)) == tgt_ch and @as(i32, @intCast(slot)) == tgt_slot) {
-                captureSpectrum(engine, buf, frames);
-            }
-            const kind = params.effect_kind[ch_i][slot].load(.monotonic);
-            if (kind != 1) continue; // 1 = EQ
-            if (!params.effect_enabled[ch_i][slot].load(.monotonic)) continue; // 旁通
-            const mix = std.math.clamp(params.effect_mix[ch_i][slot].load(.monotonic), 0, 1);
-            var sb: usize = 0;
-            while (sb < eq_bands) : (sb += 1) {
-                if (params.channel_eq[ch_i][sb].gain_db == 0) continue;
-                var f: usize = 0;
-                while (f < frames) : (f += 1) {
-                    const dry_l = buf[f * 2];
-                    const dry_r = buf[f * 2 + 1];
-                    const wet_l = eqBiquadAt(engine, ch_i, slot, sb, 0).process(dry_l);
-                    const wet_r = eqBiquadAt(engine, ch_i, slot, sb, 1).process(dry_r);
-                    buf[f * 2] = dry_l + (wet_l - dry_l) * mix;
-                    buf[f * 2 + 1] = dry_r + (wet_r - dry_r) * mix;
-                }
-            }
-        }
-
-        // 增益 + 等功率声像
-        const muted = params.channel_muted[ch_i].load(.monotonic);
-        const gain = if (muted) 0.0 else params.channel_gain[ch_i].load(.monotonic);
+        const gain = if (params.channel_muted[ch_i].load(.monotonic)) 0.0 else params.channel_gain[ch_i].load(.monotonic);
         const pan = std.math.clamp(params.channel_pan[ch_i].load(.monotonic), 0, 1);
+        const ang = pan * (std.math.pi / 2.0);
+        const gl = @cos(ang) * gain * std.math.sqrt2;
+        const gr = @sin(ang) * gain * std.math.sqrt2;
+        const dst = engine.chan_bufs[0..][0..n];
+        var f2: usize = 0;
+        while (f2 < frames) : (f2 += 1) {
+            dst[f2 * 2] += buf[f2 * 2] * gl;
+            dst[f2 * 2 + 1] += buf[f2 * 2 + 1] * gr;
+        }
+    }
+
+    // 4) **主通道（0）**：直连乐器 + 全部子通道汇入 → 效果链 → 主推子/声像 → 输出
+    // （“主通道嘛”：所有通道的音频最终都经它；其效果器作用在**汇总信号**上）
+    if (n_ch > 0) {
+        const buf = engine.chan_bufs[0..][0..n];
+        processChannelChain(engine, params, 0, buf, frames, sr, tgt_ch, tgt_slot);
+        const gain = if (params.channel_muted[0].load(.monotonic)) 0.0 else params.channel_gain[0].load(.monotonic);
+        const pan = std.math.clamp(params.channel_pan[0].load(.monotonic), 0, 1);
         const ang = pan * (std.math.pi / 2.0);
         const gl = @cos(ang) * gain * master * std.math.sqrt2;
         const gr = @sin(ang) * gain * master * std.math.sqrt2;
@@ -564,6 +575,71 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
     // 频谱分析（窗满时）——数据来自目标效果器的**输入点**（上面的捕获），
     // 不是主输出全混。
     analyzeSpectrum(engine, params, sr);
+}
+
+/// 单通道效果链处理（EQ 系数重建 + 逐槽处理 + 频谱捕获）。
+/// 注：**无“无乐器跳过”优化**——混响/延迟的尾音需状态持续推进（空缓冲
+/// 处理廉价）；主通道还会承载子通道汇入信号。
+fn processChannelChain(engine: *Engine, params: *Params, ch_i: usize, buf: []f32, frames: u32, sr: f32, tgt_ch: i32, tgt_slot: i32) void {
+    // EQ 系数重建：参数变化版本号驱动（多槽共享同一份 EQ 参数对象）
+    const ver = params.channel_eq_version[ch_i].load(.monotonic);
+    if (ver != engine.chan_eq_ver[ch_i]) {
+        engine.chan_eq_ver[ch_i] = ver;
+        for (0..effect_slots) |slot| {
+            for (0..eq_bands) |b| {
+                const p = params.channel_eq[ch_i][b];
+                eqBiquadAt(engine, ch_i, slot, b, 0).setPeak(sr, p.freq, p.q, p.gain_db);
+                eqBiquadAt(engine, ch_i, slot, b, 1).setPeak(sr, p.freq, p.q, p.gain_db);
+            }
+        }
+    }
+
+    // 效果器链长度（以 `effect_count` 为准）
+    const eff_n: usize = @min(params.effect_count[ch_i].load(.monotonic), effect_slots);
+
+    // ── 效果器链（插件式；按槽顺序）──
+    // 干湿比：效果信号与干声逐样本混合（mix = 0 为完全干声）
+    var slot: usize = 0;
+    while (slot < eff_n) : (slot += 1) {
+        // 频谱捕获点 = 目标效果器的**输入**（本槽处理之前）。
+        // 注：与本槽是否 EQ/启用无关——“进入该效果器的声音”与旁通态无关。
+        if (@as(i32, @intCast(ch_i)) == tgt_ch and @as(i32, @intCast(slot)) == tgt_slot) {
+            captureSpectrum(engine, buf, frames);
+        }
+        const kind = params.effect_kind[ch_i][slot].load(.monotonic);
+        if (!params.effect_enabled[ch_i][slot].load(.monotonic)) continue; // 旁通
+        const mix = std.math.clamp(params.effect_mix[ch_i][slot].load(.monotonic), 0, 1);
+        switch (kind) {
+            1 => { // EQ（干湿比 = “EQ 强度”）
+                var sb: usize = 0;
+                while (sb < eq_bands) : (sb += 1) {
+                    if (params.channel_eq[ch_i][sb].gain_db == 0) continue;
+                    var f: usize = 0;
+                    while (f < frames) : (f += 1) {
+                        const dry_l = buf[f * 2];
+                        const dry_r = buf[f * 2 + 1];
+                        const wet_l = eqBiquadAt(engine, ch_i, slot, sb, 0).process(dry_l);
+                        const wet_r = eqBiquadAt(engine, ch_i, slot, sb, 1).process(dry_r);
+                        buf[f * 2] = dry_l + (wet_l - dry_l) * mix;
+                        buf[f * 2 + 1] = dry_r + (wet_r - dry_r) * mix;
+                    }
+                }
+            },
+            2, 3, 4 => { // 混响 / 延迟 / 压缩器（状态每通道一份；参数按槽读）
+                if (engine.reverbs.len == 0 or engine.delays.len == 0 or engine.comps.len == 0) continue;
+                var p: [fx.max_params]f32 = undefined;
+                for (0..fx.max_params) |pi| p[pi] = params.effect_p[ch_i][slot][pi].load(.monotonic);
+                // 每拍秒数（延迟卡拍用；BPM 已钳到 ≥20，与序列器换算同一口径）
+                const beat_secs: f32 = 60.0 / @as(f32, @floatFromInt(@max(20, params.bpm.load(.monotonic))));
+                switch (kind) {
+                    2 => engine.reverbs[ch_i].process(buf, frames, sr, &p, mix),
+                    3 => engine.delays[ch_i].process(buf, frames, sr, &p, mix, beat_secs),
+                    else => engine.comps[ch_i].process(buf, frames, sr, &p, mix),
+                }
+            },
+            else => {},
+        }
+    }
 }
 
 /// 频谱捕获：把**目标效果器输入点**的通道缓冲抽取入滑窗（每 8 帧取 1 个；
@@ -1012,14 +1088,16 @@ test "audio: 频谱取自目标效果器输入（非主输出全混）" {
     for (params.spec_bars) |b| max_bar = @max(max_bar, b.load(.monotonic));
     try std.testing.expect(max_bar > 0.05); // 目标通道在发声：频谱非零
 
-    // ③ 通道 0 静音（乐器移走），通道 1 仍在发声：
-    // 目标 = 通道 0 → 频谱应衰减到 ~0（旧实现会一直显示主输出全混 → 非零）
-    params.synth_ptrs[0].store(null, .monotonic);
-    // 先把旧窗清掉（目标切换会重置滑窗）：-1 → 0
+    // ③ 通道 1 静音（乐器移走），通道 0 仍在发声：
+    // 目标 = 通道 1 → 频谱应衰减到 ~0（旧实现会一直显示主输出全混 → 非零）；
+    // 注：聚合架构下**通道 0 的输入 = 全混**（子通道汇入）——
+    // 要验“非全混”，目标需指向一个真静音的子通道
+    params.synth_ptrs[1].store(null, .monotonic);
+    // 先把旧窗清掉（目标切换会重置滑窗）：-1 → 1
     params.spec_target_ch.store(-1, .monotonic);
     @memset(&out, 0);
     renderSegment(&engine, &params, &out, 8, 48000, 1.0);
-    params.spec_target_ch.store(0, .monotonic);
+    params.spec_target_ch.store(1, .monotonic);
     i = 0;
     while (i < 8) : (i += 1) { // 两窗（4096 样本）：第一窗混旧样本，第二窗纯静音
         @memset(&out, 0);
@@ -1027,16 +1105,16 @@ test "audio: 频谱取自目标效果器输入（非主输出全混）" {
     }
     max_bar = 0;
     for (params.spec_bars) |b| max_bar = @max(max_bar, b.load(.monotonic));
-    // 通道 1 仍在响（主输出非零）——但目标通道已静音 → 频谱≈0
+    // 通道 0 仍在响（主输出非零）——但目标通道已静音 → 频谱≈0
     var mix_energy: f32 = 0;
     @memset(&out, 0);
     renderSegment(&engine, &params, &out, F, 48000, 1.0);
     for (out) |s| mix_energy += @abs(s);
-    try std.testing.expect(mix_energy > 1.0); // 主输出仍有声（通道 1）
+    try std.testing.expect(mix_energy > 1.0); // 主输出仍有声（通道 0）
     try std.testing.expect(max_bar < 0.01); // 而频谱已衰减到零（非全混）
 
     // ④ 目标切换会重置滑窗
-    params.spec_target_ch.store(1, .monotonic);
+    params.spec_target_ch.store(0, .monotonic);
     @memset(&out, 0);
     renderSegment(&engine, &params, &out, 8, 48000, 1.0);
     try std.testing.expectEqual(@as(usize, 1), engine.spec_pos); // 8/8（新目标从头开始）
@@ -1256,3 +1334,139 @@ test "audio: 鼓组——层增益生效（渲染能量随 gain 放大）" {
     try std.testing.expect(e_full > 1.0);
     try std.testing.expect(@abs(e_half / e_full - 0.25) < 0.05);
 }
+
+test "audio: 主通道聚合——子通道音频必经主通道（主推子/静音作用在汇总上）" {
+    const alloc = std.testing.allocator;
+    var env: KitTestEnv = undefined;
+    try env.init(alloc, true);
+    defer env.deinit(alloc);
+    const engine = &env.engine;
+    const params = &env.params;
+    // 新效果器状态（生产由 Engine.init 分配；测试手动给）
+    engine.reverbs = try alloc.alloc(fx.Reverb, mixer_channels);
+    for (engine.reverbs) |*r| r.* = .{};
+    defer alloc.free(engine.reverbs);
+    engine.delays = try alloc.alloc(fx.Delay, mixer_channels);
+    for (engine.delays) |*d| d.* = .{};
+    defer alloc.free(engine.delays);
+    engine.comps = try alloc.alloc(fx.Compressor, mixer_channels);
+    for (engine.comps) |*c| c.* = .{};
+    defer alloc.free(engine.comps);
+
+    // 乐器 → 通道 1（子通道）；通道 0（主）无直连乐器
+    var sp0 = synth.SynthParams{};
+    params.channel_count.store(2, .monotonic);
+    params.volume.store(1.0, .monotonic);
+    params.synth_ptrs[0].store(&sp0, .monotonic);
+    params.instrument_channel[0].store(1, .monotonic);
+    params.instrument_gain[0].store(1.0, .monotonic);
+    params.channel_gain[0].store(1.0, .monotonic);
+    params.channel_gain[1].store(1.0, .monotonic);
+
+    synth.noteOn(&engine.synths[0], 69, synth.default_velocity, synth.default_pan);
+    var out: [1024 * 2]f32 = undefined;
+    const run = struct {
+        fn run(e: *Engine, p: *Params, o: [*]f32) f64 {
+            var total: f64 = 0;
+            var k: usize = 0;
+            while (k < 8) : (k += 1) {
+                @memset(o[0 .. 1024 * 2], 0);
+                renderSegment(e, p, o, 1024, 48000, 1.0);
+                for (o[0 .. 1024 * 2]) |s| total += @as(f64, s) * s;
+            }
+            return total;
+        }
+    }.run;
+
+    const e_ok = run(engine, params, &out);
+    try std.testing.expect(e_ok > 1.0); // 子通道发声 → 主通道出口有声
+
+    // ① 主推子归零 → **全部** 静音（即使子通道推子在 1.0）——证明必经主通道
+    params.channel_gain[0].store(0.0, .monotonic);
+    try std.testing.expectEqual(@as(f64, 0), run(engine, params, &out));
+    params.channel_gain[0].store(1.0, .monotonic);
+
+    // ② 主通道静音同理
+    params.channel_muted[0].store(true, .monotonic);
+    try std.testing.expectEqual(@as(f64, 0), run(engine, params, &out));
+    params.channel_muted[0].store(false, .monotonic);
+
+    // ③ 主推子减半 → 能量 ∝ 0.25
+    params.channel_gain[0].store(0.5, .monotonic);
+    const e_half = run(engine, params, &out);
+    params.channel_gain[0].store(1.0, .monotonic);
+    try std.testing.expect(@abs(e_half / e_ok - 0.25) < 0.05);
+}
+
+test "audio: 主通道效果链作用在汇总信号上（混响/延迟加入尾音）" {
+    const alloc = std.testing.allocator;
+    var env: KitTestEnv = undefined;
+    try env.init(alloc, true);
+    defer env.deinit(alloc);
+    const engine = &env.engine;
+    const params = &env.params;
+    engine.reverbs = try alloc.alloc(fx.Reverb, mixer_channels);
+    for (engine.reverbs) |*r| r.* = .{};
+    defer alloc.free(engine.reverbs);
+    engine.delays = try alloc.alloc(fx.Delay, mixer_channels);
+    for (engine.delays) |*d| d.* = .{};
+    defer alloc.free(engine.delays);
+    engine.comps = try alloc.alloc(fx.Compressor, mixer_channels);
+    for (engine.comps) |*c| c.* = .{};
+    defer alloc.free(engine.comps);
+
+    // 子通道 1 发声；主通道挂一个 delay（干湿各半、反馈 0.5）
+    // 注：mix 不能用 1.0——纯湿时直声期（<0.25s）回波未到，直声期输出恒零
+    var sp0 = synth.SynthParams{};
+    params.channel_count.store(2, .monotonic);
+    params.volume.store(1.0, .monotonic);
+    params.synth_ptrs[0].store(&sp0, .monotonic);
+    params.instrument_channel[0].store(1, .monotonic);
+    params.instrument_gain[0].store(1.0, .monotonic);
+    params.channel_gain[0].store(1.0, .monotonic);
+    params.channel_gain[1].store(1.0, .monotonic);
+    params.effect_count[0].store(1, .monotonic);
+    params.effect_kind[0][0].store(3, .monotonic); // 3 = delay
+    params.effect_enabled[0][0].store(true, .monotonic);
+    params.effect_mix[0][0].store(0.5, .monotonic);
+    params.effect_p[0][0][0].store(@floatFromInt(fx.delay_tempo_default), .monotonic); // 档位 1/8（BPM 120 → 0.25s）
+    params.effect_p[0][0][1].store(0.5, .monotonic); // 反馈
+
+    // 开声 0.2s 后立即关声（note off + 快速释放）——看主通道的 delay 尾巴
+    synth.noteOn(&engine.synths[0], 69, synth.default_velocity, synth.default_pan);
+    var out: [1024 * 2]f32 = undefined;
+    var k: usize = 0;
+    var during: f64 = 0;
+    while (k < 9) : (k += 1) {
+        @memset(&out, 0);
+        renderSegment(engine, params, &out, 1024, 48000, 1.0);
+        for (out) |s| during += @as(f64, s) * s;
+    }
+    try std.testing.expect(during > 1.0); // 直声期有声
+    synth.allOff(&engine.synths[0]);
+    synth.render(&sp0, &engine.synths[0], &out, 1024, 48000, 1.0, false); // 推进 release
+
+    // 干声停后：主通道 delay 的尾巴仍输出（能量不归零）
+    var tail: f64 = 0;
+    k = 0;
+    while (k < 8) : (k += 1) {
+        @memset(&out, 0);
+        renderSegment(engine, params, &out, 1024, 48000, 1.0);
+        for (out) |s| tail += @as(f64, s) * s;
+    }
+    try std.testing.expect(tail > 1.0); // 尾音（子通道声音绕进主通道 delay）
+}
+
+test "audio: 有效声像合成——乐器基准 + 音符偏移（导入音符居中跟随乐器）" {
+    // 居中音符（64）完全跟随乐器基准
+    try std.testing.expectEqual(@as(u8, 64), effectivePan(0.5, 64));
+    try std.testing.expectEqual(@as(u8, 0), effectivePan(0.0, 64));
+    try std.testing.expectEqual(@as(u8, 127), effectivePan(1.0, 64));
+    // 音符偏移在基准上平移（含越界钳制）
+    try std.testing.expectEqual(@as(u8, 32), effectivePan(0.5, 32));
+    try std.testing.expectEqual(@as(u8, 95), effectivePan(0.25, 127));
+    try std.testing.expectEqual(@as(u8, 0), effectivePan(0.5, 0));
+    try std.testing.expectEqual(@as(u8, 127), effectivePan(1.0, 127));
+    try std.testing.expectEqual(@as(u8, 127), effectivePan(0.75, 127));
+}
+

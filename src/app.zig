@@ -12,6 +12,7 @@ const sequencer = @import("sequencer.zig");
 const persist = @import("persist.zig");
 const midi = @import("midi.zig");
 const eq = @import("eq.zig");
+const fx = @import("effects.zig");
 const preset_mod = @import("preset.zig");
 
 pub const Clip = model.Clip;
@@ -36,7 +37,7 @@ pub const Layout = struct {
 };
 
 /// 文件菜单动作（帧末统一执行）
-pub const FileAction = enum { open, save, save_as, import_midi, export_midi };
+pub const FileAction = enum { new, open, save, save_as, import_midi, export_midi };
 
 /// 编辑操作（框选/批量操作快捷键 → 由**当前视图**在帧内按上下文执行）
 pub const EditOp = enum { delete_selected, clone_right, copy, paste, select_all };
@@ -94,6 +95,8 @@ pub const PendingIntent = enum {
     quit,
     /// 保存后打开另一个工程（用户已在系统对话框里选了文件）
     open,
+    /// 保存后新建空工程
+    new,
 };
 
 /// 预设操作的**目标**：哪个“合成器参数槽”（乐器本体 / 鼓组层 / 以新层加入垫）。
@@ -447,6 +450,8 @@ pub const RackState = struct {
     // ── 右键菜单 ──
     /// 右键菜单中的乐器（重命名/更换/删除用；null = 未展开）
     ctx_instrument: ?usize = null,
+    /// 声像旋钮右键菜单（恢复默认值）所属乐器（null = 未展开）
+    ctx_pan: ?usize = null,
 };
 
 /// 播放状态（游标 + 传输）——设计原则：
@@ -620,11 +625,17 @@ pub const max_effects_per_channel = 16;
 pub const EffectKind = enum(u32) {
     empty = 0,
     eq = 1,
+    reverb = 2,
+    delay = 3,
+    compressor = 4,
 
     pub fn displayName(self: EffectKind) []const u8 {
         return switch (self) {
             .empty => "（空槽）",
             .eq => "EQ 参量均衡",
+            .reverb => "混响",
+            .delay => "延迟",
+            .compressor => "压缩器",
         };
     }
 };
@@ -644,6 +655,9 @@ pub const EffectSlot = struct {
         .{ .freq = 8000, .q = 1.0 },
         .{ .freq = 12000, .q = 1.0 },
     },
+    /// 通用参数位（混响/延迟/压缩器；含义见 `effects.paramInfos`）——
+    /// 添加时由 `addEffect` 按类型填默认值（EQ 不用）
+    p: [fx.max_params]f32 = .{ 0, 0, 0, 0, 0 },
 };
 
 /// 每通道效果器槽数（已废弃：效果器链改为**动态列表**，见 `MixerChannel.effects`；
@@ -2302,7 +2316,17 @@ pub const App = struct {
         if (ch >= self.mixer_channels_state.items.len) return null;
         const chain = &self.mixer_channels_state.items[ch].effects;
         if (chain.items.len >= max_effects_per_channel) return null;
-        chain.append(self.allocator, .{ .kind = kind }) catch return null;
+        // **同类效果每通道至多一个**（混响/延迟/压缩器的 DSP 状态为每通道一份，
+        // 参数需唯一——防 UI 造成同名实例参数打架）
+        if (kind != .eq) {
+            for (chain.items) |es| {
+                if (es.kind == kind) return null;
+            }
+        }
+        var slot = EffectSlot{ .kind = kind };
+        slot.mix = fx.defaultMix(@intFromEnum(kind));
+        if (kind != .eq) slot.p = fx.defaultParams(@intFromEnum(kind));
+        chain.append(self.allocator, slot) catch return null;
         return chain.items.len - 1;
     }
 
@@ -2334,8 +2358,12 @@ pub const App = struct {
     pub fn moveMixerChannel(self: *App, ch: usize, dir: i32) bool {
         const n = self.mixer_channels_state.items.len;
         if (ch >= n or n < 2) return false;
+        // **主通道（下标 0）永久固定**（用户约定）：主通道不移动，
+        // 任何与主通道交换位置的移动也拒绝（否则主通道会被换走）
+        if (ch == 0) return false;
         const ni: usize = if (dir < 0) ch -| 1 else @min(ch + 1, n - 1);
         if (ni == ch) return false;
+        if (ni == 0) return false;
         std.mem.swap(MixerChannel, &self.mixer_channels_state.items[ch], &self.mixer_channels_state.items[ni]);
         // 乐器路由跟随（交换两个通道号）
         for (self.instruments.items) |*inst| {
@@ -2403,6 +2431,39 @@ pub const App = struct {
         self.history_saved_index = self.history_current;
     }
 
+    /// 新建（空）工程：重置为默认基线——
+    /// 1 个样式 + 样式 1 在 Track 1 最左的片段 + 1 个减法合成器 + 默认调音台/BPM；
+    /// 历史以“新建”为基线，视为已保存（dirty = false）。**先停播**（数据全换）。
+    pub fn resetToDefaultProject(self: *App) void {
+        self.stopPlayback();
+        // 样式 / 调音台 / BPM 拍号
+        self.resetPatterns(1);
+        self.resetMixerChannels(default_mixer_channels);
+        self.bpm = 120;
+        self.time_num = 4;
+        self.time_den = 4;
+        self.steps_per_bar = model.stepsPerBarFor(4, 4);
+        // 音符清空；片段：样式 1 在 Track 1 最左（长度 = 样式有效长度）
+        self.notes.clearRetainingCapacity();
+        self.clips.clearRetainingCapacity();
+        const len = self.patternEffectiveLen(0);
+        self.clips.append(self.allocator, .{ .track = 0, .start = 0, .len = len, .pattern = 0 }) catch {};
+        // 乐器：重建为 1 个减法合成器（removeInstrument 会退役旧指针——音频安全）
+        while (self.instruments.items.len > 0) {
+            self.removeInstrument(self.instruments.items.len - 1);
+        }
+        _ = self.addInstrument("减法合成器");
+        // 选择 / 窗口目标钳制（一切都指向样式 0 / 乐器 0）
+        self.sel.pattern = 0;
+        self.sel.instrument = if (self.instruments.items.len > 0) 0 else -1;
+        if (self.piano.pattern != null) self.piano.pattern = 0;
+        self.mixer_win.selected_channel = 0;
+        self.mixer_win.panel = null;
+        // 历史：新建 = 新基线（视为已保存）
+        self.resetHistory("新建");
+        self.markSaved();
+    }
+
     /// 当前历史条目的操作名（供 toast/历史栏；无历史时返回 ""）
     pub fn historyLabel(self: *const App) []const u8 {
         if (self.history.items.len == 0) return "";
@@ -2453,6 +2514,7 @@ pub const App = struct {
                     .enabled = es.enabled,
                     .mix = es.mix,
                     .bands = bands,
+                    .p = es.p,
                 };
             }
             sm.effect_count = @intCast(@min(mc.effects.items.len, sm.effects.len));
@@ -2494,12 +2556,33 @@ pub const App = struct {
                 const se = sm.effects[se_i];
                 const kind: EffectKind = switch (se.kind) {
                     1 => .eq,
+                    2 => .reverb,
+                    3 => .delay,
+                    4 => .compressor,
                     else => continue, // 未知类型跳过
                 };
                 const slot = self.addEffect(i, kind) orelse break;
                 const es = &self.mixer_channels_state.items[i].effects.items[slot];
                 es.enabled = se.enabled;
                 es.mix = se.mix;
+                // 通用参数（混响/延迟/压缩器；旧存档缺失 → 全 0；
+                // 未知 kind 的槽已在上面跳过）
+                if (es.kind != .eq) {
+                    es.p = se.p;
+                    // 旧存档/手改档全 0（未写入参数）→ 用该类型默认值，避免“零值怪音色”
+                    var all_zero = true;
+                    for (se.p) |v| {
+                        if (v != 0) all_zero = false;
+                    }
+                    if (all_zero) es.p = fx.defaultParams(se.kind);
+                    // **旧档迁移**：延迟的 p[0] 曾是毫秒，现在是节奏档位码——越界/非整 → 归默认
+                    if (se.kind == 3) {
+                        const p0 = es.p[0];
+                        if (p0 < 0 or p0 > @as(f32, @floatFromInt(fx.delay_tempos.len - 1)) or p0 != @trunc(p0)) {
+                            es.p[0] = @floatFromInt(fx.delay_tempo_default);
+                        }
+                    }
+                }
                 // 段：按需复制（旧存档 4 段 → 剩下的段保留默认值）
                 const nb: usize = @min(se.bands.len, es.bands.len);
                 for (se.bands[0..nb], 0..) |b, bi| {
@@ -2622,6 +2705,12 @@ pub const App = struct {
                 for (ae.bands, be.bands) |ab, bb| {
                     if (ab.freq != bb.freq or ab.gain_db != bb.gain_db or ab.q != bb.q) return false;
                 }
+                // **通用参数位（混响/延迟/压缩）也要比较**——否则旋钮调整被判
+                // “无变化”，静默丢弃历史条目（实测 bug：三效果器旋钮不进历史、
+                // 不标脏；EQ 的 bands 有比较所以正常）
+                for (ae.p, be.p) |pa, pb| {
+                    if (pa != pb) return false;
+                }
             }
         }
         return true;
@@ -2655,6 +2744,10 @@ pub const App = struct {
             if (self.history_current > 0) self.history_current -= 1;
             if (self.history_saved_index > 0) self.history_saved_index -= 1;
         }
+        // **脏标记与操作历史同源**：当前指针 ≠ 保存点即脏。
+        // 所有编辑（含效果器旋钮等只设 `history_pending` 的拖动类控件）都经
+        // 这里提交——无需逐点手动标记（各编辑函数里的手动 set 保留为冗余）。
+        self.dirty = self.history_current != self.history_saved_index;
     }
 
     /// 当前 notes/clips 与所在快照是否**内容等价**（忽略 `selected` 瞬态字段）。
@@ -2709,6 +2802,33 @@ pub const App = struct {
         self.params.sched_edit_gen.store(self.scheduler.edit_gen, .monotonic);
     }
 
+    /// 播放中**撤销/重做/点历史**后：不停播，走“编辑重扫”（与
+    /// `rescanForPlaybackEdit` 同机制）。差分基准 = 跳转前快照 `history[old_idx]`
+    /// （历史当前项恒等于跳转前的 live 数据）。不重扫的后果：旧数据的事件
+    /// 残留在队列、新数据不响。
+    fn publishHistoryRescan(self: *App, old_idx: usize) void {
+        if (!self.playing) return;
+        if (old_idx >= self.history.items.len) return;
+        const old = &self.history.items[old_idx];
+        const cur = self.playback.cursorStep(self.sel.song_mode);
+        const rescan_from = self.rescanSafeFromStep(cur);
+        sequencer.rescanForEdit(
+            &self.scheduler,
+            &self.sched_events,
+            self.clips.items,
+            self.notes.items,
+            old.clips,
+            old.notes,
+            self.sel.song_mode,
+            self.sel.pattern,
+            cur,
+            rescan_from,
+        );
+        // 发布顺序：**先安全界、后编辑代**（与 rescanForPlaybackEdit 一致）
+        self.params.sched_rescan_from.store(self.scheduler.rescan_from, .monotonic);
+        self.params.sched_edit_gen.store(self.scheduler.edit_gen, .monotonic);
+    }
+
     /// 重扫的**安全界**：音频线程**确定还没走到**的第一步。
     ///
     /// 动机（实测 bug）：UI 游标来自帧首快照、落后音频线程；从 `游标+1`
@@ -2732,7 +2852,9 @@ pub const App = struct {
 
     /// 应用历史快照（恢复 = 整块回写；顺带钳制选择/乐器索引）
     fn applyHistoryState(self: *App, st: *const HistoryState) void {
-        self.stopPlayback(); // 调度器引用旧数据：先停
+        // 播放中**不停播**：撤销/重做/跳转走“编辑重扫”（见 `publishHistoryRescan`）——
+        // 停播会让编辑时音乐中断（回归 bug：Ctrl+Z / 点历史条目导致播放暂停）
+        if (!self.playing) self.stopPlayback(); // 停止态：作废旧事件 + 清残留声部
         self.history_pending = null; // 拖动中的 coalesce 标记作废
         self.history_pending_wheel = false; // 滚轮类 pending 一并作废
         // 拖动状态全部清空：撤销/重做后数据已换，旧拖动（及其快照/下标）
@@ -2814,8 +2936,10 @@ pub const App = struct {
     /// 撤销（Ctrl+Z）。返回是否成功。
     pub fn undo(self: *App) bool {
         if (self.history.items.len == 0 or self.history_current == 0) return false;
+        const old_idx = self.history_current;
         self.history_current -= 1;
         self.applyHistoryState(&self.history.items[self.history_current]);
+        self.publishHistoryRescan(old_idx);
         self.dirty = self.history_current != self.history_saved_index;
         return true;
     }
@@ -2823,8 +2947,10 @@ pub const App = struct {
     /// 重做（Ctrl+Alt+Z）。返回是否成功。
     pub fn redo(self: *App) bool {
         if (self.history.items.len == 0 or self.history_current + 1 >= self.history.items.len) return false;
+        const old_idx = self.history_current;
         self.history_current += 1;
         self.applyHistoryState(&self.history.items[self.history_current]);
+        self.publishHistoryRescan(old_idx);
         self.dirty = self.history_current != self.history_saved_index;
         return true;
     }
@@ -2832,8 +2958,10 @@ pub const App = struct {
     /// 跳转到指定历史条目（历史栏点击）。返回是否成功。
     pub fn jumpHistory(self: *App, index: usize) bool {
         if (self.history.items.len == 0 or index >= self.history.items.len or index == self.history_current) return false;
+        const old_idx = self.history_current;
         self.history_current = index;
         self.applyHistoryState(&self.history.items[index]);
+        self.publishHistoryRescan(old_idx);
         self.dirty = self.history_current != self.history_saved_index;
         return true;
     }
@@ -2849,6 +2977,7 @@ pub const App = struct {
         } else |_| {}
         self.history_current = 0;
         self.history_saved_index = 0;
+        self.dirty = false; // 重置 = 新基线（与派生公式一致，显式写出）
     }
 
     /// 释放历史（进程退出）
@@ -2986,6 +3115,12 @@ pub const App = struct {
         @memcpy(buf[0..len], path[0..len]); // 先复制出别名区
         if (self.project_path) |old| self.allocator.free(old);
         self.project_path = self.allocator.dupe(u8, buf[0..len]) catch null;
+    }
+
+    /// 清除工程路径（新建空工程：标题回到“未命名”）
+    pub fn clearProjectPath(self: *App) void {
+        if (self.project_path) |old| self.allocator.free(old);
+        self.project_path = null;
     }
 
     /// 当前工程名（无路径或异常时 = null）
@@ -3205,7 +3340,11 @@ pub const App = struct {
             if (!u) continue;
             const idx = self.addInstrument("MIDI 通道");
             if (idx < 0) continue; // 乐器已达上限：该通道音符将被跳过
-            self.instruments.items[@intCast(idx)].midi_channel = @intCast(ch); // 记住来源通道
+            const inst = &self.instruments.items[@intCast(idx)];
+            inst.midi_channel = @intCast(ch); // 记住来源通道
+            // MIDI 声像是**通道级**的（无音符级声像）→ 映射为乐器的静态声像
+            // （取该通道首个 CC10；动态曲线以后再做）
+            inst.pan = @as(f32, @floatFromInt(parsed.channel_pan[ch])) / 127.0;
             ch_to_inst[ch] = idx;
             inst_count += 1;
         }
@@ -3233,7 +3372,8 @@ pub const App = struct {
                 .pattern = new_pat,
                 .instrument = inst,
                 .velocity = pn.velocity,
-                .pan = pn.pan,
+                // 声像居中（默认 64）：MIDI 音符不带声像；Sawdust 的音符级声像
+                // 以乐器声像为基准叠加（导入时不快照 CC10——那是通道级的）
             });
             imported += 1;
         }
@@ -3251,6 +3391,24 @@ pub const App = struct {
         }
 
         return .{ .pattern = new_pat, .notes = imported, .instruments = inst_count, .skipped = skipped };
+    }
+
+    /// 导出用：每 MIDI 通道声像（0-127；= 该通道**首个**乐器的声像）。
+    /// 通道规则与 `exportMidiNotes` 一致（优先来源通道 `midi_channel`，否则号 mod 16）；
+    /// 音符级声像不导出（MIDI 只有通道级声像）——见 `midi.ExportSong.channel_pan`。
+    pub fn exportChannelPans(self: *const App) [16]u8 {
+        var out = [_]u8{64} ** 16;
+        var set = [_]bool{false} ** 16;
+        for (self.instruments.items, 0..) |inst, i| {
+            const ch: usize = if (inst.midi_channel >= 0)
+                @intCast(@mod(inst.midi_channel, 16))
+            else
+                @mod(i, 16);
+            if (set[ch]) continue;
+            set[ch] = true;
+            out[ch] = @intFromFloat(@round(std.math.clamp(inst.pan, 0.0, 1.0) * 127.0));
+        }
+        return out;
     }
 
     /// 导出 MIDI：把**全部片段**里的音符按全局时间展开（同音符被多个片段引用
@@ -3286,7 +3444,6 @@ pub const App = struct {
                     .pitch = @intCast(n.pitch),
                     .channel = @intCast(ch),
                     .velocity = @intCast(std.math.clamp(n.velocity, 1, 127)),
-                    .pan = @intCast(std.math.clamp(n.pan, 0, 127)),
                 });
             }
         }
@@ -4562,6 +4719,121 @@ test "app: 重扫安全界——游标附近已走过的步不重发（防双触
     // 发布的安全界与编辑代（音频据此过滤——先界后代的顺序在源码中保证）
     try std.testing.expectEqual(@as(i32, 11), app.params.sched_rescan_from.load(.monotonic));
     try std.testing.expectEqual(app.scheduler.edit_gen, app.params.sched_edit_gen.load(.monotonic));
+}
+
+test "app: 脏标记与历史同源——commitHistory 即标脏，undo 回保存点即不脏" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+    try std.testing.expect(!app.dirty); // 基线不脏
+
+    // 模拟效果器旋钮等“只设 history_pending”的拖动类编辑（无手动 dirty 置位）
+    app.mixer_channels_state.items[0].effects.append(app.allocator, .{ .kind = .compressor }) catch
+        return error.TestUnexpectedResult;
+    app.mixer_channels_state.items[0].effects.items[0].p[1] = 7.5; // 改个参数
+    app.commitHistory("调整效果器参数");
+    try std.testing.expect(app.dirty); // ← 以前这里不脏（用户报的 bug）
+
+    // 撤销回保存点 → 不脏；重做 → 又脏
+    try std.testing.expect(app.undo());
+    try std.testing.expect(!app.dirty);
+    try std.testing.expect(app.redo());
+    try std.testing.expect(app.dirty);
+
+    // 保存（markSaved）后再编辑 → 脏；撤销回保存点 → 不脏
+    app.markSaved();
+    try std.testing.expect(!app.dirty);
+    app.notes.append(app.allocator, .{ .step = 0, .len = 4, .pitch = 60, .pattern = 0 }) catch
+        return error.TestUnexpectedResult;
+    app.commitHistory("放置音符");
+    try std.testing.expect(app.dirty);
+    try std.testing.expect(app.undo());
+    try std.testing.expect(!app.dirty);
+}
+
+test "app: 效果器参数（p）改动进入历史并标脏（回归：“判无变化”坑）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    const s = app.addEffect(0, .reverb) orelse return error.TestUnexpectedResult;
+    app.commitHistory("添加效果器");
+
+    // 模拟面板旋钮：只改 es.p[0]（以前会被 stateEqualsCurrent 判“无变化”）
+    const n0 = app.history.items.len;
+    app.mixer_channels_state.items[0].effects.items[s].p[0] = 0.1;
+    app.commitHistory("调整效果器参数");
+    try std.testing.expectEqual(n0 + 1, app.history.items.len); // ← 修复前这里判“无变化”进不了
+    try std.testing.expect(app.dirty);
+
+    // 撤销返回；同值再提交 → 不产生条目（等值挡重复）
+    try std.testing.expect(app.undo());
+    const n1 = app.history.items.len;
+    app.commitHistory("调整效果器参数");
+    try std.testing.expectEqual(n1, app.history.items.len);
+}
+
+test "app: 播放中撤销/点历史——不停播，走编辑重扫（回归：Ctrl+Z 导致暂停）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    // 音符编辑提交（历史 1）：放一个跨游标音符（游标=8）
+    app.addNote(.{ .step = 20, .len = 4, .pitch = 62, .pattern = 0, .instrument = 0 });
+    app.commitHistory("放置音符");
+
+    // 模拟播放中（音频已走到 8；48k/120bpm → 1000 帧/步）
+    app.playing = true;
+    app.params.playing.store(true, .monotonic);
+    app.sel.song_mode = false;
+    app.playback.piano_step = 8;
+    app.playback.start_frame = 0;
+    app.playback.start_step = 0;
+    app.params.frames_played.store(8000, .monotonic);
+    sequencer.reset(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, false, 0, 0);
+    sequencer.scheduleRange(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, false, 0, 0, 32);
+    var out: [8]synth.SchedEvent = undefined;
+    _ = app.sched_events.drain(&out);
+
+    // 撤销 → **不停播**（关键回归点）；且走编辑重扫（编辑代递增 + 发布）
+    const edit0 = app.scheduler.edit_gen;
+    try std.testing.expect(app.undo());
+    try std.testing.expect(app.playing); // ← 以前这里被 stopPlayback 打断
+    try std.testing.expect(app.params.playing.load(.monotonic));
+    try std.testing.expect(app.scheduler.edit_gen != edit0); // 重扫代递增
+    try std.testing.expectEqual(app.scheduler.edit_gen, app.params.sched_edit_gen.load(.monotonic));
+
+    // 重做 → 同样不停播
+    try std.testing.expect(app.redo());
+    try std.testing.expect(app.playing);
+    try std.testing.expect(app.params.playing.load(.monotonic));
+
+    // 点历史条目跳转 → 不停播
+    try std.testing.expect(app.jumpHistory(0));
+    try std.testing.expect(app.playing);
+    try std.testing.expect(app.params.playing.load(.monotonic));
+
+    // 停止态跳转：不触发重扫（编辑代不变）
+    app.playing = false;
+    app.params.playing.store(false, .monotonic);
+    const edit1 = app.scheduler.edit_gen;
+    try std.testing.expect(app.jumpHistory(1));
+    try std.testing.expectEqual(edit1, app.scheduler.edit_gen);
 }
 
 test "app: 撤销/重做——快照式（放置/删除/修改 + redo 截断 + 选区无关）" {
@@ -6131,4 +6403,153 @@ test "app: 键盘粗移（Ctrl：全有或全无）——拍位/级数不漂移"
     app.clearNoteSelection();
     try std.testing.expect(!app.nudgeSelectedNotesExact(0, 12));
     try std.testing.expect(!app.nudgeSelectedNotesExact(0, 0));
+}
+
+test "app: 主通道（下标 0）永久锁定——不可移动/被换位，但可重命名" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(3);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    // 给通道 1/2 改名以便验证交换
+    app.beginRenameMixerChannel(1, 0, 0);
+    app.textInputAppend('A');
+    app.textInputCommit();
+    app.beginRenameMixerChannel(2, 0, 0);
+    app.textInputAppend('B');
+    app.textInputCommit();
+
+    // ① 主通道自身不可移动（上下都拒）
+    try std.testing.expect(!app.moveMixerChannel(0, 1));
+    try std.testing.expect(!app.moveMixerChannel(0, -1));
+    // ② 其它通道“上移”到主通道位置 → 也拒绝（否则主通道会被换走）
+    try std.testing.expect(!app.moveMixerChannel(1, -1));
+    // ③ 非主通道之间正常交换
+    try std.testing.expect(app.moveMixerChannel(2, -1));
+    var nb: [24]u8 = undefined;
+    try std.testing.expectEqualStrings("B", app.mixer_channels_state.items[1].displayName(1, &nb));
+    try std.testing.expectEqualStrings("A", app.mixer_channels_state.items[2].displayName(2, &nb));
+    try std.testing.expectEqualStrings("主通道", app.mixer_channels_state.items[0].displayName(0, &nb));
+    try std.testing.expect(app.moveMixerChannel(1, 1)); // 换回
+
+    // ④ 主通道重命名仍允许（用户约定：只锁移动）
+    app.beginRenameMixerChannel(0, 0, 0);
+    app.textInputAppend('M');
+    app.textInputCommit();
+    try std.testing.expectEqualStrings("M", app.mixer_channels_state.items[0].displayName(0, &nb));
+}
+
+test "app: 同类效果器每通道至多一个（EQ 例外）；默认参数随类型填装" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(2);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    // reverb：第一个成功，同类第二个拒
+    const s0 = app.addEffect(0, .reverb) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(app.addEffect(0, .reverb) == null);
+    // 不同类可加
+    const s_d = app.addEffect(0, .delay) orelse return error.TestUnexpectedResult;
+    const s_c = app.addEffect(0, .compressor) orelse return error.TestUnexpectedResult;
+    // EQ 可多个（历史语义：参数由链上首个 EQ 共享）
+    try std.testing.expect(app.addEffect(0, .eq) != null);
+    try std.testing.expect(app.addEffect(0, .eq) != null);
+    // 另一通道不受影响
+    try std.testing.expect(app.addEffect(1, .reverb) != null);
+
+    // 默认参数：与 `fx.defaultParams` 一致（混响首位 = 空间默认，非全零）
+    const es_r = &app.mixer_channels_state.items[0].effects.items[s0];
+    const defs = fx.defaultParams(@intFromEnum(EffectKind.reverb));
+    try std.testing.expectEqual(defs[0], es_r.p[0]);
+    try std.testing.expectEqual(defs[1], es_r.p[1]);
+    try std.testing.expect(es_r.p[0] > 0);
+    // 干湿默认：混响/延迟**不全湿**（全湿 = 干声被吞——实测反馈“第一个音要等一个延迟时间才响”）
+    try std.testing.expectEqual(@as(f32, 0.30), es_r.mix);
+    try std.testing.expectEqual(@as(f32, 0.35), app.mixer_channels_state.items[0].effects.items[s_d].mix);
+    try std.testing.expectEqual(@as(f32, 1.0), app.mixer_channels_state.items[0].effects.items[s_c].mix); // 压缩器全压
+}
+
+test "app: 导入存档——延迟 p[0] 旧毫秒值迁移为节奏档位码" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(2);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    // 模拟旧档：延迟 p[0] = 375（毫秒时代的越界值）
+    var mixer = [_]persist.SavedMixerChannel{
+        .{
+            .name = "A",
+            .effect_count = 1,
+            .effects = .{
+                .{ .kind = 3, .p = .{ 375, 0.35, 0, 0, 0 } },
+                .{}, .{}, .{},
+            },
+        },
+    };
+    app.importMixerChannels(&mixer);
+    const chain = app.mixer_channels_state.items[0].effects;
+    try std.testing.expectEqual(@as(usize, 1), chain.items.len);
+    try std.testing.expectEqual(@as(f32, @floatFromInt(fx.delay_tempo_default)), chain.items[0].p[0]);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.35), chain.items[0].p[1], 0.0001); // 反馈语义未变
+
+    // 新档合法码值不受迁移影响
+    var mixer2 = [_]persist.SavedMixerChannel{
+        .{
+            .name = "B",
+            .effect_count = 1,
+            .effects = .{
+                .{ .kind = 3, .p = .{ 2, 0.5, 0, 0, 0 } },
+                .{}, .{}, .{},
+            },
+        },
+    };
+    app.importMixerChannels(&mixer2);
+    const chain2 = app.mixer_channels_state.items[0].effects;
+    try std.testing.expectEqual(@as(f32, 2), chain2.items[0].p[0]);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), chain2.items[0].p[1], 0.0001);
+}
+
+test "app: 新建（空）工程——1 样式 + Track1 最左 1 片段 + 1 乐器" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    _ = app.addInstrument("减法合成器");
+    app.addNote(.{ .step = 0, .len = 4, .pitch = 60, .pattern = 3, .instrument = 0 });
+    app.addClip(.{ .track = 5, .start = 480, .len = 96, .pattern = 2 });
+    app.bpm = 90;
+    app.resetHistory("初始状态");
+
+    app.resetToDefaultProject();
+    try std.testing.expectEqual(@as(i32, 1), app.patternCount());
+    try std.testing.expectEqual(@as(usize, 0), app.notes.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.clips.items.len);
+    const c = app.clips.items[0];
+    try std.testing.expectEqual(@as(i32, 0), c.track);
+    try std.testing.expectEqual(@as(i32, 0), c.start);
+    try std.testing.expectEqual(@as(i32, 0), c.pattern);
+    try std.testing.expectEqual(app.patternEffectiveLen(0), c.len);
+    try std.testing.expect(c.len >= 96); // 空样式 = 至少 1 小节
+    try std.testing.expectEqual(@as(usize, 1), app.instruments.items.len);
+    try std.testing.expectEqual(@as(i32, 120), app.bpm);
+    try std.testing.expectEqual(@as(i32, 0), app.sel.pattern);
+    try std.testing.expectEqual(@as(i32, 0), app.sel.instrument);
+    try std.testing.expect(!app.dirty); // 新建 = 已保存基线
+    try std.testing.expectEqual(@as(usize, 1), app.history.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.history_current);
 }

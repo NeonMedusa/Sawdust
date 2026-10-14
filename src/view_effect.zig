@@ -10,6 +10,7 @@ const Ui = @import("ui.zig").Ui;
 const app_mod = @import("app.zig");
 const App = app_mod.App;
 const eq = @import("eq.zig");
+const fx = @import("effects.zig");
 const util = @import("view_util.zig");
 const model = @import("model.zig");
 
@@ -146,42 +147,99 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     }
     cy += 28;
 
-    // ── 主区：左侧频谱+包络图，右侧频段数值 + Q 旋钮 ──
-    const info_w: i32 = 170;
-    const gx = x + 10;
-    const gw = ww - 20 - info_w - 10;
-    const gh = hh - (cy - y) - 14;
-    if (gw > 120 and gh > 80) {
-        drawEqGraph(ui, app, es, gx, cy, gw, gh);
+    // ── 主区：EQ = 频谱图 + 频段控制；其它效果器 = 参数旋钮面板 ──
+    if (es.kind == .eq) {
+        const info_w: i32 = 170;
+        const gx = x + 10;
+        const gw = ww - 20 - info_w - 10;
+        const gh = hh - (cy - y) - 14;
+        if (gw > 120 and gh > 80) {
+            drawEqGraph(ui, app, es, gx, cy, gw, gh);
 
-        // 右侧：4 段数值 + Q 旋钮（**旋钮代替推子**——推子与文字重叠，实测反馈）
-        const ix = gx + gw + 10;
-        var iy = cy;
-        ui.label("频段 / Q", ix, iy, ui.theme.text_dim);
-        iy += 16;
-        const q_knob: i32 = 20;
-        for (es.bands, 0..) |band, bi| {
-            var fb: [64]u8 = undefined;
-            // 增益带符号显示（“+3.5dB” / “-6.0dB”）——Zig 格式串不支持 `+` 标志，手动拼
-            const ft = std.fmt.bufPrint(&fb, "{d}  {d:.2}kHz  {s}{d:.1}dB", .{
-                bi + 1,
-                band.freq / 1000,
-                if (band.gain_db >= 0) "+" else "",
-                band.gain_db,
-            }) catch "";
-            // 文字在左（宽 = 剩余 − 旋钮），旋钮在右（右对齐，不重叠）
-            const text_w = info_w - q_knob - 10;
-            ui.labelClipped(ft, ix, iy + 4, text_w, ui.theme.text);
-            var q = band.q;
-            if (ui.knobRange(7700 + @as(u64, bi), &q, ix + info_w - q_knob, iy, q_knob, 0.1, 4.0)) {
-                es.bands[bi].q = q;
-                app.history_pending = "调整 EQ Q 值";
+            // 右侧：4 段数值 + Q 旋钮（**旋钮代替推子**——推子与文字重叠，实测反馈）
+            const ix = gx + gw + 10;
+            var iy = cy;
+            ui.label("频段 / Q", ix, iy, ui.theme.text_dim);
+            iy += 16;
+            const q_knob: i32 = 20;
+            for (es.bands, 0..) |band, bi| {
+                var fb: [64]u8 = undefined;
+                // 增益带符号显示（“+3.5dB” / “-6.0dB”）——Zig 格式串不支持 `+` 标志，手动拼
+                const ft = std.fmt.bufPrint(&fb, "{d}  {d:.2}kHz  {s}{d:.1}dB", .{
+                    bi + 1,
+                    band.freq / 1000,
+                    if (band.gain_db >= 0) "+" else "",
+                    band.gain_db,
+                }) catch "";
+                // 文字在左（宽 = 剩余 − 旋钮），旋钮在右（右对齐，不重叠）
+                const text_w = info_w - q_knob - 10;
+                ui.labelClipped(ft, ix, iy + 4, text_w, ui.theme.text);
+                var q = band.q;
+                if (ui.knobRange(7700 + @as(u64, bi), &q, ix + info_w - q_knob, iy, q_knob, 0.1, 4.0)) {
+                    es.bands[bi].q = q;
+                    app.history_pending = "调整 EQ Q 值";
+                }
+                iy += @max(band_row_h, q_knob + 6);
             }
-            iy += @max(band_row_h, q_knob + 6);
         }
+    } else if (es.kind != .empty) {
+        // 混响/延迟/压缩器：纵列参数旋钮（含义/范围见 `effects.paramInfos`）
+        drawParamPanel(ui, app, es, x + 10, cy, ww - 20, hh - (cy - y) - 14);
     }
 
     return true;
+}
+
+/// 参数面板（混响/延迟/压缩器）：纵列 = 名称 + 旋钮 + 数值
+/// 注：干湿（mix）不在此列——顶部已有独立干湿滑块（同一参数，避免两个入口）
+fn drawParamPanel(ui: *Ui, app: *App, es: *app_mod.EffectSlot, px: i32, py: i32, pw: i32, ph: i32) void {
+    const infos = fx.paramInfos(@intFromEnum(es.kind));
+    if (infos.len == 0 or pw < 200 or ph < 60) return;
+    const knob: i32 = 40;
+    const row_h: i32 = knob + 18;
+    const knob_x = px + 96;
+    var yy = py + 6;
+    for (infos, 0..) |info, i| {
+        if (std.mem.eql(u8, info.name, "mix")) continue; // 干湿在顶部控制行
+        if (yy + row_h > py + ph) break; // 空间不足：剩下的行不画（拉大窗口可见）
+        // 延迟「节奏」= 拖动换档（同工具栏拍号的手感）；旁注 BPM 换算后的实际毫秒
+        if (es.kind == .delay and i == 0) {
+            ui.label(info.name, px + 8, yy + @divTrunc(knob, 2) - 6, ui.theme.text_dim);
+            const max_code: i32 = @intCast(fx.delay_tempos.len - 1);
+            var code: i32 = @intFromFloat(@round(std.math.clamp(es.p[i], 0, @as(f32, @floatFromInt(fx.delay_tempos.len - 1)))));
+            if (ui.dragNumberEx(9000, knob_x, yy + @divTrunc(knob - 20, 2), 56, 20, &code, 0, max_code, 12, 0, &fmtDelayTempo)) {
+                es.p[i] = @floatFromInt(code);
+                app.history_pending = "调整延迟节奏";
+            }
+            var mb: [24]u8 = undefined;
+            const bpm_c: i32 = @max(20, app.bpm);
+            const ms = fx.delay_tempos[@intCast(code)].beats * 60000.0 / @as(f32, @floatFromInt(bpm_c));
+            ui.label(std.fmt.bufPrint(&mb, "{d:.0}ms", .{ms}) catch "", knob_x + 68, yy + @divTrunc(knob, 2) - 6, ui.theme.text);
+            yy += row_h;
+            continue;
+        }
+        ui.label(info.name, px + 8, yy + @divTrunc(knob, 2) - 6, ui.theme.text_dim);
+        var v = es.p[i];
+        if (ui.knobRange(9000 + @as(u64, i), &v, knob_x, yy, knob, info.min, info.max)) {
+            es.p[i] = v;
+            app.history_pending = "调整效果器参数";
+        }
+        var vb: [32]u8 = undefined;
+        const vt: []const u8 = if (std.mem.eql(u8, info.unit, ":1"))
+            (std.fmt.bufPrint(&vb, "{d:.1}:1", .{es.p[i]}) catch "")
+        else if (info.unit.len > 0)
+            (std.fmt.bufPrint(&vb, "{d:.1}{s}", .{ es.p[i], info.unit }) catch "")
+        else
+            (std.fmt.bufPrint(&vb, "{d:.0}%", .{es.p[i] * 100}) catch "");
+        ui.label(vt, knob_x + knob + 12, yy + @divTrunc(knob, 2) - 6, ui.theme.text);
+        yy += row_h;
+    }
+}
+
+/// 延迟节奏档位码 → 文本（"1/8" 等；`dragNumberEx` 的 fmt 回调）
+fn fmtDelayTempo(v: i32, buf: []u8) []const u8 {
+    const c = std.math.clamp(v, 0, @as(i32, @intCast(fx.delay_tempos.len)) - 1);
+    return std.fmt.bufPrint(buf, "{s}", .{fx.delay_tempos[@intCast(c)].label}) catch "?";
 }
 
 /// EQ 主图：频谱背景 + 包络曲线 + 控制点（大尺寸版）

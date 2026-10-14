@@ -293,10 +293,11 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     if (mw.ctx_effect) |ctx| {
         drawCtxMenu(ui, app, ctx);
     }
-    // ── 通道右键菜单（重命名/删除/上移/下移）──
+    // ── 通道右键菜单（重命名/删除/上移/下移；**主通道不可移动**）──
     if (mw.ctx_channel) |cc| {
         const items = [_][]const u8{ "重命名", "删除通道", "上移", "下移" };
-        drawCtxMenuGeneric(ui, app, cc, null, &items);
+        const ch_ok = [_]bool{ true, cc != 0, cc != 0, cc != 0 };
+        drawCtxMenuGeneric(ui, app, cc, null, &items, &ch_ok);
     }
     // ── 声像旋钮右键菜单（恢复默认值）──
     if (mw.ctx_pan) |pc| {
@@ -557,7 +558,20 @@ fn drawEffectRow(ui: *Ui, app: *App, ci: usize, si: usize, x: i32, y: i32, w: i3
 /// 「添加效果器」下拉（**共享控件** view_util.menuPanel）：选类型 → 填入该通道第一个空槽。
 fn drawAddEffectMenu(ui: *Ui, app: *App, ci: usize, wx: i32, wy: i32, ww: i32, hh: i32) void {
     const mw = &app.mixer_win;
-    const items = [_][]const u8{"EQ 参量均衡"};
+    const items = [_][]const u8{ "EQ 参量均衡", "混响", "延迟", "压缩器" };
+    const kinds = [_]app_mod.EffectKind{ .eq, .reverb, .delay, .compressor };
+    // 同类已存在 → 置灰（混响/延迟/压缩器每通道至多一个；EQ 可多）
+    var ok = [_]bool{ true, true, true, true };
+    if (ci < app.mixer_channels_state.items.len) {
+        for (app.mixer_channels_state.items[ci].effects.items) |es| {
+            switch (es.kind) {
+                .reverb => ok[1] = false,
+                .delay => ok[2] = false,
+                .compressor => ok[3] = false,
+                else => {},
+            }
+        }
+    }
     const clicked = util.menuPanel(
         ui,
         &mw.menu_x,
@@ -568,18 +582,21 @@ fn drawAddEffectMenu(ui: *Ui, app: *App, ci: usize, wx: i32, wy: i32, ww: i32, h
         .{ .x = wx, .y = wy, .w = ww, .h = hh },
         &items,
         170,
-        null,
+        &ok,
     );
-    if (clicked != null) {
-        // 追加到该通道的效果链末尾
-        _ = app.addEffect(ci, .eq);
-        const chain = app.mixer_channels_state.items[ci].effects;
-        if (chain.items.len > 0) {
-            app.mixer_win.panel = .{ .ch = ci, .slot = chain.items.len - 1 };
+    if (clicked) |mi| {
+        if (mi < kinds.len) {
+            // 追加到该通道的效果链末尾
+            const slot = app.addEffect(ci, kinds[mi]) orelse {
+                app.setToast("无法添加：数量达上限或同类已存在");
+                app.mixer_win.add_effect_ch = null;
+                return;
+            };
+            app.mixer_win.panel = .{ .ch = ci, .slot = slot };
             app.bringToFront(&app.effect_win.z); // 新开面板：同样置顶
+            app.mixer_win.add_effect_ch = null;
+            app.commitHistory("添加效果器");
         }
-        app.mixer_win.add_effect_ch = null;
-        app.commitHistory("添加效果器");
     }
     // 菜单关闭（点外部/点条目）→ 同步清“所属通道”
     if (!mw.menu_open) app.mixer_win.add_effect_ch = null;
@@ -588,13 +605,14 @@ fn drawAddEffectMenu(ui: *Ui, app: *App, ci: usize, wx: i32, wy: i32, ww: i32, h
 /// 效果器右键菜单（位置在**打开时快照**——不跟鼠标跑，否则永远点不到）
 fn drawCtxMenu(ui: *Ui, app: *App, ctx: app_mod.EffectRef) void {
     const items = [_][]const u8{ "删除效果器", "上移", "下移" };
-    drawCtxMenuGeneric(ui, app, ctx.ch, ctx.slot, &items);
+    drawCtxMenuGeneric(ui, app, ctx.ch, ctx.slot, &items, null);
 }
 
 /// 通用右键菜单（效果器/通道共用）：位置由**打开时快照**提供
-/// （绘制时再**鉗制到窗口内**——菜单不得超出窗口，否则超出部分点击会
+/// （绘制时再**钳制到窗口内**——菜单不得超出窗口，否则超出部分点击会
 /// 穿透到下层；见 `ctxMenuPos`）。`slot` 为 `null` 时是**通道菜单**。
-fn drawCtxMenuGeneric(ui: *Ui, app: *App, ch: usize, slot: ?usize, items: []const []const u8) void {
+/// `ok`：逐项可用性（null = 全可用；置灰项不响应点击）。
+fn drawCtxMenuGeneric(ui: *Ui, app: *App, ch: usize, slot: ?usize, items: []const []const u8, ok: ?[]const bool) void {
     const mw_win = &app.mixer_win;
     const menu_w: i32 = 130;
     const menu_h: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
@@ -607,13 +625,14 @@ fn drawCtxMenuGeneric(ui: *Ui, app: *App, ch: usize, slot: ?usize, items: []cons
     var clicked: ?usize = null;
     var inside = false;
     for (items, 0..) |item, i| {
+        const enabled = if (ok) |o| (i < o.len and o[i]) else true;
         const iy = my + 2 + @as(i32, @intCast(i)) * util.menu_item_h;
-        const ih = util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, menu_w - 2, util.menu_item_h);
+        const ih = enabled and util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, menu_w - 2, util.menu_item_h);
         if (ih) {
             inside = true;
             ui.renderer.fillRect(mx + 1, iy, menu_w - 2, util.menu_item_h, ui.theme.item_hover);
         }
-        ui.label(item, mx + 8, iy + 2, ui.theme.text);
+        ui.label(item, mx + 8, iy + 2, if (enabled) ui.theme.text else ui.theme.text_dim);
         if (ih and ui.mouse_pressed) clicked = i;
     }
 
