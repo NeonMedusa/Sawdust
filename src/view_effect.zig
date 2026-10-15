@@ -285,6 +285,11 @@ fn drawParamPanel(ui: *Ui, app: *App, es: *app_mod.EffectSlot, px: i32, py: i32,
         // 滚动状态挂在窗口面板引用上（切换效果槽时自动归零）
         var dummy_scroll: i32 = 0;
         const scroll_p: *i32 = if (app.mixer_win.panel) |*pref| &pref.scroll else &dummy_scroll;
+        // 参数编辑的唯一入口：应用 + 增量记录（撤销走参数回放，不碰 setState）
+        const ref: app_mod.PluginSlotRef = if (app.mixer_win.panel) |pref|
+            .{ .kind = .fx, .a = @intCast(pref.ch), .b = @intCast(pref.slot) }
+        else
+            .{ .kind = .fx };
         const visible: i32 = @max(1, @divTrunc(list_h, row_h));
         const content_h: i32 = @as(i32, @intCast(pcount)) * row_h;
         const scroll_max: i32 = @max(0, content_h - visible * row_h);
@@ -309,18 +314,14 @@ fn drawParamPanel(ui: *Ui, app: *App, es: *app_mod.EffectSlot, px: i32, py: i32,
                 const read_only = (meta.flags & 0x2) != 0; // kIsReadOnly：插件声明只读，跳过交互
                 if (!read_only and hovered and ui.mouse_double) {
                     // 双击 → 恢复默认值（先于拖动判定：双击帧也会发按下，否则被拖动抢走）
-                    p.setParamHost(idx, meta.default_norm);
-                    app.markPluginEdited();
-                    app.touchGesture("调整插件参数");
+                    app.setPluginParamHost(ref, p, idx, meta.default_norm);
                 } else if (!read_only and ui.dragNormV(rid, px, ry, pw - scrollbar_w, row_h - 1, &v)) {
                     // 离散参数：吸附到步长（拖动锚点无级累积 → 逐格步进可达）
                     if (meta.step_count > 0) {
                         const steps: f64 = @floatFromInt(meta.step_count);
                         v = @round(v * steps) / steps;
                     }
-                    p.setParamHost(idx, v);
-                    app.markPluginEdited();
-                    app.touchGesture("调整插件参数");
+                    app.setPluginParamHost(ref, p, idx, v);
                 }
                 const active = ui.active_id == rid;
                 ui.renderer.fillRect(px, ry, pw - scrollbar_w, row_h - 1, if (active) ui.theme.item_hover else if (hovered) ui.theme.toolbar else ui.theme.panel);

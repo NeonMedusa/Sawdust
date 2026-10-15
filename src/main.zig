@@ -1061,7 +1061,8 @@ fn loadVst3Preset(app: *App, io: std.Io, intent: PresetIntent, cat: usize, choic
             if (same_plugin) {
                 if (has_state) {
                     es.plugin.?.restoreState(comp orelse &.{}, ctrl orelse &.{});
-                    app.commitHistory("加载预设");
+                    // 记账（置脏 + 提交）：干净槽不置脏会被判“无变化”而静默丢弃条目
+                    app.notePluginStateReplaced(.{ .kind = .fx, .a = @intCast(r.ch), .b = @intCast(r.slot) }, "加载预设");
                     app.setToastWith("已加载插件预设：{s}", .{patch_name});
                 } else {
                     app.setToast("（默认音色在新建插件时生效）");
@@ -1149,8 +1150,11 @@ fn loadVst3Preset(app: *App, io: std.Io, intent: PresetIntent, cat: usize, choic
         if (has_state) {
             const pl = app.instruments.items[@intCast(ii)].plugin.?;
             pl.restoreState(comp orelse &.{}, ctrl orelse &.{});
+            // 同 syncInstrumentPlugins：恢复后全 128 panic（防幽灵声部永挂）
+            app.params.instrument_panic[@intCast(ii)].store(true, .release);
             _ = app.setInstrumentPresetName(@intCast(ii), patch_name);
-            app.commitHistory("加载预设");
+            // 记账（置脏 + 提交）：否则新条目会复用旧 blob（携带过期插件状态）
+            app.notePluginStateReplaced(.{ .kind = .instrument, .a = @intCast(ii) }, "加载预设");
             app.setToastWith("已加载插件预设：{s}", .{patch_name});
         } else {
             app.setToast("（默认音色在新建 VST3 乐器或换插件时生效）");
@@ -2308,6 +2312,8 @@ fn syncInstrumentPlugins(app: *App) void {
             // 回填类 CID（身份：重绑定自愈/存档）
             _ = inst.plugin.?.cidHex(&inst.plugin_cid);
             inst.plugin_cid_len = 32;
+            // 捕获复用：新载实例状态未知 → 登记脏（下次历史捕获现取）
+            app.markSlotStateDirty(.{ .kind = .instrument, .a = @intCast(ii) });
             if (inst.load_failed) {
                 inst.load_failed = false;
                 app.setToastWith("乐器插件已恢复加载：{s}", .{inst.plugin.?.name()});
@@ -2318,19 +2324,23 @@ fn syncInstrumentPlugins(app: *App) void {
             app.renamePlaceholderInstrument(ii, inst.plugin.?.name());
         }
         const pl = inst.plugin orelse continue;
+        const iref = app_mod.PluginSlotRef{ .kind = .instrument, .a = @intCast(ii) };
+        // 参数缓存一次建齐（撤销“参数回放”的旧值依据；restoreState 内置重建）
+        if (!pl.param_cache_valid) pl.refreshParamCache();
         // 待恢复音色（工程加载/撤销恢复后首次就绪时应用一次；幂等）
         if (inst.pending_state != null or inst.pending_state_ctrl != null) {
             pl.restoreState(inst.pending_state orelse &.{}, inst.pending_state_ctrl orelse &.{});
             inst.clearPendingState(app.allocator);
+            // **防挂音 panic**：恢复可能唤醒快照里仍在发声的声部（不在活跃位图）——
+            // 下一段全 128 音高补 off（实测 bug：播放中调 Vital 参数后撤销 → 永挂）
+            app.params.instrument_panic[ii].store(true, .release);
+            // 恢复完成 = 该槽按“已采纳”处理：插件恢复后的 getState 回声字节常与存档
+            // 不同（Vital 实测），若留着脏标 → 下次提交出现幽灵历史/脏标（v4 工程实症）
+            app.markSlotStateClean(iref);
         }
-        if (pl.pollEditorEdit() != null) {
-            app.markPluginEdited();
-            app.touchGesture("调整插件参数");
-        }
-        if (pl.takeDirtyNotice()) {
-            app.markPluginEdited();
-            app.touchGesture("编辑插件");
-        }
+        // 插件 GUI 内编辑 → 参数增量记录 + 手势（起手提交 + 静置钉值）
+        app.drainSlotEditorEdits(iref, pl);
+        if (pl.takeDirtyNotice()) app.notePluginStructural(iref);
     }
 }
 
@@ -2343,8 +2353,8 @@ fn syncPluginSlots(app: *App) void {
     app.reapRetiredPlugins();
     app.reapRetiredFx();
     const sr: f64 = @floatFromInt(@max(1, app.params.sample_rate));
-    for (app.mixer_channels_state.items) |*mc| {
-        for (mc.effects.items) |*es| {
+    for (app.mixer_channels_state.items, 0..) |*mc, ci| {
+        for (mc.effects.items, 0..) |*es, si| {
             if (es.kind != .plugin) continue;
             if (es.plugin == null) {
                 if (es.pluginPath().len == 0) continue;
@@ -2366,12 +2376,17 @@ fn syncPluginSlots(app: *App) void {
                 // 回填类 CID（身份：重绑定自愈/存档）
                 _ = es.plugin.?.cidHex(&es.plugin_cid);
                 es.plugin_cid_len = 32;
+                // 捕获复用：新载实例状态未知 → 登记脏
+                app.markSlotStateDirty(.{ .kind = .fx, .a = @intCast(ci), .b = @intCast(si) });
                 if (es.load_failed) {
                     es.load_failed = false;
                     app.setToastWith("插件已恢复加载：{s}", .{es.plugin.?.name()});
                 }
             }
             const pl = es.plugin orelse continue;
+            const fref = app_mod.PluginSlotRef{ .kind = .fx, .a = @intCast(ci), .b = @intCast(si) };
+            // 参数缓存一次建齐（撤销“参数回放”的旧值依据；restoreState 内置重建）
+            if (!pl.param_cache_valid) pl.refreshParamCache();
             // 待恢复状态（工程加载/撤销恢复后首次就绪时应用一次）
             if (es.pending_state != null or es.pending_state_ctrl != null) {
                 pl.restoreState(
@@ -2379,20 +2394,18 @@ fn syncPluginSlots(app: *App) void {
                     if (es.pending_state_ctrl) |b| b else &.{},
                 );
                 es.clearPendingState(app.allocator);
+                // 恢复完成 = 按“已采纳”处理（同乐器侧：插件回声字节不算编辑）
+                app.markSlotStateClean(fref);
             }
-            // 插件 GUI 内的编辑 → 标脏 + 手势（起手提交 + 静置钉值；面板每帧直读实时值）
-            if (pl.pollEditorEdit() != null) {
-                app.markPluginEdited();
-                app.touchGesture("调整插件参数");
-            }
-            // restart 请求：延迟变化 → 重读；结构/参数变化 → 标脏（宽限期内忽略——
+            // 插件 GUI 内的编辑 → 参数增量记录 + 手势（起手提交 + 静置钉值）
+            app.drainSlotEditorEdits(fref, pl);
+            // restart 请求：延迟变化 → 重读；结构/参数变化 → 结构信号（宽限期内忽略——
             // 加载/状态恢复/开窗后插件通常会补发一轮）
             const flags = pl.takeRestartFlags();
             if (flags != 0) {
                 if (flags & vst_host.kLatencyChanged != 0) pl.refreshLatency();
                 if (pl.restart_grace == 0 and (flags & vst_host.kDirtyRestartFlags) != 0) {
-                    app.markPluginEdited();
-                    app.touchGesture("编辑插件");
+                    app.notePluginStructural(fref);
                 }
             }
             if (pl.restart_grace > 0) pl.restart_grace -= 1;
@@ -2406,8 +2419,7 @@ fn syncPluginSlots(app: *App) void {
                         if (pl.hash_armed) {
                             if (h != pl.last_state_hash) {
                                 pl.last_state_hash = h;
-                                app.markPluginEdited();
-                                app.touchGesture("编辑插件结构");
+                                app.notePluginStructural(fref);
                             }
                         } else {
                             pl.last_state_hash = h; // 首次采样：播种（不标脏）
@@ -2418,11 +2430,8 @@ fn syncPluginSlots(app: *App) void {
             } else if (pl.hash_armed) {
                 pl.hash_armed = false; // 关编辑器：复位，下次打开重新播种
             }
-            // 插件声明“文档已脏”（IComponentHandler2::setDirty）→ 标脏
-            if (pl.takeDirtyNotice()) {
-                app.markPluginEdited();
-                app.touchGesture("编辑插件");
-            }
+            // 插件声明“文档已脏”（IComponentHandler2::setDirty）→ 结构信号
+            if (pl.takeDirtyNotice()) app.notePluginStructural(fref);
             // 插件请求打开编辑器（帧末：UI 线程）
             if (pl.takeOpenEditorRequest()) _ = pl.openEditor(app.main_hwnd);
         }

@@ -35,7 +35,7 @@ const ma = @cImport({
 });
 
 /// 每乐器每个分段发送给 VSTi 的事件上限（超出的丢弃；宁可丢事件也不分配）
-pub const vsti_batch_max = 128;
+pub const vsti_batch_max = 256;
 
 /// 调音台通道数**上限**（与 app.max_mixer_channels 一致；音频层不能 import app——循环依赖）。
 /// 运行时实际通道数以 `Params.channel_count` 为准（≤ 此值）。
@@ -103,6 +103,11 @@ pub const Params = struct {
         for (&a) |*p| p.* = std.atomic.Value(f32).init(0.5);
         break :blk a;
     },
+    /// VSTi **panic 旗标**（UI 线程置位）：下一段对全 128 音高无条件 note-off。
+    /// 用途：state 恢复（撤销/读档/载预设）可能**唤醒快照里仍在发声的声部**——
+    /// 它们不在宿主活跃位图里，按位图补 off 会漏 → 永挂（实测 bug：播放中调
+    /// Vital 参数后撤销，部分音符响个不停，暂停/停止无效）。
+    instrument_panic: [synth.max_instruments]std.atomic.Value(bool) = [_]std.atomic.Value(bool){std.atomic.Value(bool).init(false)} ** synth.max_instruments,
     /// 每槽 VST3 插件实例指针（混音通道 × 效果槽；null = 未加载/直通）——
     /// UI 侧惰性加载并发布；删除走“退役列表”延迟销毁（见 App.retirePlugin）
     plugin_ptrs: [mixer_channels][effect_slots]std.atomic.Value(?*vst_host.Plugin) = [_][effect_slots]std.atomic.Value(?*vst_host.Plugin){[_]std.atomic.Value(?*vst_host.Plugin){std.atomic.Value(?*vst_host.Plugin).init(null)} ** effect_slots} ** mixer_channels,
@@ -348,10 +353,11 @@ pub const Engine = struct {
 fn releaseAllVoices(engine: *Engine) void {
     for (engine.synths) |*s| synth.allOff(s);
     for (engine.kit_synths) |*s| synth.allOff(s);
-    // VSTi：给正在发声的乐器按音高补发 note-off（VST3 无“全体释音”事件）
+    // VSTi：**panic 式**全体释音（全 128 音高）——位图可能已失同步
+    // （如恢复唤醒的幽灵声部/批满丢事件），按位图补 off 会漏 → 用不掉挂的版本
     const params = engine.params;
     for (0..synth.max_instruments) |i| {
-        if (params.instrument_kind[i].load(.monotonic) == 2) vstiAllOff(engine, i);
+        if (params.instrument_kind[i].load(.monotonic) == 2) vstiPanic(engine, i);
     }
 }
 
@@ -401,6 +407,15 @@ fn vstiNoteOff(engine: *Engine, i: usize, pitch: u8) void {
             .noteId = -1,
         } },
     });
+}
+
+/// VSTi：**全 128 音高**无条件 note-off（panic）。
+/// 与 `vstiAllOff`（仅活跃位图）的区别：state 恢复可能唤醒“快照里仍在发声”的
+/// 幽灵声部（不在位图中）——只能地毯式清；顺带擦除位图（重新对齐真实状态）。
+/// 事件量 128 ≤ `vsti_batch_max`（已为“段内真实事件 + panic”预留翻倍容量）。
+fn vstiPanic(engine: *Engine, i: usize) void {
+    var p: u16 = 0;
+    while (p < 128) : (p += 1) vstiNoteOff(engine, i, @intCast(p));
 }
 
 /// VSTi：按位图补发全部 note-off（暂停/跳转/切类型/全体释音共用）
@@ -670,6 +685,9 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
             //  声像 = 标准立体声平衡：输出当立体声总线，按旋钮位置对两侧做等功率增益）
             const pl = params.instrument_plugin[i].load(.monotonic) orelse continue;
             if (engine.vsti_scratch.len < n) continue; // 中转缓冲未初始化（测试环境）：未加载即跳过
+            // state 恢复防挂音（UI 置旗标）：本段先对全 128 音高补 off——
+            // 恢复可能唤醒“快照里仍在发声”的幽灵声部（不在活跃位图）
+            if (params.instrument_panic[i].swap(false, .acq_rel)) vstiPanic(engine, i);
             const sc = engine.vsti_scratch[0..n];
             @memset(sc, 0);
             // 本段事件（段边界 = 事件时刻 → offset 全 0）；消费后清零
@@ -1722,5 +1740,27 @@ test "audio: publishSounding——VSTi 直接发布 note-on 活跃位图" {
     publishSounding(engine, params);
     try std.testing.expectEqual(@as(u64, 0), params.sounding_lo[0].load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), params.sounding_hi[0].load(.monotonic));
+}
+
+test "audio: VSTi panic——全 128 音高 note-off + 位图清零（state 恢复防挂音）" {
+    var env: KitTestEnv = undefined;
+    try env.init(std.testing.allocator, false);
+    defer env.deinit(std.testing.allocator);
+    const engine = &env.engine;
+    const params = &env.params;
+    params.instrument_kind[0].store(2, .monotonic);
+    vstiNoteOn(engine, 0, 60, 100);
+    vstiNoteOn(engine, 0, 72, 100);
+    try std.testing.expect(engine.vsti_active_lo[0] != 0);
+    try std.testing.expect(engine.vsti_active_hi[0] != 0);
+    const before = engine.vsti_event_n[0];
+    vstiPanic(engine, 0);
+    try std.testing.expectEqual(@as(u64, 0), engine.vsti_active_lo[0]); // 位图清零
+    try std.testing.expectEqual(@as(u64, 0), engine.vsti_active_hi[0]);
+    try std.testing.expectEqual(before + 128, engine.vsti_event_n[0]); // 全 128 无条件 off
+    for (engine.vsti_events[0][before..engine.vsti_event_n[0]], 0..) |ev, k| {
+        try std.testing.expectEqual(@intFromEnum(ivstevents.Event.EventTypes.kNoteOffEvent), ev.type);
+        try std.testing.expectEqual(@as(i16, @intCast(k)), ev.data.noteOff.pitch);
+    }
 }
 

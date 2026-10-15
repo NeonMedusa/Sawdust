@@ -90,6 +90,45 @@ pub const HistoryState = struct {
     time_num: i32 = 4,
     time_den: i32 = 4,
     steps_per_bar: i32 = model.units_per_whole,
+    /// **运行时**插件参数增量（不持久化；读档/旧条目为空 → 自动回落整块状态恢复）。
+    /// `old` = 本步开始前的值、`new` = 本步结束值；同槽同参折叠为一条。
+    /// **按 `ref` 排序**（同槽连续）——应用侧按槽取子切片
+    param_edits: []ParamEditRec = &.{},
+    /// 本步内出现过该槽的**结构性**信号（setDirty/restart/溢出/无缓存）→ 禁参数回放
+    structural_refs: []PluginSlotRef = &.{},
+};
+
+/// 插件槽引用（历史参数增量的目标）
+pub const PluginSlotRef = struct {
+    kind: enum { instrument, fx },
+    /// instrument：乐器下标；fx：通道下标
+    a: u16 = 0,
+    /// instrument 恒 0；fx：槽位
+    b: u16 = 0,
+};
+
+/// 一条插件参数增量（撤销“参数回放”的记录单元）
+pub const ParamEditRec = struct {
+    ref: PluginSlotRef,
+    param_id: u32,
+    old: f64,
+    new: f64,
+};
+
+/// 插件状态应用计划（撤销/重做/跳转逐槽决定；商 DAW 式：旋钮级走参数回放）
+pub const ApplyPlan = union(enum) {
+    /// 整块重放（pending_state → 帧末 setState；VSTi 可唤醒幽灵声部 → 后续 panic）
+    full,
+    /// 状态未变：不碰实例
+    skip,
+    /// 参数增量回放（setParam 免锁；无 setState、无 panic、不断音）
+    replay: ReplayJob,
+};
+
+pub const ReplayJob = struct {
+    recs: []const ParamEditRec,
+    /// true = 回放 old（撤销/往回跳）；false = 回放 new（重做/往前跳）
+    backward: bool,
 };
 
 /// 脏确认流程的**目标动作**（确认框按钮相同，但“保存后”要执行不同的事）
@@ -1005,6 +1044,12 @@ pub const App = struct {
     /// 进行中的“起手提交 + 静置钉值”手势（滚轮 / 插件侧改动：无明确终点事件）。
     /// 起手即提交临时条目；静置 1s / 新操作起手 / 编辑器关闭 / 保存 → 钉住最终值。
     gesture: ?Gesture = null,
+    /// 插件参数手势标签缓冲（“{插件名}：{参数名}”）；见 `paramGestureLabel` 生命周期纪律
+    gesture_label_buf: [128]u8 = undefined,
+    /// 插件状态脏标（**捕获复用**判据，见 `markSlotStateDirty`）：自上次历史
+    /// 捕获后该槽插件状态是否变过。未变槽快照/全等判定不再 getState（撤销卡顿根治）
+    instr_state_dirty: [synth.max_instruments]bool = [_]bool{false} ** synth.max_instruments,
+    fx_state_dirty: [max_mixer_channels][audio.effect_slots]bool = [_][audio.effect_slots]bool{[_]bool{false} ** audio.effect_slots} ** max_mixer_channels,
     /// 编辑器打开计数（上一帧）——从 N 变 N-1 = 有人关窗 → 手势结束（钉值）
     editors_open_prev: usize = 0,
 
@@ -1771,8 +1816,14 @@ pub const App = struct {
             var comp_b64: []const u8 = "";
             var ctrl_b64: []const u8 = "";
             if (inst.plugin) |pl| {
-                comp_b64 = self.adoptStateB64(try capturePluginStateB64(self.allocator, pl, true), pooled);
-                ctrl_b64 = self.adoptStateB64(try capturePluginStateB64(self.allocator, pl, false), pooled);
+                // 捕获复用：槽未脏且来向条目同路径 → 沿用状态文本（intern 命中同块）
+                if (self.reuseInstrumentState(inst, pooled)) |r| {
+                    comp_b64 = if (r.comp.len > 0) self.adoptStateB64(try self.allocator.dupe(u8, r.comp), pooled) else "";
+                    ctrl_b64 = if (r.ctrl.len > 0) self.adoptStateB64(try self.allocator.dupe(u8, r.ctrl), pooled) else "";
+                } else {
+                    comp_b64 = self.adoptStateB64(try capturePluginStateB64(self.allocator, pl, true), pooled);
+                    ctrl_b64 = self.adoptStateB64(try capturePluginStateB64(self.allocator, pl, false), pooled);
+                }
             } else {
                 comp_b64 = self.adoptStateB64(try b64Encode(self.allocator, if (inst.pending_state) |b| b else &.{}), pooled);
                 ctrl_b64 = self.adoptStateB64(try b64Encode(self.allocator, if (inst.pending_state_ctrl) |b| b else &.{}), pooled);
@@ -1915,9 +1966,17 @@ pub const App = struct {
         }.less);
     }
 
+    /// 两份 base64 插件状态是否同内容：池化共享 → 指针相等快路径；否则内容比较。
+    /// 撤销/重做靠它跳过“没变过”的插件状态重放（setState 会锁插件、整曲卡顿）
+    fn stateBlobsEqual(a_comp: []const u8, a_ctrl: []const u8, b_comp: []const u8, b_ctrl: []const u8) bool {
+        if (a_comp.ptr == b_comp.ptr and a_ctrl.ptr == b_ctrl.ptr) return true;
+        return std.mem.eql(u8, a_comp, b_comp) and std.mem.eql(u8, a_ctrl, b_ctrl);
+    }
+
     /// 把存档乐器恢复到已存在的 `target`（名字除外——由调用方处理；
-    /// 历史恢复/工程导入共用，防两处逻辑分叉）
-    fn applySavedInstrument(self: *App, si: *const persist.SavedInstrument, target: *model.Instrument) void {
+    /// 历史恢复/工程导入共用，防两处逻辑分叉）。
+    /// `plan`：撤销/重做逐槽决定的状态应用方式（skip 不动 / replay 参数回放 / full 整块）
+    fn applySavedInstrument(self: *App, si: *const persist.SavedInstrument, target: *model.Instrument, plan: ApplyPlan) void {
         target.volume = si.volume;
         target.pan = si.pan;
         target.muted = si.muted;
@@ -1943,10 +2002,34 @@ pub const App = struct {
             }
             target.setPluginPath(new_path); // 路径变化时内部重置 load_failed/fail_wait
             if (si.plugin_cid.len > 0) target.setPluginCid(si.plugin_cid); // 身份（自愈匹配用）
-            // 音色状态 → 待恢复（实例就绪后应用；同路径保留的实例也会重放——幂等）
-            target.clearPendingState(self.allocator);
-            target.pending_state = b64Decode(self.allocator, si.plugin_state);
-            target.pending_state_ctrl = b64Decode(self.allocator, si.plugin_state_ctrl);
+            // 状态应用计划（商 DAW 式：旋钮级撤销走参数回放，不碰 setState）
+            switch (plan) {
+                .skip => {},
+                .replay => |job| {
+                    var ok = false;
+                    if (target.pending_state == null and target.pending_state_ctrl == null) {
+                        if (target.plugin) |pl| ok = runReplay(pl, job);
+                    }
+                    const iref = PluginSlotRef{ .kind = .instrument, .a = @intCast(self.instrumentIndexOf(target) orelse 0) };
+                    if (!ok) {
+                        // ID 失配/实例缺失/前提破坏 → 整块恢复兜底
+                        target.clearPendingState(self.allocator);
+                        target.pending_state = b64Decode(self.allocator, si.plugin_state);
+                        target.pending_state_ctrl = b64Decode(self.allocator, si.plugin_state_ctrl);
+                        self.markSlotStateDirty(iref);
+                    } else {
+                        self.markSlotStateClean(iref); // 回放后实例 = 目标状态
+                    }
+                },
+                .full => {
+                    target.clearPendingState(self.allocator);
+                    target.pending_state = b64Decode(self.allocator, si.plugin_state);
+                    target.pending_state_ctrl = b64Decode(self.allocator, si.plugin_state_ctrl);
+                    if (self.instrumentIndexOf(target)) |ii| {
+                        self.markSlotStateDirty(.{ .kind = .instrument, .a = @intCast(ii) });
+                    }
+                },
+            }
             if (target.kit) |kit| {
                 self.deinitDrumKit(kit);
                 target.kit = null;
@@ -2224,6 +2307,7 @@ pub const App = struct {
 
     /// 释放全部乐器（名字 + 合成器参数，含退役的）+ 保存相关字段——进程退出时调用
     pub fn deinitAll(self: *App) void {
+        self.clearGesture(); // 手势增量列表（无引擎依赖）先释放
         // 插件实例：引擎已停（main 的 defer 顺序保证）→ 直接同步销毁；
         // 退役列表中未到期的也必须在此强制释放（之后没人再跑回收）
         for (self.mixer_channels_state.items) |*mc| {
@@ -3141,13 +3225,166 @@ pub const App = struct {
     /// 触发点：静置计时、新操作起手（鼠标按下/其它提交）、编辑器关闭、保存、导航前。
     pub fn pinPendingGesture(self: *App) void {
         const g = self.gesture orelse return;
-        self.gesture = null;
         // 仅当临时条目仍是当前顶条（期间无其它提交/导航）才替换；否则丢弃（内容已错位）
-        if (g.index != self.history_current or g.index + 1 != self.history.items.len) return;
-        const st = self.captureHistory(g.label) catch return;
+        if (g.index != self.history_current or g.index + 1 != self.history.items.len) {
+            self.clearGesture();
+            return;
+        }
+        // 先备好增量拷贝（alloc(0) 也是可 free 的真分配；失败 → 放弃本次钉值）
+        std.mem.sort(ParamEditRec, g.param_edits.items, {}, paramEditLess);
+        const recs = self.allocator.alloc(ParamEditRec, g.param_edits.items.len) catch {
+            self.clearGesture();
+            return;
+        };
+        @memcpy(recs, g.param_edits.items);
+        const srefs = self.allocator.alloc(PluginSlotRef, g.structural_refs.items.len) catch {
+            self.allocator.free(recs);
+            self.clearGesture();
+            return;
+        };
+        @memcpy(srefs, g.structural_refs.items);
+        var st = self.captureHistory(g.label) catch {
+            self.allocator.free(recs);
+            self.allocator.free(srefs);
+            self.clearGesture();
+            return;
+        };
+        st.param_edits = recs;
+        st.structural_refs = srefs;
+        self.clearGesture();
         const old = &self.history.items[g.index];
         self.freeHistoryState(old);
         old.* = st;
+    }
+
+    /// 参数增量排序：按槽（kind,a,b）+ 参数 ID——同槽记录连续，应用侧取子切片
+    fn paramEditLess(_: void, a: ParamEditRec, b: ParamEditRec) bool {
+        if (a.ref.kind != b.ref.kind) return @intFromEnum(a.ref.kind) < @intFromEnum(b.ref.kind);
+        if (a.ref.a != b.ref.a) return a.ref.a < b.ref.a;
+        if (a.ref.b != b.ref.b) return a.ref.b < b.ref.b;
+        return a.param_id < b.param_id;
+    }
+
+    /// 乐器指针 → 下标（导出时查脏标用；非本容器指针 → null）
+    fn instrumentIndexOf(self: *const App, inst: *const model.Instrument) ?usize {
+        if (self.instruments.items.len == 0) return null;
+        const base = @intFromPtr(self.instruments.items.ptr);
+        const p = @intFromPtr(inst);
+        if (p < base) return null;
+        const off = p - base;
+        if (off % @sizeOf(model.Instrument) != 0) return null;
+        const i = off / @sizeOf(model.Instrument);
+        if (i >= self.instruments.items.len) return null;
+        return i;
+    }
+
+    const ReusePair = struct { comp: []const u8, ctrl: []const u8 };
+
+    /// 捕获复用（乐器）：槽未脏且来向条目同槽同路径 → 沿用其状态文本。
+    /// 返回 null = 必须重新 getState。**只用于历史快照**（工程保存永远现取）。
+    fn reuseInstrumentState(self: *const App, inst: *const model.Instrument, pooled: bool) ?ReusePair {
+        if (!pooled) return null;
+        if (self.history.items.len == 0) return null;
+        const ii = self.instrumentIndexOf(inst) orelse return null;
+        if (ii >= self.instr_state_dirty.len or self.instr_state_dirty[ii]) return null;
+        const prev = &self.history.items[self.history_current];
+        if (ii >= prev.instruments.len) return null;
+        const psi = &prev.instruments[ii];
+        if (!std.mem.eql(u8, inst.pluginPath(), psi.plugin_path)) return null;
+        return .{ .comp = psi.plugin_state, .ctrl = psi.plugin_state_ctrl };
+    }
+
+    /// 捕获复用（效果器槽）：同 `reuseInstrumentState`
+    fn reuseFxState(self: *const App, ch: usize, slot: usize, es: *const EffectSlot, pooled: bool) ?ReusePair {
+        if (!pooled) return null;
+        if (self.history.items.len == 0) return null;
+        if (ch >= max_mixer_channels or slot >= audio.effect_slots) return null;
+        if (self.fx_state_dirty[ch][slot]) return null;
+        const prev = &self.history.items[self.history_current];
+        if (ch >= prev.mixer.len) return null;
+        const psm = prev.mixer[ch];
+        if (slot >= psm.effects.len) return null;
+        const pse = psm.effects[slot];
+        if (!std.mem.eql(u8, es.pluginPath(), pse.plugin_path)) return null;
+        return .{ .comp = pse.plugin_state, .ctrl = pse.plugin_state_ctrl };
+    }
+
+    /// 取条目中某槽的增量段（条目内按 ref 有序 → 同槽连续）
+    fn slotRecs(edits: []const ParamEditRec, ref: PluginSlotRef) []const ParamEditRec {
+        var start: ?usize = null;
+        var end: usize = 0;
+        for (edits, 0..) |rec, i| {
+            if (sameSlotRef(rec.ref, ref)) {
+                if (start == null) start = i;
+                end = i + 1;
+            }
+        }
+        if (start) |s| return edits[s..end];
+        return &.{};
+    }
+
+    /// 参数回放资格判定：单步导航 + 该槽本步无结构信号 + 有增量 + 实例就绪 +
+    /// 参数缓存匹配“来向侧”值（缓存是唯一可信的现状依据）。null = 整块恢复。
+    fn replayPlanFor(self: *const App, ref: PluginSlotRef, prev_idx: usize, target_idx: usize) ?ReplayJob {
+        if (prev_idx == target_idx) return null;
+        const backward = prev_idx > target_idx;
+        const hi = @max(prev_idx, target_idx);
+        const lo = @min(prev_idx, target_idx);
+        if (hi - lo != 1) return null; // 多步跳转：不做增量拆解（罕见操作）
+        if (hi >= self.history.items.len) return null;
+        const step = &self.history.items[hi];
+        for (step.structural_refs) |sref| {
+            if (sameSlotRef(sref, ref)) return null;
+        }
+        const recs = slotRecs(step.param_edits, ref);
+        if (recs.len == 0) return null;
+        const pl = self.slotPlugin(ref) orelse return null;
+        for (recs) |rec| {
+            const pidx = pl.findParamIndex(rec.param_id) orelse return null;
+            const cached = pl.cacheGet(pidx) orelse return null;
+            const expect = if (backward) rec.new else rec.old;
+            if (cached != expect) return null;
+        }
+        return .{ .recs = recs, .backward = backward };
+    }
+
+    /// 乐器槽的应用计划（撤销/重做逐槽）
+    fn planInstrumentApply(self: *App, i: usize, prev_idx: usize, target_idx: usize, si: *const persist.SavedInstrument, target: *const model.Instrument) ApplyPlan {
+        if (prev_idx != target_idx and prev_idx < self.history.items.len) {
+            const prev = &self.history.items[prev_idx];
+            if (i < prev.instruments.len) {
+                const psi = &prev.instruments[i];
+                if (std.mem.eql(u8, si.plugin_path, psi.plugin_path) and
+                    stateBlobsEqual(si.plugin_state, si.plugin_state_ctrl, psi.plugin_state, psi.plugin_state_ctrl))
+                {
+                    return .skip;
+                }
+            }
+        }
+        const ref = PluginSlotRef{ .kind = .instrument, .a = @intCast(@min(i, std.math.maxInt(u16))) };
+        if (target.plugin != null) {
+            if (self.replayPlanFor(ref, prev_idx, target_idx)) |job| return .{ .replay = job };
+        }
+        return .full;
+    }
+
+    /// 参数增量回放（setParam 免锁路径）。false = 无法完成（调用方整块恢复兜底）
+    fn runReplay(pl: *vst_host.Plugin, job: ReplayJob) bool {
+        for (job.recs) |rec| {
+            const v = if (job.backward) rec.old else rec.new;
+            if (!pl.setParamById(rec.param_id, v)) return false;
+        }
+        return true;
+    }
+
+    /// 旧链同槽活插件（且路径一致）——效果器参数回放前提（救援可保留实例）
+    fn fxSlotLivePlugin(self: *const App, ch: usize, slot: usize, path: []const u8) ?*vst_host.Plugin {
+        if (ch >= self.mixer_channels_state.items.len) return null;
+        const chain = &self.mixer_channels_state.items[ch].effects;
+        if (slot >= chain.items.len) return null;
+        const pl = chain.items[slot].plugin orelse return null;
+        if (!std.mem.eql(u8, chain.items[slot].pluginPath(), path)) return null;
+        return pl;
     }
 
     /// 帧末调用：手势静置 ≥ 1s → 钉值。
@@ -3277,7 +3514,13 @@ pub const App = struct {
         const needs = kind >= 2 and kind <= 4;
         if (needs) {
             if (es.fx_state) |box| {
-                if (box.kind == kind) return; // 已就绪
+                if (box.kind == kind) {
+                    // 自愈：导入/撤销重建通道后，音频侧指针可能与当前盒错位（槽位错移）
+                    if (self.params.fx_ptrs[ci][slot].load(.monotonic) != box) {
+                        self.params.fx_ptrs[ci][slot].store(box, .monotonic);
+                    }
+                    return; // 已就绪
+                }
                 self.retireFxState(box);
                 es.fx_state = null;
             }
@@ -3407,7 +3650,20 @@ pub const App = struct {
         last_change_frame: u64,
         /// 起手提交的历史下标（pin 时替换该条快照）
         index: usize,
+        /// 本手势内插件参数编辑（折叠：同槽同参一条；pin 时按 ref 排序）
+        param_edits: std.ArrayListUnmanaged(ParamEditRec) = .{ .items = &.{}, .capacity = 0 },
+        /// 本手势内出现过结构性信号的槽
+        structural_refs: std.ArrayListUnmanaged(PluginSlotRef) = .{ .items = &.{}, .capacity = 0 },
     };
+
+    /// 丢弃进行中的手势（释放增量/结构信号列表）
+    fn clearGesture(self: *App) void {
+        if (self.gesture) |*g| {
+            g.param_edits.deinit(self.allocator);
+            g.structural_refs.deinit(self.allocator);
+            self.gesture = null;
+        }
+    }
 
     /// 标记“已保存”（脏标记清零 + 记住当前历史位置）
     pub fn markSaved(self: *App) void {
@@ -3422,6 +3678,225 @@ pub const App = struct {
     pub fn markPluginEdited(self: *App) void {
         self.dirty = true;
         self.plugin_dirty = true;
+    }
+
+    // ── 插件状态脏标（捕获复用：未变槽不再 getState）──
+
+    /// 置某槽插件状态脏标（一切已知状态变更必须调：参数编辑/结构信号/状态恢复/实例新载）
+    pub fn markSlotStateDirty(self: *App, ref: PluginSlotRef) void {
+        switch (ref.kind) {
+            .instrument => {
+                if (ref.a < self.instr_state_dirty.len) self.instr_state_dirty[ref.a] = true;
+            },
+            .fx => {
+                if (ref.a < max_mixer_channels and ref.b < audio.effect_slots) {
+                    self.fx_state_dirty[ref.a][ref.b] = true;
+                }
+            },
+        }
+    }
+
+    /// 插件状态按“已采纳”标记（恢复完成/参数回放完成）——与当前条目视为一致。
+    /// **关键语义**：插件恢复后的 `getState` 回声字节与存档字节常常不同
+    /// （实测 Vital：17.5 万字节里 11.5 万不同）——插件自身重归一化，不是用户编辑；
+    /// 若不按“已采纳”处理，下一次提交会把回声当成差异→幽灵历史条目，
+    /// 而幽灵条目的 blob 又与基线不同 → 跳转时整块 setState（卡顿）。
+    pub fn markSlotStateClean(self: *App, ref: PluginSlotRef) void {
+        switch (ref.kind) {
+            .instrument => {
+                if (ref.a < self.instr_state_dirty.len) self.instr_state_dirty[ref.a] = false;
+            },
+            .fx => {
+                if (ref.a < max_mixer_channels and ref.b < audio.effect_slots) {
+                    self.fx_state_dirty[ref.a][ref.b] = false;
+                }
+            },
+        }
+    }
+
+    /// 就地替换插件状态的**记账**（预设加载等无手势路径专用）：置脏 + 标插件已改 + 提交历史。
+    /// **这类路径必须走这里**：脏标驱动“提交时的差异检测 + 快照现取”——不置脏会被判
+    /// “无变化”而静默丢弃条目（效果器实症），或复用旧 blob 生成携带过期状态的条目
+    /// （乐器侧实症：靠 preset_name 差异勉强建了条目，但 blob 是旧状态）。
+    pub fn notePluginStateReplaced(self: *App, ref: PluginSlotRef, label: []const u8) void {
+        self.markSlotStateDirty(ref);
+        self.markPluginEdited();
+        self.commitHistory(label);
+    }
+
+    fn clearAllStateDirty(self: *App) void {
+        self.instr_state_dirty = [_]bool{false} ** synth.max_instruments;
+        self.fx_state_dirty = [_][audio.effect_slots]bool{[_]bool{false} ** audio.effect_slots} ** max_mixer_channels;
+    }
+
+    fn sameSlotRef(a: PluginSlotRef, b: PluginSlotRef) bool {
+        return a.kind == b.kind and a.a == b.a and a.b == b.b;
+    }
+
+    /// 槽引用 → 活插件实例（无 → null）
+    fn slotPlugin(self: *const App, ref: PluginSlotRef) ?*vst_host.Plugin {
+        switch (ref.kind) {
+            .instrument => {
+                if (ref.a >= self.instruments.items.len) return null;
+                return self.instruments.items[ref.a].plugin;
+            },
+            .fx => {
+                if (ref.a >= self.mixer_channels_state.items.len) return null;
+                const ch = &self.mixer_channels_state.items[ref.a];
+                if (ref.b >= ch.effects.items.len) return null;
+                return ch.effects.items[ref.b].plugin;
+            },
+        }
+    }
+
+    /// 宿主参数列表编辑（拖动/双击复位）**唯一入口**：应用 + 记录增量 + 手势。
+    /// “旧值”取参数缓存（缓存只由宿主写，故为本次编辑前值）。
+    pub fn setPluginParamHost(self: *App, ref: PluginSlotRef, pl: *vst_host.Plugin, idx: usize, norm: f64) void {
+        const old = pl.cacheGet(idx);
+        const id: u32 = if (idx < pl.params.len) pl.params[idx].id else 0;
+        pl.setParamHost(idx, norm);
+        self.markSlotStateDirty(ref);
+        self.markPluginEdited();
+        if (old) |o| {
+            if (self.gesture == null) {
+                self.touchGesture(self.paramGestureLabel(ref, pl, id));
+            } else {
+                self.touchGesture("调整插件参数"); // 续接：label 被忽略
+            }
+            self.recordParamEdit(ref, id, o, norm);
+        } else {
+            // 无缓存 → 无法回放：先建立手势（后续 setDirty/restart 往往同帧到）
+            self.notePluginStructural(ref);
+        }
+    }
+
+    /// 手势标签的“归属名”：乐器 → 乐器槽名（如“Solokey”）；效果器 → 通道名
+    /// （自定义优先，未命名用调音台同款占位名“主通道/通道#N”）；都取不到 → 插件名。
+    fn gestureOwnerName(self: *App, ref: PluginSlotRef, pl: *vst_host.Plugin, buf: []u8) []const u8 {
+        switch (ref.kind) {
+            .instrument => {
+                if (ref.a < self.instruments.items.len) {
+                    const n = self.instruments.items[ref.a].name;
+                    if (n.len > 0) return n;
+                }
+            },
+            .fx => {
+                if (ref.a < self.mixer_channels_state.items.len) {
+                    return self.mixer_channels_state.items[ref.a].displayName(ref.a, buf);
+                }
+            },
+        }
+        return pl.name();
+    }
+
+    /// 插件参数手势的标签（**“{归属名}: {参数名}”**，如“Solokey: Oscillator 1 Level”；
+    /// 英文冒号省宽；参数名未知 → 仅归属名；归属名异常为空 → 固定串）。
+    /// 借用 App 内固定缓冲：**仅在无进行中手势时调用**（否则会覆写到手势仍引用的内容）。
+    fn paramGestureLabel(self: *App, ref: PluginSlotRef, pl: *vst_host.Plugin, id: u32) []const u8 {
+        var owner_buf: [32]u8 = undefined;
+        const owner = self.gestureOwnerName(ref, pl, &owner_buf);
+        if (owner.len == 0) return "调整插件参数";
+        const buf = &self.gesture_label_buf;
+        var w: usize = @min(owner.len, buf.len);
+        @memcpy(buf[0..w], owner[0..w]);
+        const name = if (pl.findParamIndex(id)) |i| pl.params[i].name() else "";
+        if (name.len > 0) {
+            const sep = ": ";
+            if (w + sep.len < buf.len) {
+                @memcpy(buf[w .. w + sep.len], sep);
+                w += sep.len;
+            }
+            const n = @min(name.len, buf.len - w);
+            @memcpy(buf[w .. w + n], name[0..n]);
+            w += n;
+        }
+        return buf[0..w];
+    }
+
+    /// 排空某槽编辑器交互（帧末）。begin/perform/end 语义：
+    /// - begin（不同槽/参数）→ 先钉住当前手势：**换旋钮 = 切历史**；
+    /// - end → 仅消费（同旋钮连拧靠 1s 静置合并——用户拍板）；
+    /// - perform → 起手提交（手势）+ 记增量（旧值取缓存）；未知 ID/无缓存 → 结构信号。
+    pub fn drainSlotEditorEdits(self: *App, ref: PluginSlotRef, pl: *vst_host.Plugin) void {
+        var buf: [64]vst_host.EditEvent = undefined;
+        var any_perform = false;
+        while (true) {
+            const n = pl.drainEditEvents(&buf);
+            if (n == 0) break;
+            for (buf[0..n]) |ev| {
+                switch (ev.kind) {
+                    .begin => self.splitGestureOnBegin(ref, ev.id),
+                    .end => {},
+                    .perform => {
+                        if (!any_perform) {
+                            any_perform = true;
+                            self.markSlotStateDirty(ref);
+                            self.markPluginEdited();
+                            if (self.gesture == null) {
+                                self.touchGesture(self.paramGestureLabel(ref, pl, ev.id));
+                            } else {
+                                self.touchGesture("调整插件参数"); // 续接：label 被忽略
+                            }
+                        }
+                        self.applyEditorPerform(ref, pl, ev.id, ev.value);
+                    },
+                }
+            }
+        }
+        if (pl.takeEditOverflow()) self.notePluginStructural(ref);
+    }
+
+    /// 新互动的 begin：若当前手势已经在编辑**别的参数**（或别的槽）→ 先钉住（切开历史）。
+    /// 同参数 begin 续接（有的插件每次变动前都发 begin）。
+    fn splitGestureOnBegin(self: *App, ref: PluginSlotRef, id: u32) void {
+        const g = if (self.gesture) |*g| g else return;
+        for (g.param_edits.items) |rec| {
+            if (sameSlotRef(rec.ref, ref) and rec.param_id == id) return;
+        }
+        self.pinPendingGesture();
+    }
+
+    /// 一条 perform 的记账：增量（旧值取缓存）+ 缓存跟随；无法记增量 → 结构信号
+    fn applyEditorPerform(self: *App, ref: PluginSlotRef, pl: *vst_host.Plugin, id: u32, value: f64) void {
+        const idx = pl.findParamIndex(id);
+        var rec_ok = false;
+        if (idx) |i| {
+            if (pl.cacheGet(i)) |old| {
+                self.recordParamEdit(ref, id, old, value);
+                rec_ok = true;
+            }
+            pl.cacheSet(i, value); // 缓存跟随（后续编辑的“旧值”）
+        }
+        if (!rec_ok) {
+            if (self.gesture) |*g| self.addStructuralRef(g, ref);
+        }
+    }
+
+    /// 记录一条参数增量（同槽同参折叠：old 首次、new 末次）。无手势 → 丢弃（回落整块）
+    fn recordParamEdit(self: *App, ref: PluginSlotRef, param_id: u32, old: f64, new: f64) void {
+        const g = if (self.gesture) |*g| g else return;
+        for (g.param_edits.items) |*rec| {
+            if (sameSlotRef(rec.ref, ref) and rec.param_id == param_id) {
+                rec.new = new;
+                return;
+            }
+        }
+        g.param_edits.append(self.allocator, .{ .ref = ref, .param_id = param_id, .old = old, .new = new }) catch {};
+    }
+
+    fn addStructuralRef(self: *App, g: *Gesture, ref: PluginSlotRef) void {
+        for (g.structural_refs.items) |sref| {
+            if (sameSlotRef(sref, ref)) return;
+        }
+        g.structural_refs.append(self.allocator, ref) catch {};
+    }
+
+    /// 结构性改动信号（setDirty/restart/编辑溢出/无缓存）：本步禁用该槽参数回放
+    pub fn notePluginStructural(self: *App, ref: PluginSlotRef) void {
+        self.markSlotStateDirty(ref);
+        self.markPluginEdited();
+        self.touchGesture("编辑插件");
+        if (self.gesture) |*g| self.addStructuralRef(g, ref);
     }
 
     /// 新建（空）工程：重置为默认基线——
@@ -3475,6 +3950,8 @@ pub const App = struct {
         self.allocator.free(st.instruments);
         for (st.pattern_names) |nm| self.allocator.free(nm);
         self.allocator.free(st.pattern_names);
+        self.allocator.free(st.param_edits);
+        self.allocator.free(st.structural_refs);
     }
 
     /// 把当前调音台通道导出为存档切片（历史快照 / 工程保存共用）
@@ -3516,20 +3993,39 @@ pub const App = struct {
                 var comp_b64: []const u8 = "";
                 var ctrl_b64: []const u8 = "";
                 if (include_plugin_state and es.kind == .plugin) {
-                    const raw_c = try captureSlotStateB64(allocator, &es, true);
-                    const raw_k = try captureSlotStateB64(allocator, &es, false);
-                    if (pooled) {
-                        comp_b64 = if (raw_c.len > 0) (self.state_pool.intern(self.allocator, raw_c) orelse blk: {
-                            self.allocator.free(raw_c);
-                            break :blk "";
-                        }) else raw_c;
-                        ctrl_b64 = if (raw_k.len > 0) (self.state_pool.intern(self.allocator, raw_k) orelse blk: {
-                            self.allocator.free(raw_k);
-                            break :blk "";
-                        }) else raw_k;
+                    // 捕获复用：槽未脏且来向条目同槽同路径 → 沿其文本（intern 命中同块）
+                    if (self.reuseFxState(i, si, &es, pooled)) |r| {
+                        const rc = if (r.comp.len > 0) try self.allocator.dupe(u8, r.comp) else @as([]const u8, "");
+                        const rk = if (r.ctrl.len > 0) try self.allocator.dupe(u8, r.ctrl) else @as([]const u8, "");
+                        if (pooled) {
+                            comp_b64 = if (rc.len > 0) (self.state_pool.intern(self.allocator, rc) orelse blk: {
+                                self.allocator.free(rc);
+                                break :blk "";
+                            }) else rc;
+                            ctrl_b64 = if (rk.len > 0) (self.state_pool.intern(self.allocator, rk) orelse blk: {
+                                self.allocator.free(rk);
+                                break :blk "";
+                            }) else rk;
+                        } else {
+                            comp_b64 = rc;
+                            ctrl_b64 = rk;
+                        }
                     } else {
-                        comp_b64 = raw_c;
-                        ctrl_b64 = raw_k;
+                        const raw_c = try captureSlotStateB64(allocator, &es, true);
+                        const raw_k = try captureSlotStateB64(allocator, &es, false);
+                        if (pooled) {
+                            comp_b64 = if (raw_c.len > 0) (self.state_pool.intern(self.allocator, raw_c) orelse blk: {
+                                self.allocator.free(raw_c);
+                                break :blk "";
+                            }) else raw_c;
+                            ctrl_b64 = if (raw_k.len > 0) (self.state_pool.intern(self.allocator, raw_k) orelse blk: {
+                                self.allocator.free(raw_k);
+                                break :blk "";
+                            }) else raw_k;
+                        } else {
+                            comp_b64 = raw_c;
+                            ctrl_b64 = raw_k;
+                        }
                     }
                 }
                 // 状态已到手：后续失败时按归属释放（池块 release / 独占块 free）
@@ -3588,10 +4084,17 @@ pub const App = struct {
     ///   其余旧实例退役（延迟销毁，音频线程安全）；
     /// - 存档中的插件状态解码为 `pending_state`（实例就绪后由 syncPluginSlots 应用）；
     /// - 构建失败（OOM）→ 整体放弃，旧状态不变。
-    fn importMixerChannels(self: *App, mixer: []const persist.SavedMixerChannel) void {
+    /// `prev`：来向条目的通道快照（可为 null＝工程导入等无对照场景）。
+    /// `prev_idx`/`target_idx`：历史双向下标（逐槽应用计划：skip / 参数回放 / 整块）；
+    /// 实例/状态盒救援与它们无关。
+    fn importMixerChannels(self: *App, mixer: []const persist.SavedMixerChannel, prev: ?[]const persist.SavedMixerChannel, prev_idx: usize, target_idx: usize) void {
         const alloc = self.allocator;
         const n_saved = @min(mixer.len, max_mixer_channels);
         const n_total = if (mixer.len == 0) default_mixer_channels else n_saved;
+        // 参数回放任务（构建期登记；救援后执行——那时新槽才持有实例）
+        const ReplayJobSlot = struct { ch: usize, slot: usize, job: ReplayJob, saved: *const persist.SavedEffectSlot };
+        var replay_jobs: std.ArrayListUnmanaged(ReplayJobSlot) = .{ .items = &.{}, .capacity = 0 };
+        defer replay_jobs.deinit(alloc);
 
         // ── 1) 构建新通道列表（先不动旧链：救援需要旧槽仍存活）──
         var new_list: std.ArrayListUnmanaged(MixerChannel) = .{ .items = &.{}, .capacity = 0 };
@@ -3653,10 +4156,32 @@ pub const App = struct {
                             }
                         }
                     }
-                    // 插件状态（base64 → 原始字节；空/解码失败 → null，用默认参数）
+                    // 插件状态（base64 → 原始字节；空/解码失败 → null，用默认参数）。
+                    // 逐槽计划：状态未变 → 不设 pending；参数回放 → 延后（救援后执行）；
+                    // 其余 → pending（帧末 setState；防卡顿的商 DAW 式分流）
                     if (kind == .plugin) {
-                        slot.pending_state = b64Decode(alloc, se.plugin_state);
-                        slot.pending_state_ctrl = b64Decode(alloc, se.plugin_state_ctrl);
+                        var skip_state = false;
+                        if (prev) |pm| {
+                            if (i < pm.len and se_i < pm[i].effects.len) {
+                                const pse = pm[i].effects[se_i];
+                                skip_state = std.mem.eql(u8, se.plugin_path, pse.plugin_path) and
+                                    stateBlobsEqual(se.plugin_state, se.plugin_state_ctrl, pse.plugin_state, pse.plugin_state_ctrl);
+                            }
+                        }
+                        var replay_ok = false;
+                        if (!skip_state and prev_idx != target_idx) {
+                            const ref = PluginSlotRef{ .kind = .fx, .a = @intCast(@min(i, std.math.maxInt(u16))), .b = @intCast(@min(se_i, std.math.maxInt(u16))) };
+                            if (self.fxSlotLivePlugin(i, se_i, se.plugin_path) != null) {
+                                if (self.replayPlanFor(ref, prev_idx, target_idx)) |job| {
+                                    replay_jobs.append(alloc, .{ .ch = i, .slot = se_i, .job = job, .saved = &sm.effects[se_i] }) catch {};
+                                    replay_ok = true;
+                                }
+                            }
+                        }
+                        if (!skip_state and !replay_ok) {
+                            slot.pending_state = b64Decode(alloc, se.plugin_state);
+                            slot.pending_state_ctrl = b64Decode(alloc, se.plugin_state_ctrl);
+                        }
                     }
                     // 段：按需复制（旧存档 4 段 → 剩下的段保留默认值）
                     const nb: usize = @min(se.bands.len, slot.bands.len);
@@ -3695,11 +4220,40 @@ pub const App = struct {
             for (mc.effects.items, 0..) |*nes, si| {
                 if (si >= old_mc.effects.items.len) break;
                 const oes = &old_mc.effects.items[si];
+                // 内置效果（混响/延迟/压缩）：同位置同类型 → **DSP 状态盒随槽搬运**。
+                // 否则撤销/重做每次重建通道都会：延迟盒 768KB 重分配 + 尾音/回声清零
+                //（卡顿 + 跳音）
+                if (nes.kind == oes.kind and nes.kind != .plugin and nes.kind != .empty) {
+                    if (oes.fx_state) |box| {
+                        nes.fx_state = box;
+                        oes.fx_state = null; // 已搬走：退役清理不重复处理
+                    }
+                    continue;
+                }
                 const old_pl = oes.plugin orelse continue;
                 if (nes.kind != .plugin or oes.kind != .plugin) continue;
                 if (!std.mem.eql(u8, nes.pluginPath(), oes.pluginPath())) continue;
                 nes.plugin = old_pl;
                 oes.plugin = null; // 已搬走：退役循环跳过
+            }
+        }
+        // ── 2.5) 参数增量回放（实例已就位；setParam 免锁，不碰 setState）──
+        for (replay_jobs.items) |rj| {
+            var done = false;
+            if (rj.ch < new_list.items.len) {
+                const chain = &new_list.items[rj.ch].effects;
+                if (rj.slot < chain.items.len) {
+                    const nes = &chain.items[rj.slot];
+                    if (nes.plugin) |pl| done = runReplay(pl, rj.job);
+                    if (done) {
+                        self.markSlotStateClean(.{ .kind = .fx, .a = @intCast(rj.ch), .b = @intCast(rj.slot) });
+                    } else if (nes.pending_state == null and nes.pending_state_ctrl == null) {
+                        // 兜底：整块恢复（从目标保存文本解码）
+                        nes.pending_state = b64Decode(alloc, rj.saved.plugin_state);
+                        nes.pending_state_ctrl = b64Decode(alloc, rj.saved.plugin_state_ctrl);
+                        self.markSlotStateDirty(.{ .kind = .fx, .a = @intCast(rj.ch), .b = @intCast(rj.slot) });
+                    }
+                }
             }
         }
         // ── 3) 旧链：剩余实例退役 + 释放（含 pending 状态/状态盒）──
@@ -3756,6 +4310,11 @@ pub const App = struct {
             pat_names[i] = try self.allocator.dupe(u8, nm);
             pn += 1;
         }
+        // 参数增量默认空（pin 时填入）；仍用真分配（freeHistoryState 无条件 free）
+        const recs0 = try self.allocator.alloc(ParamEditRec, 0);
+        errdefer self.allocator.free(recs0);
+        // 已捕获（本次全部槽都已“现取或复用”）→ 插件状态脏标清零
+        self.clearAllStateDirty();
         return .{
             .label = label_copy,
             .notes = notes,
@@ -3763,6 +4322,7 @@ pub const App = struct {
             .instruments = insts,
             .mixer = mixer,
             .pattern_names = pat_names,
+            .param_edits = recs0,
             .bpm = self.bpm,
             .time_num = self.time_num,
             .time_den = self.time_den,
@@ -3788,7 +4348,7 @@ pub const App = struct {
                 a.pattern != b.pattern or a.offset != b.offset) return false;
         }
         if (st.instruments.len != self.instruments.items.len) return false;
-        for (st.instruments, self.instruments.items) |a, b| {
+        for (st.instruments, self.instruments.items, 0..) |a, b, ii| {
             if (a.volume != b.volume or a.pan != b.pan or a.muted != b.muted or
                 a.mixer != b.mixer or a.midi_channel != b.midi_channel) return false;
             if (!std.mem.eql(u8, a.name, b.name)) return false;
@@ -3815,7 +4375,7 @@ pub const App = struct {
             if (!std.meta.eql(a.synth, cur)) return false;
             // VST3 乐器：路径与音色也要比较——否则调音色/换插件被判“无变化”而静默丢历史
             if (!std.mem.eql(u8, a.plugin_path, b.pluginPath())) return false;
-            if (b.kind == .vst3) {
+            if (b.kind == .vst3 and ii < self.instr_state_dirty.len and self.instr_state_dirty[ii]) {
                 if (!self.instrumentStateMatchesLive(&b, a.plugin_state, a.plugin_state_ctrl)) return false;
             }
         }
@@ -3827,7 +4387,7 @@ pub const App = struct {
         }
         // 调音台通道（数量/增益/声像/静音/效果链）——否则“添加通道/效果器”会被判无变化
         if (st.mixer.len != self.mixer_channels_state.items.len) return false;
-        for (st.mixer, self.mixer_channels_state.items) |a, b| {
+        for (st.mixer, self.mixer_channels_state.items, 0..) |a, b, ci| {
             if (a.volume != b.volume or a.pan != b.pan or a.muted != b.muted) return false;
             // 通道名也要比较——否则重命名被判为“无变化”，静默丢弃历史条目
             if (!std.mem.eql(u8, a.name, b.name[0..b.name_len])) return false;
@@ -3846,9 +4406,10 @@ pub const App = struct {
                 for (ae.p, be.p) |pa, pb| {
                     if (pa != pb) return false;
                 }
-                // 插件路径与状态（历史快照携带插件 state；不一致 → 视为有变化）
+                // 插件路径与状态（历史快照携带插件 state；不一致 → 视为有变化）。
+                // 脏标未置 → 自上次捕获未变，免 getState 直接视为相等
                 if (!std.mem.eql(u8, ae.plugin_path, be.pluginPath())) return false;
-                if (be.kind == .plugin) {
+                if (be.kind == .plugin and ci < max_mixer_channels and si < audio.effect_slots and self.fx_state_dirty[ci][si]) {
                     if (!self.pluginStateMatchesLive(&be, ae.plugin_state, ae.plugin_state_ctrl)) return false;
                 }
             }
@@ -3991,12 +4552,18 @@ pub const App = struct {
     }
 
     /// 应用历史快照（恢复 = 整块回写；顺带钳制选择/乐器索引）
-    fn applyHistoryState(self: *App, st: *const HistoryState) void {
+    /// 应用历史条目。`prev_idx`＝**来向条目**（改 `history_current` 之前的下标）：
+    /// 用于跳过未变插件状态的重放——撤销/重做最贵的一步是逐插件 `setState`
+    /// （插件内部锁 + 可能重建内部状态 → 全曲卡顿），而多数条目间只有少数插件真正变过。
+    /// 判定：目标条目与来向条目该槽的状态（含路径）同内容；池化保证同内容常是同指针 → O(1)。
+    /// 前提“实例现状 == 来向条目状态”由两条纪律保证：编辑必经手势提交（导航前
+    /// `pinPendingGesture` 钉值），且条目应用后帧末即重放（同帧无第二次导航）。
+    fn applyHistoryState(self: *App, st: *const HistoryState, prev_idx: usize, target_idx: usize) void {
         // 播放中**不停播**：撤销/重做/跳转走“编辑重扫”（见 `publishHistoryRescan`）——
         // 停播会让编辑时音乐中断（回归 bug：Ctrl+Z / 点历史条目导致播放暂停）
         if (!self.playing) self.stopPlayback(); // 停止态：作废旧事件 + 清残留声部
         self.history_pending = null; // 拖动中的 coalesce 标记作废
-        self.gesture = null; // 进行中的手势作废（导航入口已先行钉值）
+        self.clearGesture(); // 进行中的手势作废（导航入口已先行钉值）
         // 拖动状态全部清空：撤销/重做后数据已换，旧拖动（及其快照/下标）
         // 会指向错误内容（下标可能越界）；用户需重新按下才能继续拖
         self.piano.drag_note = null;
@@ -4019,7 +4586,9 @@ pub const App = struct {
                     self.allocator.free(target.name);
                     target.name = dup;
                 }
-                self.applySavedInstrument(si, target);
+                // 逐槽状态应用计划（skip / 参数回放 / 整块）
+                const plan = self.planInstrumentApply(i, prev_idx, target_idx, si, target);
+                self.applySavedInstrument(si, target, plan);
             }
         } else {
             while (self.instruments.items.len > 0) {
@@ -4029,7 +4598,7 @@ pub const App = struct {
                 const idx = self.addInstrument(si.name);
                 if (idx < 0) continue;
                 const target = &self.instruments.items[@intCast(idx)];
-                self.applySavedInstrument(si, target);
+                self.applySavedInstrument(si, target, .full); // 全新实例：整块重放
             }
         }
         // 音符/片段
@@ -4052,8 +4621,13 @@ pub const App = struct {
         self.time_num = st.time_num;
         self.time_den = st.time_den;
         self.steps_per_bar = st.steps_per_bar;
-        // 调音台通道（含效果链）
-        self.importMixerChannels(st.mixer);
+        // 调音台通道（含效果链）。来向条目 + 双向下标 = 逐槽状态应用计划依据
+        self.importMixerChannels(
+            st.mixer,
+            if (prev_idx < self.history.items.len and prev_idx != target_idx) self.history.items[prev_idx].mixer else null,
+            prev_idx,
+            target_idx,
+        );
         // 选择钳制
         if (self.sel.pattern >= self.patternCount()) self.sel.pattern = self.patternCount() - 1;
         // 钢琴卷帘：目标样式可能已被撤销到不存在 → 钳到有效范围
@@ -4079,7 +4653,7 @@ pub const App = struct {
         self.pinPendingGesture(); // 手势未钉：先把最终值钉住再导航
         const old_idx = self.history_current;
         self.history_current -= 1;
-        self.applyHistoryState(&self.history.items[self.history_current]);
+        self.applyHistoryState(&self.history.items[self.history_current], old_idx, self.history_current);
         self.publishHistoryRescan(old_idx);
         self.dirty = self.history_current != self.history_saved_index or self.plugin_dirty;
         return true;
@@ -4091,7 +4665,7 @@ pub const App = struct {
         self.pinPendingGesture();
         const old_idx = self.history_current;
         self.history_current += 1;
-        self.applyHistoryState(&self.history.items[self.history_current]);
+        self.applyHistoryState(&self.history.items[self.history_current], old_idx, self.history_current);
         self.publishHistoryRescan(old_idx);
         self.dirty = self.history_current != self.history_saved_index or self.plugin_dirty;
         return true;
@@ -4103,7 +4677,7 @@ pub const App = struct {
         self.pinPendingGesture();
         const old_idx = self.history_current;
         self.history_current = index;
-        self.applyHistoryState(&self.history.items[index]);
+        self.applyHistoryState(&self.history.items[index], old_idx, index);
         self.publishHistoryRescan(old_idx);
         self.dirty = self.history_current != self.history_saved_index or self.plugin_dirty;
         return true;
@@ -4114,7 +4688,7 @@ pub const App = struct {
         for (self.history.items) |*st| self.freeHistoryState(st);
         self.history.clearRetainingCapacity();
         self.history_pending = null;
-        self.gesture = null;
+        self.clearGesture();
         if (self.captureHistory(label)) |st| {
             self.history.append(self.allocator, st) catch self.freeHistoryState(&st);
         } else |_| {}
@@ -4505,7 +5079,7 @@ pub const App = struct {
             const idx = self.addInstrument(inst.name);
             if (idx < 0) continue;
             const target = &self.instruments.items[@intCast(idx)];
-            self.applySavedInstrument(inst, target);
+            self.applySavedInstrument(inst, target, .full);
         }
 
         // 全局设置
@@ -4516,7 +5090,7 @@ pub const App = struct {
         self.time_den = p.time_den;
         self.steps_per_bar = p.steps_per_bar;
         // 调音台通道：**动态数量**（旧存档无此字段 → 保持默认 2 个）——共用 `importMixerChannels`
-        self.importMixerChannels(p.mixer);
+        self.importMixerChannels(p.mixer, null, 0, 0);
         // 样式列表：优先按名字恢复（含自定义名）；旧存档无名字 → 按数量重建默认名
         if (p.pattern_names.len > 0) {
             self.restorePatternNames(p.pattern_names);
@@ -7807,7 +8381,7 @@ test "app: 导入存档——延迟 p[0] 旧毫秒值迁移为节奏档位码" {
             },
         },
     };
-    app.importMixerChannels(&mixer);
+    app.importMixerChannels(&mixer, null, 0, 0);
     const chain = app.mixer_channels_state.items[0].effects;
     try std.testing.expectEqual(@as(usize, 1), chain.items.len);
     try std.testing.expectEqual(@as(f32, @floatFromInt(fx.delay_tempo_default)), chain.items[0].p[0]);
@@ -7823,7 +8397,7 @@ test "app: 导入存档——延迟 p[0] 旧毫秒值迁移为节奏档位码" {
             },
         },
     };
-    app.importMixerChannels(&mixer2);
+    app.importMixerChannels(&mixer2, null, 0, 0);
     const chain2 = app.mixer_channels_state.items[0].effects;
     try std.testing.expectEqual(@as(f32, 2), chain2.items[0].p[0]);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), chain2.items[0].p[1], 0.0001);
@@ -7891,7 +8465,7 @@ test "app: 插件槽——添加 / 存档往返（plugin_path）/ 无实例删�
     try std.testing.expectEqualStrings("C:\\fake\\test.vst3", saved[0].effects[0].plugin_path);
 
     // 导入回（现有链无实例——退役路径不应误判）
-    app.importMixerChannels(saved);
+    app.importMixerChannels(saved, null, 0, 0);
     try std.testing.expectEqualStrings("C:\\fake\\test.vst3", app.mixer_channels_state.items[0].effects.items[0].pluginPath());
     try std.testing.expectEqual(@as(usize, 0), app.retired_plugins.items.len);
 
@@ -8007,7 +8581,7 @@ test "VST3 状态：工程存档往返（base64 → pending 解码 → 恢复）
     defer app2.deinitAll();
     defer app2.clips.deinit(app2.allocator);
     defer app2.notes.deinit(app2.allocator);
-    app2.importMixerChannels(parsed.value.mixer);
+    app2.importMixerChannels(parsed.value.mixer, null, 0, 0);
     const es2 = &app2.mixer_channels_state.items[0].effects.items[0];
     try std.testing.expectEqual(EffectKind.plugin, es2.kind);
     try std.testing.expect(es2.pending_state != null);
@@ -8100,9 +8674,11 @@ test "VST3 乐器：音色随工程存档与撤销往返（pending → restoreSt
     try std.testing.expect(ni >= 0);
     const idx: usize = @intCast(ni);
     app.instruments.items[idx].plugin = pl;
+    const iref = PluginSlotRef{ .kind = .instrument, .a = @intCast(idx) };
+    pl.refreshParamCache(); // 生产：实例就绪帧自动建齐（测试手动）
     app.commitHistory("接入插件"); // 快照携带默认音色（0.1）
-    pl.setParamHost(0, 0.5); // level = 0.5
-    app.commitHistory("设定音色");
+    app.setPluginParamHost(iref, pl, 0, 0.5); // level = 0.5（唯一入口：应用 + 记录增量）
+    app.pinPendingGesture();
 
     // 工程导出（含乐器 state）→ JSON 往返
     const proj = try app.exportProject();
@@ -8114,14 +8690,272 @@ test "VST3 乐器：音色随工程存档与撤销往返（pending → restoreSt
     defer parsed.deinit();
     try std.testing.expect(parsed.value.instruments[0].plugin_state.len > 0);
 
-    // 改音色 → 提交 → 撤销 → pending 就绪 → 应用 → 回退 0.5
-    pl.setParamHost(0, 0.2);
-    app.commitHistory("改音色");
+    // 改音色 → 钉值 → 撤销 → **参数回放**（不整块 setState；pending 保持空）→ 回退 0.5
+    app.setPluginParamHost(iref, pl, 0, 0.2);
+    app.pinPendingGesture();
     try std.testing.expect(app.undo());
     const inst = &app.instruments.items[idx];
-    try std.testing.expect(inst.pending_state != null);
-    inst.plugin.?.restoreState(inst.pending_state.?, inst.pending_state_ctrl orelse &.{});
-    try std.testing.expectApproxEqAbs(@as(f64, 0.5), inst.plugin.?.paramNorm(0), 0.01);
+    try std.testing.expect(inst.pending_state == null); // 增量回放：无需整块恢复
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), pl.paramNorm(0), 0.01); // 回放 old
+    // 重做 → 回放 new（0.2）
+    try std.testing.expect(app.redo());
+    try std.testing.expectApproxEqAbs(@as(f64, 0.2), pl.paramNorm(0), 0.01);
+}
+
+test "工程加载恢复后：插件回声字节不算编辑（单击不产生幽灵历史）" {
+    // Vital 实测陷阱：setState(自己的存档字节) 后再 getState，字节不同（插件重归一化）——
+    // 若非“已采纳”处理：①单击片段提交→幽灵历史条目（实测 v4 工程）；
+    // ②幽灵条目 blob 与基线不同 → 条目间跳转每次对全部实例整块 setState（卡顿）。
+    const vital_path = "C:\\Program Files\\Common Files\\VST3/Vital.vst3";
+    const dll_z = std.testing.allocator.dupeZ(u8, vital_path) catch return;
+    defer std.testing.allocator.free(dll_z);
+    const pl = vst_host.loadPlugin(std.testing.allocator, dll_z, 48000, 4096, .instrument) catch return; // 未安装 → 跳过
+
+    var app = App{ .allocator = std.testing.allocator };
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    defer app.deinitAll();
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+
+    const ni = app.addInstrumentVst3(vital_path);
+    try std.testing.expect(ni >= 0);
+    const idx: usize = @intCast(ni);
+    app.instruments.items[idx].plugin = pl;
+    const iref = PluginSlotRef{ .kind = .instrument, .a = @intCast(idx) };
+    app.resetHistory("打开工程"); // E0 = “存档字节”
+
+    // 模拟“加载工程走一遍恢复”：pending(来自 E0) → 恢复 → **按已采纳标 clean**（修复后契约）
+    const si = app.history.items[0].instruments[0];
+    app.applySavedInstrument(&si, &app.instruments.items[idx], .full);
+    const inst = &app.instruments.items[idx];
+    const archive_raw = try std.testing.allocator.dupe(u8, inst.pending_state orelse &.{}); // 存档原始字节
+    defer std.testing.allocator.free(archive_raw);
+    pl.restoreState(archive_raw, inst.pending_state_ctrl orelse &.{});
+    inst.clearPendingState(app.allocator);
+    app.markSlotStateClean(iref);
+
+    // 前提：恢复回声确实与存档字节不同（插件已守恒时本场景不存在 → 跳过）
+    const st = pl.captureState(std.testing.allocator);
+    defer st.deinit(std.testing.allocator);
+    if (std.mem.eql(u8, st.comp, archive_raw)) return;
+
+    // ① 修复后：clean → 单击片段提交 → **不产生新条目**
+    const before = app.history.items.len;
+    app.commitHistory("移动片段");
+    try std.testing.expectEqual(before, app.history.items.len);
+
+    // ② 对照（修复前语义）：留着脏标 → 回声被当差异 → 幽灵条目，且其 blob ≠ 存档
+    //    （这正是“两条目间跳转整块 setState → 卡顿”的源头）
+    app.markSlotStateDirty(iref);
+    app.commitHistory("移动片段");
+    try std.testing.expectEqual(before + 1, app.history.items.len);
+    try std.testing.expect(!std.mem.eql(u8, app.history.items[before].instruments[0].plugin_state, si.plugin_state));
+}
+
+test "就地替换插件状态记账：提交建条目且快照现取（预设加载路径回归锁）" {
+    const dll_path = "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll";
+    const dll_z = std.testing.allocator.dupeZ(u8, dll_path) catch return;
+    defer std.testing.allocator.free(dll_z);
+
+    var app = App{ .allocator = std.testing.allocator };
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    defer app.deinitAll();
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    app.resetHistory("初始");
+
+    const slot = app.addEffect(0, .plugin) orelse return error.TestUnexpectedResult;
+    app.mixer_channels_state.items[0].effects.items[slot].setPluginPath(dll_path);
+    const pl = vst_host.loadEffect(std.testing.allocator, dll_z, 48000, 4096) catch return;
+    app.mixer_channels_state.items[0].effects.items[slot].plugin = pl;
+    const fref = PluginSlotRef{ .kind = .fx, .a = 0, .b = @intCast(slot) };
+    pl.refreshParamCache();
+    app.markSlotStateDirty(fref);
+    pl.setParamHost(0, 0.3);
+    app.commitHistory("接入插件"); // E_before：blob = 状态(0.3)
+
+    // 造一份“另一状态”的字节（0.7），然后让 live 回到 0.3（== 当前条目）
+    pl.setParamHost(0, 0.7);
+    const st = pl.captureState(std.testing.allocator);
+    defer st.deinit(std.testing.allocator);
+    pl.setParamHost(0, 0.3);
+
+    // 模拟预设加载（main.loadVst3Preset 的就地路径）：恢复 + 记账
+    const before = app.history.items.len;
+    pl.restoreState(st.comp, st.ctrl);
+    app.notePluginStateReplaced(fref, "加载预设");
+
+    // 条目建立 + 快照**现取**（blob 与上一条不同——不置脏的旧实现会静默丢弃或复用旧 blob）
+    try std.testing.expectEqual(before + 1, app.history.items.len);
+    try std.testing.expect(app.dirty and app.plugin_dirty);
+    const prev_blob = app.history.items[before - 1].mixer[0].effects[slot].plugin_state;
+    const new_blob = app.history.items[before].mixer[0].effects[slot].plugin_state;
+    try std.testing.expect(!std.mem.eql(u8, prev_blob, new_blob));
+    // 撤销 → 结构路径无增量 → 整块恢复 pending 就绪
+    try std.testing.expect(app.undo());
+    const es_u = &app.mixer_channels_state.items[0].effects.items[slot];
+    try std.testing.expect(es_u.pending_state != null);
+}
+
+test "编辑器参数手势切分规则：不同（槽/参数）的 begin 钉住当前手势；同参数续接" {
+    var app = App{ .allocator = std.testing.allocator };
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    defer app.deinitAll();
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    app.resetHistory("初始");
+
+    const fa = PluginSlotRef{ .kind = .fx, .a = 0, .b = 0 };
+    const fb = PluginSlotRef{ .kind = .fx, .a = 0, .b = 1 };
+    const fi = PluginSlotRef{ .kind = .instrument, .a = 0 };
+
+    // 造一个“A 手势”（临时条目 = 当前顶条，满足 pin 的 index 前提）
+    app.gesture = .{ .label = "调整插件参数：A", .last_change_frame = 0, .index = app.history_current };
+    if (app.gesture) |*g| {
+        try g.param_edits.append(app.allocator, .{ .ref = fa, .param_id = 7, .old = 0.1, .new = 0.5 });
+    }
+
+    // 同参数 begin → 续接（手势保持）
+    app.splitGestureOnBegin(fa, 7);
+    try std.testing.expect(app.gesture != null);
+
+    // 同槽不同参数 begin → 切：钉住当前手势（顶条目收官，label 保留）并清空手势
+    app.splitGestureOnBegin(fa, 8);
+    try std.testing.expect(app.gesture == null);
+    try std.testing.expectEqualStrings("调整插件参数：A", app.history.items[app.history.items.len - 1].label);
+
+    // 跨槽（不同槽 + 跨到乐器槽，同 ID）→ 同样切
+    app.gesture = .{ .label = "调整插件参数：B", .last_change_frame = 0, .index = app.history_current };
+    if (app.gesture) |*g| {
+        try g.param_edits.append(app.allocator, .{ .ref = fb, .param_id = 7, .old = 0.0, .new = 0.2 });
+    }
+    app.splitGestureOnBegin(fi, 7);
+    try std.testing.expect(app.gesture == null);
+}
+
+/// 测试辅助：“插件 GUI 内部”改参（只动控制器值、绕开宿主缓存/推送）——
+/// 真实顺序 = 先插件内部变化（本函数）、再 begin/perform/end 通知宿主。
+fn guiSetParam(pl: *vst_host.Plugin, idx: usize, v: f64) void {
+    const c = pl.controller orelse return;
+    const rc = pl.raw_controller orelse return;
+    _ = c.vtable.setParamNormalized(rc, pl.params[idx].id, v);
+}
+
+test "编辑器参数手势：同旋钮连拧合并为一条（静置语义；撤销一次全回退）" {
+    const dll_path = "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll";
+    const dll_z = std.testing.allocator.dupeZ(u8, dll_path) catch return;
+    defer std.testing.allocator.free(dll_z);
+
+    var app = App{ .allocator = std.testing.allocator };
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    defer app.deinitAll();
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+
+    const slot = app.addEffect(0, .plugin) orelse return error.TestUnexpectedResult;
+    app.mixer_channels_state.items[0].effects.items[slot].setPluginPath(dll_path);
+    const pl = vst_host.loadEffect(std.testing.allocator, dll_z, 48000, 4096) catch return;
+    app.mixer_channels_state.items[0].effects.items[slot].plugin = pl;
+    const fref = PluginSlotRef{ .kind = .fx, .a = 0, .b = @intCast(slot) };
+    pl.setParamHost(0, 0.31); // 专属基线（免与其它测试残留相撞）
+    pl.refreshParamCache();
+    app.markSlotStateDirty(fref);
+    // 通道命名（效果器归属名进标签）
+    {
+        const mc0 = &app.mixer_channels_state.items[0];
+        const cname = "Pedalboard";
+        @memcpy(mc0.name[0..cname.len], cname);
+        mc0.name_len = cname.len;
+    }
+    app.resetHistory("初始");
+    const vbase = pl.paramNorm(0);
+
+    const h = pl.handler_obj orelse return error.TestUnexpectedResult;
+    const id = pl.params[0].id;
+
+    // 一拧（GUI 内部改值 → begin/perform/end 通知）
+    _ = h.iface.vtable.beginEdit(&h.iface, id);
+    guiSetParam(pl, 0, 0.6);
+    _ = h.iface.vtable.performEdit(&h.iface, id, 0.6);
+    _ = h.iface.vtable.endEdit(&h.iface, id);
+    app.drainSlotEditorEdits(fref, pl);
+    // 立刻二拧（同参数 begin → 不切分）
+    _ = h.iface.vtable.beginEdit(&h.iface, id);
+    guiSetParam(pl, 0, 0.9);
+    _ = h.iface.vtable.performEdit(&h.iface, id, 0.9);
+    _ = h.iface.vtable.endEdit(&h.iface, id);
+    app.drainSlotEditorEdits(fref, pl);
+    try std.testing.expect(app.gesture != null); // 手势续接中（未切）
+
+    const n = app.history.items.len; // temp 条目
+    app.pinPendingGesture();
+    try std.testing.expectEqual(n, app.history.items.len); // 合并：仍是一条
+    // 标签 = “{归属名}: {参数名}”（效果器 → 通道名）
+    try std.testing.expect(std.mem.startsWith(u8, app.history.items[n - 1].label, "Pedalboard"));
+    try std.testing.expect(std.mem.endsWith(u8, app.history.items[n - 1].label, pl.params[0].name()));
+
+    // 撤销一次 → 两拧一起回退（合并证明）
+    try std.testing.expect(app.undo());
+    try std.testing.expectApproxEqAbs(vbase, pl.paramNorm(0), 1e-6);
+}
+
+test "编辑器参数手势：同一插件换旋钮切历史（Vital 实测场景：Level→Pan）" {
+    const vital_path = "C:\\Program Files\\Common Files\\VST3/Vital.vst3";
+    const dll_z = std.testing.allocator.dupeZ(u8, vital_path) catch return;
+    defer std.testing.allocator.free(dll_z);
+    const pl = vst_host.loadPlugin(std.testing.allocator, dll_z, 48000, 4096, .instrument) catch return; // 未安装 → 跳过
+    // 探针实测的 Vital 参数（版本差异 → 不存在则跳过）
+    const li = pl.findParamIndex(50797) orelse return; // Oscillator 1 Level
+    const pi = pl.findParamIndex(50800) orelse return; // Oscillator 1 Pan
+
+    var app = App{ .allocator = std.testing.allocator };
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    defer app.deinitAll();
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+
+    const ni = app.addInstrumentVst3(vital_path);
+    try std.testing.expect(ni >= 0);
+    const idx: usize = @intCast(ni);
+    app.instruments.items[idx].plugin = pl;
+    app.renamePlaceholderInstrument(idx, "Solokey"); // 乐器名进标签（如“Solokey: Oscillator 1 Level”）
+    const iref = PluginSlotRef{ .kind = .instrument, .a = @intCast(idx) };
+    pl.refreshParamCache();
+    app.markSlotStateDirty(iref);
+    app.resetHistory("初始");
+
+    const h = pl.handler_obj orelse return error.TestUnexpectedResult;
+    const lvbase = pl.paramNorm(li);
+    // 拧 Level（GUI 内部改值 → begin/perform/end）
+    _ = h.iface.vtable.beginEdit(&h.iface, 50797);
+    guiSetParam(pl, li, 0.3);
+    _ = h.iface.vtable.performEdit(&h.iface, 50797, 0.3);
+    _ = h.iface.vtable.endEdit(&h.iface, 50797);
+    app.drainSlotEditorEdits(iref, pl);
+    // 立刻拧 Pan：begin 不同参数 → 应切历史
+    _ = h.iface.vtable.beginEdit(&h.iface, 50800);
+    guiSetParam(pl, pi, 0.7);
+    _ = h.iface.vtable.performEdit(&h.iface, 50800, 0.7);
+    _ = h.iface.vtable.endEdit(&h.iface, 50800);
+    app.drainSlotEditorEdits(iref, pl);
+    app.pinPendingGesture();
+
+    try std.testing.expectEqual(@as(usize, 3), app.history.items.len); // 初始 + Level + Pan
+    try std.testing.expect(std.mem.startsWith(u8, app.history.items[1].label, "Solokey"));
+    try std.testing.expect(std.mem.endsWith(u8, app.history.items[1].label, pl.params[li].name()));
+    try std.testing.expect(std.mem.endsWith(u8, app.history.items[2].label, pl.params[pi].name()));
+    try std.testing.expect(!std.mem.eql(u8, app.history.items[1].label, app.history.items[2].label));
+    // 两步撤销：Pan 先回退、Level 不受影响；再撤销 → Level 回退到基线
+    try std.testing.expect(app.undo());
+    try std.testing.expectApproxEqAbs(@as(f64, 0.3), pl.paramNorm(li), 0.02);
+    try std.testing.expect(app.undo());
+    try std.testing.expect(app.history_current == 0);
+    try std.testing.expectApproxEqAbs(lvbase, pl.paramNorm(li), 0.02);
 }
 
 test "VST3 乐器：加载后占位名 → 插件真名（重名去重 #N）" {
@@ -8169,13 +9003,201 @@ test "VST3 乐器：换路径清零旧 pending（防参数灌到别的乐器）�
     var si = persist.SavedInstrument{ .kind = 2 };
     si.plugin_path = "C:\\x\\new.vst3";
     si.plugin_state = ""; // 新乐器无音色
-    app.applySavedInstrument(&si, &app.instruments.items[0]);
+    app.applySavedInstrument(&si, &app.instruments.items[0], .full);
     const inst2 = &app.instruments.items[0];
     try std.testing.expectEqualStrings("C:\\x\\new.vst3", inst2.pluginPath());
     try std.testing.expect(inst2.pending_state == null); // 旧 pending 已释放（否则测试分配器报泄漏）
     try std.testing.expect(inst2.pending_state_ctrl == null);
     try std.testing.expect(!inst2.load_failed); // 新路径 → 失败态重置，立即尝试
     try std.testing.expectEqual(@as(u16, 0), inst2.fail_wait);
+}
+
+test "撤销：状态未变的插件槽跳过重放（不设 pending → 无 setState 风暴）" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    defer app.deinitAll();
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    app.resetHistory("初始");
+
+    // 通道 0 加一个 VST3 效果槽（无实例：状态串为空）
+    {
+        var slot = EffectSlot{ .kind = .plugin };
+        slot.setPluginPath("C:\\fx\\a.vst3");
+        app.mixer_channels_state.items[0].effects.append(alloc, slot) catch unreachable;
+    }
+    app.commitHistory("添加效果器");
+    app.mixer_channels_state.items[0].volume = 0.5;
+    app.commitHistory("调音量");
+
+    // 撤销到“添加效果器”：效果槽状态与来向条目同内容 → 跳过重放（不设 pending）
+    try std.testing.expect(app.undo());
+    const es = &app.mixer_channels_state.items[0].effects.items[0];
+    try std.testing.expect(es.kind == .plugin);
+    try std.testing.expect(es.pending_state == null);
+    try std.testing.expect(es.pending_state_ctrl == null);
+
+    // 重做再撤销：内容仍一致 → 仍跳过（且无泄漏）
+    try std.testing.expect(app.redo());
+    const es2 = &app.mixer_channels_state.items[0].effects.items[0];
+    try std.testing.expect(es2.pending_state == null);
+    try std.testing.expect(app.undo());
+    try std.testing.expect(app.mixer_channels_state.items[0].effects.items[0].pending_state == null);
+}
+
+test "撤销：VST3 乐器状态未变时跳过重放（pending 不设）" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    defer app.deinitAll();
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    app.resetHistory("初始");
+
+    try std.testing.expect(app.addInstrumentVst3("C:\\v\\syn.vst3") == 0);
+    app.commitHistory("添加乐器");
+    app.instruments.items[0].volume = 0.3;
+    app.commitHistory("调音量");
+
+    try std.testing.expect(app.undo());
+    const inst = &app.instruments.items[0];
+    try std.testing.expect(inst.kind == .vst3);
+    try std.testing.expect(inst.pending_state == null); // 状态未变 → 不重放
+    try std.testing.expect(inst.pending_state_ctrl == null);
+    try std.testing.expectEqual(@as(f32, 0.8), inst.volume); // 其它字段照常回退
+}
+
+test "VST3 编辑队列：多条排空/最后一条兼容/溢出降级" {
+    const dll_z = std.testing.allocator.dupeZ(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll") catch return;
+    defer std.testing.allocator.free(dll_z);
+    const pl = vst_host.loadEffect(std.testing.allocator, dll_z, 48000, 4096) catch return;
+    defer vst_host.unloadPlugin(std.testing.allocator, pl);
+    const h = pl.handler_obj orelse return error.TestUnexpectedResult;
+
+    // 一次拖动 = 大量连续编辑：必须**全量**排出（此前只留最后一条）
+    for (0..100) |i| _ = h.iface.vtable.performEdit(&h.iface, 7, @as(f64, @floatFromInt(i)) / 100.0);
+    var buf: [16]vst_host.ParamEdit = undefined;
+    var total: usize = 0;
+    var last = vst_host.ParamEdit{ .id = 0, .value = 0 };
+    while (true) {
+        const n = pl.drainEditorEdits(&buf);
+        if (n == 0) break;
+        total += n;
+        last = buf[n - 1];
+    }
+    try std.testing.expectEqual(@as(usize, 100), total);
+    try std.testing.expectEqual(@as(u32, 7), last.id);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.99), last.value, 1e-9);
+
+    // `pollEditorEdit` 兼容旧语义（取最后一条）
+    _ = h.iface.vtable.performEdit(&h.iface, 8, 0.25);
+    const pe = pl.pollEditorEdit() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 8), pe.id);
+    try std.testing.expect(pl.pollEditorEdit() == null);
+
+    // begin/perform/end 三类事件保序（新接口）
+    _ = h.iface.vtable.beginEdit(&h.iface, 7);
+    _ = h.iface.vtable.performEdit(&h.iface, 7, 0.5);
+    _ = h.iface.vtable.endEdit(&h.iface, 7);
+    var ebuf: [8]vst_host.EditEvent = undefined;
+    const ne = pl.drainEditEvents(&ebuf);
+    try std.testing.expectEqual(@as(usize, 3), ne);
+    try std.testing.expect(ebuf[0].kind == .begin and ebuf[0].id == 7);
+    try std.testing.expect(ebuf[1].kind == .perform and ebuf[1].id == 7);
+    try std.testing.expect(ebuf[2].kind == .end and ebuf[2].id == 7);
+
+    // perform-only 兼容接口：begin/end 一并消费（不丢 perform）
+    _ = h.iface.vtable.beginEdit(&h.iface, 9);
+    _ = h.iface.vtable.performEdit(&h.iface, 9, 0.6);
+    _ = h.iface.vtable.endEdit(&h.iface, 9);
+    var pbuf2: [4]vst_host.ParamEdit = undefined;
+    const np2 = pl.drainEditorEdits(&pbuf2);
+    try std.testing.expectEqual(@as(usize, 1), np2);
+    try std.testing.expectEqual(@as(u32, 9), pbuf2[0].id);
+
+    // 溢出：写 300 条不读 → 丢弃 + 降级旗标（消费方须回落整块恢复）
+    for (0..300) |i| _ = h.iface.vtable.performEdit(&h.iface, 9, @as(f64, @floatFromInt(i)) / 300.0);
+    try std.testing.expectEqual(@as(usize, 0), pl.drainEditorEdits(&buf));
+    try std.testing.expect(pl.takeEditOverflow());
+    try std.testing.expect(!pl.takeEditOverflow());
+}
+
+test "撤销：参数增量回放（不 setState）+ 未变槽捕获复用（零 getState）" {
+    const dll_path = "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll";
+    const dll_z = std.testing.allocator.dupeZ(u8, dll_path) catch return;
+    defer std.testing.allocator.free(dll_z);
+
+    var app = App{ .allocator = std.testing.allocator };
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    defer app.deinitAll();
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    app.resetHistory("初始");
+
+    const slot = app.addEffect(0, .plugin) orelse return error.TestUnexpectedResult;
+    app.mixer_channels_state.items[0].effects.items[slot].setPluginPath(dll_path);
+    const pl = vst_host.loadEffect(std.testing.allocator, dll_z, 48000, 4096) catch return;
+    app.mixer_channels_state.items[0].effects.items[slot].plugin = pl;
+    const fref = PluginSlotRef{ .kind = .fx, .a = 0, .b = @intCast(slot) };
+    pl.refreshParamCache(); // 生产：实例就绪帧自动建齐（测试手动）
+    app.markSlotStateDirty(fref);
+    pl.setParamHost(0, 0.8);
+    app.commitHistory("接入插件");
+
+    // 与插件无关的编辑（BPM）→ 未脏槽捕获复用：**不调 getState**
+    const c0 = pl.get_state_calls;
+    app.bpm = 130;
+    app.commitHistory("改 BPM");
+    try std.testing.expectEqual(c0, pl.get_state_calls);
+
+    // 旋钮：0.8 → 0.2（唯一入口，带增量）；钉值后撤销 → 参数回放
+    app.setPluginParamHost(fref, pl, 0, 0.2);
+    app.pinPendingGesture();
+    try std.testing.expect(app.undo());
+    const es_u = &app.mixer_channels_state.items[0].effects.items[slot];
+    try std.testing.expect(es_u.pending_state == null); // 未整块 setState
+    try std.testing.expectApproxEqAbs(@as(f64, 0.8), pl.paramNorm(0), 0.01); // 回放 old
+    // 重做 → 回放 new（0.2）
+    try std.testing.expect(app.redo());
+    try std.testing.expectApproxEqAbs(@as(f64, 0.2), pl.paramNorm(0), 0.01);
+}
+
+test "撤销：结构性信号存在时参数回放降级为整块恢复（pending 就绪）" {
+    const dll_path = "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll";
+    const dll_z = std.testing.allocator.dupeZ(u8, dll_path) catch return;
+    defer std.testing.allocator.free(dll_z);
+
+    var app = App{ .allocator = std.testing.allocator };
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    defer app.deinitAll();
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    app.resetHistory("初始");
+
+    const slot = app.addEffect(0, .plugin) orelse return error.TestUnexpectedResult;
+    app.mixer_channels_state.items[0].effects.items[slot].setPluginPath(dll_path);
+    const pl = vst_host.loadEffect(std.testing.allocator, dll_z, 48000, 4096) catch return;
+    app.mixer_channels_state.items[0].effects.items[slot].plugin = pl;
+    const fref = PluginSlotRef{ .kind = .fx, .a = 0, .b = @intCast(slot) };
+    pl.refreshParamCache();
+    app.markSlotStateDirty(fref);
+    pl.setParamHost(0, 0.8);
+    app.commitHistory("接入插件");
+
+    // 旋钮 + 结构信号（setDirty/restart/溢出同类）→ 本步禁参数回放
+    app.setPluginParamHost(fref, pl, 0, 0.2);
+    app.notePluginStructural(fref);
+    app.pinPendingGesture();
+    try std.testing.expect(app.undo());
+    const es_u = &app.mixer_channels_state.items[0].effects.items[slot];
+    try std.testing.expect(es_u.pending_state != null); // 降级：整块恢复就绪
+    pl.restoreState(es_u.pending_state.?, es_u.pending_state_ctrl orelse &.{});
+    try std.testing.expectApproxEqAbs(@as(f64, 0.8), pl.paramNorm(0), 0.01);
 }
 
 test "VST3 预设：分类标签/可用性/路径解析（扫描缓存驱动）" {
@@ -8556,15 +9578,20 @@ test "VST3 状态：历史携带插件状态（池共享/去重）与撤销回�
     // 注：zig-vst3 示例插件的参数是**进程级全局存储**（多实例共享）——先设一个专属基线值，
     // 避免与前面测试残留的全局值相撞导致去重误跳（测试环境特有问题）
     const pl = app.mixer_channels_state.items[0].effects.items[slot].plugin.?;
+    const fref = PluginSlotRef{ .kind = .fx, .a = 0, .b = @intCast(slot) };
     pl.setParamHost(0, 0.9);
+    app.markSlotStateDirty(fref); // 生产路径经 setPluginParamHost 钩子自动置脏（此处直调插件 API）
     app.commitHistory("添加插件");
 
     // 三次调参：A(0.3) → B(0.5) → A2(0.3)
     pl.setParamHost(0, 0.3);
+    app.markSlotStateDirty(fref);
     app.commitHistory("调参 A");
     pl.setParamHost(0, 0.5);
+    app.markSlotStateDirty(fref);
     app.commitHistory("调参 B");
     pl.setParamHost(0, 0.3);
+    app.markSlotStateDirty(fref);
     app.commitHistory("调参 A2");
     try std.testing.expectEqual(@as(usize, 5), app.history.items.len);
 

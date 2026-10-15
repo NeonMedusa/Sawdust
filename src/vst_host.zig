@@ -24,6 +24,9 @@
 
 const std = @import("std");
 const vst3 = @import("zig_vst3");
+
+/// 编辑器编辑环形队列长度（每条 16B；UI 每帧排空，容量按“极端扫动一帧上百条”留裕量）
+const edit_ring_len = 256;
 const ipb = vst3.pluginterfaces.base.ipluginbase;
 const btypes = vst3.pluginterfaces.base.types;
 const tuid = vst3.tuid;
@@ -368,6 +371,12 @@ pub const HostTime = struct {
 /// 一次插件 GUI 内的参数编辑（轮询出来供面板同步/标脏）
 pub const ParamEdit = struct { id: u32, value: f64 };
 
+/// 编辑器参数交互事件种类（`IComponentHandler` 的 begin/perform/end 三件套）
+pub const EditEventKind = enum(u8) { begin = 0, perform = 1, end = 2 };
+
+/// 一条编辑器交互事件（环形队列元素；begin/end 的 value 无义）
+pub const EditEvent = struct { kind: EditEventKind, id: u32, value: f64 };
+
 /// `IComponentHandler::restartComponent` 标志（Vst::RestartFlags 子集）
 pub const kLatencyChanged: i32 = 1 << 3;
 
@@ -635,19 +644,16 @@ const PluginHandler = extern struct {
     fn release2(ptr: *anyopaque) callconv(.c) btypes.uint32 {
         return ownerOf2(ptr).ref_count.fetchSub(1, .seq_cst) - 1;
     }
-    fn beginEdit(_: *anyopaque, _: vsttypes.ParamID) callconv(.c) btypes.tresult {
+    fn beginEdit(ptr: *anyopaque, id: vsttypes.ParamID) callconv(.c) btypes.tresult {
+        if (ownerOf(ptr).owner) |pl| pl.recordEditEvent(.begin, id, 0);
         return btypes.kResultOk;
     }
     fn performEdit(ptr: *anyopaque, id: vsttypes.ParamID, value: vsttypes.ParamValue) callconv(.c) btypes.tresult {
-        const self = ownerOf(ptr);
-        if (self.owner) |pl| {
-            pl.edit_param.store(id, .monotonic);
-            pl.edit_value_bits.store(@bitCast(value), .monotonic);
-            _ = pl.edit_seq.fetchAdd(1, .release);
-        }
+        if (ownerOf(ptr).owner) |pl| pl.recordEditEvent(.perform, id, value);
         return btypes.kResultOk;
     }
-    fn endEdit(_: *anyopaque, _: vsttypes.ParamID) callconv(.c) btypes.tresult {
+    fn endEdit(ptr: *anyopaque, id: vsttypes.ParamID) callconv(.c) btypes.tresult {
+        if (ownerOf(ptr).owner) |pl| pl.recordEditEvent(.end, id, 0);
         return btypes.kResultOk;
     }
     fn restartComponent(ptr: *anyopaque, flags: btypes.int32) callconv(.c) btypes.tresult {
@@ -673,6 +679,7 @@ const PluginHandler = extern struct {
         return btypes.kResultOk;
     }
     fn startGroupEdit(_: *anyopaque) callconv(.c) btypes.tresult {
+        // IComponentHandler2 分组编辑：暂不参与手势切分（将来：组内禁按参数切）
         return btypes.kResultOk;
     }
     fn finishGroupEdit(_: *anyopaque) callconv(.c) btypes.tresult {
@@ -965,11 +972,22 @@ pub const Plugin = struct {
     ctx: ivstprocesscontext.ProcessContext = .{},
     /// 每插件组件处理器实例（加载时创建；记录插件 GUI 内编辑与 restart 请求）
     handler_obj: ?*PluginHandler = null,
-    edit_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    edit_param: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    edit_value_bits: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    restart_flags: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
+    /// 编辑器交互事件**环形队列**（插件 GUI 线程写、宿主 UI 线程读）：begin/perform/end
+    /// 三类事件全量保留——撤销“参数增量回放”的数据源；begin 事件还用于“按旋钮切历史”。
+    edit_ring: [edit_ring_len]EditEvent = [_]EditEvent{.{ .kind = .perform, .id = 0, .value = 0 }} ** edit_ring_len,
+    /// 累计写入数（单调）；`edit_ring[w % len]` 为最新一条
+    edit_w: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// 已读累计数（仅 UI 线程写）
     edit_seen: u32 = 0,
+    /// 写超读丢段（消费方降级为整块状态恢复）
+    edit_overflow: bool = false,
+    /// 参数值缓存（归一化；下标与 `params` 对齐）。**撤销“旧值”的精确来源**：
+    /// 只由宿主写（编辑器侧变更由 UI 排空时同步）——故“编辑前值”恒准。
+    param_cache: []f64 = &.{},
+    param_cache_valid: bool = false,
+    /// 统计：`captureState` 实际调用次数（测试断言“捕获复用”用）
+    get_state_calls: u32 = 0,
+    restart_flags: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
     /// 插件经 IComponentHandler2::setDirty(true) 的标脏通知（计数，去重轮询）
     dirty_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     dirty_seen: u32 = 0,
@@ -1055,6 +1073,7 @@ pub const Plugin = struct {
         const v = std.math.clamp(norm, 0, 1);
         _ = c.vtable.setParamNormalized(rc, self.params[idx].id, v);
         self.pushParamMsg(self.params[idx].id, v);
+        self.cacheSet(idx, v); // 缓存跟随宿主写入（编辑器侧由排空时同步）
     }
 
     /// 当前归一化值
@@ -1081,15 +1100,120 @@ pub const Plugin = struct {
         return std.fmt.bufPrint(buf, "{d:.3}", .{v}) catch "";
     }
 
-    /// 插件 GUI 内的参数编辑（去重轮询；无新编辑 → null）
+    /// 插件 GUI 内的参数编辑（去重轮询；无新编辑 → null）。
+    /// 注：缓存/增量场景请用 `drainEditorEdits`（本函数只回最后一条，兼容旧调用）
     pub fn pollEditorEdit(self: *Plugin) ?ParamEdit {
-        const seq = self.edit_seq.load(.acquire);
-        if (seq == self.edit_seen) return null;
-        self.edit_seen = seq;
-        return .{
-            .id = self.edit_param.load(.monotonic),
-            .value = @bitCast(self.edit_value_bits.load(.monotonic)),
-        };
+        var buf: [8]ParamEdit = undefined;
+        const n = self.drainEditorEdits(&buf);
+        if (n == 0) return null;
+        return buf[n - 1];
+    }
+
+    /// 记录一条编辑器交互事件（插件 GUI 线程；**不动参数缓存**——缓存中的值
+    /// 必须保持“宿主已知的当前值”，排空时它正好是编辑前的旧值）。
+    pub fn recordEditEvent(self: *Plugin, kind: EditEventKind, id: u32, value: f64) void {
+        const w = self.edit_w.load(.monotonic);
+        self.edit_ring[w % edit_ring_len] = .{ .kind = kind, .id = id, .value = value };
+        self.edit_w.store(w + 1, .release);
+    }
+
+    /// 兼容旧名（只记录 perform）
+    pub fn recordEditorEdit(self: *Plugin, id: u32, value: f64) void {
+        self.recordEditEvent(.perform, id, value);
+    }
+
+    /// 排空交互事件队列（UI 线程，**保序**）；返回拷出的条数。写超读超过一圈 →
+    /// 丢弃并置 `takeEditOverflow`（消费方须降级）。
+    pub fn drainEditEvents(self: *Plugin, out: []EditEvent) usize {
+        const w = self.edit_w.load(.acquire);
+        if (w -% self.edit_seen > edit_ring_len) {
+            // 追不上：中间段已被覆盖，全部作废（降级信号）
+            self.edit_seen = w;
+            self.edit_overflow = true;
+            return 0;
+        }
+        var n: usize = 0;
+        while (self.edit_seen != w and n < out.len) {
+            out[n] = self.edit_ring[self.edit_seen % edit_ring_len];
+            self.edit_seen += 1;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// 兼容接口：只拷出 perform 事件（begin/end 一并**消费**——单一消费者模型；
+    /// 输出满时游标停在未消费事件上，不丢事件）
+    pub fn drainEditorEdits(self: *Plugin, out: []ParamEdit) usize {
+        const w = self.edit_w.load(.acquire);
+        if (w -% self.edit_seen > edit_ring_len) {
+            self.edit_seen = w;
+            self.edit_overflow = true;
+            return 0;
+        }
+        var n: usize = 0;
+        while (self.edit_seen != w) {
+            const ev = self.edit_ring[self.edit_seen % edit_ring_len];
+            if (ev.kind == .perform) {
+                if (n >= out.len) break;
+                out[n] = .{ .id = ev.id, .value = ev.value };
+                n += 1;
+            }
+            self.edit_seen += 1;
+        }
+        return n;
+    }
+
+    /// 取走溢出旗标（读后清零）
+    pub fn takeEditOverflow(self: *Plugin) bool {
+        const f = self.edit_overflow;
+        self.edit_overflow = false;
+        return f;
+    }
+
+    // ── 参数值缓存与按 ID 回放（撤销“参数增量回放”支撑）──
+
+    /// 重建参数值缓存（加载完成/状态恢复后调用；UI 线程）
+    pub fn refreshParamCache(self: *Plugin) void {
+        const c = self.controller orelse return;
+        const rc = self.raw_controller orelse return;
+        if (self.param_cache.len != self.params.len) {
+            if (self.param_cache.len > 0) self.alloc.free(self.param_cache);
+            self.param_cache = self.alloc.alloc(f64, self.params.len) catch {
+                self.param_cache = &.{};
+                self.param_cache_valid = false;
+                return;
+            };
+        }
+        for (self.params, 0..) |p, i| {
+            self.param_cache[i] = c.vtable.getParamNormalized(rc, p.id);
+        }
+        self.param_cache_valid = true;
+    }
+
+    /// 缓存读（无效 → null）；调用方据此决定能否参数回放
+    pub fn cacheGet(self: *const Plugin, idx: usize) ?f64 {
+        if (!self.param_cache_valid or idx >= self.param_cache.len) return null;
+        return self.param_cache[idx];
+    }
+
+    /// 缓存写（无效则不动；供排空/回放时同步）
+    pub fn cacheSet(self: *Plugin, idx: usize, v: f64) void {
+        if (self.param_cache_valid and idx < self.param_cache.len) self.param_cache[idx] = v;
+    }
+
+    /// 参数 ID → 下标（插件参数表通常几十~几百项；线性扫描足够）
+    pub fn findParamIndex(self: *const Plugin, id: u32) ?usize {
+        for (self.params, 0..) |p, i| {
+            if (p.id == id) return i;
+        }
+        return null;
+    }
+
+    /// 按参数 ID 设置归一化值（撤销参数回放用）。找不到该 ID → false。
+    pub fn setParamById(self: *Plugin, id: u32, norm: f64) bool {
+        const idx = self.findParamIndex(id) orelse return false;
+        self.setParamHost(idx, norm);
+        return true;
     }
 
     /// 取走 restartComponent 请求的 flags（0 = 无）
@@ -1142,6 +1266,7 @@ pub const Plugin = struct {
 
     /// 抓取插件状态（组件 + 控制器各一份；调用方释放）。UI 线程。
     pub fn captureState(self: *Plugin, allocator: std.mem.Allocator) StateBlobs {
+        self.get_state_calls +%= 1;
         var out = StateBlobs{};
         {
             var ms = MemStream{ .alloc = allocator };
@@ -1167,6 +1292,8 @@ pub const Plugin = struct {
     /// 恢复插件状态（空 = 跳过该侧）。UI 线程；实例需已完全初始化。
     pub fn restoreState(self: *Plugin, comp: []const u8, ctrl: []const u8) void {
         self.restart_grace = 90; // JUCE 等在状态恢复后会补发 kParamValuesChanged
+        // 状态已换 → 参数缓存失效，末尾重建（缓存是撤销“旧值”的依据，不能脏）
+        self.param_cache_valid = false;
         // 丢弃待送参数：它们已被恢复的状态覆盖；否则下一个 process 会用旧值
         // 把恢复值又压回去（实测：拖动→撤销→process 回旧值）
         self.pend_tail.store(self.pend_head.load(.acquire), .release);
@@ -1192,6 +1319,7 @@ pub const Plugin = struct {
                 }
             }
         }
+        self.refreshParamCache();
     }
 
     pub const EditorResult = enum { opened, no_editor, failed };
@@ -1801,6 +1929,9 @@ pub fn loadEffect(allocator: std.mem.Allocator, path: [:0]const u8, sample_rate:
 /// 销毁插件实例（UI 线程）。
 pub fn unloadPlugin(allocator: std.mem.Allocator, pl: *Plugin) void {
     var p = pl;
+    if (p.param_cache.len > 0) p.alloc.free(p.param_cache);
+    p.param_cache = &.{};
+    p.param_cache_valid = false;
     p.closeEditor(); // 先关编辑器（插件还活着时发起 removed）
     // 终止前先摘掉组件处理器与连接（规范流程；编辑器已关，handler 无用）
     if (p.raw_controller) |rc| {
