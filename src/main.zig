@@ -647,11 +647,17 @@ pub fn main(init: std.process.Init) !u8 {
         // 预设浏览器（模态；同上——浮动窗口之后）
         if (app.preset_browser.open) view_presets.draw(&ui, &app, @intCast(win.fb.width), @intCast(win.fb.height));
         // 模态确认框（最上层；自绘——避开系统 MessageBox 把鼠标吸到默认按钮）
-        if (app.modal != null) drawModal(&ui, &app);
+        if (app.modal != null) {
+            // 注：裁切覆盖矩形由各对话框**按自身矩形**登记（不是全屏）——全屏裁掉会让
+            // 插件 UI 在弹窗期间“消失”（用户实测反馈）；只按对话框裁，插件保持可见，
+            // 输入由 `setEditorEnabled` 闸门拦截（禁用窗点击归父窗口）。
+            drawModal(&ui, &app);
+        }
         // 文本输入框（最顶层——跨窗口/菜单，重命名乐器/通道用）
         if (app.text_input.active) {
             const ti = &app.text_input;
             ti.view_off = ui.textFieldSyncOffset(ti.text(), ti.cursor, ti.w, ti.view_off);
+            ui.noteOverlayRect(ti.x, ti.y, ti.w, text_input_h); // 遮挡插件子窗口
             ui.renderer.fillRect(ti.x + 2, ti.y + 2, ti.w, text_input_h, r_mod.rgb(12, 13, 16)); // 阴影
             ui.textField(ti.text(), ti.cursor, ti.selection(), ti.view_off, ti.x, ti.y, ti.w, text_input_h);
         }
@@ -775,6 +781,8 @@ pub fn main(init: std.process.Init) !u8 {
     syncPluginSlots(&app);
     // 4.4d) VST3 乐器实例同步（惰性加载 + 编辑器编辑轮询）
     syncInstrumentPlugins(&app);
+    // 4.4e) VST3 插件界面嵌入同步（面板 → 子窗口；遮挡→隐藏；见函数注释）
+    syncPluginEditors(&app, &ui, @intCast(win.fb.width), @intCast(win.fb.height));
 
         // 4.5) 同步窗口标题（脏标记 `*` + 工程名；仅在变化时刷 Win32）
         const cur_name = app.projectName();
@@ -1767,7 +1775,7 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     const menu_open = app.menuIsOpen();
 
     // 浮动窗口列表（按 z 升序 = 从下到上）；排序用插入排序（元素很少）
-    var wins: [8]struct { z: i32, draw: enum { rack, synth, mixer, effect, drumkit, help, settings, plugin_mgr } } = undefined;
+    var wins: [8]struct { z: i32, draw: app_mod.WinKind } = undefined;
     var nwin: usize = 0;
     if (rack_open) {
         wins[nwin] = .{ .z = app.rack.z, .draw = .rack };
@@ -1894,6 +1902,24 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
             .plugin_mgr => _ = view_plugins.draw(ui, app, w, h),
         }
         ui.endLayer();
+    }
+
+    // 记录本帧浮动窗口的绘制顺序与最终矩形（插件子窗口区域裁切用；与绘制严格同序）。
+    // 注：在绘制之后读取——各窗口的 x/y/w/h 已 clamp/更新为最终值。
+    app.win_draw_n = 0;
+    for (wins[0..nwin]) |win| {
+        if (app.win_draw_n >= app.win_draw_info.len) break;
+        app.win_draw_info[app.win_draw_n] = switch (win.draw) {
+            .rack => .{ .kind = .rack, .x = app.rack.x, .y = app.rack.y, .w = app.rack.w, .h = app.rack.h },
+            .synth => .{ .kind = .synth, .x = app.synth_win.x, .y = app.synth_win.y, .w = app.synth_win.w, .h = app.synth_win.h },
+            .mixer => .{ .kind = .mixer, .x = app.mixer_win.x, .y = app.mixer_win.y, .w = app.mixer_win.w, .h = app.mixer_win.h },
+            .effect => .{ .kind = .effect, .x = app.effect_win.x, .y = app.effect_win.y, .w = app.effect_win.w, .h = app.effect_win.h },
+            .drumkit => .{ .kind = .drumkit, .x = app.drumkit_win.x, .y = app.drumkit_win.y, .w = app.drumkit_win.w, .h = app.drumkit_win.h },
+            .help => .{ .kind = .help, .x = app.help_win.x, .y = app.help_win.y, .w = app.help_win.w, .h = app.help_win.h },
+            .settings => .{ .kind = .settings, .x = app.settings_win.x, .y = app.settings_win.y, .w = app.settings_win.w, .h = app.settings_win.h },
+            .plugin_mgr => .{ .kind = .plugin_mgr, .x = app.plugin_mgr.x, .y = app.plugin_mgr.y, .w = app.plugin_mgr.w, .h = app.plugin_mgr.h },
+        };
+        app.win_draw_n += 1;
     }
 }
 
@@ -2121,6 +2147,7 @@ fn drawFileMenu(ui: *Ui, app: *App) void {
 
     ui.renderer.fillRect(menu_x, menu_y, menu_w, menu_h, ui.theme.panel);
     ui.renderer.strokeRect(menu_x, menu_y, menu_w, menu_h, ui.theme.accent);
+    ui.noteOverlayRect(menu_x, menu_y, menu_w, menu_h); // 遮挡插件子窗口
 
     var activated: ?usize = null;
     for (items, 0..) |it, ii| {
@@ -2344,6 +2371,146 @@ fn syncInstrumentPlugins(app: *App) void {
     }
 }
 
+/// VST3 插件界面嵌入同步（每帧帧末，**决策见 `tmp/vst-ui-embed-plan.md`**）：
+/// - 乐器面板（.instrument 目标）/ 效果面板（插件槽）打开 → 把插件编辑器**子窗口**
+///   挂进面板内容区（面板尺寸固定 = 插件尺寸 + 自绘 chrome）；
+/// - 归属对不上的编辑器（面板关闭/切目标/插件被换的残留）→ 关闭；
+/// - 遮挡：其它浮动窗口（Z 高且矩形相交）或菜单/弹层（`ui` 登记的遮罩矩形）→ 隐藏。
+const vst_panel_title_h: i32 = 22;
+const vst_fx_row_h: i32 = 22 + 34; // 标题 + 控制行（启用开关）
+
+fn rectsOverlap(ax: i32, ay: i32, aw: i32, ah: i32, bx: i32, by: i32, bw: i32, bh: i32) bool {
+    return ax < bx + bw and bx < ax + aw and ay < by + bh and by < ay + ah;
+}
+
+/// 收集“绘制在指定面板之后（= 在其上）的窗口/弹层”中与插件内容区相交的矩形
+/// （主窗口 client 坐标；`setEditorClip` 区域裁切用）。与绘制**同源**（`win_draw_info`）。
+/// 上限 24 = 窗口 ≤7 + 遮罩 ≤16，不会溢出。
+fn collectEditorCovers(app: *App, ui: *const Ui, panel: app_mod.WinKind, cx: i32, cy: i32, cw: i32, ch: i32, out: []vst_host.EditClipRect) usize {
+    var n: usize = 0;
+    var start: usize = app.win_draw_n; // 未找到自身（理论不会）：只减弹层（安全侧）
+    for (app.win_draw_info[0..app.win_draw_n], 0..) |wnd, wi| {
+        if (wnd.kind == panel) {
+            start = wi + 1;
+            break;
+        }
+    }
+    for (app.win_draw_info[start..app.win_draw_n]) |wnd| {
+        if (n >= out.len) break;
+        if (intersectRect(wnd.x, wnd.y, wnd.w, wnd.h, cx, cy, cw, ch)) |r| {
+            out[n] = r;
+            n += 1;
+        }
+    }
+    for (ui.overlay_rects[0..ui.overlay_n]) |r0| {
+        if (n >= out.len) break;
+        if (intersectRect(r0.x, r0.y, r0.w, r0.h, cx, cy, cw, ch)) |r| {
+            out[n] = r;
+            n += 1;
+        }
+    }
+    return n;
+}
+
+/// 两矩形的相交矩形（分离/贴边 → null）
+fn intersectRect(ax: i32, ay: i32, aw: i32, ah: i32, bx: i32, by: i32, bw: i32, bh: i32) ?vst_host.EditClipRect {
+    const x0 = @max(ax, bx);
+    const y0 = @max(ay, by);
+    const x1 = @min(ax + aw, bx + bw);
+    const y1 = @min(ay + ah, by + bh);
+    if (x1 <= x0 or y1 <= y0) return null;
+    return .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+}
+
+/// 打开编辑器（带失败退避）：失败后 ~2 秒内不再重试（防每帧骚扰插件）
+fn ensureEditor(app: *App, pl: *vst_host.Plugin) void {
+    if (pl.editor_fail_wait > 0) pl.editor_fail_wait -= 1;
+    if (pl.view == null and !pl.editor_no_ui and pl.editor_fail_wait == 0) {
+        if (pl.openEditor(app.main_hwnd) == .failed) pl.editor_fail_wait = 120;
+    }
+}
+
+fn syncPluginEditors(app: *App, ui: *Ui, fw: i32, fh: i32) void {
+    // 期望挂载：乐器面板（.instrument 目标 + VST3）/ 效果面板（插件槽）
+    var instr_pl: ?*vst_host.Plugin = null;
+    if (app.synth_win.open) {
+        switch (app.synth_win.target) {
+            .instrument => |ii| {
+                if (ii >= 0 and ii < app.instruments.items.len) {
+                    const inst = &app.instruments.items[@intCast(ii)];
+                    if (inst.kind == .vst3) instr_pl = inst.plugin;
+                }
+            },
+            else => {},
+        }
+    }
+    var fx_pl: ?*vst_host.Plugin = null;
+    if (app.mixer_win.panel) |panel| {
+        if (panel.ch < app.mixer_channels_state.items.len) {
+            const mc = &app.mixer_channels_state.items[panel.ch];
+            if (panel.slot < mc.effects.items.len) {
+                const es = &mc.effects.items[panel.slot];
+                if (es.kind == .plugin) fx_pl = es.plugin;
+            }
+        }
+    }
+
+    // 1) 归属对不上的编辑器：关闭（面板关闭/切目标/插件被换的残留）
+    for (app.instruments.items) |*inst| {
+        if (inst.plugin) |pl| {
+            if (pl.view != null and pl != instr_pl and pl != fx_pl) pl.closeEditor();
+        }
+    }
+    for (app.mixer_channels_state.items) |*mc| {
+        for (mc.effects.items) |*es| {
+            if (es.kind == .plugin) {
+                if (es.plugin) |pl| {
+                    if (pl.view != null and pl != instr_pl and pl != fx_pl) pl.closeEditor();
+                }
+            }
+        }
+    }
+
+    // 2) 乐器面板：尺寸固定=插件尺寸；坐标同步；遮挡则隐藏
+    if (instr_pl) |pl| {
+        ensureEditor(app, pl);
+        if (pl.view != null) {
+            app.synth_win.w = pl.editor_w + 2;
+            app.synth_win.h = pl.editor_h + vst_panel_title_h + 1;
+            // 保险钳制：拖拽途中面板 x/y 可能瞬时未钳制（顶部 clamp 下帧才生效）——
+            // 子窗口绝不能比面板 chrome 更早跑出去（用户实测“插件 UI 跑出去”）
+            const cx = std.math.clamp(app.synth_win.x + 1, 0, @max(0, fw - pl.editor_w - 1));
+            const cy = std.math.clamp(app.synth_win.y + vst_panel_title_h, 0, @max(0, fh - pl.editor_h - 1));
+            pl.syncEditorRect(cx, cy);
+            // 区域裁切（见 `setEditorClip`）：减去所有画在面板之上的窗口/弹层矩形
+            var covers: [24]vst_host.EditClipRect = undefined;
+            const nc = collectEditorCovers(app, ui, .synth, cx, cy, pl.editor_w, pl.editor_h, &covers);
+            pl.setEditorClip(covers[0..nc]);
+            // 输入闸门：模态框/菜单展开期间禁用子窗口（点击不落到插件上）
+            pl.setEditorEnabled(app.modal == null and ui.overlay_n == 0);
+        }
+    }
+
+    // 3) 效果面板（保留顶部控制行：启用开关）
+    if (fx_pl) |pl| {
+        ensureEditor(app, pl);
+        if (pl.view != null) {
+            app.effect_win.w = pl.editor_w + 2;
+            app.effect_win.h = pl.editor_h + vst_fx_row_h + 1;
+            // 保险钳制（同乐器侧）
+            const cx = std.math.clamp(app.effect_win.x + 1, 0, @max(0, fw - pl.editor_w - 1));
+            const cy = std.math.clamp(app.effect_win.y + vst_fx_row_h, 0, @max(0, fh - pl.editor_h - 1));
+            pl.syncEditorRect(cx, cy);
+            // 区域裁切（见 `setEditorClip`）：减去所有画在面板之上的窗口/弹层矩形
+            var covers: [24]vst_host.EditClipRect = undefined;
+            const nc = collectEditorCovers(app, ui, .effect, cx, cy, pl.editor_w, pl.editor_h, &covers);
+            pl.setEditorClip(covers[0..nc]);
+            // 输入闸门：模态框/菜单展开期间禁用子窗口（点击不落到插件上）
+            pl.setEditorEnabled(app.modal == null and ui.overlay_n == 0);
+        }
+    }
+}
+
 /// VST3 插件槽同步（每帧帧末）：
 /// 1) 退役实例倒计时释放（见 App.retirePlugin）；
 /// 2) 有路径、无实例的槽 → 惰性加载（导入存档/撤销恢复后的场景）；
@@ -2433,7 +2600,7 @@ fn syncPluginSlots(app: *App) void {
             // 插件声明“文档已脏”（IComponentHandler2::setDirty）→ 结构信号
             if (pl.takeDirtyNotice()) app.notePluginStructural(fref);
             // 插件请求打开编辑器（帧末：UI 线程）
-            if (pl.takeOpenEditorRequest()) _ = pl.openEditor(app.main_hwnd);
+            if (pl.takeOpenEditorRequest()) app.openPanelForPlugin(pl);
         }
     }
     // 编辑器关闭 → 手势结束（把最终值钉住）
@@ -2961,6 +3128,7 @@ fn drawDirtyConfirm(ui: *Ui, app: *App, w: i32, h: i32) void {
     const dlg_h: i32 = 110;
     const dx = @divTrunc(w - dlg_w, 2);
     const dy = @divTrunc(h - dlg_h, 2);
+    ui.noteOverlayRect(dx, dy, dlg_w + 4, dlg_h + 4); // 裁切插件子窗口（含阴影；仅对话框范围）
 
     // 对话框背景 + 边框
     ui.renderer.fillRect(dx + 4, dy + 4, dlg_w, dlg_h, r_mod.rgb(12, 13, 16)); // 阴影
@@ -2993,6 +3161,7 @@ fn drawPresetOverwrite(ui: *Ui, app: *App, w: i32, h: i32) void {
     const dlg_h: i32 = 110;
     const dx = @divTrunc(w - dlg_w, 2);
     const dy = @divTrunc(h - dlg_h, 2);
+    ui.noteOverlayRect(dx, dy, dlg_w + 4, dlg_h + 4); // 裁切插件子窗口（含阴影；仅对话框范围）
 
     ui.renderer.fillRect(dx + 4, dy + 4, dlg_w, dlg_h, r_mod.rgb(12, 13, 16));
     ui.renderer.fillRect(dx, dy, dlg_w, dlg_h, ui.theme.panel);
@@ -3023,6 +3192,7 @@ fn drawPresetDelete(ui: *Ui, app: *App, w: i32, h: i32) void {
     const dlg_h: i32 = 110;
     const dx = @divTrunc(w - dlg_w, 2);
     const dy = @divTrunc(h - dlg_h, 2);
+    ui.noteOverlayRect(dx, dy, dlg_w + 4, dlg_h + 4); // 裁切插件子窗口（含阴影；仅对话框范围）
 
     ui.renderer.fillRect(dx + 4, dy + 4, dlg_w, dlg_h, r_mod.rgb(12, 13, 16));
     ui.renderer.fillRect(dx, dy, dlg_w, dlg_h, ui.theme.panel);
@@ -3112,4 +3282,22 @@ test {
     _ = @import("vst_scan.zig");
     _ = @import("plugin_db.zig");
     _ = @import("ui_test.zig");
+}
+ test "main: 编辑器遮挡矩形相交判定（插件子窗口隐藏用）" {
+    try std.testing.expect(rectsOverlap(0, 0, 10, 10, 5, 5, 10, 10));
+    try std.testing.expect(rectsOverlap(5, 5, 10, 10, 0, 0, 10, 10));
+    try std.testing.expect(!rectsOverlap(0, 0, 10, 10, 10, 10, 10, 10)); // 边贴边不算
+    try std.testing.expect(!rectsOverlap(0, 0, 10, 10, 20, 20, 5, 5));
+}
+ test "main: 相交矩形计算（插件子窗口裁切覆盖集用）" {
+    const r = intersectRect(0, 0, 10, 10, 5, 5, 10, 10) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i32, 5), r.x);
+    try std.testing.expectEqual(@as(i32, 5), r.y);
+    try std.testing.expectEqual(@as(i32, 5), r.w);
+    try std.testing.expectEqual(@as(i32, 5), r.h);
+    try std.testing.expect(intersectRect(0, 0, 10, 10, 10, 10, 10, 10) == null); // 贴边不算
+    try std.testing.expect(intersectRect(0, 0, 10, 10, 20, 20, 5, 5) == null);
+    const r2 = intersectRect(0, 0, 10, 10, 2, 2, 100, 100) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i32, 8), r2.w);
+    try std.testing.expectEqual(@as(i32, 8), r2.h);
 }

@@ -173,6 +173,7 @@ pub fn drawPatternCtxMenu(ui: *Ui, app: *App) void {
     const my = app.panels.ctx_pat_y;
     ui.renderer.fillRect(mx, my, menu_w, menu_h, ui.theme.panel);
     ui.renderer.strokeRect(mx, my, menu_w, menu_h, ui.theme.accent);
+    ui.noteOverlayRect(mx, my, menu_w, menu_h); // 遮挡插件子窗口
 
     var clicked: ?usize = null;
     var inside = false;

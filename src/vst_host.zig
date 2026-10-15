@@ -945,10 +945,26 @@ pub const Plugin = struct {
     // ── 编辑器（阶段 3；仅 UI 线程）──
     /// 已挂接的编辑器视图（打开中）
     view: ?*iplugview.IPlugView = null,
-    /// 编辑器窗口句柄（打开中）
+    /// 编辑器**子窗口**句柄（挂在主窗口内；打开中）
     editor_hwnd: ?*anyopaque = null,
     /// 宿主侧 IPlugFrame 实例（打开中）
     frame: ?*EditorFrame = null,
+    /// 插件请求的内容尺寸（面板按它定尺寸；`resizeView` 更新）
+    editor_w: i32 = 0,
+    editor_h: i32 = 0,
+    /// 子窗口位置（`syncEditorRect` 记账，防每帧重复 SetWindowPos）
+    editor_x: i32 = 0,
+    editor_y: i32 = 0,
+    /// 区域裁切哈希（覆盖矩形+位置尺寸；变化才重建 RGN；见 `setEditorClip`）
+    clip_hash: u64 = 0,
+    clip_valid: bool = false,
+    /// 插件无界面（createView 空/不支持 HWND）——缓存，面板显示参数列表兜底
+    editor_no_ui: bool = false,
+    /// 编辑器打开失败后的退避帧数（防每帧重试骚扰插件）
+    editor_fail_wait: u8 = 0,
+    /// 输入闸门：模态框/菜单展开期间禁用子窗口（点击不落到插件上；
+    /// 禁用窗的点击归父窗口 → 软 UI 的模态层正常拦截）。变化才动作。
+    editor_enabled: bool = true,
 
     /// 单组件形态（component 即 controller；state 同步策略不同）
     ctrl_same: bool = false,
@@ -1324,17 +1340,23 @@ pub const Plugin = struct {
 
     pub const EditorResult = enum { opened, no_editor, failed };
 
-    /// 打开插件编辑器窗口（UI 线程）。已打开则置前；插件无界面 → `.no_editor`。
-    pub fn openEditor(self: *Plugin, owner: ?*anyopaque) EditorResult {
-        if (self.editor_hwnd) |h| {
-            _ = SetForegroundWindow(h);
-            return .opened;
-        }
-        const raw_ctrl = self.raw_controller orelse return .no_editor;
-        const ctrl = self.controller orelse return .no_editor;
+    /// 打开插件编辑器（UI 线程）：创建**子窗口**并挂接插件视图（嵌入宿主面板）。
+    /// 已打开则直接返回；插件无界面 → `.no_editor`（缓存 `editor_no_ui`）。
+    pub fn openEditor(self: *Plugin, parent: ?*anyopaque) EditorResult {
+        if (self.view != null) return .opened;
+        if (self.editor_no_ui) return .no_editor;
+        const raw_ctrl = self.raw_controller orelse {
+            self.editor_no_ui = true;
+            return .no_editor;
+        };
+        const ctrl = self.controller orelse {
+            self.editor_no_ui = true;
+            return .no_editor;
+        };
         const raw_view: ?*iplugview.IPlugView = ctrl.vtable.createView(raw_ctrl, iedit.ViewType.kEditor);
         const view = raw_view orelse {
             std.debug.print("[vst] 编辑器：createView 返回 null（插件无界面或未实现）\n", .{});
+            self.editor_no_ui = true;
             return .no_editor;
         };
         var committed = false;
@@ -1344,6 +1366,7 @@ pub const Plugin = struct {
 
         if (view.vtable.isPlatformTypeSupported(view, iplugview.PlatformType.kPlatformTypeHWND) != btypes.kResultOk) {
             std.debug.print("[vst] 编辑器：插件不支持 HWND 平台\n", .{});
+            self.editor_no_ui = true;
             return .no_editor;
         }
 
@@ -1358,23 +1381,19 @@ pub const Plugin = struct {
 
         if (!ensureEditorClass()) return .failed;
 
-        // 标题：插件名 → UTF-16
-        var title_buf: [128]u16 = undefined;
-        const tl = std.unicode.utf8ToUtf16Le(title_buf[0 .. title_buf.len - 1], self.name()) catch 0;
-        title_buf[tl] = 0;
-
-        var wr = RECT{ .right = cw, .bottom = ch };
-        _ = AdjustWindowRectEx(&wr, editor_style, 0, 0);
+        // 子窗口：无标题栏/边框（规范：attached 的 parent 是 HWND，“should attach a
+        // child window to it”）；外框与标题栏由我们的软渲染面板提供。
+        // 注：子窗口坐标 = 物理像素（规范 Coordinates 段）。
         const hwnd = CreateWindowExW(
             0,
             editor_class_name,
-            @ptrCast(&title_buf),
-            editor_style | WS_VISIBLE,
-            128,
-            128,
-            wr.right - wr.left,
-            wr.bottom - wr.top,
-            owner,
+            null,
+            0x40000000 | WS_VISIBLE, // WS_CHILD | WS_VISIBLE
+            0,
+            0,
+            cw,
+            ch,
+            parent,
             null,
             GetModuleHandleW(null),
             null,
@@ -1385,7 +1404,7 @@ pub const Plugin = struct {
             _ = DestroyWindow(hwnd);
             return .failed;
         };
-        frame.* = .{ .hwnd = hwnd };
+        frame.* = .{ .hwnd = hwnd, .owner = self };
         self.frame = frame;
 
         _ = view.vtable.setFrame(view, frame.asInterface());
@@ -1399,10 +1418,64 @@ pub const Plugin = struct {
         _ = SetFocus(hwnd);
         self.view = view;
         self.editor_hwnd = hwnd;
+        self.editor_w = cw;
+        self.editor_h = ch;
+        self.editor_x = 0;
+        self.editor_y = 0;
+        self.clip_valid = false;
+        self.editor_enabled = true;
         self.restart_grace = 90; // 开窗瞬间可能触发插件补发 restart——宽限期内不当“已改”
         committed = true;
         return .opened;
     }
+
+    /// 面板侧每帧同步：移动子窗口到面板内容区（变化才 SetWindowPos）。
+    /// 大小以 `editor_w/h`（插件请求）为准。
+    pub fn syncEditorRect(self: *Plugin, x: i32, y: i32) void {
+        const hwnd = self.editor_hwnd orelse return;
+        if (x == self.editor_x and y == self.editor_y) return;
+        self.editor_x = x;
+        self.editor_y = y;
+        _ = SetWindowPos(hwnd, null, x, y, self.editor_w, self.editor_h, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    /// 输入闸门（见字段注释）：模态/菜单期间禁用；变化才动作
+    pub fn setEditorEnabled(self: *Plugin, enabled: bool) void {
+        if (self.editor_enabled == enabled) return;
+        const hwnd = self.editor_hwnd orelse return;
+        self.editor_enabled = enabled;
+        _ = EnableWindow(hwnd, if (enabled) 1 else 0);
+    }
+
+    /// 子窗口**区域裁切**：把“绘制在面板之上”的矩形（主窗口 client 坐标）从子窗口中
+    /// 减掉（`SetWindowRgn`）。子窗口是原生窗口，永远在软渲染之上——不裁切就会出现
+    /// “插件界面盖住菜单/浮动窗口”；部分遮挡时保留可见部分（与原生窗口行为一致），
+    /// 且被裁区域的鼠标点击会自动穿透到下层（区域同时作用于命中测试）。
+    /// 变化检测：覆盖集合/位置/尺寸不变则跳过（RGN 只重建于变化时）。
+    pub fn setEditorClip(self: *Plugin, covers: []const EditClipRect) void {
+        const hwnd = self.editor_hwnd orelse return;
+        var hsh = std.hash.Wyhash.init(0x9e3779b97f4a7c15);
+        hsh.update(std.mem.asBytes(&self.editor_x));
+        hsh.update(std.mem.asBytes(&self.editor_y));
+        hsh.update(std.mem.asBytes(&self.editor_w));
+        hsh.update(std.mem.asBytes(&self.editor_h));
+        hsh.update(std.mem.sliceAsBytes(covers));
+        const h = hsh.final();
+        if (self.clip_valid and h == self.clip_hash) return;
+        self.clip_hash = h;
+        self.clip_valid = true;
+        const full = CreateRectRgn(0, 0, self.editor_w, self.editor_h) orelse return;
+        for (covers) |c| {
+            const r = clipRectToClient(c, self.editor_x, self.editor_y, self.editor_w, self.editor_h) orelse continue;
+            const reg = CreateRectRgn(r[0], r[1], r[2], r[3]) orelse continue;
+            _ = CombineRgn(full, full, reg, RGN_DIFF);
+            _ = DeleteObject(reg);
+        }
+        if (SetWindowRgn(hwnd, full, 1) == 0) {
+            _ = DeleteObject(full); // 失败：系统未接管区域，需自删
+        }
+    }
+
 
     /// 关闭插件编辑器（UI 线程；幂等）
     pub fn closeEditor(self: *Plugin) void {
@@ -1420,6 +1493,9 @@ pub const Plugin = struct {
             self.editor_hwnd = null;
             _ = DestroyWindow(h);
         }
+        self.clip_valid = false;
+        self.editor_x = 0;
+        self.editor_y = 0;
     }
 
     /// 处理一块**交错立体声**（就地；`frames` ≤ `max_block`）。
@@ -1973,12 +2049,28 @@ pub fn unloadPlugin(allocator: std.mem.Allocator, pl: *Plugin) void {
 
 const editor_class_name = std.unicode.utf8ToUtf16LeStringLiteral("SawdustVstEditor");
 /// WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX（无 WS_THICKFRAME：暂不让用户拉伸）
-const editor_style: u32 = 0x00C00000 | 0x00080000 | 0x00020000;
 const WS_VISIBLE: u32 = 0x10000000;
 const SWP_NOSIZE: u32 = 0x0001;
 const SWP_NOMOVE: u32 = 0x0002;
 const SWP_NOZORDER: u32 = 0x0004;
 const SWP_NOACTIVATE: u32 = 0x0010;
+const RGN_DIFF: i32 = 4;
+
+/// 插件子窗口裁切用的覆盖矩形（主窗口 client 坐标；`main` 侧收集）
+pub const EditClipRect = struct { x: i32, y: i32, w: i32, h: i32 };
+
+/// 覆盖矩形 → 子窗口 client 坐标的相交矩形（`[x0,y0,x1,y1]`；不相交/退化 → null）。
+/// 纯函数（单测）。
+fn clipRectToClient(c: EditClipRect, ex: i32, ey: i32, ew: i32, eh: i32) ?[4]i32 {
+    const x0 = @max(0, c.x - ex);
+    const y0 = @max(0, c.y - ey);
+    const x1 = @min(ew, c.x + c.w - ex);
+    const y1 = @min(eh, c.y + c.h - ey);
+    if (x1 <= x0 or y1 <= y0) return null;
+    return .{ x0, y0, x1, y1 };
+}
+const SW_SHOWNA: i32 = 8;
+const SW_HIDE: i32 = 0;
 const GWLP_USERDATA: i32 = -21;
 const WM_KILLFOCUS: u32 = 0x0008;
 const WM_SETFOCUS: u32 = 0x0007;
@@ -2002,22 +2094,27 @@ const RECT = extern struct { left: i32 = 0, top: i32 = 0, right: i32 = 0, bottom
 
 extern "kernel32" fn GetModuleHandleW(?[*:0]const u16) callconv(.winapi) ?*anyopaque;
 extern "user32" fn RegisterClassExW(*const WNDCLASSEXW) callconv(.winapi) u16;
-extern "user32" fn CreateWindowExW(u32, [*:0]const u16, [*:0]const u16, u32, i32, i32, i32, i32, ?*anyopaque, ?*anyopaque, ?*anyopaque, ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "user32" fn CreateWindowExW(u32, [*:0]const u16, ?[*:0]const u16, u32, i32, i32, i32, i32, ?*anyopaque, ?*anyopaque, ?*anyopaque, ?*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "user32" fn DestroyWindow(*anyopaque) callconv(.winapi) i32;
 extern "user32" fn DefWindowProcW(*anyopaque, u32, usize, isize) callconv(.winapi) isize;
-extern "user32" fn AdjustWindowRectEx(*RECT, u32, i32, u32) callconv(.winapi) i32;
 extern "user32" fn SetWindowLongPtrW(*anyopaque, i32, isize) callconv(.winapi) isize;
 extern "user32" fn GetWindowLongPtrW(*anyopaque, i32) callconv(.winapi) isize;
 extern "user32" fn SetWindowPos(?*anyopaque, ?*anyopaque, i32, i32, i32, i32, u32) callconv(.winapi) i32;
-extern "user32" fn SetForegroundWindow(*anyopaque) callconv(.winapi) i32;
+extern "user32" fn SetWindowRgn(?*anyopaque, ?*anyopaque, i32) callconv(.winapi) i32;
+extern "user32" fn EnableWindow(?*anyopaque, i32) callconv(.winapi) i32;
+extern "gdi32" fn CreateRectRgn(i32, i32, i32, i32) callconv(.winapi) ?*anyopaque;
+extern "gdi32" fn CombineRgn(?*anyopaque, ?*anyopaque, ?*anyopaque, i32) callconv(.winapi) i32;
+extern "gdi32" fn DeleteObject(?*anyopaque) callconv(.winapi) i32;
 extern "user32" fn SetFocus(*anyopaque) callconv(.winapi) ?*anyopaque;
 
-/// 宿主侧 IPlugFrame：插件 `resizeView` 请求 → 调整编辑器窗口大小。
+/// 宿主侧 IPlugFrame：插件 `resizeView` 请求 → 记录尺寸 + 调整子窗口 + `onSize`。
 /// 简化：ref 计数只记账（生命周期由 Plugin.closeEditor 掌控）。
 const EditorFrame = extern struct {
     iface: iplugview.IPlugFrame = .{ .vtable = &vtable },
     ref_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
     hwnd: ?*anyopaque = null,
+    /// 所属插件（resizeView 时回写 editor_w/h）
+    owner: *Plugin = undefined,
 
     pub fn asInterface(self: *EditorFrame) *iplugview.IPlugFrame {
         return &self.iface;
@@ -2045,13 +2142,15 @@ const EditorFrame = extern struct {
 
     fn resizeView(ptr: *anyopaque, view: ?*iplugview.IPlugView, rect: *iplugview.ViewRect) callconv(.c) btypes.tresult {
         const self: *EditorFrame = @fieldParentPtr("iface", @as(*iplugview.IPlugFrame, @ptrCast(@alignCast(ptr))));
-        const hwnd = self.hwnd orelse return btypes.kResultFalse;
         const w = rect.right - rect.left;
         const h = rect.bottom - rect.top;
         if (w <= 0 or h <= 0 or w > 8192 or h > 8192) return btypes.kResultFalse;
-        var wr = RECT{ .right = w, .bottom = h };
-        _ = AdjustWindowRectEx(&wr, editor_style, 0, 0);
-        _ = SetWindowPos(hwnd, null, 0, 0, wr.right - wr.left, wr.bottom - wr.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        // 记录插件请求尺寸（面板按它布局）+ 立即调整子窗口（宿主调整平台窗口）
+        self.owner.editor_w = w;
+        self.owner.editor_h = h;
+        if (self.owner.editor_hwnd) |hwnd| {
+            _ = SetWindowPos(hwnd, null, self.owner.editor_x, self.owner.editor_y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
         if (view) |v| {
             _ = v.vtable.onSize(v, rect); // 通知插件实际大小（规范流程）
         }
@@ -2137,4 +2236,19 @@ test "vst_host: 多输出求和混音（主静音 + 辅助立体声 + 单声道�
     try std.testing.expectApproxEqAbs(@as(f32, 0.75), buf[1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 1.25), buf[6], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.75), buf[7], 1e-6);
+}
+
+test "vst_host: 覆盖矩形→子窗口 client 裁切坐标（SetWindowRgn 用）" {
+    const E = struct {
+        fn rc(x: i32, y: i32, w: i32, h: i32) EditClipRect {
+            return .{ .x = x, .y = y, .w = w, .h = h };
+        }
+    };
+    // 子窗位于 (100, 50)，尺寸 200x100
+    const r1 = clipRectToClient(E.rc(150, 80, 20, 20), 100, 50, 200, 100) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(i32, &.{ 50, 30, 70, 50 }, &r1); // 完全在内
+    const r2 = clipRectToClient(E.rc(0, 0, 120, 70), 100, 50, 200, 100) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(i32, &.{ 0, 0, 20, 20 }, &r2); // 左上溢出→钳制
+    try std.testing.expect(clipRectToClient(E.rc(0, 0, 100, 50), 100, 50, 200, 100) == null); // 贴边不相交
+    try std.testing.expect(clipRectToClient(E.rc(400, 400, 10, 10), 100, 50, 200, 100) == null); // 在外
 }

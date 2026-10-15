@@ -150,7 +150,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
         if (ci < app.instruments.items.len) {
             const is_vst3 = app.instruments.items[ci].kind == .vst3;
             const items: []const []const u8 = if (is_vst3)
-                &.{ "打开插件界面", "重新定位插件…", "重命名", "更换乐器…", "删除乐器" }
+                &.{ "重新定位插件…", "重命名", "更换乐器…", "删除乐器" }
             else
                 &.{ "重命名", "更换乐器…", "删除乐器" };
             const mw: i32 = 160;
@@ -159,6 +159,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
             const my = app.rack.ctx_y;
             ui.renderer.fillRect(mx, my, mw, mh, ui.theme.panel);
             ui.renderer.strokeRect(mx, my, mw, mh, ui.theme.accent);
+            ui.noteOverlayRect(mx, my, mw, mh); // 遮挡插件子窗口
             var clicked: ?usize = null;
             var inside = false;
             for (items, 0..) |item, i| {
@@ -173,39 +174,24 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
             }
             if (clicked) |ic| {
                 if (is_vst3 and ic == 0) {
-                    // 打开插件自带界面
-                    const inst = &app.instruments.items[ci];
-                    if (inst.plugin) |pl| {
-                        switch (pl.openEditor(app.main_hwnd)) {
-                            .opened => {},
-                            .no_editor => app.setToast("此插件无编辑器界面"),
-                            .failed => app.setToast("编辑器打开失败"),
-                        }
-                    } else {
-                        app.setToast("插件未加载（稍候或检查路径）");
-                    }
+                    // 重新定位插件…（文件对话框 → 换路径；pending 保留）
+                    app.pending_relocate_instrument = ci;
                 } else {
                     const act: usize = if (is_vst3) ic - 1 else ic;
-                    if (is_vst3 and act == 0) {
-                        // 重新定位插件…（文件对话框 → 换路径；pending 保留）
-                        app.pending_relocate_instrument = ci;
-                    } else {
-                        const a2: usize = if (is_vst3) act - 1 else act;
-                        switch (a2) {
-                            0 => {
-                                // 重命名：输入框弹在乐器名位置（行内就地）
-                                app.beginRenameInstrument(ci, mx + 4, my + 4);
-                            },
-                            1 => {
-                                // 更换乐器 → 打开预设面板（任意插件；选中即换，保留属性）
-                                app.openPresetBrowser(.{ .change_instrument = @intCast(ci) });
-                            },
-                            2 => {
-                                app.removeInstrument(ci);
-                                app.commitHistory("删除乐器"); // 原子操作：立即提交
-                            },
-                            else => {},
-                        }
+                    switch (act) {
+                        0 => {
+                            // 重命名：输入框弹在乐器名位置（行内就地）
+                            app.beginRenameInstrument(ci, mx + 4, my + 4);
+                        },
+                        1 => {
+                            // 更换乐器 → 打开预设面板（任意插件；选中即换，保留属性）
+                            app.openPresetBrowser(.{ .change_instrument = @intCast(ci) });
+                        },
+                        2 => {
+                            app.removeInstrument(ci);
+                            app.commitHistory("删除乐器"); // 原子操作：立即提交
+                        },
+                        else => {},
                     }
                 }
                 app.rack.ctx_instrument = null;
@@ -227,6 +213,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
             const my = app.rack.ctx_y;
             ui.renderer.fillRect(mx, my, mw2, mh2, ui.theme.panel);
             ui.renderer.strokeRect(mx, my, mw2, mh2, ui.theme.accent);
+            ui.noteOverlayRect(mx, my, mw2, mh2); // 遮挡插件子窗口
             const iy = my + 2;
             const hovered = util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, mw2 - 2, util.menu_item_h);
             if (hovered) ui.renderer.fillRect(mx + 1, iy, mw2 - 2, util.menu_item_h, ui.theme.item_hover);

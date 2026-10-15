@@ -571,6 +571,7 @@ fn drawCtxMenuGeneric(ui: *Ui, app: *App, ch: usize, slot: ?usize, items: []cons
     const my = pos[1];
     ui.renderer.fillRect(mx, my, menu_w, menu_h, ui.theme.panel);
     ui.renderer.strokeRect(mx, my, menu_w, menu_h, ui.theme.accent);
+    ui.noteOverlayRect(mx, my, menu_w, menu_h); // 遮挡插件子窗口
 
     var clicked: ?usize = null;
     var inside = false;
@@ -655,6 +656,7 @@ fn drawPanCtxMenu(ui: *Ui, app: *App, ch: usize) void {
     const my = pos[1];
     ui.renderer.fillRect(mx, my, menu_w, menu_h, ui.theme.panel);
     ui.renderer.strokeRect(mx, my, menu_w, menu_h, ui.theme.accent);
+    ui.noteOverlayRect(mx, my, menu_w, menu_h); // 遮挡插件子窗口
 
     const item = "恢复默认值";
     const iy = my + 2;

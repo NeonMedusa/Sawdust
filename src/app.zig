@@ -165,6 +165,12 @@ pub const PresetTarget = union(enum) {
 };
 
 /// 预设浏览器弹窗状态（**统一的插件+预设选择器**；见 `docs/drumkit.md` §5.2）
+/// 浮动窗口种类（绘制序列表与插件子窗口裁切共用）
+pub const WinKind = enum { rack, synth, mixer, effect, drumkit, help, settings, plugin_mgr };
+
+/// 浮动窗口“绘制顺序 + 最终矩形”（`main.drawApp` 逐帧填写）
+pub const WinDraw = struct { kind: WinKind, x: i32, y: i32, w: i32, h: i32 };
+
 pub const PresetBrowser = struct {
     open: bool = false,
     /// 选中分类序号（指向 `preset_lib.categories`；越界时锚 0）
@@ -648,6 +654,8 @@ pub const SynthWindow = struct {
     resize_my: i32 = 0,
     /// 当前编辑的**目标**（乐器合成器 / 鼓组层）；点击机架/鼓组编辑器设定
     target: PresetTarget = .{ .instrument = 0 },
+    /// VST3 无界面插件（兜底参数列表）的滚动位置；切目标时需要重置
+    param_scroll: i32 = 0,
 };
 
 /// 鼓组编辑器（浮动窗口）状态——左音高列表 + 右垫详情（`docs/drumkit.md` §7）
@@ -1153,6 +1161,10 @@ pub const App = struct {
     help_win: HelpWindow = .{},
     settings_win: SettingsWindow = .{},
     plugin_mgr: PluginMgrWindow = .{},
+    /// 本帧浮动窗口的**绘制顺序与最终矩形**（`main.drawApp` 逐帧填写；与绘制严格同序：
+    /// 后排 = 在上）——插件子窗口区域裁切（`setEditorClip`）据此收集覆盖矩形
+    win_draw_info: [8]WinDraw = [_]WinDraw{.{ .kind = .rack, .x = 0, .y = 0, .w = 0, .h = 0 }} ** 8,
+    win_draw_n: usize = 0,
     /// 插件管理数据（main 启动时加载；`null` = 未初始化——单元测试不加载）
     plugin_cfg: ?plugin_db.Config = null,
     plugin_cache: ?plugin_db.Cache = null,
@@ -3479,10 +3491,35 @@ pub const App = struct {
 
     /// 把一个插件实例送入退役列表（延迟销毁；可安全地对音频线程正在引用的实例）
     pub fn retirePlugin(self: *App, pl: *vst_host.Plugin) void {
+        // 嵌入面板的编辑器子窗口必须先关（实例退役后没人再同步它）
+        if (pl.view != null) pl.closeEditor();
         self.retired_plugins.append(self.allocator, .{ .pl = pl, .countdown = 30 }) catch {
             vst_host.unloadPlugin(self.allocator, pl); // 分配失败：立即释放（极罕见）
         };
     }
+
+    /// 插件请求暴露界面（`requestOpenEditor`）→ 打开其所属面板（嵌入路径由帧末同步接手）。
+    /// 找不到归属（已退役/待卸载）→ 忽略。
+    pub fn openPanelForPlugin(self: *App, pl: *vst_host.Plugin) void {
+        for (self.instruments.items, 0..) |*inst, ii| {
+            if (inst.plugin == pl) {
+                self.synth_win.target = .{ .instrument = @intCast(ii) };
+                self.synth_win.open = true;
+                self.bringToFront(&self.synth_win.z);
+                return;
+            }
+        }
+        for (self.mixer_channels_state.items, 0..) |*mc, ch| {
+            for (mc.effects.items, 0..) |*es, si| {
+                if (es.kind == .plugin and es.plugin == pl) {
+                    self.mixer_win.panel = .{ .ch = ch, .slot = si };
+                    self.bringToFront(&self.effect_win.z);
+                    return;
+                }
+            }
+        }
+    }
+
 
     /// 效果器状态盒进退役列表（音频线程可能仍持有指针；倒计时后销毁）
     pub fn retireFxState(self: *App, box: *audio.FxBox) void {
@@ -3634,7 +3671,11 @@ pub const App = struct {
 
     /// 把某窗口提到最上层（点击该窗口时调用）。
     /// 参数是窗口 z 字段的指针——四个窗口结构都持有 `z: i32`。
+    /// **模态框展开期间不动作**：窗口的“点击置顶”用的是纯几何判断（`inRect`，
+    /// 不查输入屏蔽），弹窗按钮的点击会“点穿”到后面窗口——实测 bug：点“取消”
+    /// 把它后面的窗口提上来了。
     pub fn bringToFront(self: *App, z: *i32) void {
+        if (self.modal != null) return;
         self.z_top += 1;
         z.* = self.z_top;
     }
@@ -9626,4 +9667,22 @@ test "VST3 状态：历史携带插件状态（池共享/去重）与撤销回�
     for (&buf) |*v| v.* = 1.0;
     pl_r.process(&buf, 256);
     try std.testing.expectApproxEqAbs(@as(f32, 0.3), buf[0], 0.02);
+}
+
+test "模态框展开期间 bringToFront 不动作（弹窗按钮点穿回归锁）" {
+    var app = App{ .allocator = std.testing.allocator };
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    defer app.deinitAll();
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+
+    const z0 = app.synth_win.z;
+    app.bringToFront(&app.synth_win.z);
+    try std.testing.expect(app.synth_win.z > z0); // 正常路径：可置顶
+
+    app.modal = .dirty_confirm;
+    const z1 = app.synth_win.z;
+    app.bringToFront(&app.synth_win.z);
+    try std.testing.expectEqual(z1, app.synth_win.z); // 模态期间：不动作
 }

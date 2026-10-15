@@ -9,6 +9,9 @@ const Theme = @import("ui.zig").Theme;
 const r_mod = @import("render.zig");
 const Rect = @import("ui.zig").Rect;
 const model = @import("model.zig");
+const App = @import("app.zig").App;
+const PluginSlotRef = @import("app.zig").PluginSlotRef;
+const vst_host = @import("vst_host.zig");
 
 // ── 布局常量 ──
 pub const toolbar_h: i32 = 40; // 顶部工具栏高度
@@ -16,6 +19,88 @@ pub const status_h: i32 = 26; // 底部状态栏高度
 pub const splitter_w: i32 = 4; // 分隔条宽度
 pub const min_pane_w: i32 = 100; // 每栏最小宽度
 pub const title_h: i32 = 24; // 面板标题栏高度
+
+/// VST3 插件参数列表（拖动编辑 / 双击恢复默认；滚轮滚动）——效果面板与
+/// “无界面插件”的乐器面板共用。`list_top` 为列表顶；底部留 14px 提示行。
+/// `id_base` 区分不同面板的拖动 id（避免两面板同时打开时拖拽串台）。
+pub fn drawPluginParamList(
+    ui: *Ui,
+    app: *App,
+    pl: ?*vst_host.Plugin,
+    load_failed: bool,
+    scroll_p: *i32,
+    ref: PluginSlotRef,
+    id_base: u64,
+    px: i32,
+    py: i32,
+    pw: i32,
+    ph: i32,
+    list_top: i32,
+) void {
+    const row_h: i32 = 17;
+    const list_h = py + ph - list_top - 14;
+    if (list_h < row_h) return;
+    const p = pl orelse {
+        if (load_failed) {
+            ui.label("（插件加载失败——每 ~2 秒自动重试；文件恢复后自动加载）", px + 8, list_top + 2, ui.theme.danger);
+        } else {
+            ui.label("（插件未加载）", px + 8, list_top + 2, ui.theme.text_dim);
+        }
+        return;
+    };
+    const pcount = p.paramCount();
+    if (pcount == 0) {
+        ui.label("（此插件没有可用参数）", px + 8, list_top + 2, ui.theme.text_dim);
+        return;
+    }
+    const visible: i32 = @max(1, @divTrunc(list_h, row_h));
+    const content_h: i32 = @as(i32, @intCast(pcount)) * row_h;
+    const scroll_max: i32 = @max(0, content_h - visible * row_h);
+    const scrollbar_w: i32 = if (scroll_max > 0) 6 else 0;
+    // 滚轮（悬停在列表区）
+    if (hitUI(ui, px, list_top, pw, list_h) and scroll_max > 0) {
+        scroll_p.* = std.math.clamp(scroll_p.* - ui.wheel * 24, 0, scroll_max);
+    }
+    scroll_p.* = std.math.clamp(scroll_p.*, 0, scroll_max);
+    const value_w: i32 = 130; // 右侧值文本预留宽
+    {
+        const saved = ui.renderer.pushClip(px, list_top, pw - scrollbar_w, list_h);
+        defer ui.renderer.popClip(saved);
+        var idx: usize = 0;
+        while (idx < pcount) : (idx += 1) {
+            const ry = list_top + @as(i32, @intCast(idx)) * row_h - scroll_p.*;
+            if (ry + row_h <= list_top or ry >= list_top + list_h) continue; // 视口剔除
+            const meta = &p.params[idx];
+            const rid: u64 = id_base + @as(u64, idx);
+            const hovered = hitUI(ui, px, ry, pw - scrollbar_w, row_h - 1);
+            var v = p.paramNorm(idx);
+            const read_only = (meta.flags & 0x2) != 0; // kIsReadOnly：插件声明只读，跳过交互
+            if (!read_only and hovered and ui.mouse_double) {
+                // 双击 → 恢复默认值（先于拖动判定：双击帧也会发按下，否则被拖动抢走）
+                app.setPluginParamHost(ref, p, idx, meta.default_norm);
+            } else if (!read_only and ui.dragNormV(rid, px, ry, pw - scrollbar_w, row_h - 1, &v)) {
+                // 离散参数：吸附到步长（拖动锚点无级累积 → 逐格步进可达）
+                if (meta.step_count > 0) {
+                    const steps: f64 = @floatFromInt(meta.step_count);
+                    v = @round(v * steps) / steps;
+                }
+                app.setPluginParamHost(ref, p, idx, v);
+            }
+            const active = ui.active_id == rid;
+            ui.renderer.fillRect(px, ry, pw - scrollbar_w, row_h - 1, if (active) ui.theme.item_hover else if (hovered) ui.theme.toolbar else ui.theme.panel);
+            ui.renderer.strokeRect(px, ry, pw - scrollbar_w, row_h - 1, ui.theme.panel_border);
+            ui.labelClipped(meta.name(), px + 6, ry + 2, pw - scrollbar_w - value_w - 16, if (hovered or active) ui.theme.text else ui.theme.text_dim);
+            var vb: [40]u8 = undefined;
+            const vt = p.paramText(idx, &vb);
+            const vw: i32 = @min(value_w, @as(i32, @intFromFloat(ui.font.measure(vt))));
+            ui.labelClipped(vt, px + pw - scrollbar_w - 6 - vw, ry + 2, vw + 2, ui.theme.text);
+        }
+    }
+    if (scroll_max > 0) {
+        ui.drawScrollbar(px + pw - 7, list_top, 5, list_h, scroll_p.*, content_h, list_h);
+    }
+    ui.label("拖动调整 · 双击恢复默认", px + 8, py + ph - 13, ui.theme.text_dim);
+}
 
 /// 视图切换按钮（标题栏**最右侧**）：播放列表 ⇄ 钢琴卷帘。
 /// `x` = 面板右缘；按钮右对齐。返回 true = 本帧被点击（调用方执行切换）。
@@ -440,6 +525,7 @@ pub fn titleSelectorMenu(
     const my = below_y;
     ui.renderer.fillRect(mx, my, mw, mh, ui.theme.panel);
     ui.renderer.strokeRect(mx, my, mw, mh, ui.theme.accent);
+    ui.noteOverlayRect(mx, my, mw, mh); // 遮挡插件子窗口（标题栏下拉）
     if (n == 0) ui.label("（空）", mx + 10, my + 4, ui.theme.text_dim);
     var consumed = false;
     for (items, 0..) |it, ii| {

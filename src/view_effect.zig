@@ -29,8 +29,12 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     const es = &mc.effects.items[panel.slot];
 
     const ew = &app.effect_win;
-    ew.w = std.math.clamp(ew.w, win_min_w, @max(win_min_w, w - 20));
-    ew.h = std.math.clamp(ew.h, win_min_h, @max(win_min_h, h - 20));
+    // 嵌入预期（插件有界面）：尺寸固定=插件尺寸，松约束；无界面 → 列表常规最小尺寸
+    const embedded_expected = es.kind == .plugin and es.plugin != null and !es.plugin.?.editor_no_ui;
+    const min_w: i32 = if (embedded_expected) 80 else win_min_w;
+    const min_h: i32 = if (embedded_expected) 80 else win_min_h;
+    ew.w = std.math.clamp(ew.w, min_w, @max(min_w, w - 20));
+    ew.h = std.math.clamp(ew.h, min_h, @max(min_h, h - 20));
     ew.x = std.math.clamp(ew.x, 0, @max(0, w - ew.w));
     ew.y = std.math.clamp(ew.y, 0, @max(0, h - ew.h));
 
@@ -127,32 +131,36 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         if (!ui.mouse_down) {
             ui.active_id = 0;
         } else {
-            ew.x = ui.mouse_x - ew.grab_dx;
-            ew.y = ui.mouse_y - ew.grab_dy;
+            // 拖出主窗口时**当场钳制**（顶部 clamp 下帧才生效——期间子窗口会跟着
+            // 鼠标跑出面板/主窗口，用户实测“插件 UI 跑出去”）
+            ew.x = std.math.clamp(ui.mouse_x - ew.grab_dx, 0, @max(0, w - ww));
+            ew.y = std.math.clamp(ui.mouse_y - ew.grab_dy, 0, @max(0, h - hh));
         }
     }
 
-    // 右下角缩放柄
-    const grip = 14;
-    const grip_hovered = util.hitUI(ui, x + ww - grip, y + hh - grip, grip, grip);
-    if (grip_hovered) ui.cursor = .resize_h;
-    if (grip_hovered and ui.mouse_pressed) {
-        ui.active_id = 7601;
-        ew.resize_w0 = ww;
-        ew.resize_h0 = hh;
-        ew.resize_mx = ui.mouse_x;
-        ew.resize_my = ui.mouse_y;
-    }
-    if (ui.active_id == 7601) {
-        if (!ui.mouse_down) {
-            ui.active_id = 0;
-        } else {
-            ew.w = ew.resize_w0 + (ui.mouse_x - ew.resize_mx);
-            ew.h = ew.resize_h0 + (ui.mouse_y - ew.resize_my);
+    // 右下角缩放柄（嵌入模式：面板尺寸跟随插件，不提供手动缩放）
+    if (!embedded_expected) {
+        const grip = 14;
+        const grip_hovered = util.hitUI(ui, x + ww - grip, y + hh - grip, grip, grip);
+        if (grip_hovered) ui.cursor = .resize_h;
+        if (grip_hovered and ui.mouse_pressed) {
+            ui.active_id = 7601;
+            ew.resize_w0 = ww;
+            ew.resize_h0 = hh;
+            ew.resize_mx = ui.mouse_x;
+            ew.resize_my = ui.mouse_y;
         }
+        if (ui.active_id == 7601) {
+            if (!ui.mouse_down) {
+                ui.active_id = 0;
+            } else {
+                ew.w = ew.resize_w0 + (ui.mouse_x - ew.resize_mx);
+                ew.h = ew.resize_h0 + (ui.mouse_y - ew.resize_my);
+            }
+        }
+        ui.renderer.line(x + ww - 10, y + hh - 2, x + ww - 2, y + hh - 10, ui.theme.panel_border);
+        ui.renderer.line(x + ww - 6, y + hh - 2, x + ww - 2, y + hh - 6, ui.theme.panel_border);
     }
-    ui.renderer.line(x + ww - 10, y + hh - 2, x + ww - 2, y + hh - 10, ui.theme.panel_border);
-    ui.renderer.line(x + ww - 6, y + hh - 2, x + ww - 2, y + hh - 6, ui.theme.panel_border);
 
     var cy = y + win_title_h + 6;
 
@@ -237,22 +245,16 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
 /// 参数面板（混响/延迟/压缩器）：纵列 = 名称 + 旋钮 + 数值
 /// 注：干湿（mix）不在此列——顶部已有独立干湿滑块（同一参数，避免两个入口）
 fn drawParamPanel(ui: *Ui, app: *App, es: *app_mod.EffectSlot, px: i32, py: i32, pw: i32, ph: i32) void {
-    // VST3 插件：头部信息 + 参数列表（拖动编辑 / 双击恢复默认；滚轮滚动）
+    // VST3 插件：界面已嵌在内容区（子窗口）时不画软层；否则头部信息 + 参数列表
     if (es.kind == .plugin) {
+        if (es.plugin) |p| {
+            if (p.view != null) return; // 嵌入中：子窗口覆盖内容区
+        }
         const pl = es.plugin;
-        // ── 头部：名称 + [打开界面]（右）；路径 · 延迟 ──
+        // ── 头部：名称；路径 · 延迟（无按钮：插件界面直接嵌在下方）──
         {
             const name_t = if (pl) |p| p.name() else "（未加载）";
-            ui.labelClipped(name_t, px + 8, py + 4, pw - 116, if (es.load_failed) ui.theme.danger else ui.theme.text);
-            if (pl) |p| {
-                if (ui.button(@intFromPtr(p), "打开界面", px + pw - 96, py + 2, 88, 20)) {
-                    switch (p.openEditor(app.main_hwnd)) {
-                        .opened => {},
-                        .no_editor => ui.label("（此插件无编辑器界面）", px + pw - 220, py + 26, ui.theme.text_dim),
-                        .failed => ui.label("（编辑器打开失败）", px + pw - 220, py + 26, ui.theme.text_dim),
-                    }
-                }
-            }
+            ui.labelClipped(name_t, px + 8, py + 4, pw - 16, if (es.load_failed) ui.theme.danger else ui.theme.text);
         }
         var yy = py + 28;
         {
@@ -264,79 +266,14 @@ fn drawParamPanel(ui: *Ui, app: *App, es: *app_mod.EffectSlot, px: i32, py: i32,
         }
         yy += 18;
 
-        // ── 参数列表（可滚动；行 = 名称 + 值文本）──
-        const list_top = yy;
-        const list_h = py + ph - list_top - 14;
-        const row_h: i32 = 17;
-        if (list_h < row_h) return;
-        const p = pl orelse {
-            if (es.load_failed) {
-                ui.label("（插件加载失败——每 ~2 秒自动重试；文件恢复后自动加载）", px + 8, list_top + 2, ui.theme.danger);
-            } else {
-                ui.label("（插件未加载）", px + 8, list_top + 2, ui.theme.text_dim);
-            }
-            return;
-        };
-        const pcount = p.paramCount();
-        if (pcount == 0) {
-            ui.label("（此插件没有可用参数）", px + 8, list_top + 2, ui.theme.text_dim);
-            return;
-        }
         // 滚动状态挂在窗口面板引用上（切换效果槽时自动归零）
         var dummy_scroll: i32 = 0;
         const scroll_p: *i32 = if (app.mixer_win.panel) |*pref| &pref.scroll else &dummy_scroll;
-        // 参数编辑的唯一入口：应用 + 增量记录（撤销走参数回放，不碰 setState）
         const ref: app_mod.PluginSlotRef = if (app.mixer_win.panel) |pref|
             .{ .kind = .fx, .a = @intCast(pref.ch), .b = @intCast(pref.slot) }
         else
             .{ .kind = .fx };
-        const visible: i32 = @max(1, @divTrunc(list_h, row_h));
-        const content_h: i32 = @as(i32, @intCast(pcount)) * row_h;
-        const scroll_max: i32 = @max(0, content_h - visible * row_h);
-        const scrollbar_w: i32 = if (scroll_max > 0) 6 else 0;
-        // 滚轮（悬停在列表区）
-        if (util.hitUI(ui, px, list_top, pw, list_h) and scroll_max > 0) {
-            scroll_p.* = std.math.clamp(scroll_p.* - ui.wheel * 24, 0, scroll_max);
-        }
-        scroll_p.* = std.math.clamp(scroll_p.*, 0, scroll_max);
-        const value_w: i32 = 130; // 右侧值文本预留宽
-        {
-            const saved = ui.renderer.pushClip(px, list_top, pw - scrollbar_w, list_h);
-            defer ui.renderer.popClip(saved);
-            var idx: usize = 0;
-            while (idx < pcount) : (idx += 1) {
-                const ry = list_top + @as(i32, @intCast(idx)) * row_h - scroll_p.*;
-                if (ry + row_h <= list_top or ry >= list_top + list_h) continue; // 视口剔除
-                const meta = &p.params[idx];
-                const rid: u64 = 7900 + @as(u64, idx);
-                const hovered = util.hitUI(ui, px, ry, pw - scrollbar_w, row_h - 1);
-                var v = p.paramNorm(idx);
-                const read_only = (meta.flags & 0x2) != 0; // kIsReadOnly：插件声明只读，跳过交互
-                if (!read_only and hovered and ui.mouse_double) {
-                    // 双击 → 恢复默认值（先于拖动判定：双击帧也会发按下，否则被拖动抢走）
-                    app.setPluginParamHost(ref, p, idx, meta.default_norm);
-                } else if (!read_only and ui.dragNormV(rid, px, ry, pw - scrollbar_w, row_h - 1, &v)) {
-                    // 离散参数：吸附到步长（拖动锚点无级累积 → 逐格步进可达）
-                    if (meta.step_count > 0) {
-                        const steps: f64 = @floatFromInt(meta.step_count);
-                        v = @round(v * steps) / steps;
-                    }
-                    app.setPluginParamHost(ref, p, idx, v);
-                }
-                const active = ui.active_id == rid;
-                ui.renderer.fillRect(px, ry, pw - scrollbar_w, row_h - 1, if (active) ui.theme.item_hover else if (hovered) ui.theme.toolbar else ui.theme.panel);
-                ui.renderer.strokeRect(px, ry, pw - scrollbar_w, row_h - 1, ui.theme.panel_border);
-                ui.labelClipped(meta.name(), px + 6, ry + 2, pw - scrollbar_w - value_w - 16, if (hovered or active) ui.theme.text else ui.theme.text_dim);
-                var vb: [40]u8 = undefined;
-                const vt = p.paramText(idx, &vb);
-                const vw: i32 = @min(value_w, @as(i32, @intFromFloat(ui.font.measure(vt))));
-                ui.labelClipped(vt, px + pw - scrollbar_w - 6 - vw, ry + 2, vw + 2, ui.theme.text);
-            }
-        }
-        if (scroll_max > 0) {
-            ui.drawScrollbar(px + pw - 7, list_top, 5, list_h, scroll_p.*, content_h, list_h);
-        }
-        ui.label("拖动调整 · 双击恢复默认", px + 8, py + ph - 13, ui.theme.text_dim);
+        util.drawPluginParamList(ui, app, pl, es.load_failed, scroll_p, ref, 7900, px, py, pw, ph, yy);
         return;
     }
     const infos = fx.paramInfos(@intFromEnum(es.kind));

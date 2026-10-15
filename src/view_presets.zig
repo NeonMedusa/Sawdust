@@ -43,6 +43,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) void {
     ui.renderer.fillRect(px + 3, py + 3, panel_w, panel_h, r_mod.rgb(10, 11, 13)); // 阴影
     ui.renderer.fillRect(px, py, panel_w, panel_h, ui.theme.panel);
     ui.renderer.strokeRect(px, py, panel_w, panel_h, ui.theme.accent);
+    ui.noteOverlayRect(px, py, panel_w, panel_h); // 模态面板：遮挡插件子窗口
 
     // 标题（按意图区分；replace 带当前插件名）
     ui.renderer.fillRect(px + 1, py + 1, panel_w - 2, util.title_h - 1, ui.theme.toolbar);
@@ -244,6 +245,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) void {
                     const my = std.math.clamp(app.preset_browser.ctx_y, 0, @max(0, h - mh));
                     ui.renderer.fillRect(mx, my, mw, mh, ui.theme.panel);
                     ui.renderer.strokeRect(mx, my, mw, mh, ui.theme.accent);
+                    ui.noteOverlayRect(mx, my, mw, mh); // 遮挡插件子窗口
                     var clicked: ?usize = null;
                     var inside = false;
                     for (items, 0..) |item, mi| {

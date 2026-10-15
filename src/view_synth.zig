@@ -17,6 +17,8 @@ const PresetSaveSource = @import("app.zig").PresetSaveSource;
 const synth = @import("synth.zig");
 const model = @import("model.zig");
 const util = @import("view_util.zig");
+const vst_host = @import("vst_host.zig");
+const PluginSlotRef = @import("app.zig").PluginSlotRef;
 
 const win_title_h: i32 = 22;
 // 振荡器行高（一行一个：容纳旋钮 34 + 上下余量）
@@ -32,9 +34,23 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     const sw = &app.synth_win;
     if (!sw.open) return false;
 
-    // 约束在屏幕内
-    sw.w = std.math.clamp(sw.w, win_min_w, @max(win_min_w, w - 20));
-    sw.h = std.math.clamp(sw.h, win_min_h, @max(win_min_h, h - 20));
+    // 约束在屏幕内（VST3 嵌入：尺寸固定=插件尺寸，松约束；其余：常规最小尺寸）
+    var vst3_pl: ?*vst_host.Plugin = null;
+    target_is_vst3_check: {
+        const ii: i32 = switch (sw.target) {
+            .instrument => |v| v,
+            else => break :target_is_vst3_check,
+        };
+        if (ii < 0 or ii >= @as(i32, @intCast(app.instruments.items.len))) break :target_is_vst3_check;
+        const inst = &app.instruments.items[@intCast(ii)];
+        if (inst.kind == .vst3) vst3_pl = inst.plugin;
+    }
+    const embedded = vst3_pl != null and vst3_pl.?.view != null;
+    const expect_ui = vst3_pl != null and !vst3_pl.?.editor_no_ui;
+    const min_w: i32 = if (expect_ui) 80 else win_min_w;
+    const min_h: i32 = if (expect_ui) 80 else win_min_h;
+    sw.w = std.math.clamp(sw.w, min_w, @max(min_w, w - 20));
+    sw.h = std.math.clamp(sw.h, min_h, @max(min_h, h - 20));
     sw.x = std.math.clamp(sw.x, 0, @max(0, w - sw.w));
     sw.y = std.math.clamp(sw.y, 0, @max(0, h - sw.h));
 
@@ -46,7 +62,11 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     // 乐器目标：**跟随当前选择**（旧行为）；鼓组层目标：固定绑定（不跟随）。
     // 目标失效（乐器被删/变成鼓组/层被删）→ 自动关闭。
     switch (sw.target) {
-        .instrument => sw.target = .{ .instrument = app.sel.instrument },
+        .instrument => |cur| {
+            const ni = app.sel.instrument;
+            if (cur != ni) sw.param_scroll = 0; // 换目标：兜底列表滚动归零
+            sw.target = .{ .instrument = ni };
+        },
         else => {},
     }
     const p = app.resolvePresetTarget(sw.target) orelse {
@@ -91,7 +111,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     // 预设按钮（标题栏右侧）：[预设 ▾] [保存为…]
     // 减法/VST3 乐器都有预设库——VST3 分类 = 插件 CID（`vst3_<cid>`）；
     // 见 main 的 loadVst3Preset/saveVst3Preset
-    const target_is_vst3 = switch (sw.target) {
+    const target_is_vst3 = vst3_pl != null or switch (sw.target) {
         .instrument => |ii| (ii >= 0 and ii < @as(i32, @intCast(app.instruments.items.len)) and app.instruments.items[@intCast(ii)].kind == .vst3),
         else => false,
     };
@@ -166,39 +186,43 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         if (!ui.mouse_down) {
             ui.active_id = 0;
         } else {
-            sw.x = ui.mouse_x - sw.grab_dx;
-            sw.y = ui.mouse_y - sw.grab_dy;
+            // 拖出主窗口时**当场钳制**（顶部 clamp 下帧才生效——期间子窗口会跟着
+            // 鼠标跑出面板/主窗口，用户实测“插件 UI 跑出去”）
+            sw.x = std.math.clamp(ui.mouse_x - sw.grab_dx, 0, @max(0, w - ww));
+            sw.y = std.math.clamp(ui.mouse_y - sw.grab_dy, 0, @max(0, h - hh));
         }
     }
 
-    // 右下角缩放柄
-    const grip = 14;
-    const grip_hovered = util.hitUI(ui, x + ww - grip, y + hh - grip, grip, grip);
-    if (grip_hovered) ui.cursor = .resize_h;
-    if (grip_hovered and ui.mouse_pressed) {
-        ui.active_id = 5001;
-        sw.resize_w0 = ww;
-        sw.resize_h0 = hh;
-        sw.resize_mx = ui.mouse_x;
-        sw.resize_my = ui.mouse_y;
-    }
-    if (ui.active_id == 5001) {
-        if (!ui.mouse_down) {
-            ui.active_id = 0;
-        } else {
-            sw.w = sw.resize_w0 + (ui.mouse_x - sw.resize_mx);
-            sw.h = sw.resize_h0 + (ui.mouse_y - sw.resize_my);
+    // 右下角缩放柄（VST3 嵌入：面板尺寸跟随插件，不提供手动缩放）
+    if (!embedded) {
+        const grip = 14;
+        const grip_hovered = util.hitUI(ui, x + ww - grip, y + hh - grip, grip, grip);
+        if (grip_hovered) ui.cursor = .resize_h;
+        if (grip_hovered and ui.mouse_pressed) {
+            ui.active_id = 5001;
+            sw.resize_w0 = ww;
+            sw.resize_h0 = hh;
+            sw.resize_mx = ui.mouse_x;
+            sw.resize_my = ui.mouse_y;
         }
+        if (ui.active_id == 5001) {
+            if (!ui.mouse_down) {
+                ui.active_id = 0;
+            } else {
+                sw.w = sw.resize_w0 + (ui.mouse_x - sw.resize_mx);
+                sw.h = sw.resize_h0 + (ui.mouse_y - sw.resize_my);
+            }
+        }
+        ui.renderer.line(x + ww - 10, y + hh - 2, x + ww - 2, y + hh - 10, ui.theme.panel_border);
+        ui.renderer.line(x + ww - 6, y + hh - 2, x + ww - 2, y + hh - 6, ui.theme.panel_border);
     }
-    ui.renderer.line(x + ww - 10, y + hh - 2, x + ww - 2, y + hh - 10, ui.theme.panel_border);
-    ui.renderer.line(x + ww - 6, y + hh - 2, x + ww - 2, y + hh - 6, ui.theme.panel_border);
 
-    // ── VST3 乐器：插件信息面板（须在振荡器/ADSR 等合成器 UI 之前分流）──
+    // ── VST3 乐器：插件界面嵌入（子窗口）或兜底参数列表（须在振荡器/ADSR 之前分流）──
     if (target_is_vst3) {
         switch (sw.target) {
             .instrument => |ii| {
                 if (ii >= 0 and ii < @as(i32, @intCast(app.instruments.items.len))) {
-                    drawVst3Body(ui, app, &app.instruments.items[@intCast(ii)], x, y, ww);
+                    drawVst3Body(ui, app, &app.instruments.items[@intCast(ii)], ii, &sw.param_scroll, x, y, ww, hh);
                 }
             },
             else => {},
@@ -310,35 +334,35 @@ fn fmtPercent(v: i32, buf: []u8) []const u8 {
 /// 振荡器行（一行一个）：开关 / 序号 / 波形按钮 / 音量旋钮 /
 /// 合奏数量（0-16）/ 合奏散布（0-100%）——两个数值控件与 BPM 同款
 /// （上下拖动、光标冻结隐藏）
-/// VST3 乐器信息面板（合成器 UI 不适用）：名称/路径/延迟 + 打开界面
-fn drawVst3Body(ui: *Ui, app: *App, inst: *model.Instrument, x: i32, y: i32, ww: i32) void {
-    var yy = y + win_title_h + 10;
+/// VST3 乐器体：嵌入中（子窗口覆盖内容区）不画；否则信息行 + 参数列表兜底
+/// （无界面插件走列表；“打开界面”按钮已移除——用户拍板：简单易用流派）
+fn drawVst3Body(ui: *Ui, app: *App, inst: *model.Instrument, ii: i32, scroll_p: *i32, x: i32, y: i32, ww: i32, hh: i32) void {
+    if (inst.plugin) |p| {
+        if (p.view != null) return; // 嵌入中：子窗口覆盖内容区
+    }
+    const body_y = y + win_title_h;
+    var yy = body_y + 10;
     ui.label(inst.name, x + 10, yy, ui.theme.text);
     yy += 22;
     ui.labelClipped(inst.pluginPath(), x + 10, yy, ww - 20, ui.theme.text_dim);
     yy += 22;
-    if (inst.plugin) |pl| {
+    const pl = inst.plugin;
+    if (pl) |p| {
         var b: [64]u8 = undefined;
-        ui.label(std.fmt.bufPrint(&b, "{s} · 延迟 {d} 样本", .{ pl.name(), pl.latency }) catch "", x + 10, yy, ui.theme.text_dim);
-        yy += 26;
-        if (ui.button(@intFromPtr(pl) + 100000, "打开插件界面", x + 10, yy, 120, 24)) {
-            switch (pl.openEditor(app.main_hwnd)) {
-                .opened => {},
-                .no_editor => ui.label("（此插件无编辑器界面）", x + 140, yy + 6, ui.theme.text_dim),
-                .failed => ui.label("（编辑器打开失败）", x + 140, yy + 6, ui.theme.text_dim),
-            }
-        }
+        ui.label(std.fmt.bufPrint(&b, "{s} · 延迟 {d} 样本", .{ p.name(), p.latency }) catch "", x + 10, yy, ui.theme.text_dim);
     } else {
         if (inst.load_failed) {
             ui.label("（插件加载失败——将自动重试；文件恢复后自动加载）", x + 10, yy, ui.theme.danger);
         } else {
             ui.label("（插件未加载）", x + 10, yy, ui.theme.text_dim);
         }
+        return;
     }
-    yy += 44;
+    yy += 24;
     ui.renderer.hline(x + 8, yy, ww - 16, ui.theme.panel_border);
     yy += 8;
-    ui.labelClipped("参数在插件自带界面中调整；音符请用钢琴卷帘编辑", x + 10, yy, ww - 20, ui.theme.text_dim);
+    const iref = PluginSlotRef{ .kind = .instrument, .a = @intCast(@min(ii, std.math.maxInt(u16))) };
+    util.drawPluginParamList(ui, app, pl, inst.load_failed, scroll_p, iref, 9600, x + 10, body_y, ww - 20, hh - win_title_h, yy);
 }
 
 fn drawOscRow(ui: *Ui, app: *App, p: *synth.SynthParams, oi: usize, x: i32, y: i32, w: i32) void {

@@ -103,10 +103,16 @@ pub const Theme = struct {
     record: Color = r_mod.rgb(220, 68, 68),
 };
 
+pub const UiRect = struct { x: i32, y: i32, w: i32, h: i32 };
+
 pub const Ui = struct {
     renderer: Renderer,
     font: *Font,
     theme: Theme = .{},
+
+    /// 本帧登记的“遮罩”矩形（菜单/弹层；插件子窗口遮挡判定，见 `noteOverlayRect`）
+    overlay_rects: [16]UiRect = undefined,
+    overlay_n: usize = 0,
 
     // ── 瞬时输入状态（每帧由 main 更新）──
     mouse_x: i32 = 0,
@@ -261,6 +267,26 @@ pub const Ui = struct {
         self.renderer.clear(self.theme.bg);
         self.cursor = .arrow; // 每帧重置；控件按需改
         self.resetLayers();
+        self.overlay_n = 0; // 遮罩登记表每帧重建（各菜单/弹层绘制时登记）
+    }
+
+    // ── 遮罩矩形登记（插件编辑器子窗口的遮挡判定用）──
+    // 菜单/下拉/弹层绘制时登记自己的矩形；帧末 syncPluginEditors 查
+    // `overlayBlocks`：命中则隐藏插件子窗口（否则子窗口永远盖在软渲染之上）。
+
+    /// 登记一个“遮罩”矩形（本帧有效；最多 16 个，超出丢弃）
+    pub fn noteOverlayRect(self: *Ui, x: i32, y: i32, w: i32, h: i32) void {
+        if (self.overlay_n >= self.overlay_rects.len) return;
+        self.overlay_rects[self.overlay_n] = .{ .x = x, .y = y, .w = w, .h = h };
+        self.overlay_n += 1;
+    }
+
+    /// 给定矩形是否与任一已登记遮罩相交
+    pub fn overlayBlocks(self: *const Ui, x: i32, y: i32, w: i32, h: i32) bool {
+        for (self.overlay_rects[0..self.overlay_n]) |r| {
+            if (x < r.x + r.w and r.x < x + w and y < r.y + r.h and r.y < y + h) return true;
+        }
+        return false;
     }
 
     pub fn endFrame(self: *Ui) void {
@@ -1483,3 +1509,20 @@ pub const Ui = struct {
         return false;
     }
 };
+
+
+test "ui: 遮罩矩形登记与命中（插件子窗口遮挡判定用）" {
+    var ui = Ui{ .renderer = undefined, .font = undefined };
+    ui.overlay_n = 0;
+    ui.noteOverlayRect(10, 10, 100, 50);
+    try std.testing.expect(ui.overlayBlocks(50, 20, 10, 10)); // 相交
+    try std.testing.expect(ui.overlayBlocks(105, 55, 10, 10)); // 边缘相交
+    try std.testing.expect(!ui.overlayBlocks(200, 200, 10, 10)); // 不相交
+    try std.testing.expect(!ui.overlayBlocks(0, 0, 10, 5)); // 左上方
+    // 上限：超过 16 个丢弃（不崩）；beginFrame 会清空
+    ui.overlay_n = 0;
+    var i: usize = 0;
+    while (i < 40) : (i += 1) ui.noteOverlayRect(0, 0, 1, 1);
+    try std.testing.expectEqual(@as(usize, 16), ui.overlay_n);
+    try std.testing.expect(ui.overlayBlocks(0, 0, 1, 1));
+}
