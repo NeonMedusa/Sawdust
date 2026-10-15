@@ -1,6 +1,9 @@
 //! VST3 探测工具（阶段 1：**只读枚举**——不接音频、不显示界面）。
 //!
-//! 用法：`vstscan [目录...]`（默认扫描系统 VST3 目录）。
+//! **已并入主程序（同二进制自举）**：入口为 `Sawdust.exe --vst-scan …`——
+//! 插件扫描以**独立进程**运行同一 exe（坏插件崩溃隔离在 worker 里），
+//! 不再单独构建 `vstscan.exe`。
+//! 用法：`Sawdust.exe --vst-scan [目录...]`（默认扫描系统 VST3 目录）。
 //! 输出：每个 .vst3 模块一行路径，其下列出效果器类（名称 · 厂商 · 版本）。
 //!
 //! 复用 `src/vst_host.zig` 的模块加载/枚举（主程序接入同一实现）。
@@ -25,9 +28,39 @@ extern "user32" fn TranslateMessage(*const MSG) callconv(.winapi) i32;
 extern "user32" fn DispatchMessageW(*const MSG) callconv(.winapi) isize;
 extern "kernel32" fn Sleep(u32) callconv(.winapi) void;
 
-pub fn main(init: std.process.Init) !u8 {
+// 控制台接驳（GUI 子系统 exe 的 CLI 模式）
+extern "kernel32" fn AttachConsole(dwProcessId: u32) callconv(.winapi) i32;
+extern "kernel32" fn GetStdHandle(nStdHandle: u32) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn SetStdHandle(nStdHandle: u32, hHandle: ?*anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn CreateFileW(
+    lpFileName: [*:0]const u16,
+    dwDesiredAccess: u32,
+    dwShareMode: u32,
+    lpSecurityAttributes: ?*anyopaque,
+    dwCreationDisposition: u32,
+    dwFlagsAndAttributes: u32,
+    hTemplateFile: ?*anyopaque,
+) callconv(.winapi) ?*anyopaque;
+
+/// 接上**父控制台**（`ATTACH_PARENT_PROCESS`）——GUI 子系统的 exe 从终端启动时，
+/// 标准句柄可能为 NULL（`std.debug.print` 无处可去）。策略：
+/// - 无父控制台（双击；或被 GUI 进程 spawn 的扫描 worker）→ 静默失败，**不弹窗**；
+/// - 已有合法标准句柄（终端继承 / 重定向管道）→ **不覆盖**（重定向才能正常捕获）；
+/// - 句柄为 NULL 时 → 重开 `CONOUT$` 并 SetStdHandle。
+fn attachParentConsole() void {
+    if (AttachConsole(0xFFFF_FFFF) == 0) return; // ATTACH_PARENT_PROCESS
+    const h = CreateFileW(std.unicode.utf8ToUtf16LeStringLiteral("CONOUT$"), 0x8000_0000 | 0x4000_0000, 1 | 2, null, 3, 0, null);
+    const raw = @intFromPtr(h orelse return);
+    if (raw == std.math.maxInt(usize)) return; // INVALID_HANDLE_VALUE
+    if (GetStdHandle(0xFFFF_FFF5) == null) _ = SetStdHandle(0xFFFF_FFF5, h); // STD_OUTPUT_HANDLE
+    if (GetStdHandle(0xFFFF_FFF4) == null) _ = SetStdHandle(0xFFFF_FFF4, h); // STD_ERROR_HANDLE
+}
+
+/// 同二进制自举入口（原 `vstscan.exe` 的 main；由主程序 `--vst-scan` 转发）。
+pub fn cliMain(init: std.process.Init) !u8 {
     const alloc = init.gpa;
     const io = init.io;
+    attachParentConsole(); // GUI 子系统下从终端启动：把输出接回父控制台
 
     // 命令行：`vstscan [目录...]`（默认扫系统 VST3 目录）
     var arg_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, alloc);
@@ -36,6 +69,7 @@ pub fn main(init: std.process.Init) !u8 {
     var dirs: [16][]const u8 = undefined;
     var nd: usize = 0;
     while (arg_it.next()) |a| {
+        if (nd == 0 and std.mem.eql(u8, a, "--vst-scan")) continue; // 同二进制自举前缀（主程序转发）
         if (nd < dirs.len) {
             dirs[nd] = a;
             nd += 1;
@@ -45,7 +79,7 @@ pub fn main(init: std.process.Init) !u8 {
     // （只枚举工厂类、不实例化；JSONL 协议与崩溃定位见 `vst_scan.zig`）
     if (nd > 0 and std.mem.eql(u8, dirs[0], "--jsonl")) {
         if (nd < 3) {
-            std.debug.print("用法：vstscan --jsonl <输出.jsonl> <目录或文件...>\n", .{});
+            std.debug.print("用法：Sawdust --vst-scan --jsonl <输出.jsonl> <目录或文件...>\n", .{});
             return 1;
         }
         const out_path = dirs[1];
@@ -60,7 +94,7 @@ pub fn main(init: std.process.Init) !u8 {
     // （多输出插件支持前后的探测：总线数/类型/通道数/默认激活位）
     if (nd > 0 and std.mem.eql(u8, dirs[0], "--buses")) {
         const p = if (nd > 1) dirs[1] else {
-            std.debug.print("用法：vstscan --buses <文件.vst3>\n", .{});
+            std.debug.print("用法：Sawdust --vst-scan --buses <文件.vst3>\n", .{});
             return 1;
         };
         const pz = alloc.dupeZ(u8, p) catch return 1;
@@ -74,7 +108,7 @@ pub fn main(init: std.process.Init) !u8 {
     // `vstscan --classes <文件.vst3>`：列出工厂里**全部类**（含非效果器：控制器等）
     if (nd > 0 and std.mem.eql(u8, dirs[0], "--classes")) {
         const p = if (nd > 1) dirs[1] else {
-            std.debug.print("用法：vstscan --classes <文件.vst3>\n", .{});
+            std.debug.print("用法：Sawdust --vst-scan --classes <文件.vst3>\n", .{});
             return 1;
         };
         const pz = alloc.dupeZ(u8, p) catch return 1;
@@ -91,7 +125,7 @@ pub fn main(init: std.process.Init) !u8 {
     // `vstscan --params <文件.vst3>`：列出参数（阶段 4 面板数据的无头验证）
     if (nd > 0 and std.mem.eql(u8, dirs[0], "--params")) {
         const p = if (nd > 1) dirs[1] else {
-            std.debug.print("用法：vstscan --params <文件.vst3>\n", .{});
+            std.debug.print("用法：Sawdust --vst-scan --params <文件.vst3>\n", .{});
             return 1;
         };
         const pz = alloc.dupeZ(u8, p) catch return 1;
@@ -114,7 +148,7 @@ pub fn main(init: std.process.Init) !u8 {
     // `vstscan --run <文件.vst3> [effect|instrument]`：音频试跑（加载 → 喂正弦/静音 → 统计输出）
     if (nd > 0 and std.mem.eql(u8, dirs[0], "--run")) {
         const p = if (nd > 1) dirs[1] else {
-            std.debug.print("用法：vstscan --run <文件.vst3> [effect|instrument]\n", .{});
+            std.debug.print("用法：Sawdust --vst-scan --run <文件.vst3> [effect|instrument]\n", .{});
             return 1;
         };
         const role: host.Role = if (nd > 2 and std.mem.eql(u8, dirs[2], "instrument")) .instrument else .effect;
@@ -124,7 +158,7 @@ pub fn main(init: std.process.Init) !u8 {
     // `vstscan --editor <文件.vst3> [秒数]`：编辑器接口冒烟（打开 → 泵消息 → 关闭）
     if (nd > 0 and std.mem.eql(u8, dirs[0], "--editor")) {
         const p = if (nd > 1) dirs[1] else {
-            std.debug.print("用法：vstscan --editor <文件.vst3> [秒数]\n", .{});
+            std.debug.print("用法：Sawdust --vst-scan --editor <文件.vst3> [秒数]\n", .{});
             return 1;
         };
         const secs: u32 = if (nd > 2) (std.fmt.parseInt(u32, dirs[2], 10) catch 1) else 1;

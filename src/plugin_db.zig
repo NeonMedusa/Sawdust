@@ -580,7 +580,7 @@ test "plugin_db: 缓存存盘往返（含类信息）" {
     try std.testing.expect(c2.findByCid("0102030405060708090a0b0c0d0e0f10") != null);
 }
 
-test "plugin_db: 真实 vstscan 输出可解析（文件存在才跑）" {
+test "plugin_db: 真实扫描输出可解析（文件存在才跑）" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
     const data = std.Io.Dir.cwd().readFileAlloc(io, "tmp/vst_scan_out.jsonl", alloc, .unlimited) catch return; // 不存在：跳过

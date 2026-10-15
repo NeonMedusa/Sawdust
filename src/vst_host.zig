@@ -864,7 +864,7 @@ fn collectClasses(m: Mod, out: *Scan) void {
 }
 
 /// 扫描一个 `.vst3` 模块（加载 → 枚举全部类 → 卸载）
-/// 诊断：打印模块中**第一个音频类**的全部总线布局（`vstscan --buses` 用）——
+/// 诊断：打印模块中**第一个音频类**的全部总线布局（`Sawdust --vst-scan --buses` 用）——
 /// 多输出插件（如 SFLT 0进17出）支持前的探测：总线数/类型/通道数/默认激活位。
 pub fn dumpBuses(path: [:0]const u8) !void {
     const m = try loadModule(path);

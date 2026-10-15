@@ -43,10 +43,16 @@ const fx = @import("effects.zig");
 const vst_host = @import("vst_host.zig");
 const eq = @import("eq.zig");
 const audio = @import("audio.zig");
+const vstscan = @import("vstscan.zig"); // 插件扫描工具（同二进制自举入口 `--vst-scan`）
 
 pub fn main(init: std.process.Init) !u8 {
     const allocator = init.gpa;
     const io = init.io;
+
+    // 隐藏 CLI 模式（**同二进制自举**）：`Sawdust.exe --vst-scan …` = 原 vstscan 工具。
+    // 插件扫描据此以独立进程运行**自身**（坏插件崩溃隔离在子进程；主程序零污染）。
+    // 必须在任何 GUI/音频初始化**之前**——否则 worker 进程会拉起窗口。
+    if (hasScanArg(init)) return vstscan.cliMain(init);
 
     var win: window.Window = undefined;
     try win.init(allocator, "Sawdust — Simple Audio Workstation", 1280, 760);
@@ -845,6 +851,28 @@ fn exeDir(allocator: std.mem.Allocator, buf: []u8) []const u8 {
     const dir = std.fs.path.dirname(utf8) orelse return "";
     const m = @min(dir.len, buf.len);
     @memcpy(buf[0..m], dir[0..m]);
+    return buf[0..m];
+}
+
+/// 首个参数是否为 `--vst-scan`（同二进制自举入口判定；**GUI 初始化之前**调用）。
+fn hasScanArg(init: std.process.Init) bool {
+    var it = std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa) catch return false;
+    defer it.deinit();
+    _ = it.skip(); // argv0
+    const a = it.next() orelse return false;
+    return std.mem.eql(u8, a, "--vst-scan");
+}
+
+/// 可执行文件**完整路径**（UTF-8 写入 `buf`；失败返回 ""）。
+/// 扫描 worker 用同二进制自举（`--vst-scan`）——需把自身路径传给 CreateProcessW。
+fn selfExePath(allocator: std.mem.Allocator, buf: []u8) []const u8 {
+    var wbuf: [1024]u16 = undefined;
+    const n = GetModuleFileNameW(null, &wbuf, wbuf.len);
+    if (n == 0 or n >= wbuf.len) return "";
+    const utf8 = std.unicode.utf16LeToUtf8Alloc(allocator, wbuf[0..n]) catch return "";
+    defer allocator.free(utf8);
+    const m = @min(utf8.len, buf.len);
+    @memcpy(buf[0..m], utf8[0..m]);
     return buf[0..m];
 }
 
@@ -2632,7 +2660,8 @@ fn syncPluginSlots(app: *App) void {
 
 // ── 插件管理：文件夹/文件选择 + 扫描 worker（进程）──
 //
-// 扫描 = 独立 worker 进程（`vstscan.exe --jsonl`）：坏插件崩的是它，主进程零污染；
+// 扫描 = 独立 worker 进程（**自身 exe** `--vst-scan --jsonl`，同二进制自举）：
+// 坏插件崩的是它，主进程零污染；
 // 进度/崩溃定位靠 JSONL（孤立 `start` 行）——协议见 `vst_scan.zig`。
 // 进程走 Win32 直调（`CREATE_NO_WINDOW` 不闪控制台；不依赖 std.process 形态）。
 
@@ -2768,7 +2797,7 @@ fn appendUtf16Quoted(list: *std.ArrayListUnmanaged(u16), alloc: std.mem.Allocato
     try list.append(alloc, '"');
 }
 
-/// 「开始扫描」：spawn `vstscan.exe --jsonl <数据目录>/scan_tmp.jsonl <根...>`。
+/// 「开始扫描」：spawn **自身 exe**（`Sawdust.exe --vst-scan --jsonl <数据目录>/scan_tmp.jsonl <根...>`）。
 /// 根 = 启用的文件夹 + 单文件；路径全部加引号（Program Files 含空格）。
 fn startPluginScan(app: *App, io: std.Io) void {
     const pm = &app.plugin_mgr;
@@ -2792,14 +2821,13 @@ fn startPluginScan(app: *App, io: std.Io) void {
         return;
     }
 
-    var edir_buf: [1024]u8 = undefined;
-    const edir = exeDir(app.allocator, &edir_buf);
-    if (edir.len == 0) {
-        app.setToast("无法定位程序目录");
+    // 扫描 worker = **自身 exe**（--vst-scan 自举）；不再依赖单独构建的 vstscan.exe
+    var exe_buf: [1200]u8 = undefined;
+    const exe_path = selfExePath(app.allocator, &exe_buf);
+    if (exe_path.len == 0) {
+        app.setToast("无法定位程序路径");
         return;
     }
-    var exe_buf: [1200]u8 = undefined;
-    const exe_path = std.fmt.bufPrint(&exe_buf, "{s}\\vstscan.exe", .{edir}) catch return;
 
     var out_buf: [640]u8 = undefined;
     const out_path = std.fmt.bufPrint(&out_buf, "{s}/scan_tmp.jsonl", .{root}) catch return;
@@ -2809,7 +2837,7 @@ fn startPluginScan(app: *App, io: std.Io) void {
     var cmd: std.ArrayListUnmanaged(u16) = .{ .items = &.{}, .capacity = 0 };
     defer cmd.deinit(app.allocator);
     appendUtf16Quoted(&cmd, app.allocator, exe_path) catch return;
-    appendUtf16(&cmd, app.allocator, " --jsonl ") catch return;
+    appendUtf16(&cmd, app.allocator, " --vst-scan --jsonl ") catch return;
     appendUtf16Quoted(&cmd, app.allocator, out_path) catch return;
     for (roots.items) |r| {
         appendUtf16(&cmd, app.allocator, " ") catch return;
@@ -2821,7 +2849,7 @@ fn startPluginScan(app: *App, io: std.Io) void {
     var si = STARTUPINFOW{ .cb = @sizeOf(STARTUPINFOW) };
     var pi = PROCESS_INFORMATION{};
     if (CreateProcessW(null, cmd_z.ptr, null, null, 0, scan_no_window, null, null, &si, &pi) == 0) {
-        app.setToast("无法启动扫描进程（vstscan.exe 是否在程序目录？）");
+        app.setToast("无法启动扫描进程（自身 exe 自举失败）");
         return;
     }
     if (pi.hThread) |h| _ = CloseHandle(h);

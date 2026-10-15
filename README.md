@@ -52,14 +52,14 @@ libs/zig-vst3/                 # VST3 绑定（submodule；MIT）
 > 已克隆的仓库补 `git submodule update --init` 即可。
 
 ```bash
-zig build                 # 调试构建 → zig-out/bin/Sawdust.exe + vstscan.exe
+zig build                 # 调试构建 → zig-out/bin/Sawdust.exe（**单文件**）
 zig build run             # 构建并运行
 zig build test            # 单元测试
 zig build -Doptimize=ReleaseFast
 ```
 
-> 注：插件管理器的扫描依赖**与主程序同目录的 `vstscan.exe`**（`zig build` 会一并产出；
-> 打包发布时两个 exe 需同行）。
+> 注：插件管理器的扫描以**独立进程运行自身 exe**（`Sawdust.exe --vst-scan …`，同二进制
+> 自举）——坏插件崩溃隔离在 worker 进程里；发布只需一个 exe。
 
 ## 快捷键
 

@@ -36,27 +36,20 @@ pub fn build(b: *std.Build) void {
         for ([_][]const u8{ "user32", "gdi32", "kernel32", "ole32", "uuid", "winmm", "comdlg32", "shell32" }) |lib| {
             exe.root_module.linkSystemLibrary(lib, .{});
         }
+        // **GUI 子系统**：双击 exe 不再弹控制台黑框。CLI 自举模式（`--vst-scan`）
+        // 从终端启动时会接上父控制台（见 `vstscan.attachParentConsole`），
+        // 被 GUI spawn 的扫描 worker 则静默无窗口。
+        exe.subsystem = .windows;
     }
 
     b.installArtifact(exe);
     // 主程序也用 VST3 绑定（插件槽）——同一 path 依赖模块
+    // （build.zig.zon 的 path 依赖 → libs/zig-vst3 submodule；构建全程不碰网络——
+    //   避开 zig fetch 不走系统代理的痛点）
     exe.root_module.addImport("zig_vst3", b.dependency("zig_vst3", .{ .target = target, .optimize = optimize }).module("zig-vst3"));
 
-    // ── VST3 探测工具（阶段 1：只读枚举，不影响主程序）──
-    // 依赖经 build.zig.zon 的 **path 依赖**引入（libs/zig-vst3，submodule）——
-    // 构建全程不碰网络（zig fetch 不走系统代理的痛点）
-    const zig_vst3_dep = b.dependency("zig_vst3", .{ .target = target, .optimize = optimize });
-    const vstscan = b.addExecutable(.{
-        .name = "vstscan",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/vstscan.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    vstscan.root_module.addImport("zig_vst3", zig_vst3_dep.module("zig-vst3"));
-    b.installArtifact(vstscan);
+    // VST3 探测/扫描工具已**并入主程序**（`Sawdust.exe --vst-scan …` 同二进制自举；
+    // 插件扫描以独立进程运行自身 = 保留坏插件崩溃隔离）；不再单独构建 vstscan.exe。
 
     const run_step = b.step("run", "Run Sawdust");
     const run_cmd = b.addRunArtifact(exe);

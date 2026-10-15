@@ -1,5 +1,6 @@
 //! VST3 扫描 worker 核心：候选发现 + JSONL 协议输出。
-//! 由 `vstscan --jsonl <out.jsonl> <路径...>` 调用；主程序（插件管理器）按同格式消费。
+//! 由同二进制自举的扫描 worker 调用（`Sawdust.exe --vst-scan --jsonl <out.jsonl> <路径...>`）；
+//! 主程序（插件管理器）按同格式消费。
 //!
 //! **安全模型**：只读枚举插件工厂的类信息，**绝不实例化组件**（不跑插件业务代码）；
 //! worker 是独立进程——坏插件崩的是它，不是主程序。worker 内**从不 FreeLibrary**
