@@ -83,7 +83,8 @@ fn setNoteValue(nt: *model.Note, mode: NoteLaneMode, v: i32) void {
 
 /// 绘制 + 交互（由 `view_pianoroll.draw` 在音符区之后调用）。
 /// 返回 true = 本帧有改动（调用方据此 coalesce 提交历史）。
-/// - `lane_x`/`step_ws`/`scroll_s`/`zoom`：与音符区**同一**坐标映射；
+/// - `lane_x`/`step_ws`/`scroll_s`/`scroll_x`/`zoom`：与音符区**同一帧**的坐标映射
+///   （`scroll_s` 屏幕像素 / `scroll_x` 内容像素——由调用方传帧首快照，本函数内含网格绘制）；
 /// - `y`/`h`：编辑轨矩形（不含分割条）；`head_w`：轨道头宽（= 琴键列宽）。
 pub fn draw(
     ui: *Ui,
@@ -95,6 +96,7 @@ pub fn draw(
     lane_x: i32,
     step_ws: f32,
     scroll_s: f32,
+    scroll_x: i32,
     zoom: f32,
     pattern: i32,
     snap_steps: i32,
@@ -187,7 +189,7 @@ pub fn draw(
             y,
             h,
             track_x,
-            app.piano.scroll_x,
+            scroll_x, // 帧首快照（与音符区同帧——本函数在缩放补间之后绘制，勿现读 app）
             zoom,
             @floatFromInt(util.piano_step_w),
             app.steps_per_bar,
@@ -320,11 +322,25 @@ pub fn draw(
 
     // ── 播放游标（贯穿编辑轨）──
     {
-        const cur_step: i32 = if (app.sel.song_mode) app.playback.song_step else app.playback.piano_step;
-        const cx = barX(cur_step, track_x, step_ws, scroll_s);
-        if (cx >= track_x - 2 and cx <= track_x + track_w + 2) {
-            const col = if (app.playing) ui.theme.cursor_play else ui.theme.cursor_idle;
-            ui.renderer.vline(cx, y, h, col);
+        // **平滑小数步**（子步 + 渲染侧前馈/收敛；音频缓冲量化不显——“游标还是抖”的终解）。
+        // SONG：与卷帘同法映射到当前片段局部（不在片段内不画）；PAT：局部步。
+        var cur_f: f32 = app.cursorDisplay(false);
+        var show = true;
+        if (app.sel.song_mode) {
+            show = false;
+            if (model.leftmostClipFor(app.clips.items, pattern)) |c| {
+                if (model.clipSongToLocal(c, app.playback.song_step) != null) {
+                    cur_f = app.cursorDisplay(true) - @as(f32, @floatFromInt(c.start)) + @as(f32, @floatFromInt(c.offset));
+                    show = true;
+                }
+            }
+        }
+        if (show) {
+            const cx = track_x + @as(i32, @intFromFloat(cur_f * step_ws - scroll_s));
+            if (cx >= track_x - 2 and cx <= track_x + track_w + 2) {
+                const col = if (app.playing) ui.theme.cursor_play else ui.theme.cursor_idle;
+                ui.renderer.vline(cx, y, h, col);
+            }
         }
     }
 

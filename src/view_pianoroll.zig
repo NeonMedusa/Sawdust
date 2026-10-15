@@ -156,6 +156,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
 
     // 横向缩放：内容坐标 → 屏幕坐标（本帧最终值）
     const zoom: f32 = app.piano.zoom;
+    // 横向滚动**帧首快照**：网格/编辑区共用一个口径（本帧横向缩放补间在绘制之后——
+    // 若编辑区现读 `app.piano.scroll_x` 会领先一帧：左缘网格线闪动，实测“没有补间”感）
+    const scroll_x0: i32 = app.piano.scroll_x;
     const step_ws: f32 = @as(f32, @floatFromInt(util.piano_step_w)) * zoom; // 屏幕上的步宽
     const bar_ws: f32 = @as(f32, @floatFromInt(bar_w)) * zoom; // 屏幕上的小节宽
     const scroll_s: f32 = @as(f32, @floatFromInt(app.piano.scroll_x)) * zoom; // 屏幕上的滚动量
@@ -261,7 +264,6 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         }
         ui.renderer.hline(keys_x, ruler_y + seg_h - 1, seg_w, ui.theme.panel_border);
     }
-
 
     // □ 缺口：按住上下拖 = 音高行高缩放（方块本身固定不动；视口中心音高保持不动）
     {
@@ -393,9 +395,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             view_w,
             lane_y,
             lane_h,
-            lane_x,
-            app.piano.scroll_x,
-            zoom,
+               lane_x,
+               scroll_x0,
+               zoom,
             @floatFromInt(util.piano_step_w),
             spb,
             model.stepsPerBeat(app.time_den),
@@ -534,18 +536,20 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         const saved_cursor = ui.renderer.pushClip(lane_x, ruler_y, view_w, ruler_h + lane_h);
         defer ui.renderer.popClip(saved_cursor);
 
-        // 局部步 → 屏幕 x（内容像素 → 屏幕：乘 zoom）
+        // 局部步（**小数步**：子步精度）→ 屏幕 x（内容像素 → 屏幕：乘 zoom）
         const localStepX = struct {
-            fn f(step: i32, lx: i32, sw: f32, ss: f32) i32 {
-                return lx + @as(i32, @intFromFloat(@as(f32, @floatFromInt(step)) * sw - ss));
+            fn f(step: f32, lx: i32, sw: f32, ss: f32) i32 {
+                return lx + @as(i32, @intFromFloat(step * sw - ss));
             }
         }.f;
 
         if (app.sel.song_mode) {
             // SONG：找当前样式最左片段 → 全局步换算为局部步；无片段/不在范围内不显示
             if (model.leftmostClipFor(app.clips.items, pattern)) |c| {
-                if (model.clipSongToLocal(c, app.playback.song_step)) |local| {
-                    util.drawCursor(ui, localStepX(local, lane_x, step_ws, scroll_s), ruler_y, ruler_h, lane_y + lane_h, app.playing);
+                if (model.clipSongToLocal(c, app.playback.song_step) != null) {
+                    // **平滑小数步**（渲染帧线性；音频缓冲量化被吸收——实测“游标还是抖”的终解）
+                    const local_f: f32 = app.cursorDisplay(true) - @as(f32, @floatFromInt(c.start)) + @as(f32, @floatFromInt(c.offset));
+                    util.drawCursor(ui, localStepX(local_f, lane_x, step_ws, scroll_s), ruler_y, ruler_h, lane_y + lane_h, app.playing);
                 }
                 // 设置：局部 → 全局（超出片段可见范围 → 归位到片段起点）
                 // （`menu_click` 门控：点选单条目的那一帧不得穿透到标尺）
@@ -611,8 +615,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 }
             }
         } else {
-            // PAT：局部步自由设置
-            util.drawCursor(ui, localStepX(app.playback.piano_step, lane_x, step_ws, scroll_s), ruler_y, ruler_h, lane_y + lane_h, app.playing);
+            // PAT：局部步自由设置（**平滑小数步** → 平滑游标）
+            util.drawCursor(ui, localStepX(app.cursorDisplay(false), lane_x, step_ws, scroll_s), ruler_y, ruler_h, lane_y + lane_h, app.playing);
             // （`menu_click` 门控：点选单条目的那一帧不得穿透到标尺）
             const in_ruler = !menu_click and ui.hitRect(lane_x, ruler_y, view_w, ruler_h);
             // Ctrl+标尺：拖动 = 设循环区域；单击（未拖动）= 取消循环（同上）
@@ -1023,33 +1027,77 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 拖动跟随抽动（用户约定：拖动期间只平移，不缩放）
     if (!app.piano.nav_active and !ui.wheel_alt and ui.hitRect(main_x, lane_y, main_w, lane_h + splitter_h + editor_h)) {
         if (ui.wheel_ctrl) {
-            // Ctrl+滚轮：横向缩放（锚定鼠标下的内容）+ 内容区拉回
+            // Ctrl+滚轮：横向缩放——**只更新补间目标**（滚轮离散，逐帧平滑逼近；
+            // 补间块在本段之后；锚定用事件时的鼠标偏移，补间每一步都锚定）
             // 注：拉回**无条件执行**（不只在 zoom 变化时）——
             // 否则“已缩到下限 + 视口停在右侧空白”时下滚会无事发生。
-            const mouse_off = ui.mouse_x - lane_x;
-            const old_zoom = app.piano.zoom;
+            app.piano.zoom_anchor_off = ui.mouse_x - lane_x;
+            var tgt = app.piano.zoom_target;
+            // 反向输入先抵消未完成的补间（同播放列表；实测手感 bug）
+            if ((ui.wheel > 0 and tgt < app.piano.zoom) or (ui.wheel < 0 and tgt > app.piano.zoom)) tgt = app.piano.zoom;
             // 下限取 min(动态下限，当前)：内容缩短（动态下限被动抬高）时
             // 不得把视口突然放大——只拦“继续缩小”。
-            const new_zoom = std.math.clamp(old_zoom * std.math.pow(f32, util.wheel_zoom_factor, @as(f32, @floatFromInt(ui.wheel))), @min(dyn_zoom_min, old_zoom), 8.0);
-            if (new_zoom != old_zoom) {
-                app.piano.zoom = new_zoom;
-                app.piano.scroll_x = Ui.zoomAnchoredScrollX(app.piano.scroll_x, view_w, mouse_off, old_zoom, new_zoom, app.piano.content_w, content_span);
-            }
+            app.piano.zoom_target = std.math.clamp(tgt * std.math.pow(f32, util.wheel_zoom_factor, @as(f32, @floatFromInt(ui.wheel))), @min(dyn_zoom_min, tgt), 8.0);
             // 缩小/已到下限：把视口右缘拉回内容跨度内（全装得下 → 贴左）
             const vcw: i32 = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(view_w)) / app.piano.zoom)));
             app.piano.scroll_x = Ui.clampScrollToSpan(app.piano.scroll_x, vcw, content_span);
         } else if (ui.wheel_shift) {
-            // Shift+滚轮：**纵向缩放**（音高行高；锚定鼠标下的行）
-            const old_k = app.piano.key_h;
-            const new_k = std.math.clamp(old_k + ui.wheel * 2, util.piano_key_h_min, util.piano_key_h_max);
-            if (new_k != old_k) {
-                app.piano.key_h = new_k;
-                const ch_new: i32 = 128 * new_k;
-                app.piano.scroll = Ui.zoomAnchoredScrollY(app.piano.scroll, lane_h, ui.mouse_y - lane_y, old_k, new_k, ch_new);
-            }
+            // Shift+滚轮：**纵向缩放**（音高行高）——只设补间目标（补间块在本段之后）
+            app.piano.key_h_anchor_off = ui.mouse_y - lane_y;
+            var tgt = app.piano.key_h_target;
+            // 反向输入先抵消未完成的补间（同横向缩放；实测手感 bug）
+            if ((ui.wheel > 0 and tgt < app.piano.key_h) or (ui.wheel < 0 and tgt > app.piano.key_h)) tgt = app.piano.key_h;
+            app.piano.key_h_target = std.math.clamp(tgt + ui.wheel * 2, util.piano_key_h_min, util.piano_key_h_max);
         } else {
-            app.piano.scroll = std.math.clamp(app.piano.scroll - util.scrollDelta(ui), 0, @max(0, content_h - lane_h));
+            // 裸滚轮：纵向滚动——只设补间目标（滚轮离散 → 逐帧平滑）
+            app.piano.scroll_target = std.math.clamp(app.piano.scroll_target - util.scrollDelta(ui), 0, @max(0, content_h - lane_h));
         }
+    }
+
+    // ── 横向缩放的**补间动画**（同播放列表：滚轮离散，逐帧平滑逼近）──
+    // 目标由 Ctrl+滚轮设置；他处改变 zoom（滚动条拖边缘、载入工程）→ 采纳为目标不补间。
+    {
+        const p = &app.piano;
+        if (p.zoom_anim_last < 0.0 or p.zoom != p.zoom_anim_last) p.zoom_target = p.zoom;
+        if (p.zoom != p.zoom_target) {
+            const z_new = if (@abs(p.zoom_target - p.zoom) <= p.zoom_target * 0.002)
+                p.zoom_target
+            else
+                util.glideF32(p.zoom, p.zoom_target, app.frame_dt_ns, 0.03);
+            if (z_new > 0 and z_new != p.zoom) {
+                p.scroll_x = Ui.zoomAnchoredScrollX(p.scroll_x, view_w, p.zoom_anchor_off, p.zoom, z_new, p.content_w, content_span);
+                p.zoom = z_new;
+            }
+        }
+        p.zoom_anim_last = p.zoom;
+    }
+    // ── 纵向补间（Shift+滚轮 = 音高行高；裸滚轮 = 纵向滚动；τ=0.03 同横向）──
+    {
+        const p = &app.piano;
+        if (p.key_h_anim_last < 0 or p.key_h != p.key_h_anim_last) p.key_h_target = p.key_h;
+        if (p.key_h != p.key_h_target) {
+            const h_new = if (@abs(p.key_h_target - p.key_h) <= 1)
+                p.key_h_target
+            else
+                util.glideI32(p.key_h, p.key_h_target, app.frame_dt_ns, 0.03);
+            if (h_new > 0 and h_new != p.key_h) {
+                p.scroll = Ui.zoomAnchoredScrollY(p.scroll, lane_h, p.key_h_anchor_off, p.key_h, h_new, 128 * h_new);
+                p.key_h = h_new;
+            }
+        }
+        p.key_h_anim_last = p.key_h;
+        const ch_now: i32 = 128 * @max(1, p.key_h);
+        const max_s: i32 = @max(0, ch_now - lane_h);
+        if (p.scroll_anim_last < 0 or p.scroll != p.scroll_anim_last) p.scroll_target = p.scroll;
+        p.scroll_target = std.math.clamp(p.scroll_target, 0, max_s);
+        if (p.scroll != p.scroll_target) {
+            const s_new = if (@abs(p.scroll_target - p.scroll) <= 1)
+                p.scroll_target
+            else
+                util.glideI32(p.scroll, p.scroll_target, app.frame_dt_ns, 0.03);
+            p.scroll = std.math.clamp(s_new, 0, max_s);
+        }
+        p.scroll_anim_last = p.scroll;
     }
     // ── 中键拖动：平移视口（仅音符网格区；抓画布：内容跟手）──
     {
@@ -1076,12 +1124,43 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             }
         }
     }
+    // ── 视角跟随播放游标（与播放列表**共用开关**；主动操作优先）──
+    // 关键：跟的必须是**屏幕上那个游标**——
+    //   SONG 模式 = 全局步换算到当前片段局部步（同播放游标绘制逻辑；不在片段内/无片段
+    //   → 屏幕上无游标，不跟）；PAT 模式 = `piano_step`。
+    //   （曾错跟 `piano_step`：SONG 播放期间它是冻结值 → 视角跟了个静止点）
+    // 主动操作判定同播放列表：中键平移 / 横向滚动条拖动或边缘缩放（其 id=10）；纯即时恢复。
+    {
+        const p = &app.piano;
+        // **平滑小数步**（子步 + 渲染侧前馈/收敛；音频缓冲量化不显——实测“游标还是抖”的终解。
+        // 与游标绘制同一映射。）
+        const cur_step: ?f32 = if (app.sel.song_mode) blk: {
+            const c = model.leftmostClipFor(app.clips.items, pattern) orelse break :blk null;
+            if (model.clipSongToLocal(c, app.playback.song_step) == null) break :blk null;
+            break :blk app.cursorDisplay(true) - @as(f32, @floatFromInt(c.start)) + @as(f32, @floatFromInt(c.offset));
+        } else app.cursorDisplay(false);
+        const nav = p.nav_active or ui.active_id == 10;
+        // 主动操作优先（纯即时：宽限/桥接已删）：中键/滚动条按住暂停，松手当帧恢复
+        if (cur_step) |st| {
+            if (app.playlist.follow_playhead and app.playing and !nav) {
+                const cur_px: f32 = st * @as(f32, @floatFromInt(util.piano_step_w));
+                // 锚点口径 = **内容区（网格区）**（用户确认以网格区为准）
+                const off_screen: f32 = util.follow_anchor_frac * @as(f32, @floatFromInt(view_w));
+                const vcw_f: f32 = @as(f32, @floatFromInt(view_w)) / p.zoom;
+                const vcw_i: i32 = @max(1, @as(i32, @intFromFloat(vcw_f)));
+                // **软锚定**（同播放列表）：有余量 → 锚点；余量耗尽 → 就势放开（不强行延长行程）
+                const follow_span: i32 = @max(content_span, p.content_w);
+                const target = util.followTargetScrollX(cur_px, view_w, p.zoom, off_screen, follow_span);
+                p.scroll_x = Ui.clampScrollToSpan(util.followGlide(p.scroll_x, target, app.frame_dt_ns), vcw_i, follow_span);
+            }
+        }
+    }
     _ = ui.scrollbarV(11, sb_x, lane_y, ruler_h, lane_h, &app.piano.scroll, content_h, lane_h);
     ui.renderer.vline(sb_x, lane_y, lane_h, ui.theme.panel_border);
 
     // ── 力度/声像编辑轨（分割条已在布局最前处理）──
     const editor_y2 = lane_y + lane_h + splitter_h;
-    const lane_changed = view_note_lane.draw(ui, app, x + 1, editor_y2, w - 2, editor_h, lane_x, step_ws, scroll_s, zoom, pattern, snap_steps);
+    const lane_changed = view_note_lane.draw(ui, app, x + 1, editor_y2, w - 2, editor_h, lane_x, step_ws, scroll_s, scroll_x0, zoom, pattern, snap_steps);
     // 编辑轨改动：coalesce 提交（拖动中每帧置 pending，松手后帧末提交一条）
     if (lane_changed) {
         app.history_pending = if (app.piano.lane_mode == .velocity) "调整力度" else "调整声像";

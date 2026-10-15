@@ -317,10 +317,26 @@ pub const PlaylistState = struct {
     scroll: i32 = 0,
     /// 横向滚动（内容像素；视口左缘）
     scroll_x: i32 = 0,
+    /// 纵向滚动补间：目标（滚轮只设目标；`scroll` 逐帧逼近；拖滚动条写 `scroll` → 被采纳为即时）
+    scroll_target: i32 = 0,
+    /// 上一帧末 `scroll` 快照（<0 = 未初始化；检测外部改动）
+    scroll_anim_last: i32 = -1,
+    /// 轨道行高补间：目标 / 事件时鼠标偏移（相对轨道区顶）/ 上一帧末快照（<0 = 未初始化）
+    track_h_target: i32 = 44,
+    track_h_anchor_off: i32 = 0,
+    track_h_anim_last: i32 = -1,
+    /// 视角跟随播放游标（工具栏开关；主动操作优先、停手且播放中则恢复）
+    follow_playhead: bool = false,
     /// 时间轴内容长度（内容像素；下限 = 实际内容右缘）
     content_w: i32 = 0,
     /// 横向缩放（屏幕像素 / 内容像素）
     zoom: f32 = 1.0,
+    /// **缩放补间目标**（Ctrl+滚轮只设目标；`zoom` 逐帧平滑逼近——滚轮离散跳变生硬）
+    zoom_target: f32 = 1.0,
+    /// 补间锚点：最近滚轮事件时的鼠标偏移（相对内容区左缘；补间每步锚定）
+    zoom_anchor_off: i32 = 0,
+    /// 上一帧末 `zoom` 快照（检测“他处改变 zoom”→ 采纳为补间目标；<0 = 未初始化）
+    zoom_anim_last: f32 = -1,
     /// 量化/吸附网格档位（`model.snap_denoms` 下标；**与钢琴卷帘独立**）
     snap: i32 = 3, // 默认 1/8（`snap_denoms` 下标 3）
     /// 吸附网格下拉选单：展开中
@@ -391,10 +407,23 @@ pub const PianoState = struct {
     scroll: i32 = 0,
     /// 横向滚动（内容像素）
     scroll_x: i32 = 0,
+    /// 纵向滚动补间：目标 / 上一帧末快照（<0 = 未初始化；拖滚动条写 `scroll` → 被采纳为即时）
+    scroll_target: i32 = 0,
+    scroll_anim_last: i32 = -1,
+    /// 音高行高补间：目标 / 事件时鼠标偏移（相对网格顶）/ 上一帧末快照（<0 = 未初始化）
+    key_h_target: i32 = 16,
+    key_h_anchor_off: i32 = 0,
+    key_h_anim_last: i32 = -1,
     /// 时间轴内容宽度（内容像素；最小 = 可视宽度）
     content_w: i32 = 0,
     /// 横向缩放（屏幕像素 / 内容像素）
     zoom: f32 = 1.0,
+    /// **缩放补间目标**（Ctrl+滚轮只设目标；`zoom` 逐帧平滑逼近——滚轮离散跳变生硬）
+    zoom_target: f32 = 1.0,
+    /// 补间锚点：最近滚轮事件时的鼠标偏移（相对内容区左缘；补间每步锚定）
+    zoom_anchor_off: i32 = 0,
+    /// 上一帧末 `zoom` 快照（检测“他处改变 zoom”→ 采纳为补间目标；<0 = 未初始化）
+    zoom_anim_last: f32 = -1,
 
     // ── 中键拖动平移视口（音符网格区；抓画布：内容跟手）──
     nav_active: bool = false,
@@ -1079,6 +1108,12 @@ pub const App = struct {
     toast_remaining_ns: i64 = 0,
     /// toast 总时长（显示用；3 秒）
     toast_total_ns: i64 = 3_000_000_000,
+    /// 上一帧实际间隔（纳秒；main 每帧更新）——供帧率无关的滑动动画（如视角跟随）
+    frame_dt_ns: i64 = 16_666_667,
+    /// 游标平滑显示位置（**小数步**；`tickCursorSmooth` 每帧推进——渲染帧率下线性滑动，
+    /// 吸收音频缓冲量化；见 `tickCursorSmooth`/`cursorDisplay`）
+    cursor_smooth: f32 = 0,
+    cursor_smooth_ok: bool = false,
     /// “文件”菜单展开中
     file_menu_open: bool = false,
     /// “文件”菜单刚打开（帧内标记；用于区分“打开菜单那一下”与“已展开后点按钮关”）。
@@ -5381,12 +5416,67 @@ pub const App = struct {
         return last;
     }
 
+    /// SONG：**最后一个片段的右缘**（`start + len` 最大值）——不论片段内有无音符；
+    /// 无片段 → 0。播放回跳用它：片段空着也应播满整段。
+    pub fn clipsEndStep(self: *const App) i32 {
+        var last: i32 = 0;
+        for (self.clips.items) |clip| {
+            last = @max(last, clip.start + clip.len);
+        }
+        return last;
+    }
+
+    /// 播放中的**小数步位置**（子步精度；未播放或域不匹配时 = 整数步）。
+    /// 游标绘制与视角跟随用——整数步在屏幕上是 5px×zoom 的阶梯：播放中每步
+    /// “跳一下再被平滑滚动回拉”形成锯齿抖动（实测“游标很抖”，放大时尤其明显）。
+    /// `song_domain`：true = SONG（`song_step`）、false = PAT（`piano_step`）。
+    pub fn cursorStepFrac(self: *const App, song_domain: bool) f32 {
+        const base: i32 = if (song_domain) self.playback.song_step else self.playback.piano_step;
+        if (!self.playing or self.sel.song_mode != song_domain) return @floatFromInt(base);
+        const frames = self.params.frames_played.load(.monotonic);
+        const bpm: u64 = @intCast(std.math.clamp(self.bpm, 20, 999));
+        const spb_per_beat: u64 = @intCast(model.stepsPerBeat(self.time_den));
+        const step_frames: u64 = @max(1, self.params.sample_rate * 60 / (bpm * spb_per_beat));
+        const elapsed = frames -| self.playback.start_frame;
+        const frac: f32 = @as(f32, @floatFromInt(elapsed)) / @as(f32, @floatFromInt(step_frames));
+        return @as(f32, @floatFromInt(self.playback.start_step)) + frac;
+    }
+
+    /// 游标**平滑**（渲染每帧调用，main）：前馈（按当前速度恒速推进）+ 一阶收敛
+    /// （吸收音频缓冲量化——`frames_played` 是整缓冲跳的，直接用仍会阶梯抖，实测）。
+    /// 跳转/回跳/未播放（与平滑值差 > 1.5 步）→ 直接归位。**不加“不许超前”钳制**
+    /// ——那会把追赶变成“冲-停-冲”的棘轮；允许微幅超前无感知。
+    pub fn tickCursorSmooth(self: *App) void {
+        const target: f32 = self.cursorStepFrac(self.sel.song_mode);
+        if (!self.playing or !self.cursor_smooth_ok or @abs(target - self.cursor_smooth) > 1.5) {
+            self.cursor_smooth = target;
+            self.cursor_smooth_ok = true;
+            return;
+        }
+        const dt_s: f32 = @as(f32, @floatFromInt(self.frame_dt_ns)) / 1e9;
+        const bpm: u64 = @intCast(std.math.clamp(self.bpm, 20, 999));
+        const spb_per_beat: u64 = @intCast(model.stepsPerBeat(self.time_den));
+        const step_frames: f32 = @as(f32, @floatFromInt(@max(1, self.params.sample_rate * 60 / (bpm * spb_per_beat))));
+        const v: f32 = @as(f32, @floatFromInt(self.params.sample_rate)) / step_frames; // 步/秒
+        const k: f32 = 1.0 - @exp(-dt_s / 0.12);
+        self.cursor_smooth += v * dt_s + (target - self.cursor_smooth) * k;
+    }
+
+    /// 游标**显示用**小数步（平滑版；见 `tickCursorSmooth`）——
+    /// 未播放或域不匹配时 = 冻结整数步。
+    pub fn cursorDisplay(self: *const App, song_domain: bool) f32 {
+        if (self.playing and self.cursor_smooth_ok and self.sel.song_mode == song_domain) return self.cursor_smooth;
+        return @floatFromInt(if (song_domain) self.playback.song_step else self.playback.piano_step);
+    }
+
     /// 播放推进后的**循环回跳**（main 主循环每帧调用，播放中）。
     ///
     /// 规则（两条叠加）：
     /// 1. **循环区域**（用户设置）：游标到 `loop[1]` → 回跳到 `loop[0]`；
-    /// 2. **自动循环**（未设区域）：游标超过内容末尾（最后一个有效音符）
-    ///    → 回跳到开头（0）。
+    /// 2. **自动循环**（未设区域）：
+    ///    - SONG：游标到**最后一个片段的右缘**（不论片段内有无音符）→ 回跳 0；
+    ///    - PAT：游标到样式内最后一个音符末尾 → 回跳 0；
+    ///    - 都无（无片段 / 无音符）→ 以**一小节**（当前拍号）为限，防游标无限右跑。
     /// 循环区域存在时只按 1 循环（不叠加自动），否则区域播放时会被
     /// “内容末尾”绕开。
     ///
@@ -5405,8 +5495,11 @@ pub const App = struct {
             return;
         }
         // ② 自动循环：超过内容末尾
-        const end = self.contentEndStep();
-        if (end > 0 and cur >= end) {
+        //    SONG：**最后一个片段的右缘**（不论有无音符；空片段也播完整段）；
+        //    PAT：样式内音符末尾。都为 0（无内容）→ 以一小节为限（防无限右跑）。
+        const end: i32 = if (song_mode) self.clipsEndStep() else self.contentEndStep();
+        const limit: i32 = if (end > 0) end else self.steps_per_bar;
+        if (cur >= limit) {
             self.jumpPlaybackCursor(0);
         }
     }
@@ -6361,6 +6454,135 @@ test "app: 循环播放——自动回跳（内容末尾）与循环区域" {
     try std.testing.expectEqual(@as(?[2]i32, .{ 32, 64 }), app.loopRegion());
 
     app.stopPlayback();
+}
+
+test "app: 循环播放——**空内容**播完一小节自动回跳（不再无限右跑）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    // PAT：样式 0 无音符 → 内容末尾 0
+    app.sel.song_mode = false;
+    app.sel.pattern = 0;
+    try std.testing.expectEqual(@as(i32, 0), app.contentEndStep());
+
+    const bar: i32 = app.steps_per_bar;
+    app.playing = true;
+    app.playback.piano_step = bar - 1;
+    app.tickPlaybackLoop();
+    try std.testing.expectEqual(bar - 1, app.playback.piano_step); // 未到一小节：不动
+    app.playback.piano_step = bar;
+    app.tickPlaybackLoop();
+    try std.testing.expectEqual(@as(i32, 0), app.playback.piano_step); // 播完一小节：回跳
+
+    // 循环区域仍优先（空内容也一样）
+    app.setLoopRegion(4, 12);
+    app.playback.piano_step = 12;
+    app.tickPlaybackLoop();
+    try std.testing.expectEqual(@as(i32, 4), app.playback.piano_step);
+
+    // SONG：无片段 → 同样是“一小节”
+    app.clearLoopRegion();
+    app.sel.song_mode = true;
+    app.playback.song_step = bar;
+    app.tickPlaybackLoop();
+    try std.testing.expectEqual(@as(i32, 0), app.playback.song_step);
+
+    // SONG：有片段但**无音符** → 循环点 = 最后一个片段的**右缘**（不论有无音符）
+    app.clips.append(app.allocator, .{ .track = 0, .start = bar, .len = bar, .pattern = 0, .offset = 0 }) catch {};
+    try std.testing.expectEqual(bar * 2, app.clipsEndStep());
+    try std.testing.expectEqual(@as(i32, 0), app.contentEndStep()); // 无音符 → 仍 0
+    app.playback.song_step = bar * 2 - 1;
+    app.tickPlaybackLoop();
+    try std.testing.expectEqual(bar * 2 - 1, app.playback.song_step); // 未到片段右缘：不动
+    app.playback.song_step = bar * 2;
+    app.tickPlaybackLoop();
+    try std.testing.expectEqual(@as(i32, 0), app.playback.song_step); // 到片段右缘：回跳
+
+    app.stopPlayback();
+}
+
+test "app: cursorStepFrac——子步精度（播放中 = 起始步 + 已播放帧/步长帧）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    // 48000Hz、120BPM、4/4（每拍 96/4 = 24 步）→ 1000 帧/步
+    app.bpm = 120;
+    app.time_den = 4;
+    app.params.sample_rate = 48_000;
+    app.playback.start_frame = 1000;
+    app.playback.start_step = 10;
+    app.params.frames_played.store(1000 + 3500, .monotonic); // 已过 3.5 步
+
+    app.sel.song_mode = true;
+    app.playing = true;
+    try std.testing.expectEqual(@as(f32, 13.5), app.cursorStepFrac(true));
+
+    // 域不匹配 / 未播放 → 冻结整数步
+    app.playback.song_step = 7;
+    app.sel.song_mode = false;
+    try std.testing.expectEqual(@as(f32, 7), app.cursorStepFrac(true));
+    app.sel.song_mode = true;
+    app.playing = false;
+    try std.testing.expectEqual(@as(f32, 7), app.cursorStepFrac(true));
+}
+
+test "app: 游标平滑——前馈+收敛（渲染帧下线性；缓冲量化不显、单调、不跳变）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    app.bpm = 120;
+    app.time_den = 4;
+    app.params.sample_rate = 48_000; // 1000 帧/步 → 48 步/秒
+    app.playback.start_frame = 0;
+    app.playback.start_step = 0;
+    app.frame_dt_ns = 8_333_333; // ≈120fps：每帧 400 帧音频 ≈ 0.4 步
+    app.sel.song_mode = true;
+    app.playing = true;
+
+    var frames: u64 = 0;
+    var prev: f32 = -1;
+    var i: u32 = 0;
+    while (i < 200) : (i += 1) {
+        frames += 400; // 音频按缓冲整块推进（量化的来源）
+        app.params.frames_played.store(frames, .monotonic);
+        app.tickCursorSmooth();
+        const d = app.cursorDisplay(true);
+        if (i > 20) {
+            const mv = d - prev;
+            try std.testing.expect(mv >= -0.001); // 单调不回退
+            try std.testing.expect(mv <= 0.45); // ≈0.4 步/帧，无跳变
+            try std.testing.expect(@abs(d - app.cursorStepFrac(true)) <= 0.45); // 贴近真值（≤ 一个缓冲脉宽）
+        }
+        prev = d;
+    }
+    // 跳转（seek/循环回跳）→ 直接归位
+    app.playback.start_frame = 100_000;
+    app.params.frames_played.store(100_000 + 10_000, .monotonic);
+    app.tickCursorSmooth();
+    try std.testing.expect(@abs(app.cursorDisplay(true) - app.cursorStepFrac(true)) < 0.01);
+    // 停顿 → 冻结整数步
+    app.playing = false;
+    app.playback.song_step = 5;
+    app.tickCursorSmooth();
+    try std.testing.expectEqual(@as(f32, 5), app.cursorDisplay(true));
 }
 
 test "app: 循环标尺选区——相交判定（音尾伸进区域也算；PAT 局部 / SONG 全局）" {

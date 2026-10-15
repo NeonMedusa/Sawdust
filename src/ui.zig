@@ -54,6 +54,8 @@ pub const IconShape = enum {
     stop,
     /// 录制：实心圆
     record,
+    /// 跟随播放游标：`>|`（45° 角形 + 竖线，**两部分同高**）
+    follow,
 };
 
 pub const Theme = struct {
@@ -438,6 +440,23 @@ pub const Ui = struct {
                     const rem = rr * rr - dy * dy;
                     const half: i32 = @intFromFloat(@sqrt(@as(f32, @floatFromInt(@max(0, rem)))));
                     ren.hline(cx - half, cy + dy, half * 2 + 1, color);
+                }
+            },
+            .follow => {
+                // `>|`：45° 角形（尖头朝右）+ 竖线——**两部分高度严格对齐**
+                // （均 = 2r-1 = 13px，同播放/暂停图标）。
+                // 角形加粗用**水平偏移**：垂直包围盒保持不变（垂直偏移法会多一行，破坏等高）。
+                const top = cy - r + 1;
+                const hgt = r * 2 - 1;
+                const bar_x = cx + r - 2;
+                ren.fillRect(bar_x, top, 2, hgt, color); // 竖线（2px 宽，与图标同高）
+                const hh = r - 1; // 半高（45° → 深度 = 半高）
+                const tip_x = bar_x - 5; // 加粗后与竖线留 3px 间隙（1px 太近，用户要求左移）
+                const base_x = tip_x - hh;
+                var t: i32 = 0;
+                while (t <= 1) : (t += 1) {
+                    ren.line(base_x + t, top, tip_x + t, cy, color);
+                    ren.line(tip_x + t, cy, base_x + t, cy + r - 1, color);
                 }
             },
         }

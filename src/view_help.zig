@@ -37,6 +37,7 @@ const rows = [_]Row{
     .{ .sec = true, .key = "视图", .desc = "" },
     .{ .sec = false, .key = "Ctrl + 滚轮", .desc = "横向缩放" },
     .{ .sec = false, .key = "Shift + 滚轮", .desc = "纵向缩放" },
+    .{ .sec = false, .key = "跟随播放游标", .desc = "播放钮左侧按钮：播放中视角平滑跟到游标（播放列表 / 钢琴卷帘）；主动拖动视角后停手自动恢复" },
 
     .{ .sec = true, .key = "VST3 插件", .desc = "" },
     .{ .sec = false, .key = "插件管理", .desc = "工具栏「插件」：加文件夹/文件 → 开始扫描（手动）" },

@@ -563,6 +563,84 @@ pub fn scrollDelta(ui: *Ui) i32 {
     return ui.wheel * 24;
 }
 
+/// — 视角跟随（播放列表 / 钢琴卷帘共用）—
+/// 游标在**内容区（网格区）**中的目标位置比例（0 = 内容区左缘、1 = 内容区右缘）。
+/// 口径已确认：用户看的是**网格区**。演化：1/3 → 0.25 → 0.15 → 0.20 → **0.25**
+/// （0.25 由用户最终拍板：不强求设计落地后，比例与实际观感吻合）。
+pub const follow_anchor_frac: f32 = 0.25;
+
+/// 跟随目标：让游标（内容像素 `cur_px`）停在**距内容区左缘 `off_screen` 屏幕像素**处
+/// （`off_screen` 由调用方按 `follow_anchor_frac × 内容区宽` 换算，可为负 → 自动贴左）；
+/// 再夹在内容跨度内（装得下 → 贴左）。`view_w`/`zoom` 用于跨度上界。纯函数（单测）。
+pub fn followTargetScrollX(cur_px: f32, view_w: i32, zoom: f32, off_screen: f32, content_span: i32) i32 {
+    const z = @max(0.01, zoom);
+    const raw = cur_px - off_screen / z;
+    const vcw = @as(f32, @floatFromInt(view_w)) / z;
+    const max_s: f32 = @max(0, @as(f32, @floatFromInt(content_span)) - vcw);
+    return @intFromFloat(std.math.clamp(raw, 0, max_s));
+}
+
+/// f32 指数补间一步（帧率无关）：`tau_s` = 时间常数（秒）。`k = 1-exp(-dt/τ)`，
+/// 恒不过目标、单调逼近。用于缩放补间 / 跟随滑动等一切“平滑过渡”。
+pub fn glideF32(cur: f32, target: f32, dt_ns: i64, tau_s: f32) f32 {
+    if (dt_ns <= 0) return cur;
+    const dt: f32 = @as(f32, @floatFromInt(dt_ns)) / 1e9;
+    const k: f32 = 1.0 - @exp(-dt / @max(0.001, tau_s));
+    return cur + (target - cur) * k;
+}
+
+/// 跟随滑动（i32 版；τ≈0.06s）：滚动像素的指数补间。纯函数（单测）。
+pub fn followGlide(cur: i32, target: i32, dt_ns: i64) i32 {
+    return glideI32(cur, target, dt_ns, 0.06);
+}
+
+/// i32 指数补间（通用 τ；纵向滚动/行高等整数量的平滑过渡）。
+/// **最小步长 1px**：帧长较小时指数步长 < 1px，取整后会“原地不动”（实测 bug：
+/// shift+滚轮行高 ±2/档 → 单档永远不动、需连滚几档才走）。保证向目标至少走 1，
+/// 既不僵死也不过冲（差 1px 时正好走到目标）。
+pub fn glideI32(cur: i32, target: i32, dt_ns: i64, tau_s: f32) i32 {
+    if (dt_ns <= 0 or cur == target) return cur;
+    var n = @as(i32, @intFromFloat(glideF32(@floatFromInt(cur), @floatFromInt(target), dt_ns, tau_s)));
+    if (n == cur) n = if (target > cur) cur + 1 else cur - 1;
+    return n;
+}
+
+test "跟随目标滚动位置（游标停距内容区左缘 off_screen 处；夹在跨度内）" {
+    try std.testing.expectEqual(@as(i32, 0), followTargetScrollX(50, 300, 1.0, 75, 100_000)); // 左端贴 0
+    try std.testing.expectEqual(@as(i32, 925), followTargetScrollX(1000, 300, 1.0, 75, 100_000)); // 1000 - 75
+    try std.testing.expectEqual(@as(i32, 99_700), followTargetScrollX(99_900, 300, 1.0, 75, 100_000)); // 右端夹住
+    try std.testing.expectEqual(@as(i32, 0), followTargetScrollX(10_000, 300, 1.0, 75, 200)); // 装得下 → 贴左
+    try std.testing.expectEqual(@as(i32, 350), followTargetScrollX(400, 300, 2.0, 100, 100_000)); // zoom=2：100 屏幕px = 50 内容px
+    try std.testing.expectEqual(@as(i32, 1040), followTargetScrollX(1000, 300, 1.0, -40, 100_000)); // 左栏过宽 → off 为负
+}
+
+test "跟随滑动（指数逼近、不越目标）" {
+    const a = followGlide(0, 100, 16_666_667);
+    try std.testing.expect(a > 0 and a < 100);
+    try std.testing.expectEqual(@as(i32, 100), followGlide(0, 100, 10_000_000_000)); // 极大 dt：直接到位
+    const b = followGlide(200, 100, 16_666_667);
+    try std.testing.expect(b < 200 and b >= 100); // 反向同理，不低于目标
+    try std.testing.expectEqual(@as(i32, 42), followGlide(42, 42, 16_666_667)); // 已到 → 不动
+}
+
+test "glideF32：指数补间（单调逼近、不过目标、已到不动）" {
+    const a = glideF32(0, 1, 8_333_333, 0.08);
+    try std.testing.expect(a > 0 and a < 1);
+    try std.testing.expectEqual(@as(f32, 1), glideF32(1, 1, 8_333_333, 0.08)); // 已到：不动
+    const b = glideF32(2, 1, 8_333_333, 0.08);
+    try std.testing.expect(b >= 1 and b < 2); // 反向：不低于目标
+}
+
+test "glideI32：整数补间（任意 τ；已到不动、单调逼近、最小步长 1px）" {
+    try std.testing.expectEqual(@as(i32, 10), glideI32(10, 10, 8_333_333, 0.03));
+    const a = glideI32(0, 100, 8_333_333, 0.03);
+    try std.testing.expect(a > 0 and a < 100);
+    // 亚像素步长 → 最小步长 1（行高 ±2 档单档滚动的实测死区）
+    try std.testing.expectEqual(@as(i32, 1), glideI32(0, 2, 8_333_333, 0.03));
+    try std.testing.expectEqual(@as(i32, -1), glideI32(0, -2, 8_333_333, 0.03));
+    try std.testing.expectEqual(@as(i32, 1), glideI32(0, 1, 8_333_333, 0.03)); // 差 1 → 正好到目标，不超
+}
+
 /// 播放游标（倒三角 + 贯穿内容区的竖线）。
 /// `x`：游标位置（屏幕像素）；`ruler_y`/`ruler_h`：标尺行；`bottom_y`：竖线底端。
 /// 三角**矮小**（高 ≈ 标尺行一半、宽 11px）——与竖线是否相接不重要。

@@ -396,7 +396,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         const saved_cursor = ui.renderer.pushClip(lane_x, ruler_y, view_w, ruler_h + tracks_h);
         defer ui.renderer.popClip(saved_cursor);
 
-        const bar_frac: f32 = @as(f32, @floatFromInt(app.playback.song_step)) / @as(f32, @floatFromInt(spb));
+        // **平滑小数步**（渲染帧线性滑动；音频缓冲量化被吸收——实测“游标还是抖”的终解）
+        const bar_frac: f32 = app.cursorDisplay(true) / @as(f32, @floatFromInt(spb));
         const cx = lane_x + @as(i32, @intFromFloat(bar_frac * bar_ws - scroll_s));
         util.drawCursor(ui, cx, ruler_y, ruler_h, tracks_y + tracks_h, app.playing);
 
@@ -756,34 +757,86 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 拖动跟随抽动（用户约定：拖动期间只平移，不缩放）
     if (!app.playlist.nav_active and ui.hitRect(main_x, tracks_y, main_w, tracks_h)) {
         if (ui.wheel_ctrl) {
-            // Ctrl+滚轮：横向缩放（锚定鼠标下的内容）+ 内容区拉回
+            // Ctrl+滚轮：横向缩放——**只更新补间目标**（滚轮离散，逐帧平滑逼近；
+            // 补间块在本段之后；锚定用事件时的鼠标偏移，补间每一步都锚定）
             // 注：拉回**无条件执行**（不只在 zoom 变化时）——
             // 否则“已缩到下限 + 视口停在右侧空白”时下滚会无事发生。
-            const mouse_off = ui.mouse_x - lane_x;
-            const old_zoom = app.playlist.zoom;
+            app.playlist.zoom_anchor_off = ui.mouse_x - lane_x;
+            var tgt = app.playlist.zoom_target;
+            // 反向输入先抵消未完成的补间：否则“回滚一格”会先继续朝旧方向动一点（实测手感 bug）
+            if ((ui.wheel > 0 and tgt < app.playlist.zoom) or (ui.wheel < 0 and tgt > app.playlist.zoom)) tgt = app.playlist.zoom;
             // 下限取 min(动态下限，当前)：内容缩短（动态下限被动抬高）时
             // 不得把视口突然放大——只拦“继续缩小”。
-            const new_zoom = std.math.clamp(old_zoom * std.math.pow(f32, util.wheel_zoom_factor, @as(f32, @floatFromInt(ui.wheel))), @min(dyn_zoom_min, old_zoom), 8.0);
-            if (new_zoom != old_zoom) {
-                app.playlist.zoom = new_zoom;
-                app.playlist.scroll_x = Ui.zoomAnchoredScrollX(app.playlist.scroll_x, view_w, mouse_off, old_zoom, new_zoom, app.playlist.content_w, content_span);
-            }
+            app.playlist.zoom_target = std.math.clamp(tgt * std.math.pow(f32, util.wheel_zoom_factor, @as(f32, @floatFromInt(ui.wheel))), @min(dyn_zoom_min, tgt), 8.0);
             // 缩小/已到下限：把视口右缘拉回内容跨度内（全装得下 → 贴左）
             const vcw: i32 = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(view_w)) / app.playlist.zoom)));
             app.playlist.scroll_x = Ui.clampScrollToSpan(app.playlist.scroll_x, vcw, content_span);
         } else if (ui.wheel_shift) {
-            // Shift+滚轮：**纵向缩放**（轨道行高；锚定鼠标下的轨道）
-            const old_h = app.playlist.track_h;
-            const new_h = std.math.clamp(old_h + ui.wheel * 2, util.track_h_min, util.track_h_max);
-            if (new_h != old_h) {
-                app.playlist.track_h = new_h;
-                const content_h_new: i32 = @intCast(app.track_items.len * @as(usize, @intCast(new_h)));
-                app.playlist.scroll = Ui.zoomAnchoredScrollY(app.playlist.scroll, tracks_h, ui.mouse_y - tracks_y, old_h, new_h, content_h_new);
-            }
+            // Shift+滚轮：**纵向缩放**（轨道行高）——只设补间目标（补间块在本段之后）
+            app.playlist.track_h_anchor_off = ui.mouse_y - tracks_y;
+            var tgt = app.playlist.track_h_target;
+            // 反向输入先抵消未完成的补间（同横向缩放；实测手感 bug）
+            if ((ui.wheel > 0 and tgt < app.playlist.track_h) or (ui.wheel < 0 and tgt > app.playlist.track_h)) tgt = app.playlist.track_h;
+            app.playlist.track_h_target = std.math.clamp(tgt + ui.wheel * 2, util.track_h_min, util.track_h_max);
         } else {
-            app.playlist.scroll = std.math.clamp(app.playlist.scroll - util.scrollDelta(ui), 0, @max(0, content_h - tracks_h));
+            // 裸滚轮：纵向滚动——只设补间目标（滚轮离散 → 逐帧平滑）
+            app.playlist.scroll_target = std.math.clamp(app.playlist.scroll_target - util.scrollDelta(ui), 0, @max(0, content_h - tracks_h));
         }
     }
+
+    // ── 横向缩放的**补间动画**（滚轮是离散事件，直接跳变生硬；用户要求平滑）──
+    // 目标由 Ctrl+滚轮设置；他处改变 zoom（滚动条拖边缘、载入工程）→ 采纳为目标不补间。
+    // 每步 zoomAnchoredScrollX 锚定“事件时鼠标下的内容”——补间期间内容不漂。
+    {
+        const pl = &app.playlist;
+        if (pl.zoom_anim_last < 0.0 or pl.zoom != pl.zoom_anim_last) pl.zoom_target = pl.zoom;
+        if (pl.zoom != pl.zoom_target) {
+            const z_new = if (@abs(pl.zoom_target - pl.zoom) <= pl.zoom_target * 0.002)
+                pl.zoom_target
+            else
+                util.glideF32(pl.zoom, pl.zoom_target, app.frame_dt_ns, 0.03); // τ=0.03s（用户实测手感）
+            if (z_new > 0 and z_new != pl.zoom) {
+                pl.scroll_x = Ui.zoomAnchoredScrollX(pl.scroll_x, view_w, pl.zoom_anchor_off, pl.zoom, z_new, pl.content_w, content_span);
+                pl.zoom = z_new;
+            }
+        }
+        pl.zoom_anim_last = pl.zoom;
+    }
+
+    // ── 纵向补间（Shift+滚轮 = 轨道行高；裸滚轮 = 纵向滚动；τ=0.03 同横向）──
+    // 外部改动（拖纵向滚动条写 `scroll`）→ 采纳为即时目标不补间；行高补间期间
+    // 其锚定写入的 `scroll` 也会被采纳，两个补间不会互相拉锯。
+    {
+        const pl = &app.playlist;
+        // 行高
+        if (pl.track_h_anim_last < 0 or pl.track_h != pl.track_h_anim_last) pl.track_h_target = pl.track_h;
+        if (pl.track_h != pl.track_h_target) {
+            const h_new = if (@abs(pl.track_h_target - pl.track_h) <= 1)
+                pl.track_h_target
+            else
+                util.glideI32(pl.track_h, pl.track_h_target, app.frame_dt_ns, 0.03);
+            if (h_new > 0 and h_new != pl.track_h) {
+                const ch_new: i32 = @intCast(app.track_items.len * @as(usize, @intCast(h_new)));
+                pl.scroll = Ui.zoomAnchoredScrollY(pl.scroll, tracks_h, pl.track_h_anchor_off, pl.track_h, h_new, ch_new);
+                pl.track_h = h_new;
+            }
+        }
+        pl.track_h_anim_last = pl.track_h;
+        // 纵向滚动
+        const ch_now: i32 = @intCast(app.track_items.len * @as(usize, @intCast(@max(1, pl.track_h))));
+        const max_s: i32 = @max(0, ch_now - tracks_h);
+        if (pl.scroll_anim_last < 0 or pl.scroll != pl.scroll_anim_last) pl.scroll_target = pl.scroll;
+        pl.scroll_target = std.math.clamp(pl.scroll_target, 0, max_s);
+        if (pl.scroll != pl.scroll_target) {
+            const s_new = if (@abs(pl.scroll_target - pl.scroll) <= 1)
+                pl.scroll_target
+            else
+                util.glideI32(pl.scroll, pl.scroll_target, app.frame_dt_ns, 0.03);
+            pl.scroll = std.math.clamp(s_new, 0, max_s);
+        }
+        pl.scroll_anim_last = pl.scroll;
+    }
+
     // ── 中键拖动：平移视口（抓画布：内容跟手；标尺/轨道区均可起手）──
     {
         const pl = &app.playlist;
@@ -810,6 +863,32 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             }
         }
     }
+    // ── 视角跟随播放游标（工具栏开关；**主动操作优先**）──
+    // 中键平移 / 拖滚动条（id=8）按住期间暂停，松手**当帧**恢复跟随（纯即时——
+    // 曾经的宽限/桥接等“等待”逻辑已按用户实测结论删除）。
+    // 恢复后 → 指数滑动跟到游标（τ≈0.06s；锚点= `util.follow_anchor_frac`，**网格区左 15%**）。
+    // 软锚定：行程有余量 → 锚定；余量耗尽（近曲末/缩得小）→ 自然放开。
+    {
+        const pl = &app.playlist;
+        const nav = pl.nav_active or ui.active_id == 8;
+        if (pl.follow_playhead and app.playing and !nav) {
+            const cur_px: f32 = app.cursorDisplay(true) * @as(f32, @floatFromInt(util.piano_step_w)); // 平滑小数步（同游标绘制）
+            // 锚点口径 = **内容区（网格区）**（用户确认以网格区为准）
+            const off_screen: f32 = util.follow_anchor_frac * @as(f32, @floatFromInt(view_w));
+            const vcw_f: f32 = @as(f32, @floatFromInt(view_w)) / pl.zoom;
+            const vcw_i: i32 = @max(1, @as(i32, @intFromFloat(vcw_f)));
+            // **软锚定**（用户拍板）：行程有余量 → 锚点；余量耗尽 → 就势放开
+            // （scroll 钳在行程端，游标从锚点处自然向右漂移——在钳制发生的瞬间
+            // 游标恰好位于锚点，所以过渡是连续的、不跳变）。
+            // **不强行延长行程**：曾“按需延长 content_w”永远保住锚点——缩小到底时
+            // 与缩放路径钉 0 打架、滑块行程暗自生长、松手后长途滑回（实测三连坑）。
+            // 行程 = max(时间轴（全曲+3小节留白）, 用户手动拖出的延长)。
+            const follow_span: i32 = @max(content_span, pl.content_w);
+            const target = util.followTargetScrollX(cur_px, view_w, pl.zoom, off_screen, follow_span);
+            pl.scroll_x = Ui.clampScrollToSpan(util.followGlide(pl.scroll_x, target, app.frame_dt_ns), vcw_i, follow_span);
+        }
+    }
+
     _ = ui.scrollbarV(9, sb_x, tracks_y, ruler_h, tracks_h, &app.playlist.scroll, content_h, tracks_h);
 
     // ── 编辑快捷键执行（框选/批量；本视图处理片段相关）──

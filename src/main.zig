@@ -111,6 +111,11 @@ pub fn main(init: std.process.Init) !u8 {
     //   ② 改为**帧预算**：睡到“帧开始 + 预算”截止，而非固定睡眠
     //      （固定睡眠会与渲染耗时叠加，帧率随内容复杂度浮动）。
 
+    // 帧间隔基准（上一帧起点）——dt = 两次循环起点之差（**含上一帧的绘制与
+    // 帧预算睡眠**；旧实现测“绘制前”，亚毫秒被夹成 1ms 下限 → 一切按 dt 的
+    // 动画/倒计时慢 ~8 倍：跟随滑动滞后、宽限倒计时超长（实测根因））
+    var prev_frame_start_ns: i64 = 0;
+
     while (true) {
         // 帧率上限：取设置值（30..240fps；帧预算 = 1e9 / fps——改设置即时生效）
         const frame_budget_ns: i64 = @divTrunc(1_000_000_000, @as(i64, std.math.clamp(app.fps_limit, 30, 240)));
@@ -123,6 +128,12 @@ pub fn main(init: std.process.Init) !u8 {
                 std.Io.sleep(io, .fromNanoseconds(remain_ns), .awake) catch {};
             }
         }
+        // 帧间隔（帧率无关动画/倒计时用）：**完整帧间隔**（上一帧的绘制+睡眠都计入）
+        const frame_dt_raw: i64 = if (prev_frame_start_ns == 0) frame_budget_ns else frame_start_ns - prev_frame_start_ns;
+        prev_frame_start_ns = frame_start_ns;
+        app.frame_dt_ns = std.math.clamp(frame_dt_raw, 1_000_000, 100_000_000);
+        app.tickToast(app.frame_dt_ns); // 状态栏提示递减（按实际流逝）
+        app.tickCursorSmooth(); // 游标平滑（渲染帧推进；音频缓冲量化不显——实测“游标还是抖”的根因）
         // ── 脏确认流程（自绘模态；**不用系统 MessageBox**——
         // 系统弹窗会把鼠标吸到默认按钮上，实测体验差）──
         // 两种场景共用：① 退出程序；② 打开其他工程（都会丢失未保存修改）
@@ -632,10 +643,6 @@ pub fn main(init: std.process.Init) !u8 {
             win.endMouseCapture();
         }
         ui.frozen_dy = win.frozenDeltaY();
-
-        // 每帧递减状态栏提示（按实际流逝时间，与帧率无关）
-        const toast_now_ns: i64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
-        app.tickToast(toast_now_ns - frame_start_ns);
 
         ui.beginFrame();
         drawApp(&ui, &app, @intCast(win.fb.width), @intCast(win.fb.height));
@@ -2045,6 +2052,13 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
     // 传输控制（图标**自绘**：中文字体常缺几何符号字形（▶ U+25B6 等），
     // 缺字时退回 .notdef 方块——实测“播放按钮变竖长方形”；
     // 像素级画形状则任何字体下外观一致）
+    // 「跟随播放游标」开关（播放按钮**左侧**、同尺寸 36×26）：开 = 播放中视角
+    // 平滑滑到游标（动画过渡，不跳切）；中键平移/拖滚动条/滚轮等**主动操作优先**，
+    // 停手且仍在播放 → 继续跟上（实现见 `view_playlist` 尾部跟随块）
+    if (ui.iconButton(199, .follow, x, by, 36, bh, app.playlist.follow_playhead, ui.theme.accent)) {
+        app.playlist.follow_playhead = !app.playlist.follow_playhead;
+    }
+    x += 40;
     if (ui.iconButton(200, if (app.playing) .pause else .play, x, by, 36, bh, app.playing, ui.theme.accent)) {
         app.playing = !app.playing;
         if (app.playing) {
