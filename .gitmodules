@@ -1,0 +1,3 @@
+[submodule "libs/zig-vst3"]
+	path = libs/zig-vst3
+	url = https://github.com/NeonMedusa/zig-vst3.git

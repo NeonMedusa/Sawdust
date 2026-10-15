@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const synth = @import("synth.zig");
+const vst_host = @import("vst_host.zig");
 
 /// 播放列表中的一个样式片段。
 ///
@@ -76,6 +77,60 @@ pub const Instrument = struct {
     /// 合成器参数（synth 类型用；鼓组类型的“本体”不使用但保留——
     /// 类型切换/存档兼容都靠它）
     synth: *synth.SynthParams,
+
+    // ── VST3 乐器（kind == .vst3）──
+    /// 插件路径（固定缓冲零分配；同 EffectSlot 惯例）
+    plugin_path: [512]u8 = [_]u8{0} ** 512,
+    plugin_path_len: u16 = 0,
+    /// 运行时插件实例（**不存档**；main 侧惰性加载/退役回收）
+    plugin: ?*vst_host.Plugin = null,
+    /// 加载失败标记（**运行时，不存档**）——机架标红/面板提示用。
+    /// 失败后路径保留，syncInstrumentPlugins 周期重试；文件恢复→自动加载
+    load_failed: bool = false,
+    /// 重试节流（帧递减；>0 时不发起加载——防每帧反复探测缺失文件）
+    fail_wait: u16 = 0,
+
+    /// 待恢复的插件音色（工程加载/撤销时从存档解码；实例就绪后由 syncInstrumentPlugins 应用）
+    pending_state: ?[]u8 = null,
+    pending_state_ctrl: ?[]u8 = null,
+
+    /// 最后已知类 CID（32 hex 文本；0 长 = 未知）——重绑定自愈/存档身份。
+    /// 加载成功时回填；路径变化时清空（身份失效，等新加载回填）。
+    plugin_cid: [32]u8 = [_]u8{0} ** 32,
+    plugin_cid_len: u8 = 0,
+
+    pub fn pluginCid(self: *const Instrument) []const u8 {
+        return self.plugin_cid[0..self.plugin_cid_len];
+    }
+    pub fn setPluginCid(self: *Instrument, text: []const u8) void {
+        const n = @min(text.len, self.plugin_cid.len);
+        @memcpy(self.plugin_cid[0..n], text[0..n]);
+        self.plugin_cid_len = @intCast(n);
+    }
+
+    /// 释放待恢复状态（槽被移除/切换类型前必须调用）
+    pub fn clearPendingState(self: *Instrument, allocator: std.mem.Allocator) void {
+        if (self.pending_state) |b| allocator.free(b);
+        if (self.pending_state_ctrl) |b| allocator.free(b);
+        self.pending_state = null;
+        self.pending_state_ctrl = null;
+    }
+
+    pub fn pluginPath(self: *const Instrument) []const u8 {
+        return self.plugin_path[0..self.plugin_path_len];
+    }
+    pub fn setPluginPath(self: *Instrument, path: []const u8) void {
+        const n = @min(path.len, self.plugin_path.len);
+        const same = self.plugin_path_len == n and std.mem.eql(u8, self.plugin_path[0..n], path[0..n]);
+        @memcpy(self.plugin_path[0..n], path[0..n]);
+        self.plugin_path_len = @intCast(n);
+        // 路径真变化 → 重置加载失败态（新文件允许立即尝试；同路径保留节流）
+        if (!same) {
+            self.load_failed = false;
+            self.fail_wait = 0;
+            self.plugin_cid_len = 0; // 身份失效：加载成功后回填
+        }
+    }
 };
 
 /// 钢琴卷帘键列模式：琴键（音名）/ 鼓组（GM 鼓名、垫名）
@@ -83,7 +138,7 @@ pub const Instrument = struct {
 pub const KeyMode = enum(u8) { piano = 0, drum = 1 };
 
 /// 乐器类型
-pub const InstrumentKind = enum(u8) { synth = 0, drumkit = 1 };
+pub const InstrumentKind = enum(u8) { synth = 0, drumkit = 1, vst3 = 2 };
 
 /// 鼓组层的乐器类型（层 = 乐器槽）：目前仅减法合成器；
 /// 采样器/FM 将来实装。**不含鼓组**——禁止自嵌套（`docs/drumkit.md` §7）。

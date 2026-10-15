@@ -37,6 +37,15 @@ const rows = [_]Row{
     .{ .sec = true, .key = "视图", .desc = "" },
     .{ .sec = false, .key = "Ctrl + 滚轮", .desc = "横向缩放" },
     .{ .sec = false, .key = "Shift + 滚轮", .desc = "纵向缩放" },
+
+    .{ .sec = true, .key = "VST3 插件", .desc = "" },
+    .{ .sec = false, .key = "插件管理", .desc = "工具栏「插件」：加文件夹/文件 → 开始扫描（手动）" },
+    .{ .sec = false, .key = "添加乐器", .desc = "机架「+ 添加乐器」→ 预设面板（内置 + 已扫描 VST3）" },
+    .{ .sec = false, .key = "添加效果器", .desc = "混音台「+ 效果器」→ 预设面板（内置 + 已扫描 VST3）" },
+    .{ .sec = false, .key = "打开插件界面", .desc = "双击效果 / 乐器名，或面板「打开界面」按钮" },
+    .{ .sec = false, .key = "调参数", .desc = "面板列表：拖动改值 / 双击恢复默认 / 滚轮滚动" },
+    .{ .sec = false, .key = "VST3 预设", .desc = "乐器窗口「预设 ▾ / 保存为…」；按插件分类存放" },
+    .{ .sec = false, .key = "保存工程", .desc = "插件参数与音色随工程保存；撤销 / 重做同步" },
 };
 
 /// 返回 true = 鼠标被窗口消费

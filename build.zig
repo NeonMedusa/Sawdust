@@ -30,14 +30,33 @@ pub fn build(b: *std.Build) void {
         .flags = &.{"-std=c99"},
     });
 
-    // Windows 系统库（窗口 + GDI 软件渲染 + 文件对话框 + miniaudio 的 WASAPI 后端）
+    // Windows 系统库（窗口 + GDI 软件渲染 + 文件对话框 + shell（文件夹选择／插件管理）
+    // + miniaudio 的 WASAPI 后端）
     if (target.result.os.tag == .windows) {
-        for ([_][]const u8{ "user32", "gdi32", "kernel32", "ole32", "uuid", "winmm", "comdlg32" }) |lib| {
+        for ([_][]const u8{ "user32", "gdi32", "kernel32", "ole32", "uuid", "winmm", "comdlg32", "shell32" }) |lib| {
             exe.root_module.linkSystemLibrary(lib, .{});
         }
     }
 
     b.installArtifact(exe);
+    // 主程序也用 VST3 绑定（插件槽）——同一 path 依赖模块
+    exe.root_module.addImport("zig_vst3", b.dependency("zig_vst3", .{ .target = target, .optimize = optimize }).module("zig-vst3"));
+
+    // ── VST3 探测工具（阶段 1：只读枚举，不影响主程序）──
+    // 依赖经 build.zig.zon 的 **path 依赖**引入（libs/zig-vst3，submodule）——
+    // 构建全程不碰网络（zig fetch 不走系统代理的痛点）
+    const zig_vst3_dep = b.dependency("zig_vst3", .{ .target = target, .optimize = optimize });
+    const vstscan = b.addExecutable(.{
+        .name = "vstscan",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/vstscan.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    vstscan.root_module.addImport("zig_vst3", zig_vst3_dep.module("zig-vst3"));
+    b.installArtifact(vstscan);
 
     const run_step = b.step("run", "Run Sawdust");
     const run_cmd = b.addRunArtifact(exe);

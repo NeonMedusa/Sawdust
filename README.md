@@ -40,19 +40,26 @@ https://drive.google.com/drive/folders/1vHJcw6CiEt24WLKBgtTzmiMKY8IMpbfF?usp=sha
 
 ## 构建与运行
 
-需要 **Zig 0.16**。依赖已手动放在 `libs/`（不用包管理器）：
+需要 **Zig 0.16**。依赖手动放在 `libs/`（不用包管理器）：
 
 ```
 libs/stb/stb_truetype.h        # 字形光栅化（Public Domain）
 libs/miniaudio/miniaudio.h     # 音频 I/O（Public Domain / MIT-0）
+libs/zig-vst3/                 # VST3 绑定（submodule；MIT）
 ```
 
+> 仓库含 submodule（`libs/zig-vst3`）：克隆请用 `git clone --recursive`；
+> 已克隆的仓库补 `git submodule update --init` 即可。
+
 ```bash
-zig build                 # 调试构建 → zig-out/bin/Sawdust.exe
+zig build                 # 调试构建 → zig-out/bin/Sawdust.exe + vstscan.exe
 zig build run             # 构建并运行
 zig build test            # 单元测试
 zig build -Doptimize=ReleaseFast
 ```
+
+> 注：插件管理器的扫描依赖**与主程序同目录的 `vstscan.exe`**（`zig build` 会一并产出；
+> 打包发布时两个 exe 需同行）。
 
 ## 快捷键
 
@@ -79,10 +86,13 @@ zig build -Doptimize=ReleaseFast
 | `src/midi.zig` | MIDI 导入/导出（SMF 解析 + 写出；纯逻辑可单测） |
 | `src/persist.zig` | 工程保存/加载（JSON `.saw`；版本迁移） |
 | `src/preset.zig` | 预设库（扫描 / 读写 / 分类） |
+| `src/vst_host.zig` | VST3 宿主：加载 / 处理 / 参数 / 状态 / 编辑器窗口（见 `docs/plugin-hosting.md`） |
+| `src/vstscan.zig` | VST3 探测工具（枚举 / 试跑 / 参数 / 编辑器冒烟） |
 | `src/main.zig` + `src/view_*.zig` | 应用主循环与各视图（播放列表/卷帘/调音台/机架/效果器/鼓组/预设） |
 
 **文档**：踩坑记录见 `docs/pitfalls.md`；鼓组插件设计见 `docs/drumkit.md`；
-力度/声像编辑轨见 `docs/note-lane.md`；时间轴滚动条见 `docs/timeline-scrollbar.md`。
+力度/声像编辑轨见 `docs/note-lane.md`；时间轴滚动条见 `docs/timeline-scrollbar.md`；
+VST3 宿主见 `docs/plugin-hosting.md`。
 
 **线程模型**：UI 在主线程，音频回调在 miniaudio 的实时线程；
 参数用 `std.atomic.Value` 传递（无锁，实时安全）；编辑提交走"重扫"机制
@@ -98,7 +108,8 @@ zig build -Doptimize=ReleaseFast
 - [ ] 音频、音符录制
 - [ ] 更多效果器（合唱 / 失真 / 滤波器……）
 - [ ] 跨平台（Linux: X11/Wayland；macOS: Cocoa）
-- [ ] vst插件支持
+- [x] VST3 插件（效果器 + 乐器：参数编辑 / 插件界面 / 状态存档与撤销 / BPM 同步 /
+  多输出 VSTi（SFLT）/ 扫描管理器 + 预设浏览器）
 - [ ] asio支持
 - [ ] 更加强大的波表合成器
 
@@ -112,6 +123,8 @@ zig build -Doptimize=ReleaseFast
 
 - [stb_truetype](https://github.com/nothings/stb) — Public Domain
 - [miniaudio](https://github.com/mackron/miniaudio) — Public Domain / MIT-0
+- [zig-vst3](https://github.com/joshburgess/zig-vst3)（本项目 fork，submodule `libs/zig-vst3`）— MIT；
+  VST3 绑定 + 插件侧框架（钉版 VST3 SDK v3.8.0 build 66；VST3 SDK 2025 起亦为 MIT）
 
 ## 许可证
 

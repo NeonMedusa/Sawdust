@@ -64,11 +64,13 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     var tbuf: [192]u8 = undefined;
     const title: []const u8 = switch (sw.target) {
         .instrument => |ii| blk: {
-            const iname: []const u8 = if (ii >= 0 and ii < @as(i32, @intCast(app.instruments.items.len)))
-                app.instruments.items[@intCast(ii)].name
+            const inst_ptr: ?*const model.Instrument = if (ii >= 0 and ii < @as(i32, @intCast(app.instruments.items.len)))
+                &app.instruments.items[@intCast(ii)]
             else
-                "（无乐器）";
-            break :blk std.fmt.bufPrint(&tbuf, "减法合成器 — {s}", .{iname}) catch "减法合成器";
+                null;
+            const iname: []const u8 = if (inst_ptr) |it| it.name else "（无乐器）";
+            const kind_label: []const u8 = if (inst_ptr != null and inst_ptr.?.kind == .vst3) "VST3 乐器" else "减法合成器";
+            break :blk std.fmt.bufPrint(&tbuf, "{s} — {s}", .{ kind_label, iname }) catch "乐器";
         },
         .kit_layer_replace => |ref| blk: {
             const iname: []const u8 = if (ref.instrument >= 0 and ref.instrument < @as(i32, @intCast(app.instruments.items.len)))
@@ -87,7 +89,12 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     ui.label(title, x + 8, y + 4, ui.theme.text);
 
     // 预设按钮（标题栏右侧）：[预设 ▾] [保存为…]
-    // 仅减法合成器有预设库（`plugin_subtractive`）
+    // 减法/VST3 乐器都有预设库——VST3 分类 = 插件 CID（`vst3_<cid>`）；
+    // 见 main 的 loadVst3Preset/saveVst3Preset
+    const target_is_vst3 = switch (sw.target) {
+        .instrument => |ii| (ii >= 0 and ii < @as(i32, @intCast(app.instruments.items.len)) and app.instruments.items[@intCast(ii)].kind == .vst3),
+        else => false,
+    };
     {
         const save_w: i32 = 62;
         const menu_w: i32 = 58;
@@ -185,6 +192,19 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     }
     ui.renderer.line(x + ww - 10, y + hh - 2, x + ww - 2, y + hh - 10, ui.theme.panel_border);
     ui.renderer.line(x + ww - 6, y + hh - 2, x + ww - 2, y + hh - 6, ui.theme.panel_border);
+
+    // ── VST3 乐器：插件信息面板（须在振荡器/ADSR 等合成器 UI 之前分流）──
+    if (target_is_vst3) {
+        switch (sw.target) {
+            .instrument => |ii| {
+                if (ii >= 0 and ii < @as(i32, @intCast(app.instruments.items.len))) {
+                    drawVst3Body(ui, app, &app.instruments.items[@intCast(ii)], x, y, ww);
+                }
+            },
+            else => {},
+        }
+        return util.inRect(ui.mouse_x, ui.mouse_y, x, y, ww, hh);
+    }
 
     // ── 振荡器区（一行一个）──
     // 一行一个让每个振荡器的合奏控件有完整行宽（2×2 网格放不下两个数值控件）
@@ -290,6 +310,37 @@ fn fmtPercent(v: i32, buf: []u8) []const u8 {
 /// 振荡器行（一行一个）：开关 / 序号 / 波形按钮 / 音量旋钮 /
 /// 合奏数量（0-16）/ 合奏散布（0-100%）——两个数值控件与 BPM 同款
 /// （上下拖动、光标冻结隐藏）
+/// VST3 乐器信息面板（合成器 UI 不适用）：名称/路径/延迟 + 打开界面
+fn drawVst3Body(ui: *Ui, app: *App, inst: *model.Instrument, x: i32, y: i32, ww: i32) void {
+    var yy = y + win_title_h + 10;
+    ui.label(inst.name, x + 10, yy, ui.theme.text);
+    yy += 22;
+    ui.labelClipped(inst.pluginPath(), x + 10, yy, ww - 20, ui.theme.text_dim);
+    yy += 22;
+    if (inst.plugin) |pl| {
+        var b: [64]u8 = undefined;
+        ui.label(std.fmt.bufPrint(&b, "{s} · 延迟 {d} 样本", .{ pl.name(), pl.latency }) catch "", x + 10, yy, ui.theme.text_dim);
+        yy += 26;
+        if (ui.button(@intFromPtr(pl) + 100000, "打开插件界面", x + 10, yy, 120, 24)) {
+            switch (pl.openEditor(app.main_hwnd)) {
+                .opened => {},
+                .no_editor => ui.label("（此插件无编辑器界面）", x + 140, yy + 6, ui.theme.text_dim),
+                .failed => ui.label("（编辑器打开失败）", x + 140, yy + 6, ui.theme.text_dim),
+            }
+        }
+    } else {
+        if (inst.load_failed) {
+            ui.label("（插件加载失败——将自动重试；文件恢复后自动加载）", x + 10, yy, ui.theme.danger);
+        } else {
+            ui.label("（插件未加载）", x + 10, yy, ui.theme.text_dim);
+        }
+    }
+    yy += 44;
+    ui.renderer.hline(x + 8, yy, ww - 16, ui.theme.panel_border);
+    yy += 8;
+    ui.labelClipped("参数在插件自带界面中调整；音符请用钢琴卷帘编辑", x + 10, yy, ww - 20, ui.theme.text_dim);
+}
+
 fn drawOscRow(ui: *Ui, app: *App, p: *synth.SynthParams, oi: usize, x: i32, y: i32, w: i32) void {
     _ = w;
     const op = &p.osc[oi];

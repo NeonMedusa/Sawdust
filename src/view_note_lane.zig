@@ -226,6 +226,26 @@ pub fn draw(
     {
         const saved = ui.renderer.pushClip(track_x, y, track_w, h);
         defer ui.renderer.popClip(saved);
+        // 幽灵柱条（**同样式、其它乐器**；灰——只读参考、无交互；画在真实柱条之前）：
+        // 与钢琴卷帘的幽灵音符同一约定（同样式其它乐器、不参与命中/拖动）。
+        // 力度/声像两种模式共用值域坐标——幽灵与真实柱同几何，仅颜色区分。
+        for (app.notes.items) |nt| {
+            if (nt.pattern != pattern or nt.instrument == app.sel.instrument) continue;
+            const bx = barX(nt.step, track_x, step_ws, scroll_s);
+            if (bx + bar_w < track_x or bx > track_x + track_w) continue;
+            const v = noteValue(nt, mode);
+            const tip_y: i32 = if (mode == .velocity)
+                top + avail - velBarH(v, avail)
+            else
+                top + @divTrunc(avail, 2) - panBarH(v, avail);
+            const baseline: i32 = if (mode == .velocity)
+                top + avail
+            else
+                top + @divTrunc(avail, 2);
+            const lo = @min(tip_y, baseline);
+            const hi = @max(tip_y, baseline);
+            ui.renderer.fillRect(bx, lo, bar_w, @max(1, hi - lo + 1), ui.theme.ghost_note);
+        }
         // 收集可见柱条（当前样式 + 乐器；x 在视野内），按柱高降序排序
         const LaneBar = struct { idx: usize, len_px: i32, selected: bool };
         var bars: [1024]LaneBar = undefined;
@@ -324,6 +344,8 @@ pub fn draw(
             if (ui.mouse_double) {
                 // 双击：重置默认值（立即提交历史）
                 setNoteValue(&app.notes.items[idx], mode, if (mode == .velocity) model.default_velocity else model.default_pan);
+                // 该音符成为“上一个”参考（新音符放置沿用其 长度/力度/声像）
+                app.piano.rememberNote(app.notes.items[idx]);
                 app.piano.lane_drag_dirty = true;
                 changed = true;
             } else {
@@ -357,7 +379,15 @@ pub fn draw(
         const mx = std.math.clamp(ui.mouse_x, track_x, track_x + track_w - 1);
         if (paintAt(app, mx, target, track_x, step_ws, scroll_s, pattern, bar_w, mode, app.piano.lane_paint_selected_only)) changed = true;
         app.piano.lane_last_x = ui.mouse_x;
-        if (changed) app.piano.lane_drag_dirty = true;
+        if (changed) {
+            app.piano.lane_drag_dirty = true;
+            // 刚画笔编辑的值成为“上一个”参考（与“长度跟随”同一交互逻辑；
+            // 新音符放置沿用其 长度/力度/声像）
+            switch (mode) {
+                .velocity => app.piano.last_note_velocity = target,
+                .pan => app.piano.last_note_pan = target,
+            }
+        }
     }
 
     // 松手：清拖动状态（历史由调用方经 `history_pending` coalesce 提交）

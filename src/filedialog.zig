@@ -152,6 +152,43 @@ const win = if (is_windows) struct {
         const MB_ICONINFORMATION: u32 = 0x0000_0040;
         _ = MessageBoxW(owner, @ptrCast(text_w.ptr), @ptrCast(title_w.ptr), MB_OK | MB_ICONINFORMATION);
     }
+
+    // ── 文件夹选择（shell32 SHBrowseForFolderW；插件管理“+ 添加文件夹…”）──
+    const BROWSEINFOW = extern struct {
+        hwndOwner: ?*anyopaque = null,
+        pidlRoot: ?*anyopaque = null,
+        pszDisplayName: ?[*]u16 = null,
+        lpszTitle: ?[*:0]const u16 = null,
+        ulFlags: u32 = 0,
+        lpfn: ?*anyopaque = null,
+        lParam: isize = 0,
+        iImage: i32 = 0,
+    };
+    extern "shell32" fn SHBrowseForFolderW(*BROWSEINFOW) callconv(.winapi) ?*anyopaque;
+    extern "shell32" fn SHGetPathFromIDListW(*anyopaque, [*]u16) callconv(.winapi) i32;
+    extern "ole32" fn CoTaskMemFree(?*anyopaque) callconv(.winapi) void;
+    extern "ole32" fn CoInitializeEx(?*anyopaque, u32) callconv(.winapi) i32;
+
+    /// 文件夹选择框（取消 → null）。`BIF_NEWDIALOGSTYLE` 需要 COM 已初始化 →
+    /// 调用前 `CoInitializeEx`（重复调用无害，返回 S_FALSE）。
+    fn pickFolder(allocator: std.mem.Allocator, owner: ?*anyopaque, title: []const u8) !?[]u8 {
+        _ = CoInitializeEx(null, 2); // COINIT_APARTMENTTHREADED
+        const title_w = toUtf16Z(allocator, title) catch return null;
+        defer allocator.free(title_w);
+        var display: [260]u16 = undefined;
+        var bi = BROWSEINFOW{
+            .hwndOwner = owner,
+            .pszDisplayName = &display,
+            .lpszTitle = title_w.ptr,
+            .ulFlags = 0x0001 | 0x0040, // BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE
+        };
+        const pidl = SHBrowseForFolderW(&bi) orelse return null;
+        defer CoTaskMemFree(pidl);
+        var path_buf: [1024]u16 = undefined;
+        if (SHGetPathFromIDListW(pidl, &path_buf) == 0) return null;
+        const slice = std.mem.sliceTo(&path_buf, 0);
+        return try std.unicode.utf16LeToUtf8Alloc(allocator, slice);
+    }
 } else struct {};
 
 /// 三选一结果
@@ -183,10 +220,17 @@ pub fn alert(allocator: std.mem.Allocator, owner: ?*anyopaque, text: []const u8)
     win.alert(allocator, owner, text);
 }
 
+/// 选择文件夹（null = 取消或不支持）——插件管理的“+ 添加文件夹…”
+pub fn pickFolder(allocator: std.mem.Allocator, owner: ?*anyopaque, title: []const u8) !?[]u8 {
+    if (!is_windows) return null;
+    return win.pickFolder(allocator, owner, title);
+}
+
 // ── 工具（可测）──
 
 /// 「Sawdust 工程」过滤器字符串（人类可读形式；`toFilterUtf16Z` 会转成 Win32 格式）
 pub const project_filter = "Sawdust 工程 (*.saw)\x00*.saw\x00所有文件 (*.*)\x00*.*\x00";
+pub const vst3_filter = "VST3 插件 (*.vst3)\x00*.vst3\x00所有文件 (*.*)\x00*.*\x00";
 
 /// 把「描述\0通配\0…\0」转成 UTF-16 + **双 NUL 结尾**（Win32 要求）。
 /// 输入以单 NUL 分隔、单 NUL 结尾；输出在末尾再补一个 NUL。

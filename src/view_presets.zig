@@ -56,6 +56,8 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) void {
             .create_instrument => "添加乐器 — 选插件与预设",
             .change_instrument => "更换乐器 — 选插件与预设",
             .create_kit_layer => "为鼓垫添加乐器 — 选插件与预设",
+            .create_effect => "添加效果器 — 选效果与预设",
+            .replace_effect => "效果器预设 — 选效果（可换效果器）",
         };
         ui.label(title, px + 8, py + 4, ui.theme.text);
     }
@@ -81,8 +83,12 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) void {
     ui.label("插件类型", px + 8, body_y + 4, ui.theme.text_dim);
     {
         var iy = body_y + 22;
+        var n_vis: usize = 0;
         for (app.preset_lib.categories.items, 0..) |cat, i| {
+            // 可见性由意图决定（用户拍板：乐器面板不见效果器/反之；未安装 VST3 隐藏）
+            if (!app.presetCategoryRelevant(app.preset_browser.intent, cat.name)) continue;
             if (iy + row_h > py + panel_h - 1) break;
+            n_vis += 1;
             const selected = i == app.preset_browser.cat;
             // 可选性由意图决定（非可选 → 置灰；点击只提示，教“预设不换插件”的模型）
             const selectable = app.presetCategorySelectable(app.preset_browser.intent, cat.name);
@@ -91,7 +97,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) void {
                 ui.renderer.fillRect(px + 2, iy, cat_w - 4, row_h, if (selected) ui.theme.item_hover else ui.theme.slider_track);
             }
             const label_color = if (!selectable) ui.theme.key_label else if (selected) ui.theme.accent else ui.theme.text;
-            ui.labelClipped(preset_mod.pluginDisplayName(cat.name), px + 8, iy + 3, cat_w - 16, label_color);
+            ui.labelClipped(app.presetCategoryLabel(cat.name), px + 8, iy + 3, cat_w - 16, label_color);
             if (!just and !ctx_open and util.hitUI(ui, px + 2, iy, cat_w - 4, row_h) and ui.mouse_pressed) {
                 if (selectable) {
                     app.preset_browser.cat = i;
@@ -100,22 +106,33 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) void {
                     // 置灰点击 → 提示原因
                     if (std.mem.eql(u8, cat.name, preset_mod.plugin_drumkit)) {
                         app.setToast("鼓组里不能再嵌鼓组");
+                    } else if (preset_mod.vst3CidFromCategory(cat.name) != null) {
+                        app.setToast("插件未安装或未扫描到——请在插件管理里扫描/添加");
                     } else {
-                        app.setToastWith("{s}尚未实装", .{preset_mod.pluginDisplayName(cat.name)});
+                        app.setToastWith("{s}尚未实装", .{app.presetCategoryLabel(cat.name)});
                     }
                 }
             }
             iy += row_h;
         }
-        if (app.preset_lib.categories.items.len == 0) {
-            ui.label("（无）", px + 8, body_y + 22, ui.theme.text_dim);
+        if (n_vis == 0) {
+            ui.label("（无可用分类）", px + 8, body_y + 22, ui.theme.text_dim);
         }
     }
 
-    // ── 右栏：置顶默认伪预设 + 预设列表 ──
+    // ── 右栏：搜索框 → 置顶默认伪预设（同款）→ 过滤后的预设列表 ──
     const rx = px + 1 + cat_w + 1;
     const rw = panel_w - (cat_w + 2) - 2;
     {
+        // 搜索框文字 ← 输入框（编辑中实时同步；过滤即时生效）
+        if (app.text_input.active and app.text_input.target == .preset_search) {
+            const ti = &app.text_input;
+            const n = @min(ti.len, app.preset_browser.filter_buf.len);
+            @memcpy(app.preset_browser.filter_buf[0..n], ti.buf[0..n]);
+            app.preset_browser.filter_len = n;
+        }
+        const q = app.presetSearchQuery();
+
         const list_y = body_y + 4;
         const list_h = body_h - 8;
         const n_cat = app.preset_lib.categories.items.len;
@@ -125,43 +142,71 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) void {
             // 行悬停高亮“钉”在右键的那一行（不跟鼠标——否则鼠标划过菜单项时，
             // 菜单下面的行也跟着亮；用户反馈观感差）
             const ctx_row: usize = app.preset_browser.ctx orelse std.math.maxInt(usize);
-            // 行集合 = [0] 置顶默认伪预设 + [1..] 预设文件
-            const n_rows: i32 = @as(i32, @intCast(cat.presets.items.len)) + 1;
-            const content_h: i32 = n_rows * row_h;
-            // 滚动（滚轮悬停右栏；菜单展开时不让位——菜单在面板内，滚动它很怪）
-            if (!ctx_open and util.hitUI(ui, rx, list_y, rw, list_h)) {
-                app.preset_browser.scroll = std.math.clamp(app.preset_browser.scroll - util.scrollDelta(ui), 0, @max(0, content_h - list_h));
-            }
-            const saved = ui.renderer.pushClip(rx, list_y, rw, list_h);
-            defer ui.renderer.popClip(saved);
 
-            // ① 置顶默认伪预设（选中 = 用该插件默认参数建/换/重置）
+            // ① 搜索框（静态层；编辑中 main 的文本输入 overlay 会盖在同位置）
+            const sx = rx + 4;
+            const sw = rw - 8;
             {
-                const ry = list_y - app.preset_browser.scroll;
-                if (ry + row_h > list_y and ry < list_y + list_h) {
-                    const hovered = !ctx_open and util.hitUI(ui, rx, ry, rw, row_h);
-                    if (hovered) ui.renderer.fillRect(rx, ry, rw, row_h, ui.theme.item_hover);
-                    var db: [64]u8 = undefined;
-                    const dlabel = std.fmt.bufPrint(&db, "{s}", .{preset_mod.defaultPresetLabel(cat.name)}) catch "";
-                    ui.labelClipped(dlabel, rx + 8, ry + 3, rw - 16, ui.theme.accent);
-                    if (!just and !ctx_open and hovered and ui.mouse_pressed) {
-                        app.pending_preset = .{ .load = .{
-                            .intent = app.preset_browser.intent,
-                            .cat = cat_idx,
-                            .choice = .default,
-                        } };
-                        app.preset_browser.open = false;
+                const s_hovered = !ctx_open and util.hitUI(ui, sx, list_y, sw, row_h);
+                ui.renderer.fillRect(sx, list_y, sw, row_h, if (s_hovered) ui.theme.item_hover else ui.theme.slider_track);
+                ui.renderer.strokeRect(sx, list_y, sw, row_h, ui.theme.panel_border);
+                const editing = app.text_input.active and app.text_input.target == .preset_search;
+                if (!editing) {
+                    if (q.len > 0) {
+                        ui.labelClipped(q, sx + 4, list_y + 6, sw - 8, ui.theme.text);
+                    } else {
+                        ui.label("搜索预设…", sx + 4, list_y + 6, ui.theme.text_dim);
                     }
                 }
-                // 默认行与预设列表的分隔线
-                ui.renderer.hline(rx + 4, ry + row_h, rw - 8, ui.theme.panel_border);
+                if (!just and !ctx_open and s_hovered and ui.mouse_pressed) {
+                    app.beginPresetSearch(sx, list_y, sw);
+                }
+            }
+            // 搜索框与列表的分割线
+            ui.renderer.hline(rx + 4, list_y + row_h + 1, rw - 8, ui.theme.panel_border);
+
+            // ② 置顶默认伪预设（**与普通预设同款**：白字；仅恒置顶）
+            const def_y = list_y + row_h + 2;
+            {
+                const hovered = !ctx_open and util.hitUI(ui, rx, def_y, rw, row_h);
+                if (hovered) ui.renderer.fillRect(rx, def_y, rw, row_h, ui.theme.item_hover);
+                var db: [64]u8 = undefined;
+                const dlabel = std.fmt.bufPrint(&db, "{s}", .{preset_mod.defaultPresetLabel(cat.name)}) catch "";
+                ui.labelClipped(dlabel, rx + 8, def_y + 3, rw - 16, ui.theme.text);
+                if (!just and !ctx_open and hovered and ui.mouse_pressed) {
+                    app.pending_preset = .{ .load = .{
+                        .intent = app.preset_browser.intent,
+                        .cat = cat_idx,
+                        .choice = .default,
+                    } };
+                    app.preset_browser.open = false;
+                }
             }
 
-            // ② 预设文件
-            var iy = list_y + row_h - app.preset_browser.scroll;
-            for (cat.presets.items, 0..) |name, i| {
-                if (iy + row_h > list_y + list_h) break;
-                if (iy + row_h > list_y) {
+            // ③ 预设文件（过滤 + 滚动；与默认行同属一个列表，无下方分割线）
+            const list_top = def_y + row_h;
+            const list_area_h = @max(row_h, list_y + list_h - list_top);
+            var n_match: i32 = 0;
+            for (cat.presets.items) |name| {
+                if (q.len > 0 and std.ascii.indexOfIgnoreCase(name, q) == null) continue;
+                n_match += 1;
+            }
+            const content_h: i32 = n_match * row_h;
+            // 滚动（滚轮悬停列表区；菜单展开时不让位——菜单在面板内，滚动它很怪）
+            if (!ctx_open and util.hitUI(ui, rx, list_top, rw, list_area_h)) {
+                app.preset_browser.scroll = std.math.clamp(app.preset_browser.scroll - util.scrollDelta(ui), 0, @max(0, content_h - list_area_h));
+            }
+            app.preset_browser.scroll = std.math.clamp(app.preset_browser.scroll, 0, @max(0, content_h - list_area_h));
+            if (n_match > 0) {
+                const saved = ui.renderer.pushClip(rx, list_top, rw, list_area_h);
+                defer ui.renderer.popClip(saved);
+                var vi: i32 = 0;
+                for (cat.presets.items, 0..) |name, i| {
+                    if (q.len > 0 and std.ascii.indexOfIgnoreCase(name, q) == null) continue;
+                    const iy = list_top + vi * row_h - app.preset_browser.scroll;
+                    vi += 1;
+                    if (iy + row_h <= list_top) continue;
+                    if (iy >= list_top + list_area_h) break;
                     // 悬停：ctx 展开时钉在右键行；否则跟鼠标
                     const hovered = if (ctx_open) (ctx_row == i) else util.hitUI(ui, rx, iy, rw, row_h);
                     if (hovered) ui.renderer.fillRect(rx, iy, rw, row_h, ui.theme.item_hover);
@@ -182,13 +227,10 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) void {
                         app.preset_browser.ctx_y = ui.mouse_y;
                     }
                 }
-                iy += row_h;
+            } else if (q.len > 0) {
+                ui.label("（无匹配预设）", rx + 8, list_top + 3, ui.theme.text_dim);
             }
-            // 空分类提示（默认伪预设仍可用——不算“空”）
-            if (cat.presets.items.len == 0) {
-                ui.label("（还没有预设 — 用乐器窗口的「保存为…」新增）", rx + 8, iy + 4, ui.theme.text_dim);
-            }
-            ui.drawScrollbar(rx + rw - 6, list_y, 5, list_h, app.preset_browser.scroll, content_h, list_h);
+            ui.drawScrollbar(rx + rw - 6, list_top, 5, list_area_h, app.preset_browser.scroll, content_h, list_area_h);
 
             // ③ 右键菜单（重命名/删除…）——最后画：本帧吞掉其余点击
             if (app.preset_browser.ctx) |ci| {

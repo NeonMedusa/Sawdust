@@ -87,8 +87,6 @@ fn ctxMenuPos(mw: *const app_mod.MixerWindow, menu_w: i32, menu_h: i32) [2]i32 {
 pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     const mw = &app.mixer_win;
     if (!mw.open) return false;
-    // 帧首：清“刚打开”标记（共享下拉控件；必须逐帧做，否则“点外部关闭”永久失效）
-    util.menuFrameBegin(&mw.menu_just_opened);
 
     // 约束在屏幕内
     mw.w = std.math.clamp(mw.w, win_min_w, @max(win_min_w, w - 20));
@@ -123,7 +121,6 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     ui.label("×", close_x + 6, y + 4, ui.theme.text);
     if (close_hovered and ui.mouse_pressed) {
         mw.open = false;
-        mw.add_effect_ch = null;
         mw.ctx_effect = null;
         return true;
     }
@@ -285,10 +282,6 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     const sel_ch: usize = if (mw.selected_channel >= 0 and mw.selected_channel < n_ch) @intCast(mw.selected_channel) else 0;
     drawEffectPanel(ui, app, sel_ch, right_x, right_y, right_w, right_h);
 
-    // ── 添加效果器下拉（全窗口最上层）──
-    if (mw.add_effect_ch) |ech| {
-        drawAddEffectMenu(ui, app, ech, x, y, ww, hh);
-    }
     // ── 效果器右键菜单 ──
     if (mw.ctx_effect) |ctx| {
         drawCtxMenu(ui, app, ctx);
@@ -297,7 +290,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     if (mw.ctx_channel) |cc| {
         const items = [_][]const u8{ "重命名", "删除通道", "上移", "下移" };
         const ch_ok = [_]bool{ true, cc != 0, cc != 0, cc != 0 };
-        drawCtxMenuGeneric(ui, app, cc, null, &items, &ch_ok);
+        drawCtxMenuGeneric(ui, app, cc, null, &items, &ch_ok, false);
     }
     // ── 声像旋钮右键菜单（恢复默认值）──
     if (mw.ctx_pan) |pc| {
@@ -483,10 +476,8 @@ fn drawEffectPanel(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32
         const tw: i32 = @intFromFloat(ui.font.measure(label));
         ui.label(label, x + @divTrunc(w - tw, 2), by + 3, if (full) ui.theme.text_dim else ui.theme.text);
         if (hovered and ui.mouse_pressed and !full) {
-            app.mixer_win.menu_open = true;
-            app.mixer_win.menu_just_opened = true;
-            app.mixer_win.add_effect_ch = ci;
-            app.mixer_win.ctx_effect = null;
+            // M5：不再用下拉菜单——直接打开预设浏览器面板（内置 + 已扫描 VST3 效果）
+            app.openPresetBrowser(.{ .create_effect = ci });
         }
     }
 }
@@ -517,7 +508,8 @@ fn drawEffectRow(ui: *Ui, app: *App, ci: usize, si: usize, x: i32, y: i32, w: i3
     const name_avail = w - (name_x - x) - (fx_knob + 22);
     const name_hovered = util.hitUI(ui, name_x, y, @max(1, name_avail), h);
     const open_now = if (app.mixer_win.panel) |p| p.ch == ci and p.slot == si else false;
-    ui.labelClipped(es.kind.displayName(), name_x, y + 4, @max(1, name_avail), if (name_hovered or open_now) ui.theme.accent else if (es.enabled) ui.theme.text else ui.theme.text_dim);
+    const name_col = if (es.load_failed) ui.theme.danger else if (name_hovered or open_now) ui.theme.accent else if (es.enabled) ui.theme.text else ui.theme.text_dim;
+    ui.labelClipped(es.kind.displayName(), name_x, y + 4, @max(1, name_avail), name_col);
     if (name_hovered and ui.mouse_pressed and !ui.mouse_double) {
         // 单击 = 切换：面板已开时跟随切到这个效果；未开时不开窗（那是双击的职责）
         if (app.mixer_win.panel != null) {
@@ -527,8 +519,6 @@ fn drawEffectRow(ui: *Ui, app: *App, ci: usize, si: usize, x: i32, y: i32, w: i3
     if (name_hovered and ui.mouse_double) {
         // 双击：打开/切换独立面板并**置顶**
         app.mixer_win.panel = .{ .ch = ci, .slot = si };
-        app.mixer_win.menu_open = false;
-        app.mixer_win.add_effect_ch = null;
         app.mixer_win.ctx_effect = null;
         app.bringToFront(&app.effect_win.z);
     }
@@ -539,8 +529,6 @@ fn drawEffectRow(ui: *Ui, app: *App, ci: usize, si: usize, x: i32, y: i32, w: i3
         app.mixer_win.ctx_pan = null;
         app.mixer_win.ctx_menu_x = ui.mouse_x;
         app.mixer_win.ctx_menu_y = ui.mouse_y;
-        app.mixer_win.menu_open = false;
-        app.mixer_win.add_effect_ch = null;
     }
 
     // 干湿旋钮（右侧）
@@ -555,64 +543,26 @@ fn drawEffectRow(ui: *Ui, app: *App, ci: usize, si: usize, x: i32, y: i32, w: i3
     }
 }
 
-/// 「添加效果器」下拉（**共享控件** view_util.menuPanel）：选类型 → 填入该通道第一个空槽。
-fn drawAddEffectMenu(ui: *Ui, app: *App, ci: usize, wx: i32, wy: i32, ww: i32, hh: i32) void {
-    const mw = &app.mixer_win;
-    const items = [_][]const u8{ "EQ 参量均衡", "混响", "延迟", "压缩器" };
-    const kinds = [_]app_mod.EffectKind{ .eq, .reverb, .delay, .compressor };
-    // 同类已存在 → 置灰（混响/延迟/压缩器每通道至多一个；EQ 可多）
-    var ok = [_]bool{ true, true, true, true };
-    if (ci < app.mixer_channels_state.items.len) {
-        for (app.mixer_channels_state.items[ci].effects.items) |es| {
-            switch (es.kind) {
-                .reverb => ok[1] = false,
-                .delay => ok[2] = false,
-                .compressor => ok[3] = false,
-                else => {},
-            }
-        }
-    }
-    const clicked = util.menuPanel(
-        ui,
-        &mw.menu_x,
-        &mw.menu_y,
-        &mw.menu_open,
-        mw.menu_just_opened,
-        .cursor,
-        .{ .x = wx, .y = wy, .w = ww, .h = hh },
-        &items,
-        170,
-        &ok,
-    );
-    if (clicked) |mi| {
-        if (mi < kinds.len) {
-            // 追加到该通道的效果链末尾
-            const slot = app.addEffect(ci, kinds[mi]) orelse {
-                app.setToast("无法添加：数量达上限或同类已存在");
-                app.mixer_win.add_effect_ch = null;
-                return;
-            };
-            app.mixer_win.panel = .{ .ch = ci, .slot = slot };
-            app.bringToFront(&app.effect_win.z); // 新开面板：同样置顶
-            app.mixer_win.add_effect_ch = null;
-            app.commitHistory("添加效果器");
-        }
-    }
-    // 菜单关闭（点外部/点条目）→ 同步清“所属通道”
-    if (!mw.menu_open) app.mixer_win.add_effect_ch = null;
-}
-
 /// 效果器右键菜单（位置在**打开时快照**——不跟鼠标跑，否则永远点不到）
 fn drawCtxMenu(ui: *Ui, app: *App, ctx: app_mod.EffectRef) void {
-    const items = [_][]const u8{ "删除效果器", "上移", "下移" };
-    drawCtxMenuGeneric(ui, app, ctx.ch, ctx.slot, &items, null);
+    // 插件槽多一项「重新定位插件…」（换路径；pending 状态保留）
+    const is_plugin = ctx.ch < app.mixer_channels_state.items.len and
+        ctx.slot < app.mixer_channels_state.items[ctx.ch].effects.items.len and
+        app.mixer_channels_state.items[ctx.ch].effects.items[ctx.slot].kind == .plugin;
+    if (is_plugin) {
+        const items = [_][]const u8{ "更换效果器…", "重新定位插件…", "删除效果器", "上移", "下移" };
+        drawCtxMenuGeneric(ui, app, ctx.ch, ctx.slot, &items, null, true);
+    } else {
+        const items = [_][]const u8{ "更换效果器…", "删除效果器", "上移", "下移" };
+        drawCtxMenuGeneric(ui, app, ctx.ch, ctx.slot, &items, null, false);
+    }
 }
 
 /// 通用右键菜单（效果器/通道共用）：位置由**打开时快照**提供
 /// （绘制时再**钳制到窗口内**——菜单不得超出窗口，否则超出部分点击会
 /// 穿透到下层；见 `ctxMenuPos`）。`slot` 为 `null` 时是**通道菜单**。
 /// `ok`：逐项可用性（null = 全可用；置灰项不响应点击）。
-fn drawCtxMenuGeneric(ui: *Ui, app: *App, ch: usize, slot: ?usize, items: []const []const u8, ok: ?[]const bool) void {
+fn drawCtxMenuGeneric(ui: *Ui, app: *App, ch: usize, slot: ?usize, items: []const []const u8, ok: ?[]const bool, has_relocate: bool) void {
     const mw_win = &app.mixer_win;
     const menu_w: i32 = 130;
     const menu_h: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
@@ -657,8 +607,13 @@ fn drawCtxMenuGeneric(ui: *Ui, app: *App, ch: usize, slot: ?usize, items: []cons
                 else => {},
             }
         } else if (slot) |sl| {
-            // 效果器菜单：删除效果器 / 上移 / 下移
-            switch (ci) {
+            // 效果器菜单：[更换效果器…] [重新定位插件…?] 删除 / 上移 / 下移
+            const base: usize = 1 + (if (has_relocate) @as(usize, 1) else 0);
+            if (ci == 0) {
+                app.openPresetBrowser(.{ .replace_effect = .{ .ch = ch, .slot = sl } });
+            } else if (has_relocate and ci == 1) {
+                app.pending_relocate_effect = .{ .ch = ch, .slot = sl };
+            } else switch (ci - base) {
                 0 => {
                     if (ch < app.mixer_channels_state.items.len and sl < app.mixer_channels_state.items[ch].effects.items.len) {
                         if (app.mixer_win.panel) |p| {

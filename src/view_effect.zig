@@ -59,6 +59,48 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     }) catch "效果器";
     ui.label(title, x + 8, y + 4, ui.theme.text);
 
+    // 预设按钮（标题栏右侧）：[预设 ▾][保存为…]——内置单效果与 VST3 效果都支持
+    {
+        const save_w: i32 = 62;
+        const menu_w: i32 = 58;
+        const gap: i32 = 6;
+        const bx2 = x + ww - 22 - 6 - save_w;
+        const bx1 = bx2 - gap - menu_w;
+        const bh2: i32 = win_title_h - 6;
+        const by2 = y + 3;
+        if (bx1 > x + 200 and es.kind != .empty) { // 标题放不下就不画（窄窗）
+            const h1 = util.hitUI(ui, bx1, by2, menu_w, bh2);
+            ui.renderer.fillRect(bx1, by2, menu_w, bh2, if (app.preset_browser.open) ui.theme.accent else if (h1) ui.theme.item_hover else ui.theme.slider_track);
+            ui.renderer.strokeRect(bx1, by2, menu_w, bh2, ui.theme.panel_border);
+            {
+                const tw: i32 = @intFromFloat(ui.font.measure("预设"));
+                const arrow_gap: i32 = 4;
+                const total = tw + arrow_gap + util.menu_arrow_w;
+                const tx = bx1 + @divTrunc(menu_w - total, 2);
+                ui.label("预设", tx, by2 + 2, ui.theme.text);
+                util.menuArrow(ui, tx + tw + arrow_gap, by2 + @divTrunc(bh2 - util.menu_arrow_h, 2), ui.theme.text);
+            }
+            if (h1 and ui.mouse_pressed) {
+                if (app.preset_browser.open) {
+                    app.preset_browser.open = false;
+                } else {
+                    app.openPresetBrowser(.{ .replace_effect = .{ .ch = panel.ch, .slot = panel.slot } });
+                }
+                ui.active_id = 0; // 防误触发标题拖动
+            }
+            const h2 = util.hitUI(ui, bx2, by2, save_w, bh2);
+            ui.renderer.fillRect(bx2, by2, save_w, bh2, if (h2) ui.theme.item_hover else ui.theme.slider_track);
+            ui.renderer.strokeRect(bx2, by2, save_w, bh2, ui.theme.panel_border);
+            ui.label("保存为…", bx2 + 4, by2 + 2, ui.theme.text);
+            if (h2 and ui.mouse_pressed) {
+                const save_src = app_mod.PresetSaveSource{ .effect = .{ .ch = panel.ch, .slot = panel.slot } };
+                app.beginRenamePreset(bx2 - 60, y + win_title_h + 4, save_src, app.presetPrefillName(save_src));
+                app.preset_browser.open = false;
+                ui.active_id = 0;
+            }
+        }
+    }
+
     // 关闭按钮
     const close_x = x + ww - 22;
     const close_hovered = util.hitUI(ui, close_x, y + 2, 20, win_title_h - 4);
@@ -129,20 +171,22 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
             app.commitHistory("切换效果器开关");
         }
 
-        // 干湿比（横向推子；右对齐到窗口右缘）
-        const pct_w: i32 = 44; // 预留 "100%" 文字宽度
-        const mix_w: i32 = @min(180, ww - 320);
-        if (mix_w > 60) {
-            const mix_x = x + ww - 12 - pct_w - 8 - mix_w;
-            ui.label("干湿", mix_x - 34, cy + 4, ui.theme.text_dim);
-            var mix = es.mix;
-            if (ui.slider(7602, &mix, mix_x, cy + 4, mix_w, 14)) {
-                es.mix = mix;
-                app.history_pending = "调整效果器干湿";
+        // 干湿比（横向推子；右对齐到窗口右缘）——VST3 插件暂未接干湿混合（滑块隐藏，避免误导）
+        if (es.kind != .plugin) {
+            const pct_w: i32 = 44; // 预留 "100%" 文字宽度
+            const mix_w: i32 = @min(180, ww - 320);
+            if (mix_w > 60) {
+                const mix_x = x + ww - 12 - pct_w - 8 - mix_w;
+                ui.label("干湿", mix_x - 34, cy + 4, ui.theme.text_dim);
+                var mix = es.mix;
+                if (ui.slider(7602, &mix, mix_x, cy + 4, mix_w, 14)) {
+                    es.mix = mix;
+                    app.history_pending = "调整效果器干湿";
+                }
+                var mb: [16]u8 = undefined;
+                const mt = std.fmt.bufPrint(&mb, "{d:.0}%", .{es.mix * 100}) catch "";
+                ui.label(mt, mix_x + mix_w + 8, cy + 4, ui.theme.text_dim);
             }
-            var mb: [16]u8 = undefined;
-            const mt = std.fmt.bufPrint(&mb, "{d:.0}%", .{es.mix * 100}) catch "";
-            ui.label(mt, mix_x + mix_w + 8, cy + 4, ui.theme.text_dim);
         }
     }
     cy += 28;
@@ -193,6 +237,107 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
 /// 参数面板（混响/延迟/压缩器）：纵列 = 名称 + 旋钮 + 数值
 /// 注：干湿（mix）不在此列——顶部已有独立干湿滑块（同一参数，避免两个入口）
 fn drawParamPanel(ui: *Ui, app: *App, es: *app_mod.EffectSlot, px: i32, py: i32, pw: i32, ph: i32) void {
+    // VST3 插件：头部信息 + 参数列表（拖动编辑 / 双击恢复默认；滚轮滚动）
+    if (es.kind == .plugin) {
+        const pl = es.plugin;
+        // ── 头部：名称 + [打开界面]（右）；路径 · 延迟 ──
+        {
+            const name_t = if (pl) |p| p.name() else "（未加载）";
+            ui.labelClipped(name_t, px + 8, py + 4, pw - 116, if (es.load_failed) ui.theme.danger else ui.theme.text);
+            if (pl) |p| {
+                if (ui.button(@intFromPtr(p), "打开界面", px + pw - 96, py + 2, 88, 20)) {
+                    switch (p.openEditor(app.main_hwnd)) {
+                        .opened => {},
+                        .no_editor => ui.label("（此插件无编辑器界面）", px + pw - 220, py + 26, ui.theme.text_dim),
+                        .failed => ui.label("（编辑器打开失败）", px + pw - 220, py + 26, ui.theme.text_dim),
+                    }
+                }
+            }
+        }
+        var yy = py + 28;
+        {
+            var lb: [48]u8 = undefined;
+            const lat_t = if (pl) |p| (std.fmt.bufPrint(&lb, " · 延迟 {d}", .{p.latency}) catch "") else "";
+            var pb: [600]u8 = undefined;
+            const path_t = std.fmt.bufPrint(&pb, "{s}{s}", .{ std.fs.path.basename(es.pluginPath()), lat_t }) catch "";
+            ui.labelClipped(path_t, px + 8, yy, pw - 16, ui.theme.text_dim);
+        }
+        yy += 18;
+
+        // ── 参数列表（可滚动；行 = 名称 + 值文本）──
+        const list_top = yy;
+        const list_h = py + ph - list_top - 14;
+        const row_h: i32 = 17;
+        if (list_h < row_h) return;
+        const p = pl orelse {
+            if (es.load_failed) {
+                ui.label("（插件加载失败——每 ~2 秒自动重试；文件恢复后自动加载）", px + 8, list_top + 2, ui.theme.danger);
+            } else {
+                ui.label("（插件未加载）", px + 8, list_top + 2, ui.theme.text_dim);
+            }
+            return;
+        };
+        const pcount = p.paramCount();
+        if (pcount == 0) {
+            ui.label("（此插件没有可用参数）", px + 8, list_top + 2, ui.theme.text_dim);
+            return;
+        }
+        // 滚动状态挂在窗口面板引用上（切换效果槽时自动归零）
+        var dummy_scroll: i32 = 0;
+        const scroll_p: *i32 = if (app.mixer_win.panel) |*pref| &pref.scroll else &dummy_scroll;
+        const visible: i32 = @max(1, @divTrunc(list_h, row_h));
+        const content_h: i32 = @as(i32, @intCast(pcount)) * row_h;
+        const scroll_max: i32 = @max(0, content_h - visible * row_h);
+        const scrollbar_w: i32 = if (scroll_max > 0) 6 else 0;
+        // 滚轮（悬停在列表区）
+        if (util.hitUI(ui, px, list_top, pw, list_h) and scroll_max > 0) {
+            scroll_p.* = std.math.clamp(scroll_p.* - ui.wheel * 24, 0, scroll_max);
+        }
+        scroll_p.* = std.math.clamp(scroll_p.*, 0, scroll_max);
+        const value_w: i32 = 130; // 右侧值文本预留宽
+        {
+            const saved = ui.renderer.pushClip(px, list_top, pw - scrollbar_w, list_h);
+            defer ui.renderer.popClip(saved);
+            var idx: usize = 0;
+            while (idx < pcount) : (idx += 1) {
+                const ry = list_top + @as(i32, @intCast(idx)) * row_h - scroll_p.*;
+                if (ry + row_h <= list_top or ry >= list_top + list_h) continue; // 视口剔除
+                const meta = &p.params[idx];
+                const rid: u64 = 7900 + @as(u64, idx);
+                const hovered = util.hitUI(ui, px, ry, pw - scrollbar_w, row_h - 1);
+                var v = p.paramNorm(idx);
+                const read_only = (meta.flags & 0x2) != 0; // kIsReadOnly：插件声明只读，跳过交互
+                if (!read_only and hovered and ui.mouse_double) {
+                    // 双击 → 恢复默认值（先于拖动判定：双击帧也会发按下，否则被拖动抢走）
+                    p.setParamHost(idx, meta.default_norm);
+                    app.markPluginEdited();
+                    app.touchGesture("调整插件参数");
+                } else if (!read_only and ui.dragNormV(rid, px, ry, pw - scrollbar_w, row_h - 1, &v)) {
+                    // 离散参数：吸附到步长（拖动锚点无级累积 → 逐格步进可达）
+                    if (meta.step_count > 0) {
+                        const steps: f64 = @floatFromInt(meta.step_count);
+                        v = @round(v * steps) / steps;
+                    }
+                    p.setParamHost(idx, v);
+                    app.markPluginEdited();
+                    app.touchGesture("调整插件参数");
+                }
+                const active = ui.active_id == rid;
+                ui.renderer.fillRect(px, ry, pw - scrollbar_w, row_h - 1, if (active) ui.theme.item_hover else if (hovered) ui.theme.toolbar else ui.theme.panel);
+                ui.renderer.strokeRect(px, ry, pw - scrollbar_w, row_h - 1, ui.theme.panel_border);
+                ui.labelClipped(meta.name(), px + 6, ry + 2, pw - scrollbar_w - value_w - 16, if (hovered or active) ui.theme.text else ui.theme.text_dim);
+                var vb: [40]u8 = undefined;
+                const vt = p.paramText(idx, &vb);
+                const vw: i32 = @min(value_w, @as(i32, @intFromFloat(ui.font.measure(vt))));
+                ui.labelClipped(vt, px + pw - scrollbar_w - 6 - vw, ry + 2, vw + 2, ui.theme.text);
+            }
+        }
+        if (scroll_max > 0) {
+            ui.drawScrollbar(px + pw - 7, list_top, 5, list_h, scroll_p.*, content_h, list_h);
+        }
+        ui.label("拖动调整 · 双击恢复默认", px + 8, py + ph - 13, ui.theme.text_dim);
+        return;
+    }
     const infos = fx.paramInfos(@intFromEnum(es.kind));
     if (infos.len == 0 or pw < 200 or ph < 60) return;
     const knob: i32 = 40;

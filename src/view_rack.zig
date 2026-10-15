@@ -141,12 +141,18 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
         ui.label("+ 添加乐器", add_x + @divTrunc(add_w - tw, 2), add_y + @divTrunc(add_btn_h - 10, 2), ui.theme.text);
         if (hovered and ui.mouse_pressed) app.openPresetBrowser(.create_instrument);
     }
+    // 注：VST3 乐器的「浏览文件」入口已移入**插件管理**（单文件条目）——
+    // 预设面板中的 VST3 分类来自扫描缓存（用户拍板，2026-10）
 
     // 右键菜单（重命名 / 更换乐器… / 删除乐器）——同理：仅在展开时取消屏蔽
     if (app.rack.ctx_instrument != null or app.rack.ctx_pan != null) ui.input_blocked = false;
     if (app.rack.ctx_instrument) |ci| {
         if (ci < app.instruments.items.len) {
-            const items = [_][]const u8{ "重命名", "更换乐器…", "删除乐器" };
+            const is_vst3 = app.instruments.items[ci].kind == .vst3;
+            const items: []const []const u8 = if (is_vst3)
+                &.{ "打开插件界面", "重新定位插件…", "重命名", "更换乐器…", "删除乐器" }
+            else
+                &.{ "重命名", "更换乐器…", "删除乐器" };
             const mw: i32 = 160;
             const mh: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
             const mx = app.rack.ctx_x; // 固定位置（打开时记录，不跟鼠标跑）
@@ -166,20 +172,41 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
                 if (ih and ui.mouse_pressed) clicked = i;
             }
             if (clicked) |ic| {
-                switch (ic) {
-                    0 => {
-                        // 重命名：输入框弹在乐器名位置（行内就地）
-                        app.beginRenameInstrument(ci, mx + 4, my + 4);
-                    },
-                    1 => {
-                        // 更换乐器 → 打开预设面板（任意插件；选中即换，保留属性）
-                        app.openPresetBrowser(.{ .change_instrument = @intCast(ci) });
-                    },
-                    2 => {
-                        app.removeInstrument(ci);
-                        app.commitHistory("删除乐器"); // 原子操作：立即提交
-                    },
-                    else => {},
+                if (is_vst3 and ic == 0) {
+                    // 打开插件自带界面
+                    const inst = &app.instruments.items[ci];
+                    if (inst.plugin) |pl| {
+                        switch (pl.openEditor(app.main_hwnd)) {
+                            .opened => {},
+                            .no_editor => app.setToast("此插件无编辑器界面"),
+                            .failed => app.setToast("编辑器打开失败"),
+                        }
+                    } else {
+                        app.setToast("插件未加载（稍候或检查路径）");
+                    }
+                } else {
+                    const act: usize = if (is_vst3) ic - 1 else ic;
+                    if (is_vst3 and act == 0) {
+                        // 重新定位插件…（文件对话框 → 换路径；pending 保留）
+                        app.pending_relocate_instrument = ci;
+                    } else {
+                        const a2: usize = if (is_vst3) act - 1 else act;
+                        switch (a2) {
+                            0 => {
+                                // 重命名：输入框弹在乐器名位置（行内就地）
+                                app.beginRenameInstrument(ci, mx + 4, my + 4);
+                            },
+                            1 => {
+                                // 更换乐器 → 打开预设面板（任意插件；选中即换，保留属性）
+                                app.openPresetBrowser(.{ .change_instrument = @intCast(ci) });
+                            },
+                            2 => {
+                                app.removeInstrument(ci);
+                                app.commitHistory("删除乐器"); // 原子操作：立即提交
+                            },
+                            else => {},
+                        }
+                    }
                 }
                 app.rack.ctx_instrument = null;
             } else if (ui.mouse_pressed and !inside) {
@@ -323,7 +350,8 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, x: i32, y: i32, w: i32, clip_top: i32
     const is_kit = inst.kind == .drumkit;
     const name_w = @min(util.rack_name_w, w - (cx - x) - 10);
     const name_hovered = util.hitUI(ui, cx, y + 2, name_w, util.rack_row_h - 4);
-    ui.labelClipped(inst.name, cx + 4, y + @divTrunc(util.rack_row_h - 10, 2), name_w - 8, if (selected) ui.theme.text else ui.theme.text_dim);
+    const name_col = if (inst.load_failed) ui.theme.danger else if (selected) ui.theme.text else ui.theme.text_dim;
+    ui.labelClipped(inst.name, cx + 4, y + @divTrunc(util.rack_row_h - 10, 2), name_w - 8, name_col);
     if (name_hovered and ui.mouse_pressed) {
         app.setInstrument(@intCast(idx)); // 切换清选区（防跨乐器孤儿选区）
         app.rack.ctx_instrument = null;

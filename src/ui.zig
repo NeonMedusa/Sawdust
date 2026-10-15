@@ -143,7 +143,7 @@ pub const Ui = struct {
     /// - `7100-7501`：钢琴卷帘与播放列表（标尺 7100/7200/7000、框选
     ///   7300/7400、循环拖选 7500/7501）
     /// - `7150-7161`：调音台窗口交互（分割条/拖动/缩放）
-    /// - `7600-7810`：效果器窗口（窗口 7600/7601、干湿 7602、EQ 7800+）
+    /// - `7600-7900`：效果器窗口（窗口 7600/7601、干湿 7602、EQ 7800+、VST3 参数行 7900+）
     /// - `8100-8711`：调音台控件（声像 8100+ / 音量 8150+ / 干湿 8200+）
     active_id: u64 = 0,
     drag_anchor: f32 = 0,
@@ -162,6 +162,11 @@ pub const Ui = struct {
     /// □ 缩放拖动：上次的 frozen_dy（算增量）与不足一单位的余数
     zoom_last_dy: i32 = 0,
     zoom_rem: i32 = 0,
+    /// 归一化值拖动：起始值 + 起始冻结位移（**锚点式累积**——
+    /// 离散参数被步长吸附后读回值会归零，增量式永远跨不过阈值）
+    drag_f0: f64 = 0,
+    drag_dy0: i32 = 0,
+
     /// 本帧请求的光标（beginFrame 时重置为 arrow）
     cursor: CursorKind = .arrow,
     /// 本帧是否屏蔽底层控件交互（由层系统自动维护；调用方不应手写）
@@ -830,6 +835,32 @@ pub const Ui = struct {
         const tx = x + @divTrunc(w - tw, 2);
         self.font.draw(self.renderer, t, @floatFromInt(tx), @floatFromInt(self.centeredBaselineY(y, h)), self.theme.text);
         if (hovered or active) self.cursor = .resize_v;
+        return changed;
+    }
+
+    /// 垂直拖动调整归一化值（0..1；VST3 参数行用）——返回本帧是否变化。
+    /// 锚点式：按下记起始值与起始冻结位移，拖动中从锚点累积（离散参数也能逐格步进）。
+    pub fn dragNormV(self: *Ui, id: u64, x: i32, y: i32, w: i32, h: i32, value: *f64) bool {
+        const hovered = self.hit(x, y, w, h);
+        var changed = false;
+        if (self.active_id == id) {
+            const total_dy = self.frozen_dy - self.drag_dy0;
+            const nv = std.math.clamp(self.drag_f0 + @as(f64, @floatFromInt(total_dy)) * 0.004, 0, 1);
+            if (nv != value.*) {
+                value.* = nv;
+                changed = true;
+            }
+            if (!self.mouse_down) {
+                self.active_id = 0;
+                self.mouse_capture = false;
+            }
+        } else if (hovered and self.mouse_pressed) {
+            self.active_id = id;
+            self.mouse_capture = true;
+            self.drag_f0 = value.*;
+            self.drag_dy0 = self.frozen_dy;
+        }
+        if (hovered) self.cursor = .resize_v;
         return changed;
     }
 

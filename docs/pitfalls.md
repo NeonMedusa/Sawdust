@@ -1103,3 +1103,16 @@ const names = if (total == 1) first.? else
 `git restore --worktree`（含 `-c core.autocrlf=false`）可能因 stat 缓存命中
 而**跳过写盘**（命令成功、文件行尾/大小原样不动）。把目标文件 mtime 改掉
 （`(Get-Item f).LastWriteTime = Get-Date`）再 restore，才会真正重写。
+
+### LoadLibrary 损坏镜像弹**模态**框卡住进程——宿主必须 `SetErrorMode`
+
+扫描/加载插件时 `LoadLibraryA` 一个损坏或 0 字节的“dll”，Windows 会弹
+“损坏的映像 (0xc0000020)” **模态**框并**阻塞进程直到用户点击**——扫目录里的
+垃圾 dll 时每条垃圾卡一次（实测：测试进程耗时 14s → 43s，系统日志出现
+7~8 条弹窗记录）。修复：进程内**首次 LoadLibrary 前**
+`SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX)`
+（放在 `vst_host.loadModule` 咽喉点——主程序/扫描 worker/测试全覆盖；
+子进程继承，worker 也安静）。
+事后取证：弹窗文本就在**系统日志 Application Popup（ID 26）**里，
+`Get-WinEvent -LogName System | ? ProviderName -match Popup`。
+

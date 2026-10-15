@@ -136,6 +136,13 @@ pub const SavedInstrument = struct {
     key_mode: u32 = 0,
     /// 关联预设名（最近加载/保存的预设；展示/保存预填用；空 = 无）
     preset_name: []const u8 = "",
+    /// VST3 乐器插件路径（kind == 2 时有效；空 = 非插件乐器）
+    plugin_path: []const u8 = "",
+    /// VST3 乐器**音色状态**（base64 文本；空 = 无/未捕获）。组件状态与控制器状态各一份。
+    plugin_state: []const u8 = "",
+    plugin_state_ctrl: []const u8 = "",
+    /// 插件类 CID（32 hex；空 = 未知）——重绑定自愈的匹配身份
+    plugin_cid: []const u8 = "",
     /// 鼓组数据（`kind == 1` 时有效；空 = 无）
     kit: SavedDrumKit = .{},
     /// 合成器参数（synth 类型用；鼓组类型的“本体”不使用）
@@ -160,6 +167,13 @@ pub const SavedEffectSlot = struct {
     bands: []const SavedEqBand = &.{},
     /// 通用参数位（混响/延迟/压缩器；含义见 `effects.paramInfos`；旧档缺失 → 全 0）
     p: [5]f32 = .{ 0, 0, 0, 0, 0 },
+    /// VST3 插件路径（kind = 5；旧档缺失 → 空）
+    plugin_path: []const u8 = "",
+    /// VST3 插件状态（**base64 文本**；空 = 无/未捕获）。组件状态与控制器状态各一份。
+    plugin_state: []const u8 = "",
+    plugin_state_ctrl: []const u8 = "",
+    /// 插件类 CID（32 hex；空 = 未知）——重绑定自愈的匹配身份
+    plugin_cid: []const u8 = "",
 };
 
 /// 存档中的一个调音台通道
@@ -171,8 +185,9 @@ pub const SavedMixerChannel = struct {
     muted: bool = false,
     /// 有效效果器数（0 = 旧存档：按 kind != 0 推断）
     effect_count: u32 = 0,
-    /// 效果器链（固定 4 槽存储；`effect_count` 之前的项有效）
-    effects: [4]SavedEffectSlot = .{ .{}, .{}, .{}, .{} },
+    /// 效果器链（**动态长度**：导出时按实际槽数分配，至多 `app.max_effects_per_channel`；
+    /// 旧存档为固定 4 槽数组——切片解析天然兼容）
+    effects: []const SavedEffectSlot = &.{},
 };
 
 pub const Project = struct {
@@ -592,16 +607,13 @@ test "persist: 真实文件往返（写盘 → 读回）" {
 test "persist: 调音台通道往返（增益/声像/静音/效果链）" {
     const allocator = std.testing.allocator;
     const mix = [_]SavedMixerChannel{
-        .{ .name = "鼓组", .volume = 0.33, .pan = 0.2, .muted = true, .effects = .{
+        .{ .name = "鼓组", .volume = 0.33, .pan = 0.2, .muted = true, .effects = &.{
             .{ .kind = 1, .enabled = true, .mix = 0.7, .bands = &[_]SavedEqBand{
                 .{ .freq = 80, .gain_db = -6, .q = 0.7 },
                 .{ .freq = 600, .gain_db = 3.5, .q = 1.2 },
                 .{ .freq = 2500, .gain_db = -12, .q = 2.0 },
                 .{ .freq = 9000, .gain_db = 8, .q = 0.9 },
             } },
-            .{},
-            .{},
-            .{},
         } },
         .{ .volume = 0.9, .pan = 0.8, .muted = false },
     };
@@ -621,7 +633,8 @@ test "persist: 调音台通道往返（增益/声像/静音/效果链）" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.33), m0.volume, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.2), m0.pan, 1e-6);
     try std.testing.expect(m0.muted);
-    // 效果链：第 0 槽 = EQ
+    // 效果链：第 0 槽 = EQ；切片长度 = 实际条数（旧固定 4 槽 → 动态切片）
+    try std.testing.expectEqual(@as(usize, 1), m0.effects.len);
     try std.testing.expectEqual(@as(u32, 1), m0.effects[0].kind);
     try std.testing.expect(m0.effects[0].enabled);
     try std.testing.expectApproxEqAbs(@as(f32, 0.7), m0.effects[0].mix, 1e-6);
@@ -630,8 +643,6 @@ test "persist: 调音台通道往返（增益/声像/静音/效果链）" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.2), m0.effects[0].bands[1].q, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, -12), m0.effects[0].bands[2].gain_db, 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 8), m0.effects[0].bands[3].gain_db, 1e-5);
-    // 空槽
-    try std.testing.expectEqual(@as(u32, 0), m0.effects[1].kind);
     // 第二通道
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), parsed.value.mixer[1].pan, 1e-6);
     try std.testing.expect(!parsed.value.mixer[1].muted);
@@ -640,6 +651,19 @@ test "persist: 调音台通道往返（增益/声像/静音/效果链）" {
     const old = try fromJson(allocator, "{\"version\":2,\"bpm\":100}");
     defer old.deinit();
     try std.testing.expectEqual(@as(usize, 0), old.value.mixer.len);
+}
+
+test "persist: 效果链动态长度往返（>4 条不再截断）" {
+    const allocator = std.testing.allocator;
+    const six = [_]SavedEffectSlot{ .{ .kind = 1 }, .{ .kind = 1 }, .{ .kind = 1 }, .{ .kind = 1 }, .{ .kind = 1 }, .{ .kind = 1 } };
+    const mix = [_]SavedMixerChannel{.{ .effect_count = 6, .effects = &six }};
+    const project = Project{ .mixer = @constCast(&mix) };
+    const json = try toJson(allocator, project);
+    defer allocator.free(json);
+    const parsed = try fromJson(allocator, json);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 6), parsed.value.mixer[0].effects.len);
+    try std.testing.expectEqual(@as(u32, 6), parsed.value.mixer[0].effect_count);
 }
 
 test "persist: v2 输出不含 v1 兼容字段（bar/len_bars）" {

@@ -13,12 +13,29 @@
 //! 每乐器一个独立声部池（`synths`），事件按 `instrument` 路由。
 
 const std = @import("std");
+
+/// 每槽效果器 DSP 状态盒：UI 线程 `create`/延迟退役，音频线程只读。
+/// `kind` 为 2/3/4（与 `effect_kind` 同编码）；**音频侧以盒内 kind 为准**
+/// （链 kind 与指针更新有帧间竞态——按盒分派保证永不误解指针）。
+pub const FxBox = struct {
+    kind: u8,
+    payload: union {
+        reverb: fx.Reverb,
+        delay: fx.Delay,
+        comp: fx.Compressor,
+    },
+};
 const synth = @import("synth.zig");
 const eq = @import("eq.zig");
 const fx = @import("effects.zig");
+const vst_host = @import("vst_host.zig");
+const ivstevents = @import("zig_vst3").pluginterfaces.vst.ivstevents;
 const ma = @cImport({
     @cInclude("miniaudio.h");
 });
+
+/// 每乐器每个分段发送给 VSTi 的事件上限（超出的丢弃；宁可丢事件也不分配）
+pub const vsti_batch_max = 128;
 
 /// 调音台通道数**上限**（与 app.max_mixer_channels 一致；音频层不能 import app——循环依赖）。
 /// 运行时实际通道数以 `Params.channel_count` 为准（≤ 此值）。
@@ -46,6 +63,9 @@ pub const Params = struct {
     // ── 传输（UI 写、音频线程读）──
     /// BPM（序列器按此把步 → 帧换算；UI 每帧同步）
     bpm: std.atomic.Value(u32) = std.atomic.Value(u32).init(120),
+    /// 拍号（分子/分母；main 每帧同步——ProcessContext 用；仅信息性）
+    time_num: std.atomic.Value(i32) = std.atomic.Value(i32).init(4),
+    time_den: std.atomic.Value(i32) = std.atomic.Value(i32).init(4),
     /// 每拍步数（`U / 分母`；决定“一步”的真实时长；UI 每帧同步）
     steps_per_beat: std.atomic.Value(u32) = std.atomic.Value(u32).init(24),
     /// 播放起点（帧；开始播放/跳转时写入）
@@ -83,11 +103,20 @@ pub const Params = struct {
         for (&a) |*p| p.* = std.atomic.Value(f32).init(0.5);
         break :blk a;
     },
+    /// 每槽 VST3 插件实例指针（混音通道 × 效果槽；null = 未加载/直通）——
+    /// UI 侧惰性加载并发布；删除走“退役列表”延迟销毁（见 App.retirePlugin）
+    plugin_ptrs: [mixer_channels][effect_slots]std.atomic.Value(?*vst_host.Plugin) = [_][effect_slots]std.atomic.Value(?*vst_host.Plugin){[_]std.atomic.Value(?*vst_host.Plugin){std.atomic.Value(?*vst_host.Plugin).init(null)} ** effect_slots} ** mixer_channels,
+    /// 每槽效果器 DSP 状态盒（混响/延迟/压缩器；UI 线程分配/发布/退役——与
+    /// `plugin_ptrs` 同一模式）。null = 无状态（直通/未发布）。
+    /// 历史：原为每通道一份（“同类至多一个”时代）；用户要叠加相同效果 → 每槽独立。
+    fx_ptrs: [mixer_channels][effect_slots]std.atomic.Value(?*FxBox) = [_][effect_slots]std.atomic.Value(?*FxBox){[_]std.atomic.Value(?*FxBox){std.atomic.Value(?*FxBox).init(null)} ** effect_slots} ** mixer_channels,
     /// 每乐器路由到的调音台通道（0..mixer_channels-1；UI 每帧同步）
     instrument_channel: [synth.max_instruments]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** synth.max_instruments,
+    /// 每乐器的 VST3 插件实例（kind == 2/VSTi；null = 未加载）——UI 侧惰性加载/发布
+    instrument_plugin: [synth.max_instruments]std.atomic.Value(?*vst_host.Plugin) = [_]std.atomic.Value(?*vst_host.Plugin){std.atomic.Value(?*vst_host.Plugin).init(null)} ** synth.max_instruments,
 
     // ── 鼓组（每乐器：类型 + 层列表；UI 每帧同步）──
-    /// 乐器类型（0 = synth / 1 = drumkit）
+    /// 乐器类型（0 = synth / 1 = drumkit / 2 = VST3 插件）
     instrument_kind: [synth.max_instruments]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** synth.max_instruments,
     /// 鼓组层数（≤ kit_max_layers）
     kit_layer_count: [synth.max_instruments]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** synth.max_instruments,
@@ -203,11 +232,22 @@ pub const Engine = struct {
     /// 索引 = `i * kit_max_layers + l`）。启动一次分配——无生命周期管理
     /// （层槽位复用：层数/参数变时旧声部自然 release，无需释放池）。
     kit_synths: []synth.KitLayerSynth = &.{},
+    /// VSTi 渲染中转缓冲（插件的原位写出不能直接覆盖通道缓冲——需叠加）
+    vsti_scratch: []f32 = &.{},
+    /// VSTi 待发送事件批（事件在**段边界以 offset 0 生效**：dispatchNote 填充，
+    /// renderSegment 消费后清零——与内部合成器的样本级触发共用同一分段机制）
+    vsti_events: [synth.max_instruments][vsti_batch_max]ivstevents.Event = [_][vsti_batch_max]ivstevents.Event{[_]ivstevents.Event{.{}} ** vsti_batch_max} ** synth.max_instruments,
+    vsti_event_n: [synth.max_instruments]usize = [_]usize{0} ** synth.max_instruments,
+    /// VSTi 正在发声的音高（位图；all-off 时按位补发 note-off）
+    vsti_active_lo: [synth.max_instruments]u64 = [_]u64{0} ** synth.max_instruments,
+    vsti_active_hi: [synth.max_instruments]u64 = [_]u64{0} ** synth.max_instruments,
     /// 每乐器上一帧的类型（类型切换边沿 → 两个池都全释音，防悬挂）
     last_kind: [synth.max_instruments]u32 = [_]u32{0} ** synth.max_instruments,
     /// 已取但未到时的调度事件（stash；按步序保留，到时再触发）
     stash: [synth.sched_drain_max]synth.SchedEvent = undefined,
     stash_n: usize = 0,
+    /// 当前渲染**段**起点的绝对播放帧（dataCallback 每段设置；ProcessContext 用）
+    seg_abs0: u64 = 0,
     /// stash 所属的 generation（gen 变化时整批作废）
     stash_gen: u32 = 1,
     /// 上一块的播放状态（用于检测“播放 → 暂停”下降沿）
@@ -220,12 +260,9 @@ pub const Engine = struct {
     slot_eq: []eq.Biquad = &.{},
     /// 每通道已应用的 EQ 版本（与 params.channel_eq_version 对比）
     chan_eq_ver: [mixer_channels]u32 = [_]u32{0} ** mixer_channels,
-    /// 混响状态（**每通道一份**：16 × ≈134KB ≈ 2.1MB；堆分配）
-    reverbs: []fx.Reverb = &.{},
-    /// 延迟状态（每通道一份：16 × ≈384KB ≈ 6.1MB；1s 上限立体声）
-    delays: []fx.Delay = &.{},
-    /// 压缩器状态（每通道一份；状态极小）
-    comps: []fx.Compressor = &.{},
+    /// 注：混响/延迟/压缩器状态已改为**每槽状态盒**（`Params.fx_ptrs`，
+    /// UI 线程分配/退役）——原“每通道一份”的 `reverbs/delays/comps` 已移除
+    /// （用户要叠加相同效果；Delay 每份 768KB，不能按槽预分配）。
     /// 每通道渲染缓冲（**堆分配**：32 通道 × 32KB = 1MB，不能放栈）
     chan_bufs: []f32 = &.{},
     /// 频谱分析：滑窗样本（单声道混合）——滑窗取自
@@ -246,19 +283,15 @@ pub const Engine = struct {
         // 鼓组层声部池（预分配大块；≈32×16 × 9.6KB ≈ 5MB，一次分配）
         self.kit_synths = try allocator.alloc(synth.KitLayerSynth, synth.max_instruments * kit_max_layers);
         for (self.kit_synths) |*s| s.* = .{};
+        // VSTi 中转缓冲（一个渲染块大小）
+        self.vsti_scratch = try allocator.alloc(f32, 2 * 4096);
+        @memset(self.vsti_scratch, 0);
         // 调音台缓冲（堆分配——体积大不能放栈）
         self.chan_bufs = try allocator.alloc(f32, mixer_channels * 2 * 4096);
         @memset(self.chan_bufs, 0);
         const n_eq = mixer_channels * effect_slots * eq_bands * 2;
         self.slot_eq = try allocator.alloc(eq.Biquad, n_eq);
         @memset(self.slot_eq, .{});
-        // 新效果器状态（每通道一份；体积大 → 堆分配）
-        self.reverbs = try allocator.alloc(fx.Reverb, mixer_channels);
-        for (self.reverbs) |*r| r.* = .{};
-        self.delays = try allocator.alloc(fx.Delay, mixer_channels);
-        for (self.delays) |*d| d.* = .{};
-        self.comps = try allocator.alloc(fx.Compressor, mixer_channels);
-        for (self.comps) |*c| c.* = .{};
 
         var config = ma.ma_device_config_init(ma.ma_device_type_playback);
         config.playback.format = ma.ma_format_f32;
@@ -293,21 +326,13 @@ pub const Engine = struct {
             self.allocator.free(self.kit_synths);
             self.kit_synths = &.{};
         }
+        if (self.vsti_scratch.len > 0) {
+            self.allocator.free(self.vsti_scratch);
+            self.vsti_scratch = &.{};
+        }
         if (self.chan_bufs.len > 0) {
             self.allocator.free(self.chan_bufs);
             self.chan_bufs = &.{};
-        }
-        if (self.reverbs.len > 0) {
-            self.allocator.free(self.reverbs);
-            self.reverbs = &.{};
-        }
-        if (self.delays.len > 0) {
-            self.allocator.free(self.delays);
-            self.delays = &.{};
-        }
-        if (self.comps.len > 0) {
-            self.allocator.free(self.comps);
-            self.comps = &.{};
         }
         if (self.slot_eq.len > 0) {
             self.allocator.free(self.slot_eq);
@@ -323,6 +348,75 @@ pub const Engine = struct {
 fn releaseAllVoices(engine: *Engine) void {
     for (engine.synths) |*s| synth.allOff(s);
     for (engine.kit_synths) |*s| synth.allOff(s);
+    // VSTi：给正在发声的乐器按音高补发 note-off（VST3 无“全体释音”事件）
+    const params = engine.params;
+    for (0..synth.max_instruments) |i| {
+        if (params.instrument_kind[i].load(.monotonic) == 2) vstiAllOff(engine, i);
+    }
+}
+
+/// VSTi：把事件追加到该乐器的待发送批（满则丢弃——宁可丢事件不分配）
+fn vstiPush(engine: *Engine, i: usize, ev: ivstevents.Event) void {
+    const n = engine.vsti_event_n[i];
+    if (n >= engine.vsti_events[i].len) return;
+    engine.vsti_events[i][n] = ev;
+    engine.vsti_event_n[i] = n + 1;
+}
+
+/// VSTi：正在发声位图的置位/清除
+fn vstiActiveSet(engine: *Engine, i: usize, pitch: u8, on: bool) void {
+    if (pitch < 64) {
+        const bit = @as(u64, 1) << @intCast(pitch);
+        if (on) engine.vsti_active_lo[i] |= bit else engine.vsti_active_lo[i] &= ~bit;
+    } else {
+        const bit = @as(u64, 1) << @intCast(pitch - 64);
+        if (on) engine.vsti_active_hi[i] |= bit else engine.vsti_active_hi[i] &= ~bit;
+    }
+}
+
+fn vstiNoteOn(engine: *Engine, i: usize, pitch: u8, velocity: u8) void {
+    vstiActiveSet(engine, i, pitch, true);
+    vstiPush(engine, i, .{
+        .sampleOffset = 0,
+        .type = @intFromEnum(ivstevents.Event.EventTypes.kNoteOnEvent),
+        .data = .{ .noteOn = .{
+            .channel = 0,
+            .pitch = @intCast(pitch),
+            .velocity = @as(f32, @floatFromInt(@max(1, velocity))) / 127.0,
+            .length = 0,
+            .noteId = -1,
+        } },
+    });
+}
+
+fn vstiNoteOff(engine: *Engine, i: usize, pitch: u8) void {
+    vstiActiveSet(engine, i, pitch, false);
+    vstiPush(engine, i, .{
+        .sampleOffset = 0,
+        .type = @intFromEnum(ivstevents.Event.EventTypes.kNoteOffEvent),
+        .data = .{ .noteOff = .{
+            .channel = 0,
+            .pitch = @intCast(pitch),
+            .velocity = 0,
+            .noteId = -1,
+        } },
+    });
+}
+
+/// VSTi：按位图补发全部 note-off（暂停/跳转/切类型/全体释音共用）
+fn vstiAllOff(engine: *Engine, i: usize) void {
+    var lo = engine.vsti_active_lo[i];
+    while (lo != 0) {
+        const p: u8 = @intCast(@ctz(lo));
+        lo &= lo - 1;
+        vstiNoteOff(engine, i, p);
+    }
+    var hi = engine.vsti_active_hi[i];
+    while (hi != 0) {
+        const p: u8 = @intCast(@ctz(hi));
+        hi &= hi - 1;
+        vstiNoteOff(engine, i, p + 64);
+    }
 }
 
 /// 传输边沿处理：**暂停时释放全部声部**（两个池）。
@@ -404,6 +498,13 @@ fn schedEventObsolete(ev: synth.SchedEvent, gen: u32, edit_gen: u32, rescan_from
 /// 鼓组：各层池的并集（层与垫多对一，并集即该组当前发声的音高）。
 fn publishSounding(engine: *Engine, params: *Params) void {
     for (0..synth.max_instruments) |i| {
+        if (params.instrument_kind[i].load(.monotonic) == 2) {
+            // VST3 乐器：直接发布 note-on 活跃位图（宿主侧无声部模型；
+            // 位图由 vstiNoteOn/Off 维护——暂停/释音也经 all-off 同位清）
+            params.sounding_lo[i].store(engine.vsti_active_lo[i], .monotonic);
+            params.sounding_hi[i].store(engine.vsti_active_hi[i], .monotonic);
+            continue;
+        }
         if (params.synth_ptrs[i].load(.monotonic) == null) {
             params.sounding_lo[i].store(0, .monotonic);
             params.sounding_hi[i].store(0, .monotonic);
@@ -449,19 +550,57 @@ pub fn effectivePan(inst_pan: f32, note_pan: u8) u8 {
     return @intFromFloat(@round(std.math.clamp(v, 0.0, 127.0)));
 }
 
+/// VSTi 立体声平衡（等功率）：插件输出当**立体声总线**处理，声像旋钮 0..1
+/// 映射到两侧增益。0.5 = 原样（两侧 ×1）；两端 = 单侧 ×√2、另一侧 0。
+/// 恒有 gl² + gr² ≡ 2（与合成器逐音声像同一功率基准）。
+/// 注：插件自己的声像不被改动（只作用于其后的总线平衡）。“Vital 音色偏右 +
+/// 旋钮偏左 → 听感居中”即靠它。
+pub fn balanceGains(pan: f32) [2]f32 {
+    const p = std.math.clamp(pan, 0.0, 1.0);
+    const ang = p * (std.math.pi / 2.0);
+    return .{ @cos(ang) * std.math.sqrt2, @sin(ang) * std.math.sqrt2 };
+}
+
+/// 当前段的宿主时间（ProcessContext：tempo/拍号/播放位置/ppq）
+fn currentHostTime(engine: *Engine, params: *Params, sr: f32) vst_host.HostTime {
+    const playing = params.playing.load(.monotonic);
+    const bpm: u32 = @max(20, params.bpm.load(.monotonic));
+    const spb: u32 = @max(1, params.steps_per_beat.load(.monotonic));
+    const start_frame = params.start_frame.load(.monotonic);
+    const abs = engine.seg_abs0;
+    var ppq: f64 = 0;
+    if (playing and abs >= start_frame) {
+        // 每步 = 1/spb 拍；拍 = 四分音符
+        const step_frames = @as(f64, sr) * 60.0 / (@as(f64, @floatFromInt(bpm)) * @as(f64, @floatFromInt(spb)));
+        ppq = (@as(f64, @floatFromInt(abs - start_frame)) / step_frames) / @as(f64, @floatFromInt(spb));
+    }
+    return .{
+        .playing = playing,
+        .tempo = @floatFromInt(bpm),
+        .time_num = params.time_num.load(.monotonic),
+        .time_den = params.time_den.load(.monotonic),
+        .abs_samples = abs,
+        .ppq = ppq,
+    };
+}
+
 /// 触发一个音符事件（音频线程；`SchedEvent` / `NoteEvent` 均可——字段兼容）。
 /// **鼓组分支**：on 按音高分发到匹配层；off **不查映射**直接对所有层——
 /// 防“响着时改映射”漏 off → 悬挂（与调音台教训一致）。
 fn dispatchNote(engine: *Engine, ev: anytype) void {
     if (ev.instrument >= synth.max_instruments) return;
     const params = engine.params;
-    const is_kit = params.instrument_kind[ev.instrument].load(.monotonic) == 1;
+    const kind = params.instrument_kind[ev.instrument].load(.monotonic);
+    const is_kit = kind == 1;
+    const is_vsti = kind == 2;
     const base = @as(usize, ev.instrument) * kit_max_layers;
     switch (ev.kind) {
         .on => {
             // **有效声像** = 乐器声像（基准）+ 音符级偏移（Sawdust 特色）
             const pan = effectivePan(params.instrument_pan[ev.instrument].load(.monotonic), ev.pan);
-            if (is_kit) {
+            if (is_vsti) {
+                vstiNoteOn(engine, ev.instrument, ev.pitch, ev.velocity);
+            } else if (is_kit) {
                 const n_layers = @min(params.kit_layer_count[ev.instrument].load(.monotonic), kit_max_layers);
                 for (0..n_layers) |l| {
                     if (params.kit_layer_pitch[ev.instrument][l].load(.monotonic) != ev.pitch) continue;
@@ -472,7 +611,9 @@ fn dispatchNote(engine: *Engine, ev: anytype) void {
             }
         },
         .off => {
-            if (is_kit) {
+            if (is_vsti) {
+                vstiNoteOff(engine, ev.instrument, ev.pitch);
+            } else if (is_kit) {
                 // 全部层都收 off（无关层空转——防漏 off）
                 const n_layers = @min(params.kit_layer_count[ev.instrument].load(.monotonic), kit_max_layers);
                 for (0..n_layers) |l| synth.noteOff(&engine.kit_synths[base + l], ev.pitch);
@@ -501,6 +642,8 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
     const n_ch: usize = @min(params.channel_count.load(.monotonic), mixer_channels);
     if (engine.chan_bufs.len < mixer_channels * 2 * 4096 or engine.slot_eq.len < mixer_channels * effect_slots * eq_bands * 2) return;
     const buf_stride: usize = 2 * 4096;
+    // 本段的宿主时间（tempo/拍号/位置/ppq；VST3 插件的 ProcessContext）
+    const host_time = currentHostTime(engine, params, sr);
 
     // 频谱目标（UI 每帧发布）：目标效果器所在通道/槽位（-1 = 不分析）。
     // 目标变化时丢弃旧滑窗——否则两种信号的样本会混进同一窗（频谱错乱）。
@@ -517,11 +660,31 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
 
     // 2) 乐器 → 各自通道的缓冲（**按通道路由分开渲染**——通道 EQ 必须逐通道）
     for (0..synth.max_instruments) |i| {
-        const sp = params.synth_ptrs[i].load(.monotonic) orelse continue;
+        const kind = params.instrument_kind[i].load(.monotonic);
         const ch: usize = @min(params.instrument_channel[i].load(.monotonic), if (n_ch > 0) n_ch - 1 else 0);
         const g = params.instrument_gain[i].load(.monotonic); // 乐器音量×静音（推子前）
         const cbuf: [*]f32 = @ptrCast(&engine.chan_bufs[ch * buf_stride]);
-        if (params.instrument_kind[i].load(.monotonic) == 1) {
+        if (kind == 2) {
+            // VST3 乐器（VSTi）：渲染到中转缓冲 → 增益 × 等功率立体声平衡 → 叠加进通道缓冲
+            // （插件是原位写出，不能直接覆盖通道缓冲：同通道其他乐器/乐器的已渲染内容。
+            //  声像 = 标准立体声平衡：输出当立体声总线，按旋钮位置对两侧做等功率增益）
+            const pl = params.instrument_plugin[i].load(.monotonic) orelse continue;
+            if (engine.vsti_scratch.len < n) continue; // 中转缓冲未初始化（测试环境）：未加载即跳过
+            const sc = engine.vsti_scratch[0..n];
+            @memset(sc, 0);
+            // 本段事件（段边界 = 事件时刻 → offset 全 0）；消费后清零
+            pl.processInstrument(sc, frames, engine.vsti_events[i][0..engine.vsti_event_n[i]], host_time);
+            engine.vsti_event_n[i] = 0;
+            const bg = balanceGains(params.instrument_pan[i].load(.monotonic));
+            var k: usize = 0;
+            while (k < n) : (k += 2) {
+                cbuf[k] += sc[k] * g * bg[0];
+                cbuf[k + 1] += sc[k + 1] * g * bg[1];
+            }
+            continue;
+        }
+        const sp = params.synth_ptrs[i].load(.monotonic) orelse continue;
+        if (kind == 1) {
             // 鼓组：逐层渲染叠加进同一通道缓冲（整组走同一调音台链）
             const n_layers = @min(params.kit_layer_count[i].load(.monotonic), kit_max_layers);
             const base = i * kit_max_layers;
@@ -576,7 +739,6 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
     // 不是主输出全混。
     analyzeSpectrum(engine, params, sr);
 }
-
 /// 单通道效果链处理（EQ 系数重建 + 逐槽处理 + 频谱捕获）。
 /// 注：**无“无乐器跳过”优化**——混响/延迟的尾音需状态持续推进（空缓冲
 /// 处理廉价）；主通道还会承载子通道汇入信号。
@@ -625,16 +787,21 @@ fn processChannelChain(engine: *Engine, params: *Params, ch_i: usize, buf: []f32
                     }
                 }
             },
-            2, 3, 4 => { // 混响 / 延迟 / 压缩器（状态每通道一份；参数按槽读）
-                if (engine.reverbs.len == 0 or engine.delays.len == 0 or engine.comps.len == 0) continue;
+        5 => { // VST3 插件（实例未加载 → 直通；由 UI 侧惰性加载/退役）
+            if (params.plugin_ptrs[ch_i][slot].load(.monotonic)) |pl| pl.processWithHost(buf, frames, currentHostTime(engine, params, sr));
+        },
+            2, 3, 4 => { // 混响 / 延迟 / 压缩器：**每槽独立状态盒**（UI 发布指针）
+                const raw = params.fx_ptrs[ch_i][slot].load(.monotonic) orelse continue;
+                const box: *FxBox = @ptrCast(@alignCast(raw));
                 var p: [fx.max_params]f32 = undefined;
                 for (0..fx.max_params) |pi| p[pi] = params.effect_p[ch_i][slot][pi].load(.monotonic);
                 // 每拍秒数（延迟卡拍用；BPM 已钳到 ≥20，与序列器换算同一口径）
                 const beat_secs: f32 = 60.0 / @as(f32, @floatFromInt(@max(20, params.bpm.load(.monotonic))));
-                switch (kind) {
-                    2 => engine.reverbs[ch_i].process(buf, frames, sr, &p, mix),
-                    3 => engine.delays[ch_i].process(buf, frames, sr, &p, mix, beat_secs),
-                    else => engine.comps[ch_i].process(buf, frames, sr, &p, mix),
+                // 按**盒内 kind** 分派（链 kind 与指针更新有帧间竞态；盒是自洽的）
+                switch (box.kind) {
+                    2 => box.payload.reverb.process(buf, frames, sr, &p, mix),
+                    3 => box.payload.delay.process(buf, frames, sr, &p, mix, beat_secs),
+                    else => box.payload.comp.process(buf, frames, sr, &p, mix),
                 }
             },
             else => {},
@@ -698,6 +865,9 @@ fn applyKindEdges(engine: *Engine) void {
         synth.allOff(&engine.synths[i]);
         const kbase = i * kit_max_layers;
         for (0..kit_max_layers) |l| synth.allOff(&engine.kit_synths[kbase + l]);
+        // VSTi：类型切走/切回都补 off（防悬挂）；待发批一并作废
+        vstiAllOff(engine, i);
+        engine.vsti_event_n[i] = 0;
     }
 }
 
@@ -740,6 +910,7 @@ fn dataCallback(
 
     // 3) 非播放：只渲染（试听/释音尾），调度事件不触发
     if (!playing) {
+        engine.seg_abs0 = params.frames_played.load(.monotonic);
         renderSegment(engine, params, out, frames, sr, master);
         publishSounding(engine, params);
         _ = params.frames_played.fetchAdd(frames, .monotonic);
@@ -795,10 +966,12 @@ fn dataCallback(
         const off: u64 = @intCast(ev_frame - cur);
         const seg: u32 = @intCast(@min(@as(u64, frames - done), off));
         if (seg == 0) break;
+        engine.seg_abs0 = abs0 + done;
         renderSegment(engine, params, out + done * 2, seg, sr, master);
         done += seg;
     }
     if (done < frames) {
+        engine.seg_abs0 = abs0 + done;
         renderSegment(engine, params, out + done * 2, frames - done, sr, master);
     }
 
@@ -1148,6 +1321,7 @@ const KitTestEnv = struct {
         alloc.free(self.engine.kit_synths);
         if (self.engine.chan_bufs.len > 0) alloc.free(self.engine.chan_bufs);
         if (self.engine.slot_eq.len > 0) alloc.free(self.engine.slot_eq);
+        if (self.engine.vsti_scratch.len > 0) alloc.free(self.engine.vsti_scratch);
     }
 
     /// 组 0 设为鼓组；槽位按 (音高, 参数) 逐对写入
@@ -1342,16 +1516,6 @@ test "audio: 主通道聚合——子通道音频必经主通道（主推子/静
     defer env.deinit(alloc);
     const engine = &env.engine;
     const params = &env.params;
-    // 新效果器状态（生产由 Engine.init 分配；测试手动给）
-    engine.reverbs = try alloc.alloc(fx.Reverb, mixer_channels);
-    for (engine.reverbs) |*r| r.* = .{};
-    defer alloc.free(engine.reverbs);
-    engine.delays = try alloc.alloc(fx.Delay, mixer_channels);
-    for (engine.delays) |*d| d.* = .{};
-    defer alloc.free(engine.delays);
-    engine.comps = try alloc.alloc(fx.Compressor, mixer_channels);
-    for (engine.comps) |*c| c.* = .{};
-    defer alloc.free(engine.comps);
 
     // 乐器 → 通道 1（子通道）；通道 0（主）无直连乐器
     var sp0 = synth.SynthParams{};
@@ -1405,15 +1569,11 @@ test "audio: 主通道效果链作用在汇总信号上（混响/延迟加入尾
     defer env.deinit(alloc);
     const engine = &env.engine;
     const params = &env.params;
-    engine.reverbs = try alloc.alloc(fx.Reverb, mixer_channels);
-    for (engine.reverbs) |*r| r.* = .{};
-    defer alloc.free(engine.reverbs);
-    engine.delays = try alloc.alloc(fx.Delay, mixer_channels);
-    for (engine.delays) |*d| d.* = .{};
-    defer alloc.free(engine.delays);
-    engine.comps = try alloc.alloc(fx.Compressor, mixer_channels);
-    for (engine.comps) |*c| c.* = .{};
-    defer alloc.free(engine.comps);
+    // 每槽延迟状态盒（生产由 UI 线程发布；测试手动给）
+    const box = try alloc.create(FxBox);
+    box.* = .{ .kind = 3, .payload = .{ .delay = .{} } };
+    defer alloc.destroy(box);
+    params.fx_ptrs[0][0].store(box, .monotonic);
 
     // 子通道 1 发声；主通道挂一个 delay（干湿各半、反馈 0.5）
     // 注：mix 不能用 1.0——纯湿时直声期（<0.25s）回波未到，直声期输出恒零
@@ -1468,5 +1628,99 @@ test "audio: 有效声像合成——乐器基准 + 音符偏移（导入音符�
     try std.testing.expectEqual(@as(u8, 0), effectivePan(0.5, 0));
     try std.testing.expectEqual(@as(u8, 127), effectivePan(1.0, 127));
     try std.testing.expectEqual(@as(u8, 127), effectivePan(0.75, 127));
+}
+
+test "audio: VSTi 声像平衡——等功率（0.5 原样、两端满偏单侧、功率恒定）" {
+    const c = balanceGains(0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), c[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), c[1], 1e-6);
+    const l = balanceGains(0.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.4142135), l[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), l[1], 1e-6);
+    const r = balanceGains(1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), r[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.4142135), r[1], 1e-6);
+    // 等功率：gl² + gr² ≡ 2（任意位置）
+    var p: f32 = 0;
+    while (p <= 1.0) : (p += 0.1) {
+        const bg = balanceGains(p);
+        try std.testing.expectApproxEqAbs(@as(f32, 2.0), bg[0] * bg[0] + bg[1] * bg[1], 1e-5);
+    }
+}
+
+test "audio: VSTi 声像——插件输出按平衡叠加（全左/全右/居中能量分配）" {
+    const alloc = std.testing.allocator;
+    const dll_z = alloc.dupeZ(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll") catch return;
+    defer alloc.free(dll_z);
+
+    const measure = struct {
+        fn run(alloc_: std.mem.Allocator, dll_z_: [:0]const u8, pan: f32) !struct { l: f64, r: f64 } {
+            var env: KitTestEnv = undefined;
+            try env.init(alloc_, true);
+            defer env.deinit(alloc_);
+            const engine = &env.engine;
+            const params = &env.params;
+            engine.vsti_scratch = try alloc_.alloc(f32, 2 * 4096);
+
+            const pl = vst_host.loadPlugin(alloc_, dll_z_, 48000, 4096, .instrument) catch return error.SkipZigTest;
+            defer vst_host.unloadPlugin(alloc_, pl);
+            pl.setParamHost(0, 0.8); // 电平拉高
+            params.instrument_kind[0].store(2, .monotonic);
+            params.instrument_plugin[0].store(pl, .monotonic);
+            params.instrument_channel[0].store(0, .monotonic);
+            params.instrument_gain[0].store(1.0, .monotonic);
+            params.instrument_pan[0].store(pan, .monotonic);
+            params.channel_count.store(1, .monotonic);
+            params.volume.store(1.0, .monotonic);
+
+            dispatchNote(engine, synth.NoteEvent{ .kind = .on, .pitch = 60, .instrument = 0, .velocity = 100 });
+            var out: [512 * 2]f32 = undefined;
+            var sl: f64 = 0;
+            var sr: f64 = 0;
+            var i: usize = 0;
+            while (i < 8) : (i += 1) {
+                @memset(&out, 0);
+                renderSegment(engine, params, &out, 512, 48000, 1.0);
+                var k: usize = 0;
+                while (k < out.len) : (k += 2) {
+                    sl += @as(f64, out[k]) * out[k];
+                    sr += @as(f64, out[k + 1]) * out[k + 1];
+                }
+            }
+            params.instrument_plugin[0].store(null, .monotonic);
+            return .{ .l = sl, .r = sr };
+        }
+    }.run;
+
+    const left = try measure(alloc, dll_z, 0.0);
+    const right = try measure(alloc, dll_z, 1.0);
+    const mid = try measure(alloc, dll_z, 0.5);
+    try std.testing.expect(left.l > 1.0);
+    try std.testing.expect(left.r < 1e-6); // 全左：右侧寂音
+    try std.testing.expect(right.r > 1.0);
+    try std.testing.expect(right.l < 1e-6); // 全右：左侧寂音
+    try std.testing.expectApproxEqRel(mid.l, mid.r, 1e-3); // 居中：两侧相等
+    // 单侧能量：全左 ≈ 居中 ×2（等功率：×√2 增益 → 能量 ×2）
+    try std.testing.expectApproxEqRel(left.l, mid.l * 2.0, 0.05);
+}
+
+test "audio: publishSounding——VSTi 直接发布 note-on 活跃位图" {
+    var env: KitTestEnv = undefined;
+    try env.init(std.testing.allocator, false);
+    defer env.deinit(std.testing.allocator);
+    const engine = &env.engine;
+    const params = &env.params;
+    params.instrument_kind[0].store(2, .monotonic);
+    engine.vsti_active_lo[0] = @as(u64, 1) << 60;
+    engine.vsti_active_hi[0] = @as(u64, 1) << 5; // 音高 69
+    publishSounding(engine, params);
+    try std.testing.expectEqual(@as(u64, 1) << 60, params.sounding_lo[0].load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1) << 5, params.sounding_hi[0].load(.monotonic));
+    // 清位（all-off）后再发布 → 高亮归零
+    engine.vsti_active_lo[0] = 0;
+    engine.vsti_active_hi[0] = 0;
+    publishSounding(engine, params);
+    try std.testing.expectEqual(@as(u64, 0), params.sounding_lo[0].load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), params.sounding_hi[0].load(.monotonic));
 }
 
