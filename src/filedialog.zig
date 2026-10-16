@@ -229,7 +229,8 @@ pub fn pickFolder(allocator: std.mem.Allocator, owner: ?*anyopaque, title: []con
 // ── 工具（可测）──
 
 /// 「Sawdust 工程」过滤器字符串（人类可读形式；`toFilterUtf16Z` 会转成 Win32 格式）
-pub const project_filter = "Sawdust 工程 (*.saw)\x00*.saw\x00所有文件 (*.*)\x00*.*\x00";
+    pub const project_filter = "Sawdust 工程 (*.saw)\x00*.saw\x00所有文件 (*.*)\x00*.*\x00";
+    pub const wav_filter = "WAV 音频 (*.wav)\x00*.wav\x00所有文件 (*.*)\x00*.*\x00";
 pub const vst3_filter = "VST3 插件 (*.vst3)\x00*.vst3\x00所有文件 (*.*)\x00*.*\x00";
 
 /// 把「描述\0通配\0…\0」转成 UTF-16 + **双 NUL 结尾**（Win32 要求）。

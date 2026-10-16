@@ -314,6 +314,11 @@ pub fn main(init: std.process.Init) !u8 {
                     ui_input.mouse_y = m.y;
                 },
                 .key_down => |k| {
+                    // 导出进行中：Esc = 取消导出；其余键盘吞掉（模态）
+                    if (app.export_wav != null) {
+                        if (k.code == 0x1B) app.exportWavCancel();
+                        continue;
+                    }
                     // 模态确认框优先捕获键盘
                     if (app.modal != null) {
                         switch (k.code) {
@@ -666,6 +671,8 @@ pub fn main(init: std.process.Init) !u8 {
             // 输入由 `setEditorEnabled` 闸门拦截（禁用窗点击归父窗口）。
             drawModal(&ui, &app);
         }
+        // 导出进度窗（模态；置于最上层——导出期间其余元素均不可操作）
+        if (app.export_wav != null) drawExportDialog(&ui, &app, io);
         // 文本输入框（最顶层——跨窗口/菜单，重命名乐器/通道用）
         if (app.text_input.active) {
             const ti = &app.text_input;
@@ -688,8 +695,10 @@ pub fn main(init: std.process.Init) !u8 {
         // 3) 光标形状（UI 在绘制时按需请求）
         win.setCursor(ui.cursor);
 
-        // 4) 呈现（原生子窗口＝插件编辑器矩形交给窗口层裁掉——防软渲染回写盖掉子窗口像素）
-        win.exclude_n = collectEditorRects(&app, &win.exclude_rects);
+        // 4) 呈现（原生子窗口＝插件编辑器：按**其当前可见区域**裁掉回写——
+        //    未遮挡=整矩形跳过（防闪烁）；被弹窗/窗口遮挡的（已 SetWindowRgn 裁掉）
+        //    部分照常回写（保证盖在插件上的窗口/弹窗正常覆盖，不破洞）
+        collectEditorPresents(&app, &win);
         win.present();
 
         // 4.1) 历史提交（拖动类操作 **coalesce**：鼠标松开才提交一次——
@@ -726,8 +735,12 @@ pub fn main(init: std.process.Init) !u8 {
                 .save_as => saveProject(&app, &win, io, true),
                 .import_midi => importMidiWithDialog(&app, &win, io),
                 .export_midi => exportMidiWithDialog(&app, &win, io),
+                .export_wav => exportWavWithDialog(&app, &win, io),
             }
         }
+
+        // 4.2b) 导出进度推进（分块；完成后自动收尾——见 `App.exportWavFrame`）
+        if (app.export_wav != null) app.exportWavFrame(io);
 
         // 4.3) 预设库操作（文件 IO——同上帧末；App 无 io）
         if (app.pending_preset) |act| {
@@ -1861,6 +1874,10 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     if (app.modal != null) {
         _ = ui.declare(.{ .prio = 1000, .rect = .{ .x = 0, .y = 0, .w = w, .h = h }, .modal = true });
     }
+    // 导出进度窗（模态：导出期间屏蔽一切；与确认框同优先级——两者不会同时出现）
+    if (app.export_wav != null) {
+        _ = ui.declare(.{ .prio = 1000, .rect = .{ .x = 0, .y = 0, .w = w, .h = h }, .modal = true });
+    }
     // 浮动窗口：prio = 窗口 z（+1 避开主界面 0）；按 z 升序声明（同层上覆盖下）
     // 注：prio 用 1 + idx（idx = 排序后的位次）而非窗口 z 值——declare 对
     // 同 prio 是覆盖且要求 prio 互不相同；位次天然互异且与排序一致。
@@ -2181,6 +2198,7 @@ fn drawFileMenu(ui: *Ui, app: *App) void {
         .{ .label = "另存为...", .shortcut = "Ctrl+Shift+S" },
         .{ .label = "导入 MIDI...", .shortcut = "" },
         .{ .label = "导出 MIDI...", .shortcut = "" },
+        .{ .label = "导出音频 (WAV)...", .shortcut = "" },
     };
     const item_h: i32 = 22;
     const menu_x = app.file_menu_x;
@@ -2227,6 +2245,7 @@ fn drawFileMenu(ui: *Ui, app: *App) void {
             3 => .save_as,
             4 => .import_midi,
             5 => .export_midi,
+            6 => .export_wav,
             else => null,
         };
     }
@@ -2473,11 +2492,11 @@ fn ensureEditor(app: *App, pl: *vst_host.Plugin) void {
     }
 }
 
-/// 收集当前打开的插件编辑器子窗口矩形（主窗 client 坐标）——`present` 回写裁切用
-/// （原生子窗口像素由系统维护；软渲染每帧回写会盖掉它 → GDI 插件高频闪烁，实测）。
+/// 收集当前打开的插件编辑器子窗口（句柄 + 主窗 client 坐标位置）——`window.present`
+/// 按**其当前可见区域**（`GetWindowRgn`——已含 `setEditorClip` 的遮挡裁切）从回写中排除。
 /// 归属判定与 `syncPluginEditors` 同源；同一时刻最多 2 个（乐器面板 + 效果面板各一）。
-fn collectEditorRects(app: *App, out: *[4][4]i32) usize {
-    var n: usize = 0;
+fn collectEditorPresents(app: *App, win: *window.Window) void {
+    win.exclude_n = 0;
     if (app.synth_win.open) {
         switch (app.synth_win.target) {
             .instrument => |ii| {
@@ -2485,9 +2504,10 @@ fn collectEditorRects(app: *App, out: *[4][4]i32) usize {
                     const inst = &app.instruments.items[@intCast(ii)];
                     if (inst.kind == .vst3) {
                         if (inst.plugin) |pl| {
-                            if (pl.editorClientRect()) |r| {
-                                out[n] = r;
-                                n += 1;
+                            if (pl.editorPresentInfo()) |info| {
+                                win.exclude_hwnd[win.exclude_n] = info.hwnd;
+                                win.exclude_pos[win.exclude_n] = .{ info.x, info.y, info.w, info.h };
+                                win.exclude_n += 1;
                             }
                         }
                     }
@@ -2503,16 +2523,16 @@ fn collectEditorRects(app: *App, out: *[4][4]i32) usize {
                 const es = &mc.effects.items[panel.slot];
                 if (es.kind == .plugin) {
                     if (es.plugin) |pl| {
-                        if (pl.editorClientRect()) |r| {
-                            out[n] = r;
-                            n += 1;
+                        if (pl.editorPresentInfo()) |info| {
+                            win.exclude_hwnd[win.exclude_n] = info.hwnd;
+                            win.exclude_pos[win.exclude_n] = .{ info.x, info.y, info.w, info.h };
+                            win.exclude_n += 1;
                         }
                     }
                 }
             }
         }
     }
-    return n;
 }
 
 fn syncPluginEditors(app: *App, ui: *Ui, fw: i32, fh: i32) void {
@@ -3172,6 +3192,116 @@ fn exportMidiWithDialog(app: *App, win: *window.Window, io: std.Io) void {
         return;
     };
     app.setToastWith("已导出 {d} 个音符：{s}", .{ notes.len, path });
+}
+
+/// 导出音频（WAV, 24-bit）/ 整曲**离线渲染**：停播 + 暂停设备 → 快照 → 逐块渲染写盘。
+/// 默认文件名 = 工程名.wav（新建未保存的工程 → Sawdust.wav）。
+fn exportWavWithDialog(app: *App, win: *window.Window, io: std.Io) void {
+    var name_buf: [300]u8 = undefined;
+    const default_name = blk: {
+        if (app.project_path) |p| {
+            const base = std.fs.path.basename(p);
+            const stem = if (std.mem.lastIndexOfScalar(u8, base, '.')) |i| base[0..i] else base;
+            if (stem.len > 0 and stem.len < 290) break :blk std.fmt.bufPrint(&name_buf, "{s}.wav", .{stem}) catch "Sawdust.wav";
+        }
+        break :blk "Sawdust.wav";
+    };
+    const picked = filedialog.save(app.allocator, win.hwnd, "导出音频 (WAV)", default_name, filedialog.wav_filter) catch |e| {
+        app.setToastWith("导出失败：对话框出错（{s}）", .{@errorName(e)});
+        return;
+    };
+    const path = picked orelse {
+        if (filedialog.supported()) app.setToast("已取消导出");
+        return;
+    };
+    defer app.allocator.free(path);
+
+    app.exportWavBegin(io, path) catch |e| {
+        app.setToastWith("导出失败：{s}", .{@errorName(e)});
+        return;
+    };
+    // 进度/取消/完成收尾由主循环的导出状态机负责（`exportWavFrame` + `drawExportDialog`）
+}
+
+/// 导出进度窗（模态；绘于最上层）。进度条 + 取消按钮；标题可拖动（位置记忆在
+/// `app.export_win`）。完成/取消后状态机清理 `export_wav` → 本窗自动消失。
+fn drawExportDialog(ui: *Ui, app: *App, io: std.Io) void {
+    const ww: i32 = 430;
+    const hh: i32 = 118;
+    const win_w = @as(i32, @intCast(ui.renderer.fb.width));
+    const win_h = @as(i32, @intCast(ui.renderer.fb.height));
+    const ew = &app.export_win;
+    if (ew.x == -100000) { // 首帧：居中偏上
+        ew.x = @divTrunc(win_w - ww, 2);
+        ew.y = @divTrunc(win_h - hh, 3);
+    }
+    ew.x = std.math.clamp(ew.x, 0, @max(0, win_w - ww));
+    ew.y = std.math.clamp(ew.y, 0, @max(0, win_h - hh));
+    const x = ew.x;
+    const y = ew.y;
+
+    // 半透明遮罩（同模态确认框；提示其余元素不可操作）
+    ui.renderer.fillRect(0, 0, win_w, win_h, (@as(u32, 110) << 24) | 0x000000);
+    ui.noteOverlayRect(x, y, ww + 4, hh + 4); // 裁切插件子窗口（仅本窗范围，含阴影）
+
+    ui.renderer.fillRect(x + 4, y + 4, ww, hh, r_mod.rgb(10, 11, 13)); // 阴影
+    ui.renderer.fillRect(x, y, ww, hh, ui.theme.panel);
+    ui.renderer.strokeRect(x, y, ww, hh, ui.theme.accent);
+
+    // 标题（拖动区）
+    const title_bar_h: i32 = 22;
+    ui.label("导出音频 (WAV)", x + 10, y + 5, ui.theme.text);
+    if (util.hitUI(ui, x, y, ww, title_bar_h) and ui.mouse_pressed) {
+        ui.active_id = 9800; // 导出窗标题拖动（**与插件管理器的 9700 错开**——撞车会拖着两窗一起动，实测）
+        ew.grab_dx = ui.mouse_x - x;
+        ew.grab_dy = ui.mouse_y - y;
+    }
+    if (ui.active_id == 9800) {
+        if (!ui.mouse_down) {
+            ui.active_id = 0;
+        } else {
+            ew.x = ui.mouse_x - ew.grab_dx;
+            ew.y = ui.mouse_y - ew.grab_dy;
+        }
+    }
+
+    const st = if (app.export_wav) |*e| e else return;
+
+    // 进度条
+    const frac: f32 = if (st.total_frames > 0)
+        @min(1.0, @as(f32, @floatFromInt(st.done)) / @as(f32, @floatFromInt(st.total_frames)))
+    else
+        1.0;
+    const bar_x = x + 14;
+    const bar_w = ww - 28;
+    const bar_y = y + 32;
+    const bar_h: i32 = 14;
+    ui.renderer.fillRect(bar_x, bar_y, bar_w, bar_h, r_mod.rgb(28, 30, 34));
+    ui.renderer.fillRect(bar_x, bar_y, @as(i32, @intFromFloat(frac * @as(f32, @floatFromInt(bar_w)))), bar_h, ui.theme.accent);
+    ui.renderer.strokeRect(bar_x, bar_y, bar_w, bar_h, ui.theme.panel_border);
+
+    // 百分比 + 秒数 + 实时倍速/剩余估算（t0 起算）
+    const sr_f: f32 = @floatFromInt(app.params.sample_rate);
+    const done_s: f32 = @as(f32, @floatFromInt(st.done)) / sr_f;
+    const total_s: f32 = @as(f32, @floatFromInt(st.total_frames)) / sr_f;
+    const now_ns: i64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
+    const elapsed_s: f32 = std.math.clamp(@as(f32, @floatFromInt(now_ns - st.t0_ns)) / 1e9, 0.001, 1e9);
+    const rate: f32 = if (elapsed_s > 0.5) done_s / elapsed_s else 0.0; // 倍速（×实时）
+    const eta_s: f32 = if (rate > 0.01) (total_s - done_s) / rate else 0.0;
+    var buf: [128]u8 = undefined;
+    const txt = if (rate > 0.01)
+        std.fmt.bufPrint(&buf, "{d:.0}% · 已 {d:.0} / {d:.0} 秒 · {d:.1}× · 剩 ~{d:.0} 秒", .{ frac * 100.0, done_s, total_s, rate, @max(0.0, eta_s) }) catch "..."
+    else
+        std.fmt.bufPrint(&buf, "{d:.0}% · 已 {d:.0} / {d:.0} 秒", .{ frac * 100.0, done_s, total_s }) catch "...";
+    const tw: i32 = @intFromFloat(ui.font.measure(txt));
+    ui.label(txt, x + @divTrunc(ww - tw, 2), bar_y + bar_h + 5, ui.theme.text_dim);
+
+    // 取消
+    const btn_w: i32 = 96;
+    const btn_h: i32 = 26;
+    if (ui.button(9701, "取消导出", x + @divTrunc(ww - btn_w, 2), y + hh - btn_h - 10, btn_w, btn_h)) {
+        app.exportWavCancel();
+    }
 }
 
 // ── 模态确认框（自绘）──

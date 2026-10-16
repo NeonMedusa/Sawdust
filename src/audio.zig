@@ -317,6 +317,16 @@ pub const Engine = struct {
         self.initialized = true;
     }
 
+    /// 暂停/恢复音频设备（离线导出用：期间实时回调完全停走，渲染由导出循环独占）。
+    /// 未初始化（单测 / 无声卡）→ 无操作。
+    pub fn pauseDevice(self: *Engine) void {
+        if (self.initialized) _ = ma.ma_device_stop(&self.device);
+    }
+
+    pub fn resumeDevice(self: *Engine) void {
+        if (self.initialized) _ = ma.ma_device_start(&self.device);
+    }
+
     pub fn deinit(self: *Engine) void {
         if (self.initialized) {
             _ = ma.ma_device_stop(&self.device);
@@ -537,9 +547,11 @@ fn publishSounding(engine: *Engine, params: *Params) void {
                 hi |= @as(u64, 1) << @intCast(p - 64);
             }
         }
-        // 鼓组层池（未用到的池全空闲，扫描成本低）
+        // 鼓组层池（未用到的池全空闲，扫描成本低）——池未分配时跳过
+        // （离线导出/测试环境可能未 alloc：防越界）
         const kbase = i * kit_max_layers;
-        for (0..kit_max_layers) |l| {
+        const kn = @min(kit_max_layers, engine.kit_synths.len -| kbase);
+        for (0..kn) |l| {
             for (engine.kit_synths[kbase + l].voices) |v| {
                 if (!synth.isSounding(&v)) continue;
                 const p = v.pitch;
@@ -889,8 +901,7 @@ fn applyKindEdges(engine: *Engine) void {
     }
 }
 
-/// 音频回调（实时线程）：多乐器合成 + 序列器精确触发。
-/// 严格约束：无分配、无锁、无阻塞。
+/// 音频回调（实时线程）：设备包装 → `renderBlock`。严格约束：无分配、无锁、无阻塞。
 fn dataCallback(
     device: ?*ma.ma_device,
     output: ?*anyopaque,
@@ -899,11 +910,15 @@ fn dataCallback(
 ) callconv(.c) void {
     _ = input;
     const engine: *Engine = @ptrCast(@alignCast(device.?.pUserData));
-    const params = engine.params;
     const out: [*]f32 = @ptrCast(@alignCast(output.?));
-    const frames = frame_count;
-    const sr: f32 = @floatFromInt(device.?.sampleRate);
-    const sr_u64: u64 = device.?.sampleRate;
+    renderBlock(engine, engine.params, out, frame_count, @floatFromInt(device.?.sampleRate));
+}
+
+/// 渲染一个块（多乐器合成 + 序列器精确触发）——**实时回调与离线导出共用**
+/// （同一代码路径，离线/实时一致）。帧计数由 `params.frames_played` 驱动并推进；
+/// 离线导出时设备已暂停，由导出循环独占调用。
+pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, sr: f32) void {
+    const sr_u64: u64 = @intFromFloat(sr);
 
     // 1) 立即事件（试听 / all_off）——与调度事件共用分发（含鼓组分支）
     var evbuf: [synth.drain_max]synth.NoteEvent = undefined;

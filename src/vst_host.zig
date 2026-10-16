@@ -1456,6 +1456,13 @@ pub const Plugin = struct {
         return .{ self.editor_x, self.editor_y, self.editor_w, self.editor_h };
     }
 
+    /// `present` 裁切用信息：窗口句柄 + 主窗 client 坐标下的位置/尺寸；未显示 → null。
+    /// （present 会用 `GetWindowRgn` 取子窗口**当前可见区域**——已含遮挡裁切）
+    pub fn editorPresentInfo(self: *const Plugin) ?EditorPresentInfo {
+        if (self.editor_hwnd == null or !self.editor_shown) return null;
+        return .{ .hwnd = self.editor_hwnd.?, .x = self.editor_x, .y = self.editor_y, .w = self.editor_w, .h = self.editor_h };
+    }
+
     /// 输入闸门（见字段注释）：模态/菜单期间禁用；变化才动作
     pub fn setEditorEnabled(self: *Plugin, enabled: bool) void {
         if (self.editor_enabled == enabled) return;
@@ -2076,6 +2083,9 @@ const RGN_DIFF: i32 = 4;
 
 /// 插件子窗口裁切用的覆盖矩形（主窗口 client 坐标；`main` 侧收集）
 pub const EditClipRect = struct { x: i32, y: i32, w: i32, h: i32 };
+
+/// 编辑器子窗口的 present 裁切信息（见 `Plugin.editorPresentInfo`）
+pub const EditorPresentInfo = struct { hwnd: *anyopaque, x: i32, y: i32, w: i32, h: i32 };
 
 /// 覆盖矩形 → 子窗口 client 坐标的相交矩形（`[x0,y0,x1,y1]`；不相交/退化 → null）。
 /// 纯函数（单测）。

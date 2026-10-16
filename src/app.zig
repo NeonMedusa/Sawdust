@@ -17,6 +17,7 @@ const fx = @import("effects.zig");
 const plugin_db = @import("plugin_db.zig");
 const vst_host = @import("vst_host.zig");
 const preset_mod = @import("preset.zig");
+const wav = @import("wav.zig"); // 导出音频（24-bit PCM WAV 写出器）
 
 pub const Clip = model.Clip;
 pub const Note = model.Note;
@@ -40,7 +41,7 @@ pub const Layout = struct {
 };
 
 /// 文件菜单动作（帧末统一执行）
-pub const FileAction = enum { new, open, save, save_as, import_midi, export_midi };
+pub const FileAction = enum { new, open, save, save_as, import_midi, export_midi, export_wav };
 
 /// 编辑操作（框选/批量操作快捷键 → 由**当前视图**在帧内按上下文执行）
 pub const EditOp = enum { delete_selected, clone_right, copy, paste, select_all };
@@ -905,6 +906,45 @@ pub const MixerWindow = struct {
 /// 效果器定位（通道 × 槽位）
 pub const EffectRef = struct { ch: usize, slot: usize, scroll: i32 = 0 };
 
+/// 导出进行中的状态（`App.export_wav`）——生命周期：`exportWavBegin` → 每帧
+/// `exportWavFrame` 分块推进 → 完成/取消/失败统一收尾清理。
+pub const ExportWav = struct {
+    /// 目标路径（自有副本；删除半成品/UI 显示用）
+    path: []u8,
+    writer: wav.Writer,
+    /// 插件状态快照（结束时回写）
+    states: std.ArrayListUnmanaged(PlStateSnap),
+    // 传输快照（结束时恢复）
+    snap_song: i32,
+    snap_piano: i32,
+    snap_start_step: i32,
+    snap_start_frame: u64,
+    snap_frames: u64,
+    snap_song_mode: bool,
+    // 渲染进度
+    step_frames: u64,
+    total_frames: u64,
+    done: u64,
+    /// 开始时间（纳秒；预留剩余时间估算）
+    t0_ns: i64,
+    /// 取消请求（对话框按钮 / Esc 置位；下一帧步进时清理）
+    cancel_req: bool = false,
+};
+
+/// 导出里的单个插件状态快照
+const PlStateSnap = struct { pl: *vst_host.Plugin, blobs: vst_host.StateBlobs };
+
+/// 导出进度窗位置（首帧居中；标题可拖动）
+pub const ExportWindow = struct {
+    x: i32 = -100000,
+    y: i32 = -100000,
+    grab_dx: i32 = 0,
+    grab_dy: i32 = 0,
+};
+
+/// 导出尾音时长（秒）：内容末尾后再渲染这么久，让混响/延迟/释音自然衰减
+const export_tail_sec: u64 = 2;
+
 /// 帮助窗口（基本操作速查；工具栏“帮助”按钮打开）
 pub const HelpWindow = struct {
     open: bool = false,
@@ -1189,6 +1229,10 @@ pub const App = struct {
     playlist: PlaylistState = .{},
     piano: PianoState = .{},
     rack: RackState = .{},
+    /// 导出进行中状态（null = 空闲）——分块离线渲染；见 `exportWavBegin/exportWavFrame`
+    export_wav: ?ExportWav = null,
+    /// 导出进度窗位置（模态，可拖动；首帧居中）——`drawExportDialog` 用
+    export_win: ExportWindow = .{},
     panels: PanelsState = .{},
     synth_win: SynthWindow = .{},
     mixer_win: MixerWindow = .{},
@@ -3706,11 +3750,11 @@ pub const App = struct {
 
     /// 把某窗口提到最上层（点击该窗口时调用）。
     /// 参数是窗口 z 字段的指针——四个窗口结构都持有 `z: i32`。
-    /// **模态框展开期间不动作**：窗口的“点击置顶”用的是纯几何判断（`inRect`，
-    /// 不查输入屏蔽），弹窗按钮的点击会“点穿”到后面窗口——实测 bug：点“取消”
-    /// 把它后面的窗口提上来了。
+    /// **模态期间不动作**（确认框 / **导出进度窗**）：窗口的“点击置顶”用的是纯几何
+    /// 判断（`inRect`，不查输入屏蔽）——弹窗按钮/导出遮罩上的点击会“点穿”到后面窗口
+    /// （实测：点“取消”把它后面的窗口提上来；导出中点窗口也能置顶）。
     pub fn bringToFront(self: *App, z: *i32) void {
-        if (self.modal != null) return;
+        if (self.modal != null or self.export_wav != null) return;
         self.z_top += 1;
         z.* = self.z_top;
     }
@@ -5426,6 +5470,197 @@ pub const App = struct {
         return last;
     }
 
+    /// 导出整曲为 **WAV（24-bit PCM）**——同步整跑（测试/无进度窗场景）；
+    /// 主程序走“分块状态机”：`exportWavBegin` → 每帧 `exportWavFrame`，对话框驱动进度/取消。
+    pub fn exportSongWav(self: *App, io: std.Io, path: []const u8) !void {
+        try self.exportWavBegin(io, path);
+        while (self.export_wav != null) {
+            self.exportWavRun(io, std.math.maxInt(i64)) catch |e| {
+                self.exportWavFail(io, e);
+                return e;
+            };
+        }
+    }
+
+    /// 开始导出：进入状态机（快照 → 暂停设备 → 传输归零 → 打开 WAV）。
+    /// 之后由主循环每帧 `exportWavFrame` 分块推进；完成/取消/失败均自动收尾。
+    pub fn exportWavBegin(self: *App, io: std.Io, path: []const u8) !void {
+        if (self.export_wav != null) return error.ExportInProgress;
+        const path_copy = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(path_copy);
+
+        // 插件状态快照（乐器 + 混音台效果链）——导出会推进其 DSP 内部状态；
+        // 结束后回写（分配失败的那一个不入快照：该插件保持导出后的状态，可接受）
+        var states: std.ArrayListUnmanaged(PlStateSnap) = .{ .items = &.{}, .capacity = 0 };
+        errdefer {
+            for (states.items) |s| s.blobs.deinit(self.allocator);
+            states.deinit(self.allocator);
+        }
+        for (self.instruments.items) |*inst| {
+            if (inst.plugin) |pl| {
+                states.append(self.allocator, .{ .pl = pl, .blobs = pl.captureState(self.allocator) }) catch {};
+            }
+        }
+        for (self.mixer_channels_state.items) |*mc| {
+            for (mc.effects.items) |*es| {
+                if (es.kind == .plugin) {
+                    if (es.plugin) |pl| {
+                        states.append(self.allocator, .{ .pl = pl, .blobs = pl.captureState(self.allocator) }) catch {};
+                    }
+                }
+            }
+        }
+
+        // ── 快照（结束时恢复；全部为无失败读）──
+        const snap_song = self.playback.song_step;
+        const snap_piano = self.playback.piano_step;
+        const snap_start_step = self.playback.start_step;
+        const snap_start_frame = self.playback.start_frame;
+        const snap_frames = self.params.frames_played.load(.monotonic);
+        const snap_song_mode = self.sel.song_mode;
+
+        const sr: u64 = self.params.sample_rate;
+        const bpm: u64 = @intCast(std.math.clamp(self.bpm, 20, 999));
+        const spb_per_beat: u64 = @intCast(model.stepsPerBeat(self.time_den));
+        const step_frames: u64 = @max(1, sr * 60 / (bpm * spb_per_beat));
+        const end_step: u64 = @intCast(@max(0, self.clipsEndStep()));
+        const total_frames: u64 = end_step * step_frames + sr * export_tail_sec;
+
+        // 写盘器先建：失败时设备/传输都还没动，直接返回
+        const writer = try wav.Writer.create(io, path_copy, @intCast(sr), 2);
+
+        // ── 停播 + 暂停设备 + 离线传输（此后无回退错误）──
+        if (self.playing) self.stopPlayback();
+        self.engine.pauseDevice();
+        self.sel.song_mode = true;
+        self.playback.start_frame = 0;
+        self.playback.start_step = 0;
+        self.playback.song_step = 0;
+        self.params.start_frame.store(0, .monotonic);
+        self.params.start_step.store(0, .monotonic);
+        self.params.frames_played.store(0, .monotonic);
+        self.params.bpm.store(@intCast(bpm), .monotonic);
+        self.params.steps_per_beat.store(@intCast(spb_per_beat), .monotonic);
+        sequencer.reset(&self.scheduler, &self.sched_events, self.clips.items, self.notes.items, true, self.sel.pattern, 0);
+        self.params.sched_gen.store(self.scheduler.gen, .monotonic);
+        self.params.playing.store(true, .monotonic);
+
+        self.export_wav = .{
+            .path = path_copy,
+            .writer = writer,
+            .states = states,
+            .snap_song = snap_song,
+            .snap_piano = snap_piano,
+            .snap_start_step = snap_start_step,
+            .snap_start_frame = snap_start_frame,
+            .snap_frames = snap_frames,
+            .snap_song_mode = snap_song_mode,
+            .step_frames = step_frames,
+            .total_frames = total_frames,
+            .done = 0,
+            .t0_ns = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds),
+        };
+        self.export_win = .{}; // 进度窗复位（首帧居中）
+    }
+
+    /// 主循环每帧推进（时间预算内分块渲染；完成后自动收尾）。
+    /// 预算 30ms：导出期间 UI 约 30fps，但渲染吞吐接近纯 CPU 极限
+    /// （商用 DAW 的弹速即来自“跑满 CPU”；预算过小会把快插件也节流成 1–2 块/帧）。
+    pub fn exportWavFrame(self: *App, io: std.Io) void {
+        self.exportWavRun(io, 30_000_000) catch |e| self.exportWavFail(io, e);
+    }
+
+    /// 取消导出（对话框按钮 / Esc 置位；下一帧步进时清理）。
+    pub fn exportWavCancel(self: *App) void {
+        if (self.export_wav) |*ew| ew.cancel_req = true;
+    }
+
+    /// 分块渲染（`budget_ns` 内尽量多跑；maxInt = 一次跑完——同步模式）。
+    /// 完成后自动收尾（状态机消费：返回后 `export_wav` 已清理）。
+    fn exportWavRun(self: *App, io: std.Io, budget_ns: i64) !void {
+        const ew = if (self.export_wav) |*e| e else return;
+        if (ew.cancel_req) return self.exportWavCanceled(io);
+        const t0: i64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
+        var obuf: [1024 * 2]f32 = undefined;
+        while (ew.done < ew.total_frames) {
+            if (ew.cancel_req) return self.exportWavCanceled(io);
+            // 调度 lookahead：与主循环同款（提前 4 小节）
+            const cur: i32 = @intCast(ew.done / ew.step_frames);
+            const horizon = cur + self.steps_per_bar * 4;
+            if (horizon > self.scheduler.scheduled_upto) {
+                sequencer.scheduleRange(&self.scheduler, &self.sched_events, self.clips.items, self.notes.items, true, self.sel.pattern, self.scheduler.scheduled_upto, horizon);
+            }
+            const n: u32 = @intCast(@min(@as(u64, obuf.len / 2), ew.total_frames - ew.done));
+            audio.renderBlock(&self.engine, &self.params, &obuf, n, @floatFromInt(self.params.sample_rate));
+            try ew.writer.writeFrames(obuf[0 .. n * 2]);
+            ew.done += n;
+            if (budget_ns != std.math.maxInt(i64)) {
+                const now: i64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
+                if (now - t0 >= budget_ns) return; // 本帧预算用尽（下一帧继续）
+            }
+        }
+        try ew.writer.finish();
+        self.exportWavDone(io);
+    }
+
+    /// 完成：toast → 恢复快照/设备 → 释放（状态机消费）。
+    fn exportWavDone(self: *App, io: std.Io) void {
+        _ = io;
+        self.setToastWith("已导出音频：{s}", .{self.export_wav.?.path});
+        self.exportWavRestore();
+        self.exportWavFree();
+    }
+
+    /// 用户取消：丢弃半成品（删文件）→ 恢复快照/设备 → 释放。
+    fn exportWavCanceled(self: *App, io: std.Io) void {
+        self.export_wav.?.writer.abandon();
+        std.Io.Dir.cwd().deleteFile(io, self.export_wav.?.path) catch {};
+        self.setToast("已取消导出");
+        self.exportWavRestore();
+        self.exportWavFree();
+    }
+
+    /// 失败：丢半成品 → 恢复快照/设备 → 释放（toast 报错）。
+    fn exportWavFail(self: *App, io: std.Io, err: anyerror) void {
+        if (self.export_wav == null) return;
+        self.export_wav.?.writer.abandon();
+        std.Io.Dir.cwd().deleteFile(io, self.export_wav.?.path) catch {};
+        self.setToastWith("导出失败：{s}", .{@errorName(err)});
+        self.exportWavRestore();
+        self.exportWavFree();
+    }
+
+    /// 恢复快照并恢复设备（完成/取消/失败共用；设备仍暂停时回写插件状态）。
+    fn exportWavRestore(self: *App) void {
+        const ew = &self.export_wav.?;
+        for (ew.states.items) |s| s.pl.restoreState(s.blobs.comp, s.blobs.ctrl);
+        // 作废旧调度/残留声部（gen++ → stash 作废；设备恢复后首块回调全释音）
+        self.scheduler.gen +%= 1;
+        self.params.sched_gen.store(self.scheduler.gen, .monotonic);
+        self.events.push(.{ .kind = .all_off });
+        self.params.playing.store(false, .monotonic);
+        // 传输归位
+        self.sel.song_mode = ew.snap_song_mode;
+        self.playback.song_step = ew.snap_song;
+        self.playback.piano_step = ew.snap_piano;
+        self.playback.start_step = ew.snap_start_step;
+        self.playback.start_frame = ew.snap_start_frame;
+        self.params.start_step.store(ew.snap_start_step, .monotonic);
+        self.params.start_frame.store(ew.snap_start_frame, .monotonic);
+        self.params.frames_played.store(ew.snap_frames, .monotonic);
+        self.engine.resumeDevice();
+    }
+
+    /// 释放导出状态（状态机终点）。
+    fn exportWavFree(self: *App) void {
+        if (self.export_wav) |*ew| {
+            for (ew.states.items) |s| s.blobs.deinit(self.allocator);
+            ew.states.deinit(self.allocator);
+            self.allocator.free(ew.path);
+        }
+        self.export_wav = null;
+    }
+
     /// 播放中的**小数步位置**（子步精度；未播放或域不匹配时 = 整数步）。
     /// 游标绘制与视角跟随用——整数步在屏幕上是 5px×zoom 的阶梯：播放中每步
     /// “跳一下再被平滑滚动回拉”形成锯齿抖动（实测“游标很抖”，放大时尤其明显）。
@@ -6583,6 +6818,76 @@ test "app: 游标平滑——前馈+收敛（渲染帧下线性；缓冲量化�
     app.playback.song_step = 5;
     app.tickCursorSmooth();
     try std.testing.expectEqual(@as(f32, 5), app.cursorDisplay(true));
+}
+
+test "app: 导出 WAV——离线渲染整曲（长度 = 内容 + 2s 尾；有实际声音）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    // 极小的“歌”：1 小节 1 个音符 + 1 个片段（渲染量小）
+    app.bpm = 240;
+    app.time_den = 4;
+    app.params.sample_rate = 48_000;
+    app.params.volume.store(1.0, .monotonic);
+    app.sel.song_mode = true;
+    app.addNote(.{ .step = 0, .len = 8, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.clips.append(app.allocator, .{ .track = 0, .start = 0, .len = 96, .pattern = 0, .offset = 0 }) catch {};
+
+    // 最小离线引擎（无设备；布局同 `audio.zig` 的 renderSegment 测试）：
+    // 声部池 / 通道缓冲 / EQ 槽 / 队列指针 / 参数指针——生命周期由本测试负责
+    app.params.events = &app.events;
+    app.params.sched_events = &app.sched_events;
+    app.engine.params = &app.params;
+    app.engine.allocator = std.testing.allocator;
+    app.engine.synths = try std.testing.allocator.alloc(synth.Synth, 1);
+    defer std.testing.allocator.free(app.engine.synths);
+    for (app.engine.synths) |*s| s.* = .{};
+    app.engine.kit_synths = try std.testing.allocator.alloc(synth.KitLayerSynth, synth.max_instruments * audio.kit_max_layers);
+    defer std.testing.allocator.free(app.engine.kit_synths);
+    for (app.engine.kit_synths) |*s| s.* = .{};
+    app.engine.chan_bufs = try std.testing.allocator.alloc(f32, audio.mixer_channels * 2 * 4096);
+    defer std.testing.allocator.free(app.engine.chan_bufs);
+    @memset(app.engine.chan_bufs, 0);
+    app.engine.slot_eq = try std.testing.allocator.alloc(eq.Biquad, audio.mixer_channels * audio.effect_slots * eq.band_count * 2);
+    defer std.testing.allocator.free(app.engine.slot_eq);
+    @memset(app.engine.slot_eq, .{});
+    var sp = synth.SynthParams{};
+    app.params.synth_ptrs[0].store(&sp, .monotonic);
+    app.params.channel_count.store(1, .monotonic);
+    app.params.instrument_channel[0].store(0, .monotonic);
+    app.params.instrument_gain[0].store(1.0, .monotonic);
+
+    const io = std.testing.io;
+    const path = "tmp/export_song_test.wav";
+    std.Io.Dir.cwd().createDirPath(io, "tmp") catch {};
+    try app.exportSongWav(io, path);
+
+    const data = try std.Io.Dir.cwd().readFileAlloc(io, path, std.testing.allocator, .unlimited);
+    defer std.testing.allocator.free(data);
+    try std.testing.expectEqualStrings("RIFF", data[0..4]);
+    try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, data[22..24], .little));
+    try std.testing.expectEqual(@as(u32, 48_000), std.mem.readInt(u32, data[24..28], .little));
+    try std.testing.expectEqual(@as(u16, 24), std.mem.readInt(u16, data[34..36], .little));
+    // 长度 = 内容（96 步 × 500 帧/步）+ 2s 尾（48000×2）
+    const step_frames: u64 = 48_000 * 60 / (240 * 24);
+    const total_frames: u64 = 96 * step_frames + 48_000 * 2;
+    try std.testing.expectEqual(@as(usize, @intCast(44 + total_frames * 6)), data.len);
+    try std.testing.expectEqual(@as(u32, @intCast(total_frames * 6)), std.mem.readInt(u32, data[40..44], .little));
+    // 有实际声音（前 1 秒数据段存在非零字节）
+    var nz = false;
+    for (data[44..@min(data.len, 44 + 48_000 * 6)]) |b| {
+        if (b != 0) {
+            nz = true;
+            break;
+        }
+    }
+    try std.testing.expect(nz);
 }
 
 test "app: 循环标尺选区——相交判定（音尾伸进区域也算；PAT 局部 / SONG 全局）" {

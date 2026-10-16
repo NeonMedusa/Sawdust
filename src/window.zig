@@ -61,10 +61,14 @@ const WindowsWindow = struct {
 
     hwnd: ?*anyopaque = null,
     hdc_window: ?*anyopaque = null, // 窗口 DC（GetDC）
-    /// 原生子窗口矩形（主窗 client 坐标；插件编辑器）——`present` 回写时裁掉这些矩形：
-    /// 子窗口像素由系统维护，软渲染每帧回写会盖掉它（GDI 插件高频闪烁，实测）
-    exclude_rects: [4][4]i32 = undefined,
+    /// 原生子窗口（插件编辑器）：present 回写时按**其当前可见区域**排除
+    /// （`GetWindowRgn`——已含 `SetWindowRgn` 的遮挡裁切）。
+    /// 排除“全矩形”会把弹窗/菜单盖在插件上的部分也挖掉（实测“对话框盖不住 VST UI”）；
+    /// 排除“可见区域”则：没被裁时=整矩形（防闪烁），被裁时被裁部分照常回写（正常覆盖）。
     exclude_n: usize = 0,
+    exclude_hwnd: [4]?*anyopaque = .{null} ** 4,
+    /// 每项的 x/y/w/h（主窗 client 坐标；GetWindowRgn 取不到时回退整矩形）
+    exclude_pos: [4][4]i32 = undefined,
     hdc_mem: ?*anyopaque = null, // 内存 DC
     hbitmap: ?*anyopaque = null,
     old_bitmap: ?*anyopaque = null,
@@ -305,8 +309,10 @@ const WindowsWindow = struct {
         }
     }
 
-    /// 把帧缓冲推到窗口。`exclude_rects`（原生子窗口，如插件编辑器）会从回写中裁掉——
-    /// 子窗口像素由系统维护，软渲染回写会盖掉它（GDI 插件高频闪烁，实测）。
+    /// 把帧缓冲推到窗口。排除项（原生子窗口，如插件编辑器）按**当前可见区域**
+    /// 从回写中裁掉——子窗口像素由系统维护，软渲染回写会盖掉它（GDI 插件高频闪烁，实测）；
+    /// 而被 `SetWindowRgn` 裁掉（被弹窗/菜单遮挡）的部分必须照常回写，否则
+    /// 盖在插件上的弹窗会在该区域“破洞”（实测“对话框盖不住 VST UI”）。
     /// 窗口 DC 是长生命周期 OWNDC，裁剪区不随子窗口变动自动刷新——
     /// 故显式 `SelectClipRgn` 每帧构造的区域（无排除时走全屏快路径）。
     pub fn present(self: *WindowsWindow) void {
@@ -320,10 +326,26 @@ const WindowsWindow = struct {
         }
         const full = CreateRectRgn(0, 0, pw, ph) orelse return;
         defer _ = DeleteObject(full);
-        for (self.exclude_rects[0..self.exclude_n]) |r| {
-            const reg = CreateRectRgn(r[0], r[1], r[0] + r[2], r[1] + r[3]) orelse continue;
-            _ = CombineRgn(full, full, reg, RGN_DIFF);
-            _ = DeleteObject(reg);
+        for (0..self.exclude_n) |i| {
+            const rc = self.exclude_pos[i];
+            var cut = false;
+            if (self.exclude_hwnd[i]) |hwnd| {
+                const hr = CreateRectRgn(0, 0, 0, 0);
+                if (hr) |h| {
+                    // 1..=3（NULL/SIMPLE/COMPLEX）= 成功；0 = 未设区域——回退整矩形
+                    if (GetWindowRgn(hwnd, h) != 0) {
+                        _ = OffsetRgn(h, rc[0], rc[1]);
+                        _ = CombineRgn(full, full, h, RGN_DIFF);
+                        cut = true;
+                    }
+                    _ = DeleteObject(h);
+                }
+            }
+            if (!cut) {
+                const r2 = CreateRectRgn(rc[0], rc[1], rc[0] + rc[2], rc[1] + rc[3]) orelse continue;
+                _ = CombineRgn(full, full, r2, RGN_DIFF);
+                _ = DeleteObject(r2);
+            }
         }
         _ = SelectClipRgn(hdc, full);
         _ = BitBlt(hdc, 0, 0, pw, ph, @ptrCast(self.hdc_mem.?), 0, 0, SRCCOPY);
@@ -661,6 +683,8 @@ extern "gdi32" fn BitBlt(*anyopaque, i32, i32, i32, i32, *anyopaque, i32, i32, u
 extern "gdi32" fn CreateRectRgn(i32, i32, i32, i32) callconv(.winapi) ?*anyopaque;
 extern "gdi32" fn CombineRgn(?*anyopaque, ?*anyopaque, ?*anyopaque, i32) callconv(.winapi) i32;
 extern "gdi32" fn SelectClipRgn(?*anyopaque, ?*anyopaque) callconv(.winapi) i32;
+extern "gdi32" fn OffsetRgn(?*anyopaque, i32, i32) callconv(.winapi) i32;
+extern "user32" fn GetWindowRgn(?*anyopaque, ?*anyopaque) callconv(.winapi) i32;
 
 /// `CombineRgn` 模式：第一个区域减去第二个
 const RGN_DIFF: i32 = 4;
