@@ -947,6 +947,9 @@ pub const Plugin = struct {
     view: ?*iplugview.IPlugView = null,
     /// 编辑器**子窗口**句柄（挂在主窗口内；打开中）
     editor_hwnd: ?*anyopaque = null,
+    /// 子窗口是否已**首次显示**（创建时隐藏——先定位再 ShowWindow，
+    /// 否则会在主窗 (0,0) 左上角闪现一个小黑框，实测）
+    editor_shown: bool = false,
     /// 宿主侧 IPlugFrame 实例（打开中）
     frame: ?*EditorFrame = null,
     /// 插件请求的内容尺寸（面板按它定尺寸；`resizeView` 更新）
@@ -1388,7 +1391,7 @@ pub const Plugin = struct {
             0,
             editor_class_name,
             null,
-            0x40000000 | WS_VISIBLE, // WS_CHILD | WS_VISIBLE
+            0x40000000, // WS_CHILD（**不带 VISIBLE**：先隐藏创建，首次定位后再显示——防左上角小黑框闪现）
             0,
             0,
             cw,
@@ -1415,7 +1418,6 @@ pub const Plugin = struct {
             self.frame = null;
             return .failed;
         }
-        _ = SetFocus(hwnd);
         self.view = view;
         self.editor_hwnd = hwnd;
         self.editor_w = cw;
@@ -1423,6 +1425,7 @@ pub const Plugin = struct {
         self.editor_x = 0;
         self.editor_y = 0;
         self.clip_valid = false;
+        self.editor_shown = false;
         self.editor_enabled = true;
         self.restart_grace = 90; // 开窗瞬间可能触发插件补发 restart——宽限期内不当“已改”
         committed = true;
@@ -1430,13 +1433,27 @@ pub const Plugin = struct {
     }
 
     /// 面板侧每帧同步：移动子窗口到面板内容区（变化才 SetWindowPos）。
-    /// 大小以 `editor_w/h`（插件请求）为准。
+    /// 大小以 `editor_w/h`（插件请求）为准；**首次定位后才显示**（创建时隐藏，
+    /// 防在主窗左上角闪现小黑框）；显示时才抢焦点。
     pub fn syncEditorRect(self: *Plugin, x: i32, y: i32) void {
         const hwnd = self.editor_hwnd orelse return;
-        if (x == self.editor_x and y == self.editor_y) return;
-        self.editor_x = x;
-        self.editor_y = y;
-        _ = SetWindowPos(hwnd, null, x, y, self.editor_w, self.editor_h, SWP_NOZORDER | SWP_NOACTIVATE);
+        if (x != self.editor_x or y != self.editor_y) {
+            self.editor_x = x;
+            self.editor_y = y;
+            _ = SetWindowPos(hwnd, null, x, y, self.editor_w, self.editor_h, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        if (!self.editor_shown) {
+            self.editor_shown = true;
+            _ = ShowWindow(hwnd, SW_SHOW);
+            _ = SetFocus(hwnd);
+        }
+    }
+
+    /// 子窗口的 client 矩形（主窗坐标；`present` 回写裁切用）。
+    /// 未显示 → null（隐藏期间该区域仍是我们的面板像素，必须照常回写）。
+    pub fn editorClientRect(self: *const Plugin) ?[4]i32 {
+        if (self.editor_hwnd == null or !self.editor_shown) return null;
+        return .{ self.editor_x, self.editor_y, self.editor_w, self.editor_h };
     }
 
     /// 输入闸门（见字段注释）：模态/菜单期间禁用；变化才动作
@@ -1494,6 +1511,7 @@ pub const Plugin = struct {
             _ = DestroyWindow(h);
         }
         self.clip_valid = false;
+        self.editor_shown = false;
         self.editor_x = 0;
         self.editor_y = 0;
     }
@@ -2106,6 +2124,9 @@ extern "gdi32" fn CreateRectRgn(i32, i32, i32, i32) callconv(.winapi) ?*anyopaqu
 extern "gdi32" fn CombineRgn(?*anyopaque, ?*anyopaque, ?*anyopaque, i32) callconv(.winapi) i32;
 extern "gdi32" fn DeleteObject(?*anyopaque) callconv(.winapi) i32;
 extern "user32" fn SetFocus(*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "user32" fn ShowWindow(?*anyopaque, i32) callconv(.winapi) i32;
+/// `ShowWindow`：激活并显示
+const SW_SHOW: i32 = 5;
 
 /// 宿主侧 IPlugFrame：插件 `resizeView` 请求 → 记录尺寸 + 调整子窗口 + `onSize`。
 /// 简化：ref 计数只记账（生命周期由 Plugin.closeEditor 掌控）。

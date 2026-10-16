@@ -688,7 +688,8 @@ pub fn main(init: std.process.Init) !u8 {
         // 3) 光标形状（UI 在绘制时按需请求）
         win.setCursor(ui.cursor);
 
-        // 4) 呈现
+        // 4) 呈现（原生子窗口＝插件编辑器矩形交给窗口层裁掉——防软渲染回写盖掉子窗口像素）
+        win.exclude_n = collectEditorRects(&app, &win.exclude_rects);
         win.present();
 
         // 4.1) 历史提交（拖动类操作 **coalesce**：鼠标松开才提交一次——
@@ -2470,6 +2471,48 @@ fn ensureEditor(app: *App, pl: *vst_host.Plugin) void {
     if (pl.view == null and !pl.editor_no_ui and pl.editor_fail_wait == 0) {
         if (pl.openEditor(app.main_hwnd) == .failed) pl.editor_fail_wait = 120;
     }
+}
+
+/// 收集当前打开的插件编辑器子窗口矩形（主窗 client 坐标）——`present` 回写裁切用
+/// （原生子窗口像素由系统维护；软渲染每帧回写会盖掉它 → GDI 插件高频闪烁，实测）。
+/// 归属判定与 `syncPluginEditors` 同源；同一时刻最多 2 个（乐器面板 + 效果面板各一）。
+fn collectEditorRects(app: *App, out: *[4][4]i32) usize {
+    var n: usize = 0;
+    if (app.synth_win.open) {
+        switch (app.synth_win.target) {
+            .instrument => |ii| {
+                if (ii >= 0 and ii < app.instruments.items.len) {
+                    const inst = &app.instruments.items[@intCast(ii)];
+                    if (inst.kind == .vst3) {
+                        if (inst.plugin) |pl| {
+                            if (pl.editorClientRect()) |r| {
+                                out[n] = r;
+                                n += 1;
+                            }
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+    if (app.mixer_win.panel) |panel| {
+        if (panel.ch < app.mixer_channels_state.items.len) {
+            const mc = &app.mixer_channels_state.items[panel.ch];
+            if (panel.slot < mc.effects.items.len) {
+                const es = &mc.effects.items[panel.slot];
+                if (es.kind == .plugin) {
+                    if (es.plugin) |pl| {
+                        if (pl.editorClientRect()) |r| {
+                            out[n] = r;
+                            n += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return n;
 }
 
 fn syncPluginEditors(app: *App, ui: *Ui, fw: i32, fh: i32) void {

@@ -905,14 +905,13 @@ pub const MixerWindow = struct {
 /// 效果器定位（通道 × 槽位）
 pub const EffectRef = struct { ch: usize, slot: usize, scroll: i32 = 0 };
 
-/// 效果器独立面板（像合成器窗口一样可拖动/缩放）
 /// 帮助窗口（基本操作速查；工具栏“帮助”按钮打开）
 pub const HelpWindow = struct {
     open: bool = false,
     x: i32 = 420,
     y: i32 = 110,
     w: i32 = 500,
-    h: i32 = 470,
+    h: i32 = 440, // 刚好等于内容高度（18 行×21px + 节标题间距 + 边距；无滚动——冗余会让底部空一截）
     /// Z 序（越大越靠上；点窗口即置顶）——见 `RackState.z` 注释
     z: i32 = 26,
     grab_dx: i32 = 0,
@@ -972,6 +971,7 @@ pub const PluginMgrWindow = struct {
     scan_out_len: usize = 0,
 };
 
+/// 效果器独立面板（像合成器窗口一样可拖动/缩放）
 pub const EffectWindow = struct {
     x: i32 = 260,
     y: i32 = 130,
