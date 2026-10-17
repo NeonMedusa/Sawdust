@@ -241,7 +241,20 @@ pub const steps_per_bar: i32 = units_per_whole;
 /// 样式数量上限（样式列表动态增长，但不超过此值）。
 /// 播放列表预览（音域统计数组）等固定缓冲按此设限。
 /// 注：无类型常量（comptime_int）——既可作数组长度，也可参与 i32 运算。
-pub const max_patterns = 32;
+/// 样式上限——**≈无上限**（十亿；索引是 i32，值域 ~21 亿，留裕量）。
+/// 名单/音符/片段全部动态、成本完全按真实用量；预览统计按实际数量复用缓冲，
+/// 本值不参与任何预分配（纯粹防呆护栏）。
+pub const max_patterns = 1_000_000_000;
+
+/// 轨道（= 播放列表的行，纯编排行）的规模由内容推导（最短 128 行；上限受
+/// 滚动防溢出帽与 i32 字段值域约束）——处理见 docs/pitfalls.md“坐标界与防护措施”。
+
+/// 行轴**最短行程**（= 初始跨度与回收下限；横向“保底 4 小节 + 3 留白”的纵向版）。
+/// 实际跨度 = max(本值, 内容下缘 + 1 + `track_headroom`)，随内容自动生长/收回。
+pub const min_track_span = 128;
+
+/// 轨道轴末端的留白行数（与横向“3 小节留白”对称——永远留出可放置的下一行）
+pub const track_headroom = 3;
 
 /// 新工程的默认样式数（“样式 1”…“样式 N”）。
 pub const default_pattern_count = 6;
@@ -675,6 +688,37 @@ pub fn gmDrumShortName(pitch: i32) []const u8 {
 
 /// 片段是否与其它片段重叠（排除 exclude 下标；exclude == len 表示不排除任何）。
 /// 坐标单位：步（U=96）——区间为 `[start, start+len)`。
+/// 命中叠放音符：同（样式、乐器、音高）、含 `step` 的候选中取**最顶层**——
+/// 层级规则（与片段同规则，用户拍板）：左端点（start）越靠右越上层；
+/// 相同 → 数组序（越后越上层）。
+pub fn topmostNoteAt(notes: []const Note, pattern: i32, instrument: i32, pitch: i32, step: i32) ?usize {
+    var best: ?usize = null;
+    for (notes, 0..) |n, i| {
+        if (n.pattern != pattern or n.instrument != instrument or n.pitch != pitch) continue;
+        if (step < n.step or step >= n.step + n.len) continue;
+        if (best) |b| {
+            const bn = notes[b];
+            if (n.step > bn.step or (n.step == bn.step and i > b)) best = i;
+        } else best = i;
+    }
+    return best;
+}
+
+/// 命中叠放片段：同轨道、含 `step` 的候选中取**最顶层**——
+/// 层级规则（用户拍板）：左端点越靠右越上层；左端相同 → 数组序（越后越上层）。
+pub fn topmostClipAt(clips: []const Clip, track: i32, step: i32) ?usize {
+    var best: ?usize = null;
+    for (clips, 0..) |c, ci| {
+        if (c.track != track) continue;
+        if (step < c.start or step >= c.start + c.len) continue;
+        if (best) |b| {
+            const bc = clips[b];
+            if (c.start > bc.start or (c.start == bc.start and ci > b)) best = ci;
+        } else best = ci;
+    }
+    return best;
+}
+
 pub fn clipOverlaps(clips: []const Clip, exclude: usize, track: i32, start: i32, len: i32) bool {
     for (clips, 0..) |o, oi| {
         if (oi == exclude or o.track != track) continue;
@@ -747,6 +791,34 @@ test "pitchName / isBlackKey" {
     try std.testing.expect(isBlackKey(61)); // C#
     try std.testing.expect(!isBlackKey(62)); // D
     try std.testing.expect(isBlackKey(66)); // F#
+}
+
+test "topmostClipAt: 叠放命中——左端越右越上、同左端取数组序最大" {
+    const B: i32 = units_per_whole;
+    const clips = [_]Clip{
+        .{ .track = 0, .start = 0, .len = 2 * B, .pattern = 0 }, // 0
+        .{ .track = 0, .start = B, .len = 2 * B, .pattern = 0 }, // 1（更右 → 更上）
+        .{ .track = 0, .start = 0, .len = 2 * B, .pattern = 0 }, // 2（同左端，序最大 → 最上）
+        .{ .track = 1, .start = 0, .len = 2 * B, .pattern = 0 }, // 3（另一轨道）
+    };
+    try std.testing.expectEqual(@as(?usize, 2), topmostClipAt(&clips, 0, 5)); // 0/2 重叠 → 2
+    try std.testing.expectEqual(@as(?usize, 1), topmostClipAt(&clips, 0, B + 5)); // 1 与 2 → 1（左端更右）
+    try std.testing.expectEqual(@as(?usize, null), topmostClipAt(&clips, 0, 5 * B)); // 全无
+    try std.testing.expectEqual(@as(?usize, 3), topmostClipAt(&clips, 1, 5)); // 轨道 1
+}
+
+test "topmostNoteAt: 音符叠放命中——左端越右越上、同左端取数组序最大" {
+    const notes = [_]Note{
+        .{ .step = 0, .len = 48, .pitch = 60, .pattern = 0, .instrument = 0 }, // 0
+        .{ .step = 24, .len = 48, .pitch = 60, .pattern = 0, .instrument = 0 }, // 1（更右 → 更上）
+        .{ .step = 0, .len = 48, .pitch = 60, .pattern = 0, .instrument = 0 }, // 2（同左端 → 最上）
+        .{ .step = 0, .len = 48, .pitch = 62, .pattern = 0, .instrument = 0 }, // 3（另一音高）
+    };
+    try std.testing.expectEqual(@as(?usize, 2), topmostNoteAt(&notes, 0, 0, 60, 5)); // 0/2 → 2
+    try std.testing.expectEqual(@as(?usize, 1), topmostNoteAt(&notes, 0, 0, 60, 30)); // 1/2 → 1
+    try std.testing.expectEqual(@as(?usize, 3), topmostNoteAt(&notes, 0, 0, 62, 5));
+    try std.testing.expectEqual(@as(?usize, null), topmostNoteAt(&notes, 0, 0, 60, 100));
+    try std.testing.expectEqual(@as(?usize, null), topmostNoteAt(&notes, 0, 1, 60, 5)); // 另一乐器
 }
 
 test "clipOverlaps: 重叠检测、排除自身、不同轨道" {

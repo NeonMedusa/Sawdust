@@ -157,6 +157,8 @@ pub const Ui = struct {
     drag_anchor: f32 = 0,
     /// 拖动起始值（splitter 初值 / 滚动条的鼠标抓取偏移，像素）
     drag_start: i32 = 0,
+    /// 边缘缩放（.left/.right）按下时的鼠标 x——**位移式**换算的基准（零位移恒等）
+    drag_mx0: i32 = 0,
     /// 横向时间轴滚动条：手势模式（主体/左缘/右缘）+ 拖动快照
     drag_mode_h: HBarMode = .body,
     drag_anchor_x: i32 = 0, // .right=滑块左缘快照；.left=滑块右缘快照
@@ -695,7 +697,7 @@ pub const Ui = struct {
     /// 列表项：返回 true = 本帧被点击。`selected` 控制高亮。
     /// `y` 为该项顶部；`h` 为行高（调用方计算）。
     /// `bg_override`：非选中/非悬停时的底色覆盖（如播放列表的轨道名列加深）。
-    pub fn listItem(self: *Ui, id: u64, text: []const u8, x: i32, y: i32, w: i32, h: i32, selected: bool, alt: bool, bg_override: ?Color) bool {
+    pub fn listItem(self: *Ui, id: u64, text: []const u8, x: i32, y: i32, w: i32, h: i32, selected: bool, alt: bool, bg_override: ?Color, text_c: ?Color) bool {
         _ = id;
         const hovered = self.hit(x, y, w, h);
         const bg = if (selected)
@@ -709,7 +711,17 @@ pub const Ui = struct {
         else
             self.theme.panel;
         self.renderer.fillRect(x, y, w, h, bg);
-        self.labelClipped(text, x + 8, y + 2, w - 16, if (selected) self.theme.text else self.theme.text_dim);
+        self.labelClipped(text, x + 8, y + 2, w - 16, text_c orelse (if (selected) self.theme.text else self.theme.text_dim));
+        return hovered and self.mouse_pressed;
+    }
+
+    /// 方形**开关**（静音等）：`on`（启用/发声）= **蓝**（同减法合成器 OSC 开关）/ 否则 = **灰**；
+    /// 返回 true = 本帧被按下。三处共用（轨道头 / 混音台通道 / 通道机架乐器）。
+    pub fn toggleSquare(self: *Ui, on: bool, x: i32, y: i32, size: i32) bool {
+        const hovered = self.hit(x, y, size, size);
+        const off_c = r_mod.rgb(98, 101, 106); // 灰（关闭/静音）
+        self.renderer.fillRect(x, y, size, size, if (on) self.theme.accent else off_c);
+        self.renderer.strokeRect(x, y, size, size, if (hovered) self.theme.accent else self.theme.panel_border);
         return hovered and self.mouse_pressed;
     }
 
@@ -1005,8 +1017,10 @@ pub const Ui = struct {
     ///   `span`（即视图不留在“内容右侧的空白区”里）；缩到极限时上界为 0 → 自动贴左。
     ///   否则：曾把时间轴往右拉过（content_w 被拉大）时，缩小后视图会留在右边看空白。
     pub fn zoomAnchoredScrollX(scroll: i32, view_w: i32, mouse_off: i32, old_zoom: f32, new_zoom: f32, content_w: i32, span: i32) i32 {
-        const oz = @max(0.01, old_zoom);
-        const nz = @max(0.01, new_zoom);
+        // 防零下限只防“零/负”——**不能用 0.01**：时间轴超 ~12 万像素（几百小节）后
+        // 合法缩放会跌破 0.01，旧下限会让锚定公式用错 zoom → 滑块位置/长度跳变（实测）
+        const oz = @max(1e-9, old_zoom);
+        const nz = @max(1e-9, new_zoom);
         const cx = @as(f32, @floatFromInt(scroll)) + @as(f32, @floatFromInt(mouse_off)) / oz;
         const ns = cx - @as(f32, @floatFromInt(mouse_off)) / nz;
         // 缩放后视口宽（内容像素）：内容至少一屏（与滚动条控件规范化一致）
@@ -1016,6 +1030,13 @@ pub const Ui = struct {
         if (span > 0) cw = @min(cw, @max(@as(f32, @floatFromInt(span)), view_cw_new));
         const max_scroll = @max(0, cw - view_cw_new);
         return @intFromFloat(std.math.clamp(ns, 0, max_scroll));
+    }
+
+    test "ui: zoomAnchoredScrollX——深缩放（zoom<0.01）锚定精确（几百小节跳变回归）" {
+        // 时间轴 30 万像素（≈1560 小节）时 dyn_zoom_min≈0.004：
+        // 旧版 @max(0.01) 下限会让 0.02→0.008 的锚定算出 100000（错）——正确为 55000
+        const ns = Ui.zoomAnchoredScrollX(100000, 1200, 600, 0.02, 0.008, 300000, 300000);
+        try std.testing.expectEqual(@as(i32, 55000), ns);
     }
 
     test "ui: zoomStep——向上拖增大、慢拖累积、范围钳制" {
@@ -1107,8 +1128,15 @@ pub const Ui = struct {
     /// 返回 true = 本帧滚动位置变了。
     /// 坐标说明：`x`/`y`/`w`/`h` 是滚动条的**轨道**区域。
     pub fn scrollbarV(self: *Ui, id: u64, x: i32, y: i32, w: i32, h: i32, scroll: *i32, content_h: i32, view_h: i32) bool {
-        if (content_h <= view_h) {
-            // 内容不超出：不画滚动条（保持界面干净）
+        // 内容收缩后回收 scroll（删轨道 / 撤销 / 行高缩放等）——不回收的话
+        // 滑块会被顶出轨道（“超出最大行程”，实测；横向版每帧都回收，纵向漏了）。
+        // **必须先于**“内容不超出”的提前返回：否则控件隐藏时 scroll 停在脏值。
+        const max_scroll_all = @max(0, content_h - view_h);
+        if (scroll.* > max_scroll_all) scroll.* = max_scroll_all;
+        if (scroll.* < 0) scroll.* = 0;
+        if (content_h < view_h) {
+            // 内容装不满：不画滚动条（保持界面干净）；恰好等于视口时**画满行程滑块**
+            // ——“缩到底 = 滑块刚好占满行程”（实测诉求）。
             return false;
         }
 
@@ -1156,31 +1184,153 @@ pub const Ui = struct {
         return changed;
     }
 
-    /// 可交互**横向时间轴**滚动条（minimap 语义，播放列表/钢琴窗共用）。
+    /// 纵向投影（滑块 = 视口在地图上的投影）：返回相对轨道的 `[top, bot)`——
+    /// 钳到 `[0, h]`；**显示层最小 1px**：投影亚像素且与轨道相交时仍占位“一根线”。
+    /// 命中与绘制共用同一规则（看得见就抓得住）。
+    fn projThumbY(scroll: i32, view_h: i32, content_h: i32, h: i32) struct { top: i32, bot: i32 } {
+        const c64: i64 = @max(1, content_h);
+        const h64: i64 = @max(1, h);
+        const raw_top: i64 = @divTrunc(@as(i64, scroll) * h64, c64);
+        const raw_bot: i64 = @divTrunc((@as(i64, scroll) + view_h) * h64, c64);
+        const top: i32 = @intCast(std.math.clamp(raw_top, 0, h64));
+        var bot: i32 = @intCast(std.math.clamp(raw_bot, 0, h64));
+        if (bot <= top and raw_bot > 0 and raw_top < h64) bot = top + 1;
+        return .{ .top = top, .bot = bot };
+    }
+
+    /// 横向投影（同 `projThumbY`，轴换 x）：返回相对轨道的 `[x, len)`。
+    fn projThumbX(scroll: i32, view_cw: i32, content_w: i32, w: i32) struct { x: i32, len: i32 } {
+        const c64: i64 = @max(1, content_w);
+        const w64: i64 = @max(1, w);
+        const raw_x: i64 = @divTrunc(@as(i64, scroll) * w64, c64);
+        const raw_len: i64 = @divTrunc(@as(i64, view_cw) * w64, c64);
+        const xpos: i32 = @intCast(std.math.clamp(raw_x, 0, w64));
+        var len: i32 = @intCast(std.math.clamp(raw_len, 0, w64));
+        if (len == 0 and xpos < w64 and raw_x + raw_len > 0) len = 1;
+        return .{ .x = xpos, .len = len };
+    }
+
+    /// 纵向滚动条（播放列表专用）——**纯投影（mipmap）语义 + 无界悬空**
+    /// （用户拍板的新设计；横向验证后再移植同款）。
     ///
-    /// **滑块 = 视口在时间轴上的投影**：左缘 = 视口左缘，右缘 = 视口右缘。
-    /// - `zoom`：屏幕像素 / 内容像素（横向缩放；**被动压缩不改它**，只有拖边缘才改）；
-    /// - `content_w`：时间轴总长（内容像素）；`scroll`：视口左缘（内容像素）；
-    /// - 视口可见的内容宽度 `view_cw = view_w / zoom`。
-    ///
-    /// 手势：
-    /// - **拖主体**：滑块 1:1 跟手（标准拖动）；
-    /// - **拖到右端继续右拖**：**滑块左边缘 1:1 跟随鼠标**（右缘固定 → 滑块被压缩）
-    ///   → 由滑块宽反推时间轴长度（延长）；左端继续左拖则回缩（下限 = 内容右缘）；
-    /// - **拖左/右缘（≤8px）**：横向缩放（右/左端固定，像拉音符）；
-    ///   缩放下限 = min(zoom_min, **物理下限** = view_w / content_w)——
-    ///   拖出的延长让 content_w > timeline_w 时，仍可缩到“装下全部内容”（否则拖不动）。
-    ///
-    /// **时间轴长度**（每帧钳制）：
-    /// - 下限 = `max(内容右缘 + 余量, 一屏)`——行程与最右内容强相关；
-    /// - 上限 = 滑块缩到正方形（min_w）；
-    /// - **拖出的延长保留**（松手不回弹）；
-    /// - **回到左端时**（scroll == 0 且不在拖动中）行程重新贴合内容（回收延长）。
-    ///
-    /// 被动 vs 主动：内容变多 → 时间轴变长 → 滑块被动缩短（zoom 不变）；
-    /// 拖边缘 → 主动改 zoom（滑块长度随之变）。
-    ///
-    /// 返回 true = 本帧发生了变化。
+    /// - 滑块 = 视口在地图上的**原始投影**：上缘 = `scroll/内容长 × 轨道长`，
+    ///   高 = `视口/内容长 × 轨道长`；超出轨道的部分**裁剪绘制**（不压缩、不增长）；
+    /// - **滚动可越过地图底**（“悬空”）：拖滑块越过底缘继续拖 → 视口继续下移、滑块整体
+    ///   滑出轨道（完全出界 → 不可见）；**总行程（地图）不动**、无任何回收状态——
+    ///   往上滚 / 中键拖回来，滑块自然重现；
+    /// - 拖动全程按**地图比例 1:1**（鼠标 1px = `内容长/轨道长` px 内容坐标）——
+    ///   过门前后速度天然一致（旧版“压短滑块 + 反推跨度”的 1/thumb² 爆炸已根治）；
+    /// - 按下只在滑块（**可见部分**）上生效；悬空时点轨道列无事（未来“点击地图跳回”的位）；
+    /// - `scroll` 只硬钳下界 0（地图**上缘**是绝对原点）与内部防溢出帽（交互无感）；
+    /// - minimap 内容块（`mini`）+ 半透明高亮窗滑块——与横向同一观感。
+    pub fn scrollbarVExt(self: *Ui, id: u64, x: i32, y: i32, w: i32, h: i32, scroll: *i32, content_h: i32, view_h: i32, allow_overhang: bool, mini: []const MiniBlock) bool {
+        const cap: i32 = 1 << 30; // 内部防溢出（i32 内绝对安全；交互上无感）
+        if (scroll.* < 0) scroll.* = 0;
+        if (scroll.* > cap) scroll.* = cap;
+        if (content_h < view_h) return false;
+        const content64: i64 = @max(1, content_h);
+        const h64: i64 = @max(1, h);
+
+        // 轨道背景（凹槽）
+        self.renderer.fillRect(x, y, w, h, self.theme.bg);
+
+        // minimap 内容块（背景之上、滑块之下）：**横置 90°**——沿轴 = pos/len（行像素），
+        // 交叉轴 = blk.y（0..1，片段的时间位置；同横向里“轨道位置”的角色）；整图不随滚动移动
+        if (mini.len > 0) {
+            const inner_x = x + 2;
+            const inner_w = @max(4, w - 4);
+            for (mini) |blk| {
+                const by = y + @as(i32, @intCast(@divTrunc(@as(i64, blk.pos) * h, content64)));
+                const bh = @max(1, @as(i32, @intCast(@divTrunc(@as(i64, blk.len) * h, content64))));
+                if (by >= y + h or by + bh <= y) continue; // 不在轨道可视范围内：跳过
+                if (blk.kind == .full) {
+                    self.renderer.fillRect(inner_x, by, inner_w, bh, blk.color);
+                } else {
+                    // 交叉轴定位（时间类）：按 y 映射到内宽内的一条（钳制越界）
+                    const y_norm = std.math.clamp(blk.y, 0, 1);
+                    const bx = inner_x + @as(i32, @intFromFloat(y_norm * @as(f32, @floatFromInt(inner_w - 2))));
+                    self.renderer.fillRect(bx, by, 2, bh, blk.color);
+                }
+            }
+        }
+
+        // 投影几何（帧首快照，命中/拖动共用；helper 内置**显示层最小 1px 线**）
+        const pr = projThumbY(scroll.*, view_h, content_h, h);
+        const vis_top = y + pr.top;
+        const vis_bot = y + pr.bot;
+
+        var changed = false;
+        const hovered = self.hit(x - 2, y, w + 4, h);
+        // 按下只在滑块的**可见部分**上生效（完全出界 → 不可见 → 不响应）
+        const in_thumb = hovered and pr.bot > 0 and pr.top < h and
+            self.mouse_y >= vis_top and self.mouse_y < vis_bot;
+
+        if (self.active_id == id) {
+            if (!self.mouse_down) {
+                self.active_id = 0;
+            } else {
+                // 地图比例 1:1（按下时快照）——**位移式**（零位移恒等：鼠标点着不动、反复
+                // 按/松不会漂移；旧“绝对位置复原”每次点击丢掉亚像素分数 → 累积左移/上移，实测）
+                const dy: i64 = @as(i64, self.mouse_y) - @as(i64, self.drag_mx0);
+                const ns64 = @as(i64, self.drag_scroll0) + @divTrunc(dy * @max(1, self.drag_content0), h64);
+                var ns: i32 = @intCast(std.math.clamp(ns64, 0, @as(i64, cap)));
+                // 巨图模式（allow_overhang=false）：拖动不得再出图，只允许往回（回程不限）
+                if (!allow_overhang) {
+                    const map_s: i32 = @max(0, content_h - view_h);
+                    ns = @min(ns, @max(map_s, self.drag_scroll0));
+                }
+                if (ns != scroll.*) {
+                    scroll.* = ns;
+                    changed = true;
+                }
+            }
+        } else if (in_thumb and self.mouse_pressed) {
+            self.active_id = id;
+            self.drag_content0 = content_h; // 快照（地图比例；与横向共用字段——两者不同时拖动）
+            self.drag_scroll0 = scroll.*; // 快照（位移式基准：零位移恒等；巨图模式“只允许往回”的基准）
+            self.drag_mx0 = self.mouse_y; // 位移式基准（纵向用 y）
+        } else if (hovered and self.mouse_pressed) {
+            // **点击小地图（滑块外）→ 点击的内容置于视口正中**（用户拍板：可以产生悬空；
+            // 唯一例外 = 上端：不允许上悬空 → 硬钳 0）。按住继续拖 = 滑块跟手。
+            const target_top = self.mouse_y - y;
+            const clicked = @divTrunc(@as(i64, target_top) * @max(1, content_h), h64); // 点击处的内容坐标
+            const ns64 = clicked - @divTrunc(@as(i64, view_h), 2); // 视口中心对准点击处
+            const cap_eff: i64 = if (allow_overhang) cap else @max(0, content_h - view_h); // 巨图模式不出图
+            const ns: i32 = @intCast(std.math.clamp(ns64, 0, cap_eff));
+            if (ns != scroll.*) {
+                scroll.* = ns;
+                changed = true;
+            }
+            self.active_id = id;
+            self.drag_content0 = content_h;
+            self.drag_mx0 = self.mouse_y; // 位移式基准（后续拖动零位移恒等）
+            self.drag_scroll0 = ns; // 基准 = 定位后的新滚动
+        }
+
+        // 绘制滑块（本帧最终状态重投影，**裁剪**到轨道；悬空部分裁掉；完全出界不画）
+        const prf = projThumbY(scroll.*, view_h, content_h, h);
+        if (prf.bot > prf.top) {
+            const active = self.active_id == id;
+            // 半透明高亮窗：minimap 内容块透出；层级：拖动 > 悬停 > 静止（同横向）
+            const color = if (active or hovered) self.theme.accent else self.theme.scrollbar_light;
+            const tint_a: u8 = if (active) 150 else if (hovered) 120 else 70;
+            const tint = (@as(u32, tint_a) << 24) | (color & 0x00FFFFFF);
+            self.renderer.fillRect(x, y + prf.top, w, prf.bot - prf.top, tint);
+            self.renderer.strokeRect(x, y + prf.top, w, prf.bot - prf.top, color);
+        }
+        return changed;
+    }
+
+    /// 可交互**横向时间轴**滚动条（minimap 语义，播放列表/钢琴窗共用实例）——
+    /// 与纵向 `scrollbarVExt` 同一套“**纯投影 + 无界悬空**”设计
+    /// （完整规则见 docs/timeline-scrollbar.md）：
+    /// - 滑块 = 视口在地图上的原始投影（`scroll/地图长` / `视口/地图长`），超出部分裁剪；
+    /// - 拖主体 = 地图 1:1 平移（位移式：零位移恒等）；越过右端 → 悬空；左端硬钳 0；
+    /// - 拖左/右缘（≤8px）= 缩放（位移式；无“正方形”下限；悬空量保留）；
+    /// - 点击滑块外空白 = 点击处居中于视口（可产生悬空；仅左端例外钳 0）；
+    /// - `allow_overhang=false`（巨图模式）：拖动/点击不得再出图，只允许往回；
+    /// - `content_min_w`：与可写的 `content_w` 取 max 后的地图下限（旧接口形状兼容）；
+    /// - 返回 true = 本帧发生了变化。
     pub fn scrollbarTimeline(
         self: *Ui,
         id: u64,
@@ -1196,7 +1346,7 @@ pub const Ui = struct {
         zoom_min: f32,
         zoom_max: f32,
     ) bool {
-        return self.scrollbarTimelineEx(id, x, y, w, h, scroll, content_w, zoom, view_w, content_min_w, zoom_min, zoom_max, &.{});
+        return self.scrollbarTimelineEx(id, x, y, w, h, scroll, @max(content_w.*, content_min_w), zoom, view_w, zoom_min, zoom_max, true, &.{});
     }
 
     /// 同上，但带 **minimap 内容块**（`mini` 画在滑块之下，内容分布可见）。
@@ -1208,55 +1358,50 @@ pub const Ui = struct {
         w: i32,
         h: i32,
         scroll: *i32,
-        content_w: *i32,
+        content_w: i32,
         zoom: *f32,
         view_w: i32,
-        content_min_w: i32,
         zoom_min: f32,
         zoom_max: f32,
+        allow_overhang: bool,
         mini: []const MiniBlock,
     ) bool {
-        const min_w = @max(1, h); // 滑块最短 = 轨道高度（正方形）
         const edge = 8; // 边缘命中区上限（缩放）
+        const cap: i32 = 1 << 30; // 内部防溢出（交互无感）
 
-        // ── 规范化（每帧钳制）──
-        // **只钳上限，不被动抬高 zoom**：内容缩短（如删除最右音符）时，调用方传入的
-        // zoom_min 会变大——若每帧在此强制命中，视口会被自动放大、右边缘回缩
-        // （实测困扰：画面频繁变动）。缩放下限只在**用户主动缩放**时生效：
-        // 滚轮 → 视图侧钳制；拖边缘 → 下方 new_zoom 的 zoom_floor
-        // （= min(zoom_min, view_w/content_w)——物理下限：装下全部内容）。
-        if (zoom.* < 0.001) zoom.* = 0.001;
+        // ── 规范化（每帧）──
+        // zoom：只钳上限，不被动抬高（旧行为保留——内容缩短时视口不被自动放大）；
+        // 缩放下限只在**用户主动缩放**时生效（滚轮→视图侧；拖边缘→下方 zoom_floor）。
+        // 防零下限（兼顾 i32 值域：view/zoom 不得越过 @intFromFloat 上限）——
+        // 同样不能用 0.001：巨大时间轴（数千小节）的合法缩放会低于它
+        if (zoom.* < 1e-6) zoom.* = 1e-6;
         if (zoom.* > zoom_max) zoom.* = zoom_max;
         const view_cw = @max(1, viewCw(view_w, zoom.*));
-        const lo = @max(@max(0, content_min_w), view_cw); // 下限：贴合内容（且不短于一屏）
-        const square_limit = @max(lo, @as(i32, @intCast(@divTrunc(@as(i64, view_cw) * w, min_w)))); // 滑块最短 = 正方形时的内容长
+        // 地图 = max(时间轴【调用方传入】，一屏)——空工程/高倍缩小时投影不超宽
+        const cw_eff: i32 = @max(content_w, view_cw);
+        // scroll：硬钳下界 0（时间轴左端 = 绝对原点）+ 防溢出帽；**上界不设**——
+        // 可滚过地图右端（悬空），由拖动/中键产生，滚轮不得加深（视图侧钳制）
         if (scroll.* < 0) scroll.* = 0;
-        // 行程：下限贴合内容；拖出的延长保留（松手不回弹）
-        content_w.* = std.math.clamp(content_w.*, lo, square_limit);
-        // 回到左端（且不在拖动中）→ 行程重新贴合内容（回收此前拖出的延长）
-        if (self.active_id != id and scroll.* == 0) content_w.* = lo;
-        const max_scroll_pre = @max(0, content_w.* - view_cw);
-        if (scroll.* > max_scroll_pre) scroll.* = max_scroll_pre;
+        if (scroll.* > cap) scroll.* = cap;
+        const cw64: i64 = @max(1, cw_eff);
+        const w64: i64 = @max(1, w);
 
-        // 滑块几何（快照：命中 / 抓取 / 拖动换算共用）
-        const thumb_w0 = thumbW(content_w.*, view_cw, w, min_w);
-        const travel0 = w - thumb_w0;
-        const max_scroll0 = @max(0, content_w.* - view_cw);
-        const frac0 = if (max_scroll0 > 0) @as(f32, @floatFromInt(scroll.*)) / @as(f32, @floatFromInt(max_scroll0)) else 0;
-        const thumb_x0 = x + @as(i32, @intFromFloat(frac0 * @as(f32, @floatFromInt(travel0))));
-        const edge_zone = @min(edge, @max(4, @divTrunc(thumb_w0, 3)));
+        // 投影几何（帧首快照，命中/拖动共用；helper 内置**显示层最小 1px 线**）
+        const pr = projThumbX(scroll.*, view_cw, cw_eff, w);
+        const vis_l = x + pr.x;
+        const vis_r = x + @min(w, pr.x + pr.len);
+        const edge_zone = @min(edge, @max(4, @divTrunc(pr.len, 3)));
 
         // 轨道背景（凹槽，常显）
         self.renderer.fillRect(x, y, w, h, self.theme.bg);
 
         // minimap 内容块（在背景之上、滑块之下）：内容分布按比例映射到轨道
         if (mini.len > 0) {
-            const cw_den: i64 = @max(1, content_w.*);
             const inner_y = y + 2;
             const inner_h = @max(4, h - 4);
             for (mini) |blk| {
-                const bx = x + @as(i32, @intCast(@divTrunc(@as(i64, blk.pos) * w, cw_den)));
-                const bw = @max(1, @as(i32, @intCast(@divTrunc(@as(i64, blk.len) * w, cw_den))));
+                const bx = x + @as(i32, @intCast(@divTrunc(@as(i64, blk.pos) * w, cw64)));
+                const bw = @max(1, @as(i32, @intCast(@divTrunc(@as(i64, blk.len) * w, cw64))));
                 if (bx >= x + w or bx + bw <= x) continue; // 不在轨道可视范围内：跳过
                 if (blk.kind == .full) {
                     // 占满全高（片段类）
@@ -1272,9 +1417,10 @@ pub const Ui = struct {
 
         var changed = false;
         const hovered = self.hit(x, y, w, h);
-        const in_thumb = hovered and self.mouse_x >= thumb_x0 and self.mouse_x < thumb_x0 + thumb_w0;
-        const on_left = in_thumb and self.mouse_x < thumb_x0 + edge_zone;
-        const on_right = in_thumb and self.mouse_x >= thumb_x0 + thumb_w0 - edge_zone;
+        // 按下只在滑块的**可见部分**上生效（完全悬空 → 不可见 → 不响应）
+        const in_thumb = hovered and vis_r > vis_l and self.mouse_x >= vis_l and self.mouse_x < vis_r;
+        const on_left = in_thumb and self.mouse_x < vis_l + edge_zone;
+        const on_right = in_thumb and self.mouse_x >= vis_r - edge_zone;
 
         if (self.active_id == id) {
             if (!self.mouse_down) {
@@ -1282,100 +1428,69 @@ pub const Ui = struct {
             } else {
                 switch (self.drag_mode_h) {
                     .body => {
-                        // 全程按“按下时快照”换算（拖动中滑块宽度会变，不能每帧重算——会加速）
-                        const tw0 = thumbW(self.drag_content0, self.drag_view_cw0, w, min_w);
-                        const travel0s = w - tw0;
-                        const max_left0 = x + travel0s;
-                        const desired = self.mouse_x - self.drag_start; // 目标滑块左缘（屏幕）
-                        if (desired > max_left0) {
-                            // 右端继续右拖：滑块左缘 1:1 跟随鼠标（右缘固定 → 滑块被压缩）
-                            // 由滑块宽反推内容长：thumb_w = view_cw/content_w × w
-                            const thumb_w_new = @max(min_w, x + w - desired);
-                            const nc = std.math.clamp(
-                                @as(i32, @intCast(@divTrunc(@as(i64, self.drag_view_cw0) * w, thumb_w_new))),
-                                lo,
-                                square_limit,
-                            );
-                            if (nc != content_w.*) {
-                                content_w.* = nc;
-                                changed = true;
-                            }
-                            const ns = @max(0, content_w.* - self.drag_view_cw0);
-                            if (ns != scroll.*) {
-                                scroll.* = ns;
-                                changed = true;
-                            }
-                        } else if (desired < x) {
-                            // 左端继续左拖：滑块右缘 1:1 跟随鼠标（左缘固定）→ 时间轴回缩
-                            const thumb_w_new = @min(w, tw0 + (x - desired));
-                            const nc = std.math.clamp(
-                                @as(i32, @intCast(@divTrunc(@as(i64, self.drag_view_cw0) * w, @max(min_w, thumb_w_new)))),
-                                lo,
-                                square_limit,
-                            );
-                            if (nc != content_w.*) {
-                                content_w.* = nc;
-                                changed = true;
-                            }
-                            if (scroll.* != 0) {
-                                scroll.* = 0;
-                                changed = true;
-                            }
-                        } else {
-                            // 平移：滑块 1:1 跟手（内容还原到拖动起点）
-                            if (content_w.* != self.drag_content0) {
-                                content_w.* = self.drag_content0;
-                                changed = true;
-                            }
-                            const max_scroll0s = @max(0, self.drag_content0 - self.drag_view_cw0);
-                            if (travel0s > 0 and max_scroll0s > 0) {
-                                const ns = std.math.clamp(@as(i32, @intCast(@divTrunc(@as(i64, desired - x) * max_scroll0s, travel0s))), 0, max_scroll0s);
-                                if (ns != scroll.*) {
-                                    scroll.* = ns;
-                                    changed = true;
-                                }
-                            }
+                        // 地图比例 1:1（按下时快照）——**位移式**（零位移恒等：鼠标点着不动、
+                        // 反复按/松不会漂移——旧“绝对位置复原”每次点击丢掉亚像素分数、累积偏移）
+                        const dx: i64 = @as(i64, self.mouse_x) - @as(i64, self.drag_mx0);
+                        const ns64 = @as(i64, self.drag_scroll0) + @divTrunc(dx * @max(1, self.drag_content0), w64);
+                        var ns: i32 = @intCast(std.math.clamp(ns64, 0, @as(i64, cap)));
+                        // 巨图模式（allow_overhang=false）：拖动不得再出图，只允许往回（回程不限）
+                        if (!allow_overhang) {
+                            const map_s: i32 = @max(0, cw_eff - view_cw);
+                            ns = @min(ns, @max(map_s, self.drag_scroll0));
+                        }
+                        if (ns != scroll.*) {
+                            scroll.* = ns;
+                            changed = true;
                         }
                     },
                     .left => {
-                        // 拖左缘：缩放（右缘固定；视口右缘内容位置不变）
-                        const right_x = self.drag_anchor_x;
-                        const new_left = std.math.clamp(self.mouse_x - self.drag_start, x, right_x - min_w);
-                        const new_thumb_w = right_x - new_left;
-                        const new_view_cw = @max(1, @as(i32, @intCast(@divTrunc(@as(i64, new_thumb_w) * content_w.*, w))));
-                        // 缩放下限 = min(zoom_min, **物理下限**)。
-                        // 物理下限 = view_w / content_w：视野最多扩到装下全部内容（= 滑块满宽）。
-                        // 为何需要它：zoom_min 锚在 timeline_w 上，而**拖出的延长**让
-                        // content_w > timeline_w——若 zoom 已低于 zoom_min（初始 1.0、时间轴短于视口），
-                        // 旧式 min(zoom_min, zoom.*) = zoom → 想继续缩（扩宽视野）被钳死
-                        // （实测 bug：拖出延长后拖左缘“拖不动”，左边空一段可用行程却拉不动）。
-                        // min(..., zoom.*) 保留“下限不高于当前 zoom”（防内容缩短后突然放大）。
-                        const zoom_floor = @min(zoom.*, @min(zoom_min, @as(f32, @floatFromInt(view_w)) / @as(f32, @floatFromInt(@max(1, content_w.*)))));
+                        // 拖左缘：缩放（右缘钉住）——**位移式**（零位移恒等；无“正方形”下限：
+                        // 可一路压到 1px 线）。旧版用“绝对宽度 + min_w 钳制”，亚像素滑块下
+                        // 一点击就跳成正方形、视野突扩（实测）——已废。
+                        const dx: i32 = self.mouse_x - self.drag_mx0; // 右移 = 拖窄
+                        const tw0f: f32 = @as(f32, @floatFromInt(self.drag_view_cw0)) * @as(f32, @floatFromInt(w)) /
+                            @as(f32, @floatFromInt(@max(1, cw_eff)));
+                        var twf: f32 = tw0f - @as(f32, @floatFromInt(dx));
+                        const twf_floor: f32 = @min(tw0f, 1); // 压缩下限 = min(起始宽, 1px)：
+                        // 亚像素起始不许被“抬到 1px”（否则零位移也跳）；正常情况即 1px 线
+                        if (twf < twf_floor) twf = twf_floor;
+                        const twf_max: f32 = @floatFromInt(self.drag_anchor_x - x); // 左缘不出轨道左端
+                        if (twf > twf_max) twf = twf_max;
+                        const new_view_cw: i32 = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(self.drag_view_cw0)) * (twf / tw0f))));
+                        const zoom_floor = @min(zoom.*, @min(zoom_min, @as(f32, @floatFromInt(view_w)) / @as(f32, @floatFromInt(@max(1, cw_eff)))));
                         const new_zoom = std.math.clamp(@as(f32, @floatFromInt(view_w)) / @as(f32, @floatFromInt(new_view_cw)), zoom_floor, zoom_max);
                         if (new_zoom != zoom.*) {
                             zoom.* = new_zoom;
                             changed = true;
                         }
                         const vcw = @max(1, viewCw(view_w, zoom.*));
-                        const ns = std.math.clamp(self.drag_scroll0 + self.drag_view_cw0 - vcw, 0, @max(0, content_w.* - vcw));
+                        const over0 = @max(0, self.drag_scroll0 - @max(0, self.drag_content0 - self.drag_view_cw0)); // 悬空量保留
+                        const ns = std.math.clamp(self.drag_scroll0 + self.drag_view_cw0 - vcw, 0, @max(0, cw_eff - vcw)) + over0;
                         if (ns != scroll.*) {
                             scroll.* = ns;
                             changed = true;
                         }
                     },
                     .right => {
-                        // 拖右缘：缩放（左缘固定）
-                        const new_thumb_w = @min(x + w - self.drag_anchor_x, @max(min_w, self.mouse_x - self.drag_anchor_x));
-                        const new_view_cw = @max(1, @as(i32, @intCast(@divTrunc(@as(i64, new_thumb_w) * content_w.*, w))));
-                        // 缩放下限同上（物理下限：装下全部内容 = 滑块满宽）
-                        const zoom_floor = @min(zoom.*, @min(zoom_min, @as(f32, @floatFromInt(view_w)) / @as(f32, @floatFromInt(@max(1, content_w.*)))));
+                        // 拖右缘：缩放（左缘钉住）——位移式；同一套比例/下限
+                        const dx: i32 = self.mouse_x - self.drag_mx0; // 右移 = 拉宽
+                        const tw0f: f32 = @as(f32, @floatFromInt(self.drag_view_cw0)) * @as(f32, @floatFromInt(w)) /
+                            @as(f32, @floatFromInt(@max(1, cw_eff)));
+                        var twf: f32 = tw0f + @as(f32, @floatFromInt(dx));
+                        const twf_floor: f32 = @min(tw0f, 1); // 同左：亚像素起始不被抬升
+                        if (twf < twf_floor) twf = twf_floor;
+                        const twf_max: f32 = @floatFromInt(x + w - self.drag_anchor_x); // 右缘不出轨道右端
+                        if (twf > twf_max) twf = twf_max;
+                        const new_view_cw: i32 = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(self.drag_view_cw0)) * (twf / tw0f))));
+                        const zoom_floor = @min(zoom.*, @min(zoom_min, @as(f32, @floatFromInt(view_w)) / @as(f32, @floatFromInt(@max(1, cw_eff)))));
                         const new_zoom = std.math.clamp(@as(f32, @floatFromInt(view_w)) / @as(f32, @floatFromInt(new_view_cw)), zoom_floor, zoom_max);
                         if (new_zoom != zoom.*) {
                             zoom.* = new_zoom;
                             changed = true;
                         }
                         const vcw = @max(1, viewCw(view_w, zoom.*));
-                        const ns = std.math.clamp(self.drag_scroll0, 0, @max(0, content_w.* - vcw));
+                        const over0 = @max(0, self.drag_scroll0 - @max(0, self.drag_content0 - self.drag_view_cw0));
+                        const ns = std.math.clamp(self.drag_scroll0, 0, @max(0, cw_eff - vcw)) + over0;
                         if (ns != scroll.*) {
                             scroll.* = ns;
                             changed = true;
@@ -1385,12 +1500,12 @@ pub const Ui = struct {
             }
         } else if (in_thumb and self.mouse_pressed) {
             self.active_id = id;
-            self.drag_content0 = content_w.*;
+            self.drag_content0 = cw_eff;
             self.drag_scroll0 = scroll.*;
             self.drag_view_cw0 = view_cw;
             if (on_left and on_right) {
                 // 窄滑块：两缘都近时按鼠标相对位置就近选
-                self.drag_mode_h = if (self.mouse_x - thumb_x0 <= thumb_x0 + thumb_w0 - self.mouse_x) .left else .right;
+                self.drag_mode_h = if (self.mouse_x - vis_l <= vis_r - self.mouse_x) .left else .right;
             } else if (on_left) {
                 self.drag_mode_h = .left;
             } else if (on_right) {
@@ -1399,30 +1514,46 @@ pub const Ui = struct {
                 self.drag_mode_h = .body;
             }
             switch (self.drag_mode_h) {
-                .body => self.drag_start = self.mouse_x - thumb_x0,
+                .body => {},
                 .left => {
-                    self.drag_start = self.mouse_x - thumb_x0; // 左缘抓取偏移
-                    self.drag_anchor_x = thumb_x0 + thumb_w0; // 固定右缘
+                    self.drag_anchor_x = vis_r; // 参考右缘（缩放上限用）
                 },
-                .right => self.drag_anchor_x = thumb_x0, // 固定左缘
+                .right => self.drag_anchor_x = vis_l, // 参考左缘
             }
+            self.drag_mx0 = self.mouse_x; // 位移式基准（零位移恒等）
+        } else if (hovered and self.mouse_pressed) {
+            // **点击小地图（滑块外）→ 点击的内容置于视口正中**（可以产生悬空；
+            // 唯一例外 = 左端：不允许左悬空 → 硬钳 0）。按住继续拖 = 滑块跟手。
+            const target_left = self.mouse_x - x;
+            const clicked = @divTrunc(@as(i64, target_left) * @max(1, cw_eff), w64); // 点击处的内容坐标
+            const ns64 = clicked - @divTrunc(@as(i64, view_cw), 2); // 视口中心对准点击处
+            const cap_eff: i64 = if (allow_overhang) cap else @max(0, cw_eff - view_cw); // 巨图模式不出图
+            const ns: i32 = @intCast(std.math.clamp(ns64, 0, cap_eff));
+            if (ns != scroll.*) {
+                scroll.* = ns;
+                changed = true;
+            }
+            self.active_id = id;
+            self.drag_content0 = cw_eff;
+            self.drag_scroll0 = scroll.*;
+            self.drag_view_cw0 = view_cw;
+            self.drag_mode_h = .body;
+            self.drag_mx0 = self.mouse_x; // 位移式基准（后续拖动零位移恒等）
         }
 
-        // 绘制滑块（用本帧最终状态）：**半透明高亮窗**——minimap 内容块透出，
-        // 滑块同时充当“视口投影”的可视化（而非不透明色块）
-        const vcw_final = @max(1, viewCw(view_w, zoom.*));
-        const thumb_w = thumbW(content_w.*, vcw_final, w, min_w);
-        const max_scroll = @max(0, content_w.* - vcw_final);
-        const frac = if (max_scroll > 0) @as(f32, @floatFromInt(scroll.*)) / @as(f32, @floatFromInt(max_scroll)) else 0;
-        const thumb_x = x + @as(i32, @intFromFloat(frac * @as(f32, @floatFromInt(w - thumb_w))));
+        // 绘制滑块（用**本帧最终状态**重投影，**裁剪**到轨道；悬空部分裁掉；完全出界不画）
         const active = self.active_id == id;
-        // 无 hover：偏白 + 不透明度提高（否则压在 minimap 上看不清）；
-        // 层级：拖动 > 悬停 > 静止
-        const color = if (active or hovered) self.theme.accent else self.theme.scrollbar_light;
-        const tint_a: u8 = if (active) 150 else if (hovered) 120 else 70;
-        const tint = (@as(u32, tint_a) << 24) | (color & 0x00FFFFFF);
-        self.renderer.fillRect(thumb_x, y, thumb_w, h, tint);
-        self.renderer.strokeRect(thumb_x, y, thumb_w, h, color);
+        const vcw_final = @max(1, viewCw(view_w, zoom.*));
+        const prf = projThumbX(scroll.*, vcw_final, @max(content_w, vcw_final), w);
+        const fw_fin: i32 = @min(w - prf.x, prf.len);
+        if (fw_fin > 0) {
+            // 半透明高亮窗：minimap 内容块透出；层级：拖动 > 悬停 > 静止
+            const color = if (active or hovered) self.theme.accent else self.theme.scrollbar_light;
+            const tint_a: u8 = if (active) 150 else if (hovered) 120 else 70;
+            const tint = (@as(u32, tint_a) << 24) | (color & 0x00FFFFFF);
+            self.renderer.fillRect(x + prf.x, y, fw_fin, h, tint);
+            self.renderer.strokeRect(x + prf.x, y, fw_fin, h, color);
+        }
 
         // 光标：边缘（缩放）/ 主体（平移）
         if (active) {
@@ -1436,12 +1567,6 @@ pub const Ui = struct {
     /// 视口可见内容宽度（内容像素）= view_w / zoom
     fn viewCw(view_w: i32, z: f32) i32 {
         return @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(view_w)) / z)));
-    }
-
-    /// 时间轴滚动条滑块宽度：视口占内容比例 × 轨道宽，下限 min_w（正方形）。
-    fn thumbW(content_w: i32, view_cw: i32, w: i32, min_w: i32) i32 {
-        const ratio = @as(f32, @floatFromInt(view_cw)) / @as(f32, @floatFromInt(@max(1, content_w)));
-        return @min(w, @max(min_w, @as(i32, @intFromFloat(ratio * @as(f32, @floatFromInt(w))))));
     }
 
     /// 滚动条滑块最小长度（像素）——低于此值不再缩短

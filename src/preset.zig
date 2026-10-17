@@ -824,8 +824,8 @@ test "preset: vst3 分类 id 生成/解析 + v2 字段往返/旧文件兼容" {
     const json = try std.json.Stringify.valueAlloc(std.testing.allocator, f, .{});
     defer std.testing.allocator.free(json);
     // JSON 字段顺序 = 结构体声明序：可读信息在前，**不可读状态在文件末**
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":").? < std.mem.indexOf(u8, json, "\"attack\":").?);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"attack\":").? < std.mem.indexOf(u8, json, "\"vst3_state\":").?);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":").? < std.mem.indexOf(u8, json, "\"osc\":").?);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"osc\":").? < std.mem.indexOf(u8, json, "\"vst3_state\":").?);
     var parsed = try std.json.parseFromSlice(File, std.testing.allocator, json, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
     defer parsed.deinit();
     try std.testing.expectEqualStrings("Vital", parsed.value.name);

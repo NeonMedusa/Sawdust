@@ -1,0 +1,12 @@
+# 编辑器统一约定（VS Code / JetBrains / 大部分编辑器自动识别）：
+# 从"人"这一侧杜绝 CRLF、BOM、末尾空行漂移
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+
+[*.md]
+trim_trailing_whitespace = false

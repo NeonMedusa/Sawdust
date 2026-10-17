@@ -41,7 +41,7 @@ pub const Layout = struct {
 };
 
 /// 文件菜单动作（帧末统一执行）
-pub const FileAction = enum { new, open, save, save_as, import_midi, export_midi, export_wav };
+pub const FileAction = enum { new, open, save, save_as, import_midi, export_midi, export_wav, import_json, export_json };
 
 /// 编辑操作（框选/批量操作快捷键 → 由**当前视图**在帧内按上下文执行）
 pub const EditOp = enum { delete_selected, clone_right, copy, paste, select_all };
@@ -87,6 +87,10 @@ pub const HistoryState = struct {
     /// 样式名字快照（每项堆分配；长度 = 样式数）——重命名/增删样式也要能撤销
     /// （只存 `pattern_count` 不够：`resetPatterns` 会重建默认名，自定义名丢失）
     pattern_names: [][]u8,
+    /// 轨道名字快照（每项堆分配；长度 = 轨道数）——增删/重命名轨道也要能撤销
+    track_names: [][]u8,
+    /// 静音轨道快照（排序行号列表；静态释放）——静音切换也要能撤销
+    track_muted: []i32,
     bpm: i32 = 120,
     time_num: i32 = 4,
     time_den: i32 = 4,
@@ -278,7 +282,18 @@ pub const ModalKind = enum {
     preset_overwrite,
     /// 删除预设 → 确认（删除/取消）
     preset_delete,
+    /// 删除**非空样式** → 确认（删除/取消）——空样式直接删
+    pattern_delete,
+    /// 清空**非空轨道**的片段 → 确认（清空/取消）——空轨道直接提示
+    track_clear,
+    /// 删除**轨道行** → 确认（删除/取消）——空行直接删（下方整体上移）
+    track_delete,
+    /// 旧版存档（v1–v3 JSON）打开 → “备份并升级”确认（③ 迁移流程）
+    save_upgrade,
 };
+
+/// 待确认的结构删除（`struct_del_req`；`modal == .pattern_delete/.track_clear/.track_delete` 时有效）
+pub const DelReq = union(enum) { pattern: usize, track: usize, track_row: usize };
 
 /// 待确认的覆写保存请求（确认后重新排队；取消即丢弃）
 pub const OverwriteReq = struct {
@@ -328,8 +343,9 @@ pub const PlaylistState = struct {
     track_h_anim_last: i32 = -1,
     /// 视角跟随播放游标（工具栏开关；主动操作优先、停手且播放中则恢复）
     follow_playhead: bool = false,
-    /// 时间轴内容长度（内容像素；下限 = 实际内容右缘）
-    content_w: i32 = 0,
+    /// 可见行数快照（视图每帧写入；行轴无限延伸——悬空时视口下方的行也是真行）。
+    /// 供右键菜单/重命名等边界守卫读用（滚动越出地图后行号可以超出推导跨度）
+    view_rows: i32 = 128,
     /// 横向缩放（屏幕像素 / 内容像素）
     zoom: f32 = 1.0,
     /// **缩放补间目标**（Ctrl+滚轮只设目标；`zoom` 逐帧平滑逼近——滚轮离散跳变生硬）
@@ -342,6 +358,11 @@ pub const PlaylistState = struct {
     snap: i32 = 3, // 默认 1/8（`snap_denoms` 下标 3）
     /// 吸附网格下拉选单：展开中
     snap_menu_open: bool = false,
+    /// 叠放轮换：上一次按下命中的片段（双击打开用它——第一次按下的那个；
+    /// 第二次按下时命中的可能已被轮换换人）
+    prev_click_clip: ?usize = null,
+    /// 绘制排序暂存（层序下标表；跨帧复用）
+    draw_order: std.ArrayListUnmanaged(usize) = .{ .items = &.{}, .capacity = 0 },
 
     // ── 中键拖动平移视口（抓画布：内容跟手）──
     nav_active: bool = false,
@@ -404,6 +425,8 @@ pub const PianoState = struct {
     pattern: ?i32 = null,
     /// 音高行高（像素；□ 缺口缩放）——默认 16：视口内行数较少、内容更大
     key_h: i32 = 16,
+    /// 绘制排序暂存（音符层序下标表；跨帧复用）
+    draw_order: std.ArrayListUnmanaged(usize) = .{ .items = &.{}, .capacity = 0 },
     /// 纵向滚动（像素）
     scroll: i32 = 0,
     /// 横向滚动（内容像素）
@@ -415,8 +438,6 @@ pub const PianoState = struct {
     key_h_target: i32 = 16,
     key_h_anchor_off: i32 = 0,
     key_h_anim_last: i32 = -1,
-    /// 时间轴内容宽度（内容像素；最小 = 可视宽度）
-    content_w: i32 = 0,
     /// 横向缩放（屏幕像素 / 内容像素）
     zoom: f32 = 1.0,
     /// **缩放补间目标**（Ctrl+滚轮只设目标；`zoom` 逐帧平滑逼近——滚轮离散跳变生硬）
@@ -597,7 +618,7 @@ pub const Playback = struct {
 /// 交互：字符追加；退格删末尾一个 code point；回车 = 提交；ESC = 取消；
 /// 点击输入框外 = 提交（吞掉该次点击）。
 pub const TextInput = struct {
-    pub const Target = enum { instrument, mixer_channel, pattern, preset_name, kit_pad_name, preset_rename, preset_search };
+    pub const Target = enum { instrument, mixer_channel, pattern, track, preset_name, kit_pad_name, preset_rename, preset_search };
 
     active: bool = false,
     target: Target = .instrument,
@@ -665,6 +686,11 @@ pub const PanelsState = struct {
     /// 样式右键菜单位置（**打开时快照**——不跟鼠标跑，否则永远点不到）
     ctx_pat_x: i32 = 0,
     ctx_pat_y: i32 = 0,
+    /// 轨道右键菜单：目标轨道序号（null = 未展开）
+    ctx_track: ?usize = null,
+    /// 轨道右键菜单位置（打开时快照）
+    ctx_trk_x: i32 = 0,
+    ctx_trk_y: i32 = 0,
 };
 
 /// 合成器编辑器（浮动窗口）状态
@@ -717,10 +743,10 @@ pub const DrumKitWindow = struct {
 
 /// 调音台通道数：**默认 2**（主通道 + 通道#1），可添加；上限见 `max_mixer_channels`
 pub const default_mixer_channels = 2;
-/// 调音台通道上限（音频层的原子数组按此设容量）
-pub const max_mixer_channels = 32;
-/// 每通道效果器链上限（音频层的原子数组按此设容量）
-pub const max_effects_per_channel = 16;
+    /// 调音台通道**初始容量**（池化：按需增长/回收；起点 32）
+    pub const max_mixer_channels = 32;
+    /// 每通道效果器链**初始槽数**（同上；起点 32）
+    pub const max_effects_per_channel = 32;
 
 /// 效果器类型（插件式：通道上可挂多个效果器；目前只有 EQ）
 pub const EffectKind = enum(u32) {
@@ -1125,8 +1151,16 @@ pub const App = struct {
     gesture_label_buf: [128]u8 = undefined,
     /// 插件状态脏标（**捕获复用**判据，见 `markSlotStateDirty`）：自上次历史
     /// 捕获后该槽插件状态是否变过。未变槽快照/全等判定不再 getState（撤销卡顿根治）
-    instr_state_dirty: [synth.max_instruments]bool = [_]bool{false} ** synth.max_instruments,
-    fx_state_dirty: [max_mixer_channels][audio.effect_slots]bool = [_][audio.effect_slots]bool{[_]bool{false} ** audio.effect_slots} ** max_mixer_channels,
+    instr_state_dirty: []bool = &.{},
+    fx_state_dirty: [][]bool = &.{},
+    /// 容量自动回收挂起（删除/装载后置位；帧末 `pollCapacityReclaim` 合并处理）
+    shrink_pending: bool = false,
+    /// 鼓组池回收/对齐挂起（删除/类型切换；见 `gcKitPools`）
+    kit_gc_pending: bool = false,
+    /// 鼓组池全量重置挂起（装载/历史重建：乐器被重建 → 池全部失效）
+    kit_reset: bool = false,
+    /// 鼓组池删除位移日志（removeInstrument 记录 idx；帧末按序重放左移）
+    kit_shift_log: std.ArrayListUnmanaged(usize) = .{ .items = &.{}, .capacity = 0 },
     /// 编辑器打开计数（上一帧）——从 N 变 N-1 = 有人关窗 → 手势结束（钉值）
     editors_open_prev: usize = 0,
 
@@ -1193,12 +1227,17 @@ pub const App = struct {
     overwrite_req: ?OverwriteReq = null,
     /// 待确认的删除请求（`modal == .preset_delete` 时有效；取消即丢弃）
     delete_req: ?DeleteReq = null,
+    /// 待确认的结构删除（非空样式/轨道；`modal == .pattern_delete/.track_clear` 时有效）
+    struct_del_req: ?DelReq = null,
     /// 脏确认流程状态（拦截动作 → 确认 → 执行）
     dirty_flow: DirtyFlow = .none,
     /// 脏确认流程的目标动作（quit / open）
     dirty_intent: ?PendingIntent = null,
     /// 待打开的工程路径（用户已在系统对话框选好；等确认框决定后执行）
     pending_open_path: ?[]u8 = null,
+    /// 待升级的旧版存档路径 + 版本（`modal == .save_upgrade` 时有效；取消即清理）
+    pending_upgrade_path: ?[]u8 = null,
+    pending_upgrade_version: u32 = 0,
 
     // ── 音频 ──
     params: audio.Params = .{},
@@ -1281,34 +1320,19 @@ pub const App = struct {
     /// 样式列表（**动态**；名字由 App 管理生命周期，如 "样式 7"）。
     /// 数量 = `pattern_items.items.len`；上限 `max_patterns`（播放列表预览数组等按此设限）。
     pattern_items: std.ArrayListUnmanaged([]u8) = .{ .items = &.{}, .capacity = 0 },
-    track_items: []const []const u8 = &.{
-        "Track 1",   "Track 2",   "Track 3",   "Track 4",   "Track 5",
-        "Track 6",   "Track 7",   "Track 8",   "Track 9",   "Track 10",
-        "Track 11",  "Track 12",  "Track 13",  "Track 14",  "Track 15",
-        "Track 16",  "Track 17",  "Track 18",  "Track 19",  "Track 20",
-        "Track 21",  "Track 22",  "Track 23",  "Track 24",  "Track 25",
-        "Track 26",  "Track 27",  "Track 28",  "Track 29",  "Track 30",
-        "Track 31",  "Track 32",  "Track 33",  "Track 34",  "Track 35",
-        "Track 36",  "Track 37",  "Track 38",  "Track 39",  "Track 40",
-        "Track 41",  "Track 42",  "Track 43",  "Track 44",  "Track 45",
-        "Track 46",  "Track 47",  "Track 48",  "Track 49",  "Track 50",
-        "Track 51",  "Track 52",  "Track 53",  "Track 54",  "Track 55",
-        "Track 56",  "Track 57",  "Track 58",  "Track 59",  "Track 60",
-        "Track 61",  "Track 62",  "Track 63",  "Track 64",  "Track 65",
-        "Track 66",  "Track 67",  "Track 68",  "Track 69",  "Track 70",
-        "Track 71",  "Track 72",  "Track 73",  "Track 74",  "Track 75",
-        "Track 76",  "Track 77",  "Track 78",  "Track 79",  "Track 80",
-        "Track 81",  "Track 82",  "Track 83",  "Track 84",  "Track 85",
-        "Track 86",  "Track 87",  "Track 88",  "Track 89",  "Track 90",
-        "Track 91",  "Track 92",  "Track 93",  "Track 94",  "Track 95",
-        "Track 96",  "Track 97",  "Track 98",  "Track 99",  "Track 100",
-        "Track 101", "Track 102", "Track 103", "Track 104", "Track 105",
-        "Track 106", "Track 107", "Track 108", "Track 109", "Track 110",
-        "Track 111", "Track 112", "Track 113", "Track 114", "Track 115",
-        "Track 116", "Track 117", "Track 118", "Track 119", "Track 120",
-        "Track 121", "Track 122", "Track 123", "Track 124", "Track 125",
-        "Track 126", "Track 127", "Track 128",
-    },
+    /// 轨道自定义名（**稀疏**：仅存改过名的行；键 = 行号）。行本身是坐标空间（纯编排行，
+    /// 无每轨状态）——行数 = `trackCount()`（内容下缘 + 保底 + 3 行留白）随时推导，
+    /// 与横向小节对称、无限向下延伸；“添加轨道”动作已废弃（往留白行放片段即自动生长）。
+    /// 未命名的行由 `trackName()` 合成 "Track N"；原显式轨道名单已按用户拍板移除。
+    track_names: std.AutoHashMapUnmanaged(i32, []u8) = .{},
+    /// **静音轨道**（稀疏行号集合；键 = 行号）——SONG 调度时跳过其全部片段
+    /// （sequencer 通过 `Scheduler.muted` 读取；主线程调度链路，无跨线程共享）
+    track_muted: std.AutoHashMapUnmanaged(i32, void) = .{},
+    /// `trackName()` 合成默认名的临时缓冲（调用方须**立即**使用返回值，勿留存）
+    track_name_buf: [24]u8 = undefined,
+    /// 播放列表片段预览的每样式音域统计（按**实际样式数**分配/复用——见 `ensurePatStats`；
+    /// 原为 `[max_patterns]` 栈数组，上限放到十亿级后改为复用缓冲）
+    pat_stats: []PatPreviewStat = &.{},
 
     // ── 方法 ──
 
@@ -2184,6 +2208,7 @@ pub const App = struct {
     /// 添加乐器（自动分配名字与合成器参数）；返回新槽位序号（失败 -1）
     /// `base_name`：基础名（如 "减法合成器"）；同名自动追加 #2、#3…
     pub fn addInstrument(self: *App, base_name: []const u8) i32 {
+        self.ensureAudioCapacity(self.instruments.items.len + 1, 0, 0);
         // 1) 生成不重复的名字：统计已有同名（忽略 #N 后缀）数量
         var same: usize = 0;
         for (self.instruments.items) |inst| {
@@ -2232,6 +2257,7 @@ pub const App = struct {
         inst.kit = kit;
         inst.kind = .drumkit;
         inst.key_mode = .drum; // 鼓组默认键列就是鼓名（用户可切回）
+        self.ensureKitPool(@intCast(idx)); // 惰性池：创建即分配（试听立即可用）
         return idx;
     }
 
@@ -2382,6 +2408,9 @@ pub const App = struct {
                 self.drumkit_win.instrument -= 1;
             }
         }
+        self.kit_shift_log.append(self.allocator, idx) catch {}; // 鼓组池帧末左移对齐
+        self.kit_gc_pending = true;
+        self.shrink_pending = true; // 帧末尝试回收容量
     }
 
     /// 清除待打开工程的路径（取消流程时）
@@ -2394,6 +2423,18 @@ pub const App = struct {
     pub fn setPendingOpen(self: *App, path: []const u8) void {
         self.clearPendingOpen();
         self.pending_open_path = self.allocator.dupe(u8, path) catch null;
+    }
+
+    /// 登记待升级（旧版 JSON 存档；弹窗确认前不打开——③ 迁移流程）
+    pub fn setPendingUpgrade(self: *App, path: []const u8, version: u32) void {
+        self.clearPendingUpgrade();
+        self.pending_upgrade_path = self.allocator.dupe(u8, path) catch null;
+        self.pending_upgrade_version = version;
+    }
+    pub fn clearPendingUpgrade(self: *App) void {
+        if (self.pending_upgrade_path) |p| self.allocator.free(p);
+        self.pending_upgrade_path = null;
+        self.pending_upgrade_version = 0;
     }
 
     /// 释放全部乐器（名字 + 合成器参数，含退役的）+ 保存相关字段——进程退出时调用
@@ -2440,15 +2481,29 @@ pub const App = struct {
         self.toast = null;
         self.title_applied_name = null;
         self.pending_open_path = null;
+        self.clearPendingUpgrade();
         self.clipboard_notes.deinit(self.allocator);
         self.clipboard_clips.deinit(self.allocator);
+        self.playlist.draw_order.deinit(self.allocator);
+        self.piano.draw_order.deinit(self.allocator);
         self.batch_snap.deinit(self.allocator);
         self.deinitMixerChannels();
         self.deinitHistory();
         self.state_pool.deinit(self.allocator); // 历史释放完后兜底清池（防漏）
         self.deinitPatterns();
+        self.deinitTracks();
+        self.deinitPatStats();
         self.deinitInstruments();
         self.preset_lib.deinit(self.allocator);
+        if (self.instr_state_dirty.len > 0) self.allocator.free(self.instr_state_dirty);
+        self.instr_state_dirty = &.{};
+        for (self.fx_state_dirty) |r| if (r.len > 0) self.allocator.free(r);
+        if (self.fx_state_dirty.len > 0) self.allocator.free(self.fx_state_dirty);
+        self.fx_state_dirty = &.{};
+        self.engine.deinit(); // 音频引擎容量池（无设备/重复调用均幂等）
+        self.params.deinit(self.allocator);
+        self.kit_shift_log.deinit(self.allocator);
+        self.kit_shift_log = .{ .items = &.{}, .capacity = 0 };
     }
 
     // ── 预设库（数据根目录 / 扫描结果 / 弹窗状态）──
@@ -3389,7 +3444,7 @@ pub const App = struct {
     fn reuseFxState(self: *const App, ch: usize, slot: usize, es: *const EffectSlot, pooled: bool) ?ReusePair {
         if (!pooled) return null;
         if (self.history.items.len == 0) return null;
-        if (ch >= max_mixer_channels or slot >= audio.effect_slots) return null;
+        if (ch >= self.params.channels_cap or slot >= self.params.slots_cap) return null;
         if (self.fx_state_dirty[ch][slot]) return null;
         const prev = &self.history.items[self.history_current];
         if (ch >= prev.mixer.len) return null;
@@ -3497,11 +3552,15 @@ pub const App = struct {
     /// 初始化调音台通道（启动/新建/加载无 mixer 字段时）：默认 `default_mixer_channels` 个。
     /// 先释放旧链（每通道效果器列表）再重建。
     pub fn resetMixerChannels(self: *App, count: usize) void {
+        self.initAudioCapacity() catch {};
+        self.ensureAudioCapacity(0, count, 0);
         self.deinitMixerChannels();
         var i: usize = 0;
-        while (i < count and i < max_mixer_channels) : (i += 1) {
+        const n = @min(count, self.params.channels_cap);
+        while (i < n) : (i += 1) {
             self.mixer_channels_state.append(self.allocator, .{}) catch break;
         }
+        self.shrink_pending = true; // 帧末尝试回收容量
     }
 
     /// 释放调音台通道（每通道的效果器链 + **列表底层数组**）
@@ -3528,18 +3587,172 @@ pub const App = struct {
         self.mixer_channels_state = .{ .items = &.{}, .capacity = 0 };
     }
 
-    /// 添加一个通道（返回新通道下标；达到上限返回 null）
+    /// 初始化音频容量（启动第一个编辑动作/测试建立；幂等）
+    pub fn initAudioCapacity(self: *App) !void {
+        if (self.params.instruments_cap > 0) return;
+        const a = self.allocator;
+        try self.params.initCapacity(a, synth.max_instruments, max_mixer_channels, audio.effect_slots);
+        self.engine.allocator = a;
+        try self.engine.setCapacity(synth.max_instruments, max_mixer_channels, audio.effect_slots);
+        self.instr_state_dirty = try a.alloc(bool, synth.max_instruments);
+        @memset(self.instr_state_dirty, false);
+        self.fx_state_dirty = try a.alloc([]bool, max_mixer_channels);
+        @memset(self.fx_state_dirty, &.{});
+        for (self.fx_state_dirty) |*r| {
+            r.* = try a.alloc(bool, audio.effect_slots);
+            @memset(r.*, false);
+        }
+        sequencer.instrument_cap = synth.max_instruments;
+    }
+
+    /// 确保音频容量足够（乐器/通道/效果槽任一不足 → **暂停设备** → Params+Engine 扩容 → 恢复）。
+    /// 容量只增不减（需求值、当前值×2、+8 三者取大）；失败保持旧容量（下次重试）。
+    pub fn ensureAudioCapacity(self: *App, ic: usize, cc: usize, sc: usize) void {
+        self.initAudioCapacity() catch {};
+        self.engine.allocator = self.allocator;
+        const pc = self.params.instruments_cap;
+        const qc = self.params.channels_cap;
+        const rc = self.params.slots_cap;
+        if (ic <= pc and cc <= qc and sc <= rc) return;
+        const nic = if (ic <= pc) pc else @max(ic, @max(pc * 2, pc + 8));
+        const ncc = if (cc <= qc) qc else @max(cc, @max(qc * 2, qc + 8));
+        const nsc = if (sc <= rc) rc else @max(sc, @max(rc * 2, rc + 8));
+        self.engine.pauseDevice();
+        defer self.engine.resumeDevice();
+        self.params.resize(self.allocator, nic, ncc, nsc) catch return;
+        self.engine.setCapacity(nic, ncc, nsc) catch {};
+        self.growStateDirty(nic, ncc, nsc);
+        sequencer.instrument_cap = nic;
+    }
+
+    /// 确保某乐器的鼓组层声部池已分配（惰性；可在音频运行时调用——原子发布指针）。
+    /// 只有带 kit 的乐器需要；非鼓组或无乐器 = 无操作。
+    pub fn ensureKitPool(self: *App, i: usize) void {
+        if (i >= self.engine.kit_chunks.len) return; // 容量未覆盖（sync 前 ensureAudioCapacity 已跑）
+        if (self.engine.kit_chunks[i].load(.monotonic) != null) return;
+        if (i >= self.instruments.items.len) return;
+        if (self.instruments.items[i].kit == null) return;
+        const kp = self.allocator.create(audio.KitPool) catch return;
+        for (kp) |*s| s.* = .{};
+        self.engine.kit_chunks[i].store(kp, .release);
+    }
+
+    /// 释放/对齐鼓组池（**契约：设备已暂停**）：
+    /// - `kit_reset`（装载/历史重建）：全量释放（乐器已被重建，池不再对应）；
+    /// - 否则重放删除位移（逐个 idx 左移一格，按删除发生顺序重放）；
+    /// - 最后清理：索引越界或宿主不再是鼓组的池释放。
+    fn gcKitPools(self: *App) void {
+        if (self.kit_reset) {
+            self.kit_reset = false;
+            for (self.engine.kit_chunks) |*c| {
+                if (c.load(.monotonic)) |kp| self.allocator.destroy(kp);
+                c.store(null, .monotonic);
+            }
+            self.kit_shift_log.clearRetainingCapacity();
+        } else {
+            for (self.kit_shift_log.items) |idx| {
+                var i: usize = idx;
+                while (i + 1 < self.engine.kit_chunks.len) : (i += 1) {
+                    self.engine.kit_chunks[i].store(self.engine.kit_chunks[i + 1].load(.monotonic), .monotonic);
+                }
+                if (self.engine.kit_chunks.len > 0) {
+                    self.engine.kit_chunks[self.engine.kit_chunks.len - 1].store(null, .monotonic);
+                }
+            }
+            self.kit_shift_log.clearRetainingCapacity();
+        }
+        var i: usize = 0;
+        while (i < self.engine.kit_chunks.len) : (i += 1) {
+            const kp = self.engine.kit_chunks[i].load(.monotonic) orelse continue;
+            const needed = i < self.instruments.items.len and self.instruments.items[i].kit != null;
+            if (!needed) {
+                self.allocator.destroy(kp);
+                self.engine.kit_chunks[i].store(null, .monotonic);
+            }
+        }
+    }
+
+    /// 每帧调用：容量自动回收（删除/装载后置位；滞回 4×——用量不足容量 1/4 才缩容，
+    /// 防抖；缩到 max(32, 用量×2) 留余量。一次暂停设备完成全部维度）。
+    pub fn pollCapacityReclaim(self: *App) void {
+        if (!self.shrink_pending and !self.kit_gc_pending) return;
+        self.shrink_pending = false;
+        const pc = self.params.instruments_cap;
+        const qc = self.params.channels_cap;
+        const rc = self.params.slots_cap;
+        const need_ic = self.instruments.items.len;
+        const need_cc = self.mixer_channels_state.items.len;
+        var need_sc: usize = 0;
+        for (self.mixer_channels_state.items) |mc| need_sc = @max(need_sc, mc.effects.items.len);
+        const nic = if (pc > 32 and need_ic * 4 <= pc) @max(32, need_ic * 2) else pc;
+        const ncc = if (qc > 32 and need_cc * 4 <= qc) @max(32, need_cc * 2) else qc;
+        const nsc = if (rc > 32 and need_sc * 4 <= rc) @max(32, need_sc * 2) else rc;
+        if (nic == pc and ncc == qc and nsc == rc and !self.kit_gc_pending) return;
+        self.engine.pauseDevice();
+        defer self.engine.resumeDevice();
+        if (self.kit_gc_pending) {
+            self.kit_gc_pending = false;
+            self.gcKitPools();
+        }
+        if (nic != pc or ncc != qc or nsc != rc) {
+            self.params.resize(self.allocator, nic, ncc, nsc) catch return;
+            self.engine.setCapacity(nic, ncc, nsc) catch {};
+            sequencer.instrument_cap = nic;
+        }
+        // 注：状态脏标数组不缩容（体量小，按高水位保留，简化语义）
+    }
+
+    /// 状态脏标数组随容量增长（仅 UI 线程；在设备暂停窗口内调用）
+    fn growStateDirty(self: *App, ic: usize, cc: usize, sc: usize) void {
+        const a = self.allocator;
+        if (ic > self.instr_state_dirty.len) {
+            const n = a.alloc(bool, ic) catch return;
+            @memset(n, false);
+            @memcpy(n[0..self.instr_state_dirty.len], self.instr_state_dirty);
+            if (self.instr_state_dirty.len > 0) a.free(self.instr_state_dirty);
+            self.instr_state_dirty = n;
+        }
+        const need_rows = @max(cc, self.fx_state_dirty.len);
+        var need = cc > self.fx_state_dirty.len;
+        if (!need and self.fx_state_dirty.len > 0 and self.fx_state_dirty[0].len < sc) need = true;
+        if (!need) return;
+        const nr = a.alloc([]bool, need_rows) catch return;
+        @memset(nr, &.{});
+        for (0..need_rows) |i| {
+            nr[i] = a.alloc(bool, sc) catch return;
+            @memset(nr[i], false);
+            if (i < self.fx_state_dirty.len and self.fx_state_dirty[i].len > 0) {
+                const cp = @min(sc, self.fx_state_dirty[i].len);
+                @memcpy(nr[i][0..cp], self.fx_state_dirty[i][0..cp]);
+            }
+        }
+        for (self.fx_state_dirty) |r| if (r.len > 0) a.free(r);
+        if (self.fx_state_dirty.len > 0) a.free(self.fx_state_dirty);
+        self.fx_state_dirty = nr;
+    }
+
+    /// 存档中单通道最长效果链长度（扩容需求计算用）
+    fn savedMaxChainSlots(mixer: []const persist.SavedMixerChannel) usize {
+        var m: usize = 0;
+        for (mixer) |sm| {
+            const n: usize = @min(if (sm.effect_count > 0) @as(usize, @intCast(sm.effect_count)) else sm.effects.len, sm.effects.len);
+            m = @max(m, n);
+        }
+        return m;
+    }
+
+    /// 添加一个通道（返回新通道下标；失败 null）
     pub fn addMixerChannel(self: *App) ?usize {
-        if (self.mixer_channels_state.items.len >= max_mixer_channels) return null;
+        self.ensureAudioCapacity(0, self.mixer_channels_state.items.len + 1, 0);
         self.mixer_channels_state.append(self.allocator, .{}) catch return null;
         return self.mixer_channels_state.items.len - 1;
     }
 
-    /// 给某通道添加一个效果器（返回新槽下标；达到上限返回 null）
+    /// 给某通道添加一个效果器（返回新槽下标；失败 null）
     pub fn addEffect(self: *App, ch: usize, kind: EffectKind) ?usize {
         if (ch >= self.mixer_channels_state.items.len) return null;
+        self.ensureAudioCapacity(0, 0, self.mixer_channels_state.items[ch].effects.items.len + 1);
         const chain = &self.mixer_channels_state.items[ch].effects;
-        if (chain.items.len >= max_effects_per_channel) return null;
         // 注：**允许叠加同种效果**（用户拍板：选择权交给用户——多个混响/延迟
         // 叠加做特殊效果是常规玩法）。DSP 状态已改每槽一份（见 `fx_state`）。
         const slot = newEffectSlot(kind);
@@ -3566,6 +3779,7 @@ pub const App = struct {
         self.params.fx_ptrs[ch][slot].store(null, .monotonic); // 指针即时清零（不依赖下一帧同步）
         chain.items[slot].clearPendingState(self.allocator);
         _ = chain.orderedRemove(slot);
+        self.shrink_pending = true; // 帧末尝试回收容量
     }
 
     /// 把一个插件实例送入退役列表（延迟销毁；可安全地对音频线程正在引用的实例）
@@ -3743,6 +3957,7 @@ pub const App = struct {
             if (inst.mixer > @as(i32, @intCast(ch))) inst.mixer -= 1;
             inst.mixer = std.math.clamp(inst.mixer, 0, @max(0, new_n - 1));
         }
+        self.shrink_pending = true; // 帧末尝试回收容量
         return true;
     }
 
@@ -3809,7 +4024,9 @@ pub const App = struct {
                 if (ref.a < self.instr_state_dirty.len) self.instr_state_dirty[ref.a] = true;
             },
             .fx => {
-                if (ref.a < max_mixer_channels and ref.b < audio.effect_slots) {
+                if (ref.a < self.params.channels_cap and ref.b < self.params.slots_cap and
+                    ref.a < self.fx_state_dirty.len and ref.b < self.fx_state_dirty[ref.a].len)
+                {
                     self.fx_state_dirty[ref.a][ref.b] = true;
                 }
             },
@@ -3827,7 +4044,9 @@ pub const App = struct {
                 if (ref.a < self.instr_state_dirty.len) self.instr_state_dirty[ref.a] = false;
             },
             .fx => {
-                if (ref.a < max_mixer_channels and ref.b < audio.effect_slots) {
+                if (ref.a < self.params.channels_cap and ref.b < self.params.slots_cap and
+                    ref.a < self.fx_state_dirty.len and ref.b < self.fx_state_dirty[ref.a].len)
+                {
                     self.fx_state_dirty[ref.a][ref.b] = false;
                 }
             },
@@ -3845,8 +4064,8 @@ pub const App = struct {
     }
 
     fn clearAllStateDirty(self: *App) void {
-        self.instr_state_dirty = [_]bool{false} ** synth.max_instruments;
-        self.fx_state_dirty = [_][audio.effect_slots]bool{[_]bool{false} ** audio.effect_slots} ** max_mixer_channels;
+        @memset(self.instr_state_dirty, false);
+        for (self.fx_state_dirty) |r| @memset(r, false);
     }
 
     fn sameSlotRef(a: PluginSlotRef, b: PluginSlotRef) bool {
@@ -4026,6 +4245,9 @@ pub const App = struct {
         self.stopPlayback();
         // 样式 / 调音台 / BPM 拍号
         self.resetPatterns(1);
+        self.clearTrackNames(); // 轨道：自定义名清空——行跨度自动推导（最短行程 128 行）
+        self.clearTrackMutes(); // 静音集合一并清零
+        self.playlist.view_rows = 128; // 可见行快照复位（下一帧视图重写）
         self.resetMixerChannels(default_mixer_channels);
         self.bpm = 120;
         self.time_num = 4;
@@ -4070,6 +4292,9 @@ pub const App = struct {
         self.allocator.free(st.instruments);
         for (st.pattern_names) |nm| self.allocator.free(nm);
         self.allocator.free(st.pattern_names);
+        for (st.track_names) |nm| self.allocator.free(nm);
+        self.allocator.free(st.track_names);
+        self.allocator.free(st.track_muted);
         self.allocator.free(st.param_edits);
         self.allocator.free(st.structural_refs);
     }
@@ -4209,7 +4434,8 @@ pub const App = struct {
     /// 实例/状态盒救援与它们无关。
     fn importMixerChannels(self: *App, mixer: []const persist.SavedMixerChannel, prev: ?[]const persist.SavedMixerChannel, prev_idx: usize, target_idx: usize) void {
         const alloc = self.allocator;
-        const n_saved = @min(mixer.len, max_mixer_channels);
+        self.ensureAudioCapacity(0, if (mixer.len == 0) default_mixer_channels else mixer.len, savedMaxChainSlots(mixer));
+        const n_saved = mixer.len;
         const n_total = if (mixer.len == 0) default_mixer_channels else n_saved;
         // 参数回放任务（构建期登记；救援后执行——那时新槽才持有实例）
         const ReplayJobSlot = struct { ch: usize, slot: usize, job: ReplayJob, saved: *const persist.SavedEffectSlot };
@@ -4430,6 +4656,30 @@ pub const App = struct {
             pat_names[i] = try self.allocator.dupe(u8, nm);
             pn += 1;
         }
+        // 轨道自定义名（稀疏 → 密集到最大命名行号；空串 = 未命名）
+        const n_named: usize = self.denseTrackNamesLen();
+        const trk_names = try self.allocator.alloc([]u8, n_named);
+        var tn: usize = 0;
+        errdefer {
+            for (trk_names[0..tn]) |nm| self.allocator.free(nm);
+            self.allocator.free(trk_names);
+        }
+        while (tn < n_named) : (tn += 1) {
+            trk_names[tn] = if (self.track_names.get(@intCast(tn))) |nm|
+                try self.allocator.dupe(u8, nm)
+            else
+                try self.allocator.alloc(u8, 0);
+        }
+        // 静音轨道（排序行号列表——集合语义；快照可撤销）
+        const nmute: usize = self.track_muted.count();
+        const muted_list = try self.allocator.alloc(i32, nmute);
+        errdefer self.allocator.free(muted_list);
+        {
+            var mi: usize = 0;
+            var mit = self.track_muted.keyIterator();
+            while (mit.next()) |k| : (mi += 1) muted_list[mi] = k.*;
+            std.mem.sort(i32, muted_list, {}, std.sort.asc(i32));
+        }
         // 参数增量默认空（pin 时填入）；仍用真分配（freeHistoryState 无条件 free）
         const recs0 = try self.allocator.alloc(ParamEditRec, 0);
         errdefer self.allocator.free(recs0);
@@ -4442,6 +4692,8 @@ pub const App = struct {
             .instruments = insts,
             .mixer = mixer,
             .pattern_names = pat_names,
+            .track_names = trk_names,
+            .track_muted = muted_list,
             .param_edits = recs0,
             .bpm = self.bpm,
             .time_num = self.time_num,
@@ -4505,6 +4757,17 @@ pub const App = struct {
         for (st.pattern_names, self.pattern_items.items) |a, b| {
             if (!std.mem.eql(u8, a, b)) return false;
         }
+        // 轨道自定义名（稀疏比较：快照数组 = 到最大命名行号为止，空串 = 未命名）
+        if (st.track_names.len != self.denseTrackNamesLen()) return false;
+        for (st.track_names, 0..) |a, i| {
+            const b = self.track_names.get(@intCast(i)) orelse "";
+            if (!std.mem.eql(u8, a, b)) return false;
+        }
+        // 静音集合（数量 + 隶属——快照已排序，集合语义比较）
+        if (st.track_muted.len != self.track_muted.count()) return false;
+        for (st.track_muted) |k| {
+            if (!self.track_muted.contains(k)) return false;
+        }
         // 调音台通道（数量/增益/声像/静音/效果链）——否则“添加通道/效果器”会被判无变化
         if (st.mixer.len != self.mixer_channels_state.items.len) return false;
         for (st.mixer, self.mixer_channels_state.items, 0..) |a, b, ci| {
@@ -4529,7 +4792,7 @@ pub const App = struct {
                 // 插件路径与状态（历史快照携带插件 state；不一致 → 视为有变化）。
                 // 脏标未置 → 自上次捕获未变，免 getState 直接视为相等
                 if (!std.mem.eql(u8, ae.plugin_path, be.pluginPath())) return false;
-                if (be.kind == .plugin and ci < max_mixer_channels and si < audio.effect_slots and self.fx_state_dirty[ci][si]) {
+                if (be.kind == .plugin and ci < self.params.channels_cap and si < self.params.slots_cap and self.fx_state_dirty[ci][si]) {
                     if (!self.pluginStateMatchesLive(&be, ae.plugin_state, ae.plugin_state_ctrl)) return false;
                 }
             }
@@ -4684,6 +4947,10 @@ pub const App = struct {
         if (!self.playing) self.stopPlayback(); // 停止态：作废旧事件 + 清残留声部
         self.history_pending = null; // 拖动中的 coalesce 标记作废
         self.clearGesture(); // 进行中的手势作废（导航入口已先行钉值）
+        // 容量先行：存档可能比当前容量大（扩容后重建；设备自动暂停/恢复）
+        self.ensureAudioCapacity(st.instruments.len, st.mixer.len, savedMaxChainSlots(st.mixer));
+        self.kit_reset = true;
+        self.kit_gc_pending = true; // 乐器将被重建：鼓组池帧末全量重置
         // 拖动状态全部清空：撤销/重做后数据已换，旧拖动（及其快照/下标）
         // 会指向错误内容（下标可能越界）；用户需重新按下才能继续拖
         self.piano.drag_note = null;
@@ -4737,6 +5004,8 @@ pub const App = struct {
         } else if (self.patternCount() == 0) {
             self.resetPatterns(model.default_pattern_count);
         }
+        self.setTrackNames(st.track_names); // 空快照 → 全部回到合成默认名（行跨度自动推导）
+        self.setTrackMutes(st.track_muted); // 静音集合同理（空快照 → 全未静音）
         self.bpm = st.bpm;
         self.time_num = st.time_num;
         self.time_den = st.time_den;
@@ -4838,7 +5107,9 @@ pub const App = struct {
         var buf: [32]u8 = undefined;
         var name_text: []const u8 = "";
         var n: i32 = 1;
-        outer: while (n <= @as(i32, model.max_patterns)) : (n += 1) {
+        // 最小可用名 ≤ 数量+1（鸽笼原理）——不扫到上限（上限已放到十亿级）
+        const bound: i32 = @intCast(self.pattern_items.items.len + 1);
+        outer: while (n <= bound) : (n += 1) {
             const text = std.fmt.bufPrint(&buf, "样式 {d}", .{n}) catch return -1;
             for (self.pattern_items.items) |existing| {
                 if (std.mem.eql(u8, existing, text)) continue :outer;
@@ -4846,7 +5117,7 @@ pub const App = struct {
             name_text = text;
             break;
         }
-        if (name_text.len == 0) return -1; // 32 个名字全被占用（与上限同构，走不到）
+        if (name_text.len == 0) return -1; // 名字全被占用（与上限同构，走不到）
         const name = self.allocator.dupe(u8, name_text) catch return -1;
         self.pattern_items.append(self.allocator, name) catch {
             self.allocator.free(name);
@@ -4943,6 +5214,269 @@ pub const App = struct {
         self.pattern_items.deinit(self.allocator);
     }
 
+    // ── 轨道（播放列表的行；增删/重命名）──
+
+    /// 保证 `pat_stats` 至少有 `n` 项并返回切片（已有项保留；新增项为零值）。
+    /// 分配失败 → 返回现有长度（调用方按 `.len` 操作，安全）。
+    pub const PatPreviewStat = struct { min_pitch: i32 = 127, max_pitch: i32 = 0, has_notes: bool = false };
+
+    pub fn ensurePatStats(self: *App, n: usize) []PatPreviewStat {
+        if (self.pat_stats.len < n) {
+            const old_len = self.pat_stats.len;
+            if (old_len == 0) {
+                self.pat_stats = self.allocator.alloc(PatPreviewStat, n) catch return self.pat_stats;
+            } else {
+                self.pat_stats = self.allocator.realloc(self.pat_stats, n) catch return self.pat_stats;
+            }
+            @memset(self.pat_stats[old_len..], .{});
+        }
+        return self.pat_stats;
+    }
+
+    /// 释放预览统计缓冲（进程退出时调用）
+    pub fn deinitPatStats(self: *App) void {
+        if (self.pat_stats.len > 0) self.allocator.free(self.pat_stats);
+        self.pat_stats = &.{};
+    }
+
+    /// 轨道行跨度（**推导**，非存储）：= max(`model.min_track_span`（最短行程 128 行），
+    /// 内容下缘 + 1 + `model.track_headroom`）。与横向“内容右缘 + 3 小节留白（保底 4）”
+    /// 完全对称——行空间无限向下延伸：往留白行放片段即自动生长（“添加轨道”动作不再需要）。
+    /// 留白恒 ≥ `track_headroom`：max 选中本值时，最短行程比内容多出 ≥3 行。
+    pub fn trackCount(self: *const App) i32 {
+        var last: i32 = -1;
+        for (self.clips.items) |c| {
+            if (c.track > last) last = c.track;
+        }
+        return @max(model.min_track_span, last + 1 + model.track_headroom);
+    }
+
+    /// 自定义名数组的“密集长度”（最大命名行号 + 1；无命名单 = 0）——历史快照/存档用
+    fn denseTrackNamesLen(self: *const App) usize {
+        var max_i: i32 = -1;
+        var it = self.track_names.keyIterator();
+        while (it.next()) |k| {
+            if (k.* > max_i) max_i = k.*;
+        }
+        return if (max_i < 0) 0 else @intCast(max_i + 1);
+    }
+
+    /// 清空轨道上的全部片段（原“删除轨道”；**行本身与名字保留**——行号是绝对坐标，
+    /// 无序号重映射）。返回删除的片段数（0 = 本来就是空行）。
+    /// 非空轨道的确认流程由调用方（右键菜单/确认框）把关。
+    pub fn clearTrackData(self: *App, idx: usize) usize {
+        const ti: i32 = @intCast(idx);
+        var removed: usize = 0;
+        var i: usize = 0;
+        while (i < self.clips.items.len) {
+            if (self.clips.items[i].track == ti) {
+                _ = self.clips.swapRemove(i);
+                removed += 1;
+            } else {
+                i += 1;
+            }
+        }
+        if (removed > 0) {
+            // 跨度可能因此缩短 → 选择钳制
+            if (self.sel.track >= self.trackCount()) self.sel.track = self.trackCount() - 1;
+            self.dirty = true;
+        }
+        return removed;
+    }
+
+    /// 轨道显示名：有自定义名用之；否则合成 "Track N"（写入 `track_name_buf`——
+    /// 返回值指向 App 内部缓冲，调用方须**立即**使用，不要跨调用留存）。
+    pub fn trackName(self: *App, idx: usize) []const u8 {
+        const key: i32 = std.math.cast(i32, idx) orelse return "";
+        if (self.track_names.get(key)) |nm| return nm;
+        return std.fmt.bufPrint(&self.track_name_buf, "Track {d}", .{key + 1}) catch "Track";
+    }
+
+    /// 样式占用（删除确认框文案用）：音符数 / 片段数
+    pub fn patternUsage(self: *const App, idx: usize) struct { notes: usize, clips: usize } {
+        const pi: i32 = @intCast(idx);
+        var n_notes: usize = 0;
+        for (self.notes.items) |nt| {
+            if (nt.pattern == pi) n_notes += 1;
+        }
+        var n_clips: usize = 0;
+        for (self.clips.items) |c| {
+            if (c.pattern == pi) n_clips += 1;
+        }
+        return .{ .notes = n_notes, .clips = n_clips };
+    }
+
+    /// 轨道占用（删除确认框文案用）：片段数
+    pub fn trackUsage(self: *const App, idx: usize) usize {
+        const ti: i32 = @intCast(idx);
+        var n: usize = 0;
+        for (self.clips.items) |c| {
+            if (c.track == ti) n += 1;
+        }
+        return n;
+    }
+
+    /// 以稀疏形式写入轨道自定义名（撤销/重做/加载工程用；**复制每一项**；
+    /// 空串 = 未命名（跳过）；数组下标 = 行号）。写入前先清空现有名字。
+    fn setTrackNames(self: *App, names: anytype) void {
+        self.clearTrackNames();
+        for (names, 0..) |nm, i| {
+            if (nm.len == 0) continue;
+            const copy = self.allocator.dupe(u8, nm) catch continue;
+            self.track_names.put(self.allocator, @intCast(i), copy) catch {
+                self.allocator.free(copy);
+            };
+        }
+    }
+
+    /// 清空全部轨道自定义名（新建工程/重置等）——之后全部显示合成默认名
+    pub fn clearTrackNames(self: *App) void {
+        var it = self.track_names.valueIterator();
+        while (it.next()) |v| self.allocator.free(v.*);
+        self.track_names.clearRetainingCapacity();
+    }
+
+    /// 轨道是否静音（稀疏集合查询；越界/未记录 → 未静音）
+    pub fn trackMuted(self: *const App, idx: usize) bool {
+        const key: i32 = std.math.cast(i32, idx) orelse return false;
+        return self.track_muted.contains(key);
+    }
+
+    /// 设置/取消轨道静音（调用方负责 commitHistory；会置脏）
+    pub fn setTrackMuted(self: *App, idx: usize, muted: bool) void {
+        const key: i32 = std.math.cast(i32, idx) orelse return;
+        if (muted) {
+            self.track_muted.put(self.allocator, key, {}) catch {};
+        } else {
+            _ = self.track_muted.remove(key);
+        }
+        self.dirty = true;
+    }
+
+    /// 以列表重建静音集合（历史/存档用；先清空）
+    fn setTrackMutes(self: *App, list: []const i32) void {
+        self.track_muted.clearRetainingCapacity();
+        for (list) |k| self.track_muted.put(self.allocator, k, {}) catch {};
+    }
+
+    /// 清空全部静音（新建工程/重置）
+    pub fn clearTrackMutes(self: *App) void {
+        self.track_muted.clearRetainingCapacity();
+    }
+
+    /// 行**上移/下移**：与相邻行整体交换（片段 + 自定义名 + 静音 + 选择跟随）。
+    /// **默认名不随行移动**——合成名按行号（位置）显示，永远是 "Track N"（用户拍板）。
+    pub fn swapTrackRows(self: *App, a: usize, b: usize) void {
+        if (a == b) return;
+        const ai: i32 = @intCast(a);
+        const bi: i32 = @intCast(b);
+        for (self.clips.items) |*c| {
+            if (c.track == ai) {
+                c.track = bi;
+            } else if (c.track == bi) {
+                c.track = ai;
+            }
+        }
+        // 自定义名交换（稀疏；所有权随值走）
+        const na = self.track_names.fetchRemove(ai);
+        const nb = self.track_names.fetchRemove(bi);
+        if (na) |kv| self.track_names.put(self.allocator, bi, kv.value) catch self.allocator.free(kv.value);
+        if (nb) |kv| self.track_names.put(self.allocator, ai, kv.value) catch self.allocator.free(kv.value);
+        // 静音交换
+        const ma = self.track_muted.contains(ai);
+        const mb = self.track_muted.contains(bi);
+        if (mb) {
+            self.track_muted.put(self.allocator, ai, {}) catch {};
+        } else {
+            _ = self.track_muted.remove(ai);
+        }
+        if (ma) {
+            self.track_muted.put(self.allocator, bi, {}) catch {};
+        } else {
+            _ = self.track_muted.remove(bi);
+        }
+        // 选择跟随被移动的行
+        if (self.sel.track == ai) {
+            self.sel.track = bi;
+        } else if (self.sel.track == bi) {
+            self.sel.track = ai;
+        }
+        self.dirty = true;
+    }
+
+    /// 行**删除**（**下方整体上移**）：片段/自定义名/静音同步前移；默认名随位置自动。
+    pub fn removeTrackRow(self: *App, idx: usize) void {
+        const ti: i32 = @intCast(idx);
+        var i: usize = 0;
+        while (i < self.clips.items.len) {
+            const c = &self.clips.items[i];
+            if (c.track == ti) {
+                _ = self.clips.swapRemove(i);
+            } else {
+                if (c.track > ti) c.track -= 1;
+                i += 1;
+            }
+        }
+        // 自定义名：收集 → 清空 → 按新键回填（被删行的名字释放）
+        const KV = struct { k: i32, v: []u8 };
+        var keep: std.ArrayListUnmanaged(KV) = .{ .items = &.{}, .capacity = 0 };
+        defer keep.deinit(self.allocator);
+        var itn = self.track_names.iterator();
+        while (itn.next()) |e| {
+            const k = e.key_ptr.*;
+            const v = e.value_ptr.*;
+            if (k == ti) {
+                self.allocator.free(v);
+                continue;
+            }
+            keep.append(self.allocator, .{ .k = if (k > ti) k - 1 else k, .v = v }) catch {
+                self.allocator.free(v);
+            };
+        }
+        self.track_names.clearRetainingCapacity();
+        for (keep.items) |kv| self.track_names.put(self.allocator, kv.k, kv.v) catch self.allocator.free(kv.v);
+        // 静音：同理
+        var keepm: std.ArrayListUnmanaged(i32) = .{ .items = &.{}, .capacity = 0 };
+        defer keepm.deinit(self.allocator);
+        var itm = self.track_muted.keyIterator();
+        while (itm.next()) |kp| {
+            if (kp.* == ti) continue;
+            keepm.append(self.allocator, if (kp.* > ti) kp.* - 1 else kp.*) catch {};
+        }
+        self.track_muted.clearRetainingCapacity();
+        for (keepm.items) |k| self.track_muted.put(self.allocator, k, {}) catch {};
+        if (self.sel.track > ti) self.sel.track -= 1;
+        if (self.sel.track >= self.trackCount()) self.sel.track = self.trackCount() - 1;
+        self.dirty = true;
+    }
+
+    /// 释放轨道名字表（进程退出时调用）
+    pub fn deinitTracks(self: *App) void {
+        self.clearTrackNames();
+        self.track_names.deinit(self.allocator);
+        self.track_muted.deinit(self.allocator);
+    }
+
+    /// 打开轨道重命名输入框（位置由调用方给；复用文本输入基建——支持中文 IME）
+    pub fn beginRenameTrack(self: *App, idx: usize, x: i32, y: i32) void {
+        if (idx >= @as(usize, @intCast(self.playlist.view_rows))) return;
+        const ti = &self.text_input;
+        ti.active = true;
+        ti.target = .track;
+        ti.index = idx;
+        ti.x = x;
+        ti.y = y;
+        // 预填 = **仅自定义名**；未命名（默认 Track N）→ 输入框留空（用户拍板）
+        const name = self.track_names.get(std.math.cast(i32, idx) orelse 0) orelse "";
+        const n = @min(name.len, ti.buf.len);
+        @memcpy(ti.buf[0..n], name[0..n]);
+        ti.len = n;
+        ti.cursor = n;
+        ti.sel_anchor = null;
+        ti.drag_active = false;
+        ti.view_off = 0;
+    }
+
     /// 设置当前工程路径（**安全**：不依赖 path 与旧值的别名关系）。
     /// 复制到临时缓冲后才释放旧值——即使 path 就是旧 project_path
     /// （普通保存的场景）也不会读已释放内存（实测 use-after-free：
@@ -4982,7 +5516,9 @@ pub const App = struct {
     pub fn menuIsOpen(self: *const App) bool {
         return self.rack.ctx_instrument != null or
             self.file_menu_open or self.panels.ctx_pattern != null or
-            self.preset_browser.open;
+            self.panels.ctx_track != null or
+            self.preset_browser.open or
+            self.mixer_win.ctx_effect != null or self.mixer_win.ctx_channel != null or self.mixer_win.ctx_pan != null;
     }
 
     /// 设置状态栏提示（覆盖旧的；默认显示约 3 秒）
@@ -5053,6 +5589,48 @@ pub const App = struct {
             pat_names[i] = try alloc.dupe(u8, nm);
             pn += 1;
         }
+        // 轨道自定义名（**v4 稀疏对**：rows + names 平行数组，只含命名行；升序）——
+        // 行跨度与默认名（Track N）都是位置推导，不入档；旧档密集数组由加载侧垫片兼容
+        const n_named: usize = self.track_names.count();
+        const trk_rows = try alloc.alloc(i32, n_named);
+        errdefer alloc.free(trk_rows);
+        const trk_names = try alloc.alloc([]const u8, n_named);
+        var tn: usize = 0;
+        errdefer {
+            for (trk_names[0..tn]) |nm| alloc.free(nm);
+            alloc.free(trk_names);
+        }
+        {
+            var mit = self.track_names.iterator();
+            while (mit.next()) |e| {
+                trk_rows[tn] = e.key_ptr.*;
+                trk_names[tn] = try alloc.dupe(u8, e.value_ptr.*);
+                tn += 1;
+            }
+            // 按行号排序（平行数组同步交换；命名行数很小，插入排序足够）
+            var si: usize = 1;
+            while (si < tn) : (si += 1) {
+                const rk = trk_rows[si];
+                const rv = trk_names[si];
+                var sj: usize = si;
+                while (sj > 0 and trk_rows[sj - 1] > rk) : (sj -= 1) {
+                    trk_rows[sj] = trk_rows[sj - 1];
+                    trk_names[sj] = trk_names[sj - 1];
+                }
+                trk_rows[sj] = rk;
+                trk_names[sj] = rv;
+            }
+        }
+        // 静音轨道（排序行号列表）
+        const nmute: usize = self.track_muted.count();
+        const muted_list = try alloc.alloc(i32, nmute);
+        errdefer alloc.free(muted_list);
+        {
+            var mi: usize = 0;
+            var mit = self.track_muted.keyIterator();
+            while (mit.next()) |k| : (mi += 1) muted_list[mi] = k.*;
+            std.mem.sort(i32, muted_list, {}, std.sort.asc(i32));
+        }
         return .{
             .bpm = self.bpm,
             .volume = self.volume, // 主音量（持久化——重开工程恢复）
@@ -5061,6 +5639,9 @@ pub const App = struct {
             .steps_per_bar = self.steps_per_bar,
             .pattern_count = self.patternCount(),
             .pattern_names = pat_names,
+            .track_names = trk_names,
+            .track_name_rows = trk_rows,
+            .track_muted = muted_list,
             .clips = clips,
             .notes = notes,
             .instruments = insts,
@@ -5169,6 +5750,10 @@ pub const App = struct {
         self.allocator.free(p.instruments);
         for (p.pattern_names) |nm| self.allocator.free(nm);
         self.allocator.free(p.pattern_names);
+        for (p.track_names) |nm| self.allocator.free(nm);
+        self.allocator.free(p.track_names);
+        self.allocator.free(p.track_name_rows);
+        self.allocator.free(p.track_muted);
         if (p.mixer.len > 0) {
             self.freeSavedMixerChannels(p.mixer, false);
             self.allocator.free(p.mixer);
@@ -5179,6 +5764,11 @@ pub const App = struct {
     pub fn importProject(self: *App, p: persist.Project) void {
         // 停止播放（避免调度器引用已被清空的数据）
         self.stopPlayback();
+        // 容量先行（存档规模可能超过当前容量；设备自动暂停/恢复）
+        self.ensureAudioCapacity(p.instruments.len, p.mixer.len, savedMaxChainSlots(p.mixer));
+        self.kit_reset = true;
+        self.kit_gc_pending = true; // 乐器将被重建：鼓组池帧末全量重置
+        self.shrink_pending = true; // 帧末回收多余容量（若新工程更小）
 
         // 清空旧数据
         self.clips.clearRetainingCapacity();
@@ -5217,10 +5807,28 @@ pub const App = struct {
         } else {
             self.resetPatterns(if (p.pattern_count > 0) p.pattern_count else model.default_pattern_count);
         }
+        // 轨道自定义名（稀疏）：旧存档的数组（当年含默认名）逐项保留为空串以外的条目；
+        // 行跨度由片段推导——不再需要“补默认数量/覆盖最右片段”的逻辑
+        // 轨道自定义名：**v4 稀疏对**（rows + names 平行数组）；行跨度由片段推导。
+        // 旧档（v3 及以前）为密集数组——垫片：无 rows 时按“跳过空串”派生行号
+        if (p.track_name_rows.len > 0 and p.track_name_rows.len == p.track_names.len) {
+            self.clearTrackNames();
+            var ti: usize = 0;
+            while (ti < p.track_name_rows.len) : (ti += 1) {
+                const row = p.track_name_rows[ti];
+                if (row < 0) continue;
+                const copy = self.allocator.dupe(u8, p.track_names[ti]) catch continue;
+                self.track_names.put(self.allocator, row, copy) catch self.allocator.free(copy);
+            }
+        } else {
+            self.setTrackNames(p.track_names); // 旧档垫片（setTrackNames 本就跳过空串）
+        }
+        self.setTrackMutes(p.track_muted);
 
         // 选择/clamp 回有效范围
         self.sel.pattern = 0;
         self.sel.track = 0;
+        self.playlist.scroll = 0; // 悬空/滚动位置不带入新工程
         self.sel.instrument = if (self.instruments.items.len > 0) 0 else -1;
         self.playback.song_step = 0;
         self.playback.piano_step = 0;
@@ -5243,6 +5851,50 @@ pub const App = struct {
         /// 被跳过的音符数（乐器上限、非法音高等）
         skipped: usize,
     };
+
+    /// 叠放轮换（用户拍板）：把片段沉到**同轨道同左端点**组的最底层（数组序最前）。
+    /// 返回沉降后的新下标（已在底层则原样返回）。不单独提交历史
+    /// （层级变更随下一次提交/拖动折叠）。
+    pub fn sinkClipToTieBottom(self: *App, ci: usize) usize {
+        if (ci >= self.clips.items.len) return ci;
+        const c = self.clips.items[ci];
+        var min_i: usize = ci;
+        for (self.clips.items, 0..) |o, oi| {
+            if (oi == ci) continue;
+            if (o.track == c.track and o.start == c.start and oi < min_i) min_i = oi;
+        }
+        if (min_i == ci) return ci; // 已在最底
+        _ = self.clips.orderedRemove(ci);
+        const ins = if (min_i > ci) min_i - 1 else min_i;
+        self.clips.insert(self.allocator, ins, c) catch {
+            // 插入失败（OOM）：补回尾部（保数据，层级不完美）
+            self.clips.append(self.allocator, c) catch {};
+            return self.clips.items.len -| 1;
+        };
+        self.dirty = true;
+        return ins;
+    }
+
+    /// 叠放轮换（音符版，与片段同规则）：沉到**同样式同乐器同音高同左端点**组的最底。
+    /// 返回新下标（已在底层则原样）。不单独提交历史。
+    pub fn sinkNoteToTieBottom(self: *App, ci: usize) usize {
+        if (ci >= self.notes.items.len) return ci;
+        const n = self.notes.items[ci];
+        var min_i: usize = ci;
+        for (self.notes.items, 0..) |o, oi| {
+            if (oi == ci) continue;
+            if (o.pattern == n.pattern and o.instrument == n.instrument and o.pitch == n.pitch and o.step == n.step and oi < min_i) min_i = oi;
+        }
+        if (min_i == ci) return ci; // 已在最底
+        _ = self.notes.orderedRemove(ci);
+        const ins = if (min_i > ci) min_i - 1 else min_i;
+        self.notes.insert(self.allocator, ins, n) catch {
+            self.notes.append(self.allocator, n) catch {};
+            return self.notes.items.len -| 1;
+        };
+        self.dirty = true;
+        return ins;
+    }
 
     /// 导入 MIDI：每个用到的通道 → 一个新乐器（默认减法合成器参数）；
     /// 音符全部写进**一个新建样式**（不自动放片段——由用户自己放置）。
@@ -5301,18 +5953,8 @@ pub const App = struct {
             imported += 1;
         }
 
-        // 选中新样式（用户一眼能看到）；乐器选中第一个新建的
-        self.sel.pattern = new_pat;
-        if (self.piano.pattern != null) self.piano.pattern = new_pat;
-        if (inst_count > 0) {
-            for (ch_to_inst) |idx| {
-                if (idx >= 0) {
-                    self.sel.instrument = idx;
-                    break;
-                }
-            }
-        }
-
+        // **纯追加，不干扰视图**（用户拍板：自动跳到新样式/新乐器迷惑性太强——
+        // 导入只追加，样式号在 toast 里告知，用户自行前往）。
         return .{ .pattern = new_pat, .notes = imported, .instruments = inst_count, .skipped = skipped };
     }
 
@@ -5323,6 +5965,8 @@ pub const App = struct {
         var out = [_]u8{64} ** 16;
         var set = [_]bool{false} ** 16;
         for (self.instruments.items, 0..) |inst, i| {
+            // 无来源通道且乐器号 ≥ 16 → 不导出（与 `exportMidiNotes` 同规则）
+            if (inst.midi_channel < 0 and i >= 16) continue;
             const ch: usize = if (inst.midi_channel >= 0)
                 @intCast(@mod(inst.midi_channel, 16))
             else
@@ -5346,15 +5990,23 @@ pub const App = struct {
                 if (n.pattern != clip.pattern) continue;
                 if (n.pitch < 0 or n.pitch > 127 or n.len <= 0) continue;
                 if (n.instrument < 0) continue;
-                // 通道：优先乐器记录的来源通道（MIDI 导入往返稳定）；否则乐器号 mod 16
-                const ch: i32 = blk: {
-                    const ii = @as(usize, @intCast(n.instrument));
-                    if (ii < self.instruments.items.len) {
-                        const mc = self.instruments.items[ii].midi_channel;
-                        if (mc >= 0) break :blk @mod(mc, 16);
+                // 通道：优先乐器记录的来源通道（MIDI 导入往返稳定）；否则乐器号 = 通道。
+                // **无来源通道且乐器号 ≥ 16 → 不导出**（MIDI 只有 16 通道；此前用
+                // 乐器号 mod 16 折回，会挤占已有通道——用户拍板偷懒：宁缺毋挤）
+                const ii = @as(usize, @intCast(n.instrument));
+                var ch: i32 = undefined;
+                if (ii < self.instruments.items.len) {
+                    const mc = self.instruments.items[ii].midi_channel;
+                    if (mc >= 0) {
+                        ch = @mod(mc, 16);
+                    } else if (ii < 16) {
+                        ch = @intCast(ii);
+                    } else {
+                        continue;
                     }
-                    break :blk @mod(n.instrument, 16);
-                };
+                } else {
+                    continue; // 悬空引用（理论不可达）：不导出
+                }
                 // 全局步 = 局部步 + 片段起点 − 片段左缘偏移（与序列器同一公式）
                 const gs = clip.start + (n.step - clip.offset);
                 const ge = gs + n.len;
@@ -5739,6 +6391,16 @@ pub const App = struct {
         }
     }
 
+    /// 选中与**全局步区域** `[lo, hi)` 相交的片段（播放列表循环选区用；与
+    /// `selectNotesInRegionSong` 同语义：片段窗口 `[start, start+len)` 与区域有重叠即选中）。
+    pub fn selectClipsInRegionSong(self: *App, lo: i32, hi: i32) void {
+        self.clearClipSelection();
+        for (self.clips.items) |*c| {
+            if (c.len <= 0) continue;
+            if (c.start < hi and c.start + c.len > lo) c.selected = true;
+        }
+    }
+
     /// 选中落入**全局步区域** `[lo, hi)` 的音符（按片段映射；播放列表
     /// 的循环选区用）。
     pub fn selectNotesInRegionSong(self: *App, lo: i32, hi: i32) void {
@@ -5791,14 +6453,14 @@ pub const App = struct {
 
     /// 试听音符（**指定乐器**——鼓组编辑器绑定窗口时不依赖当前选择）
     pub fn auditionOnInst(self: *App, inst: i32, pitch: i32) void {
-        if (inst < 0 or inst >= synth.max_instruments) return;
+        if (inst < 0 or inst >= @as(i32, @intCast(self.params.instruments_cap))) return;
         if (pitch < 0 or pitch > 127) return;
         self.events.push(.{ .kind = .on, .pitch = @intCast(pitch), .instrument = @intCast(inst) });
     }
 
     /// 试听释音（**指定乐器**）
     pub fn auditionOffInst(self: *App, inst: i32, pitch: i32) void {
-        if (inst < 0 or inst >= synth.max_instruments) return;
+        if (inst < 0 or inst >= @as(i32, @intCast(self.params.instruments_cap))) return;
         if (pitch < 0 or pitch > 127) return;
         self.events.push(.{ .kind = .off, .pitch = @intCast(pitch), .instrument = @intCast(inst) });
     }
@@ -5856,7 +6518,6 @@ pub const App = struct {
         self.piano.drag_note = null;
         self.piano.scroll = (127 - 84) * self.piano.key_h; // 视野顶部从 C6 开始（下方可见 C3-C6）
         self.piano.scroll_x = 0;
-        self.piano.content_w = 0; // 重置为一屏（由滚动条控件规范化）
     }
 
     // ── 文本输入（就地重命名）──
@@ -6114,6 +6775,32 @@ pub const App = struct {
                             self.pattern_items.items[ti.index] = c;
                             self.dirty = true;
                             self.commitHistory("重命名样式");
+                        }
+                    }
+                }
+            },
+            .track => {
+                const key: i32 = @intCast(ti.index);
+                if (val.len == 0) {
+                    // **空 = 恢复默认名**（Track N）：删除自定义名条目（用户拍板）
+                    if (self.track_names.fetchRemove(key)) |kv| {
+                        self.allocator.free(kv.value);
+                        self.dirty = true;
+                        self.commitHistory("恢复默认轨道名");
+                    }
+                } else {
+                    const old = self.track_names.get(key);
+                    // 改名 == 合成默认名（且本无自定义名）→ 无需入表
+                    const same = if (old) |o| std.mem.eql(u8, o, val) else std.mem.eql(u8, val, self.trackName(ti.index));
+                    if (!same) {
+                        const copy = self.allocator.dupe(u8, val) catch null;
+                        if (copy) |c| {
+                            self.track_names.put(self.allocator, key, c) catch {
+                                self.allocator.free(c);
+                            };
+                            if (old) |o| self.allocator.free(o);
+                            self.dirty = true;
+                            self.commitHistory("重命名轨道");
                         }
                     }
                 }
@@ -6559,10 +7246,173 @@ test "app: 调音台——添加通道/效果器 + 撤销恢复（动态链）" 
     app.commitHistory("删除效果器");
     try std.testing.expectEqual(@as(usize, 1), app.mixer_channels_state.items[0].effects.items.len);
 
-    // 通道上限：添到满
-    while (app.addMixerChannel() != null) {}
-    try std.testing.expectEqual(@as(usize, max_mixer_channels), app.mixer_channels_state.items.len);
-    try std.testing.expect(app.addMixerChannel() == null);
+    // 池化：通道无人工上限——加到 40 条（自动扩容），容量随之增长
+    while (app.mixer_channels_state.items.len < 40) {
+        try std.testing.expect(app.addMixerChannel() != null);
+    }
+    try std.testing.expectEqual(@as(usize, 40), app.mixer_channels_state.items.len);
+    try std.testing.expect(app.params.channels_cap >= 40);
+    // 新通道上的效果器也能正常添加（扩容后的行/扁平数组可用）
+    try std.testing.expect(app.addEffect(39, .eq) != null);
+    try std.testing.expect(app.addEffect(39, .reverb) != null);
+    app.removeEffect(39, 0);
+    try std.testing.expectEqual(@as(usize, 1), app.mixer_channels_state.items[39].effects.items.len);
+}
+
+test "app: 片段叠放——沉底轮换（点中即沉到同左端点组最底）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    // 三条同轨道同左端点的片段（数组序 0,1,2 = 层序底→顶）
+    app.addClip(.{ .track = 0, .start = 0, .len = 96, .pattern = 0 });
+    app.addClip(.{ .track = 0, .start = 0, .len = 96, .pattern = 0 });
+    app.addClip(.{ .track = 0, .start = 0, .len = 96, .pattern = 0 });
+    // 命中 = 最顶层（数组序最大）
+    try std.testing.expectEqual(@as(?usize, 2), model.topmostClipAt(app.clips.items, 0, 5));
+    // 沉底：2 → 新下标 0；层序变为 [旧2, 旧0, 旧1]，顶层 = 下标 2（旧1）
+    try std.testing.expectEqual(@as(usize, 0), app.sinkClipToTieBottom(2));
+    try std.testing.expectEqual(@as(?usize, 2), model.topmostClipAt(app.clips.items, 0, 5));
+    // 三连沉 → 回到初始序
+    try std.testing.expectEqual(@as(usize, 0), app.sinkClipToTieBottom(2));
+    try std.testing.expectEqual(@as(usize, 0), app.sinkClipToTieBottom(2));
+    // 另一轨道的独苗：原样返回（不跨轨成组）
+    app.addClip(.{ .track = 1, .start = 0, .len = 96, .pattern = 0 });
+    try std.testing.expectEqual(@as(usize, 3), app.sinkClipToTieBottom(3));
+}
+
+test "app: 音符叠放——沉底轮换（点中即沉到同音高同左端点组最底）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    app.addNote(.{ .step = 0, .len = 24, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.addNote(.{ .step = 0, .len = 24, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.addNote(.{ .step = 0, .len = 24, .pitch = 60, .pattern = 0, .instrument = 0 });
+    try std.testing.expectEqual(@as(?usize, 2), model.topmostNoteAt(app.notes.items, 0, 0, 60, 5));
+    // 三连沉 → 回环（同片段测试）
+    try std.testing.expectEqual(@as(usize, 0), app.sinkNoteToTieBottom(2));
+    try std.testing.expectEqual(@as(?usize, 2), model.topmostNoteAt(app.notes.items, 0, 0, 60, 5));
+    try std.testing.expectEqual(@as(usize, 0), app.sinkNoteToTieBottom(2));
+    try std.testing.expectEqual(@as(usize, 0), app.sinkNoteToTieBottom(2));
+    // 同音高但左端不同：不跨组成团
+    app.addNote(.{ .step = 48, .len = 24, .pitch = 60, .pattern = 0, .instrument = 0 });
+    try std.testing.expectEqual(@as(usize, 3), app.sinkNoteToTieBottom(3));
+}
+
+test "app: MIDI 导入为纯追加（不干扰已有乐器/音符/样式；含撤销往返）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    const old_inst = app.addInstrument("减法合成器");
+    try std.testing.expect(old_inst >= 0);
+    app.addNote(.{ .step = 0, .len = 4, .pitch = 60, .pattern = 0, .instrument = old_inst });
+    app.resetHistory("初始状态");
+    const old_notes = app.notes.items.len;
+    const old_pats = app.pattern_items.items.len;
+    const old_insts = app.instruments.items.len;
+
+    var pnotes = [_]midi.ParsedNote{
+        .{ .start_tick = 0, .end_tick = 480, .pitch = 64, .channel = 2, .velocity = 90 },
+        .{ .start_tick = 480, .end_tick = 960, .pitch = 67, .channel = 2, .velocity = 90 },
+    };
+    var parsed = midi.Parsed{ .ticks_per_quarter = 480, .notes = &pnotes };
+
+    // 导入前把“视图”钉在已有内容上（复现用户场景）
+    app.sel.pattern = 0;
+    app.piano.pattern = 0;
+    app.sel.instrument = old_inst;
+
+    const r = try app.importMidi(&parsed);
+    try std.testing.expectEqual(@as(usize, 2), r.notes);
+    try std.testing.expectEqual(@as(usize, 1), r.instruments);
+    // 1) 已有音符/乐器/样式原样保留
+    try std.testing.expectEqual(old_notes + 2, app.notes.items.len);
+    try std.testing.expectEqual(old_insts + 1, app.instruments.items.len);
+    try std.testing.expectEqual(old_pats + 1, app.pattern_items.items.len);
+    try std.testing.expectEqualStrings("减法合成器", app.instruments.items[0].name);
+    try std.testing.expectEqual(@as(i32, 0), app.notes.items[0].pattern);
+    try std.testing.expectEqual(old_inst, app.notes.items[0].instrument);
+    // 2) 新内容在“后方追加”
+    try std.testing.expectEqual(@as(i32, @intCast(old_pats)), r.pattern);
+    try std.testing.expectEqual(@as(i32, 2), app.instruments.items[old_insts].midi_channel);
+    try std.testing.expectEqual(r.pattern, app.notes.items[old_notes].pattern);
+    try std.testing.expectEqual(@as(i32, @intCast(old_insts)), app.notes.items[old_notes].instrument);
+    // 3) 视图**不被劫持**（用户拍板：样式/乐器都不自动切——导入只追加，
+    //    样式号在 toast 里告知）
+    try std.testing.expectEqual(@as(i32, 0), app.sel.pattern);
+    try std.testing.expectEqual(@as(?i32, 0), app.piano.pattern);
+    try std.testing.expectEqual(old_inst, app.sel.instrument);
+
+    // 4) 提交后撤销/重做往返：模型与旧内容均稳定
+    app.commitHistory("导入 MIDI");
+    try std.testing.expect(app.undo());
+    try std.testing.expectEqual(old_notes, app.notes.items.len);
+    try std.testing.expectEqual(old_insts, app.instruments.items.len);
+    try std.testing.expect(app.redo());
+    try std.testing.expectEqual(old_notes + 2, app.notes.items.len);
+    try std.testing.expectEqual(old_insts + 1, app.instruments.items.len);
+}
+
+test "app: MIDI 导出——超过 16 的乐器不导出（防通道挤占；带来源通道者除外）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    var i: usize = 0;
+    while (i < 17) : (i += 1) {
+        try std.testing.expect(app.addInstrument("减法合成器") >= 0);
+    }
+    app.addNote(.{ .step = 0, .len = 4, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.addNote(.{ .step = 0, .len = 4, .pitch = 62, .pattern = 0, .instrument = 16 }); // 超限：不导出
+    app.clips.append(app.allocator, .{ .track = 0, .start = 0, .len = 96, .pattern = 0, .offset = 0 }) catch {};
+    const evs = try app.exportMidiNotes(app.allocator);
+    defer app.allocator.free(evs);
+    try std.testing.expectEqual(@as(usize, 1), evs.len);
+    try std.testing.expect(evs[0].channel == 0);
+    // 带来源通道的记录（导入而来）：即使 ≥16 也按记录通道导出（往返稳定）
+    app.instruments.items[16].midi_channel = 5;
+    const evs2 = try app.exportMidiNotes(app.allocator);
+    defer app.allocator.free(evs2);
+    try std.testing.expectEqual(@as(usize, 2), evs2.len);
+}
+
+test "app: 池化——乐器无人工上限（40 个自动扩容；容量只增不减）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    app.resetHistory("初始状态");
+    const cap0 = app.params.instruments_cap;
+    var i: usize = 0;
+    while (i < 40) : (i += 1) {
+        try std.testing.expect(app.addInstrument("减法合成器") >= 0);
+    }
+    try std.testing.expectEqual(@as(usize, 40), app.instruments.items.len);
+    try std.testing.expect(app.params.instruments_cap > cap0);
+    try std.testing.expect(app.params.instruments_cap >= 40);
+    try std.testing.expect(sequencer.instrument_cap >= 40);
+    try std.testing.expect(app.params.synth_ptrs.len >= 40);
+    // 删除全部 → 帧末回收（滞回：4× 余量才缩容）→ 回到初始容量 32
+    while (app.instruments.items.len > 0) app.removeInstrument(app.instruments.items.len - 1);
+    try std.testing.expectEqual(@as(usize, 0), app.instruments.items.len);
+    try std.testing.expect(app.params.instruments_cap >= 40); // 回收前仍是扩容后的容量
+    app.pollCapacityReclaim();
+    try std.testing.expectEqual(@as(usize, 32), app.params.instruments_cap);
+    // 缩容后仍可继续添加（容量再增长）
+    try std.testing.expect(app.addInstrument("减法合成器") >= 0);
+    try std.testing.expectEqual(@as(usize, 1), app.instruments.items.len);
 }
 
 test "app: 撤销——合成器参数（ADSR）也恢复（修“调 ADSR 不产生历史”）" {
@@ -6839,24 +7689,13 @@ test "app: 导出 WAV——离线渲染整曲（长度 = 内容 + 2s 尾；有�
     app.addNote(.{ .step = 0, .len = 8, .pitch = 60, .pattern = 0, .instrument = 0 });
     app.clips.append(app.allocator, .{ .track = 0, .start = 0, .len = 96, .pattern = 0, .offset = 0 }) catch {};
 
-    // 最小离线引擎（无设备；布局同 `audio.zig` 的 renderSegment 测试）：
-    // 声部池 / 通道缓冲 / EQ 槽 / 队列指针 / 参数指针——生命周期由本测试负责
+    // 最小离线引擎（无设备；容量数组由 setCapacity 建立）——生命周期由本测试负责
     app.params.events = &app.events;
     app.params.sched_events = &app.sched_events;
     app.engine.params = &app.params;
     app.engine.allocator = std.testing.allocator;
-    app.engine.synths = try std.testing.allocator.alloc(synth.Synth, 1);
-    defer std.testing.allocator.free(app.engine.synths);
-    for (app.engine.synths) |*s| s.* = .{};
-    app.engine.kit_synths = try std.testing.allocator.alloc(synth.KitLayerSynth, synth.max_instruments * audio.kit_max_layers);
-    defer std.testing.allocator.free(app.engine.kit_synths);
-    for (app.engine.kit_synths) |*s| s.* = .{};
-    app.engine.chan_bufs = try std.testing.allocator.alloc(f32, audio.mixer_channels * 2 * 4096);
-    defer std.testing.allocator.free(app.engine.chan_bufs);
-    @memset(app.engine.chan_bufs, 0);
-    app.engine.slot_eq = try std.testing.allocator.alloc(eq.Biquad, audio.mixer_channels * audio.effect_slots * eq.band_count * 2);
-    defer std.testing.allocator.free(app.engine.slot_eq);
-    @memset(app.engine.slot_eq, .{});
+    try app.engine.setCapacity(app.params.instruments_cap, app.params.channels_cap, app.params.slots_cap);
+    defer app.engine.deinit();
     var sp = synth.SynthParams{};
     app.params.synth_ptrs[0].store(&sp, .monotonic);
     app.params.channel_count.store(1, .monotonic);
@@ -7341,6 +8180,17 @@ test "app: menuIsOpen——每种菜单都必须计入（漏项会穿透下层�
     app.preset_browser.open = true;
     try std.testing.expect(app.menuIsOpen());
     app.preset_browser.open = false;
+
+    // 调音台右键菜单（通道/效果器/声像）——实测 bug：漏项 → 点击穿透到通道条
+    app.mixer_win.ctx_channel = 0;
+    try std.testing.expect(app.menuIsOpen());
+    app.mixer_win.ctx_channel = null;
+    app.mixer_win.ctx_effect = .{ .ch = 0, .slot = 0 };
+    try std.testing.expect(app.menuIsOpen());
+    app.mixer_win.ctx_effect = null;
+    app.mixer_win.ctx_pan = 0;
+    try std.testing.expect(app.menuIsOpen());
+    app.mixer_win.ctx_pan = null;
 
     // 全部关闭 → 无菜单
     try std.testing.expect(!app.menuIsOpen());
@@ -8030,9 +8880,109 @@ test "app: 样式——添加避开重名（删除后重加）+ 上限拒绝" {
     try std.testing.expectEqual(@as(i32, 2), ni); // 追加在末尾
     try std.testing.expectEqualStrings("样式 2", app.pattern_items.items[@intCast(ni)]); // 补最小空号
 
-    // 上限：装满后拒绝
-    app.resetPatterns(model.max_patterns);
-    try std.testing.expectEqual(@as(i32, -1), app.addPattern());
+    // 上限（≈十亿，不可达）——“装满后拒绝”无法再靠填满测试（会挂）；
+    // 该分支就是 `addPattern` 里一行 `>= max_patterns` 比较。
+}
+
+test "app: 轨道轴——行跨度推导（保底+留白）、片段下缘生长、清空无重映射" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+
+    // 空工程：最短行程 128 行
+    try std.testing.expectEqual(@as(i32, 128), app.trackCount());
+    try std.testing.expectEqualStrings("Track 1", app.trackName(0));
+    try std.testing.expectEqualStrings("Track 32", app.trackName(31));
+
+    // 片段放到第 40 行（0 起）→ 低于最短行程 → 仍 128
+    app.clips.append(app.allocator, .{ .track = 40, .start = 0, .len = 48, .pattern = 0 }) catch {};
+    try std.testing.expectEqual(@as(i32, 128), app.trackCount());
+
+    // 放到第 200 行 → 按内容推导：200 + 1 + 3 留白
+    app.clips.append(app.allocator, .{ .track = 200, .start = 0, .len = 48, .pattern = 0 }) catch {};
+    try std.testing.expectEqual(@as(i32, 204), app.trackCount());
+
+    // 空行清空：无事发生
+    app.clips.append(app.allocator, .{ .track = 0, .start = 96, .len = 48, .pattern = 0 }) catch {};
+    try std.testing.expectEqual(@as(usize, 0), app.clearTrackData(5));
+    try std.testing.expectEqual(@as(usize, 3), app.clips.items.len);
+
+    // 清空第 200 行 → 片段删、其余**不重映射**、跨度收回最短行程
+    try std.testing.expectEqual(@as(usize, 1), app.trackUsage(200));
+    try std.testing.expectEqual(@as(usize, 1), app.clearTrackData(200));
+    try std.testing.expectEqual(@as(usize, 2), app.clips.items.len);
+    try std.testing.expectEqual(@as(i32, 40), app.clips.items[0].track); // swapRemove：尾项顶上
+    try std.testing.expectEqual(@as(i32, 0), app.clips.items[1].track);
+    try std.testing.expectEqual(@as(i32, 128), app.trackCount());
+}
+
+test "app: 轨道重命名（文本输入提交）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetHistory("初始状态");
+
+    app.beginRenameTrack(1, 0, 0);
+    while (app.text_input.text().len > 0) app.textInputBackspace();
+    app.textInputAppend('鼓');
+    app.textInputCommit();
+    try std.testing.expectEqualStrings("鼓", app.trackName(1));
+    try std.testing.expectEqualStrings("Track 1", app.trackName(0));
+}
+
+test "app: 轨道名随存档导出/导入（稀疏保留；旧档无字段=全默认；跨度由片段推导）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    // 改名第 2 条 → “鼓”
+    app.beginRenameTrack(1, 0, 0);
+    while (app.text_input.text().len > 0) app.textInputBackspace();
+    app.textInputAppend('鼓');
+    app.textInputCommit();
+
+    const proj = try app.exportProject();
+    defer app.freeProject(proj);
+
+    var app2 = App{ .allocator = std.testing.allocator };
+    defer app2.clips.deinit(app2.allocator);
+    defer app2.notes.deinit(app2.allocator);
+    defer app2.deinitAll();
+    app2.resetMixerChannels(default_mixer_channels);
+    app2.importProject(proj);
+    try std.testing.expectEqual(@as(i32, 128), app2.trackCount());
+    try std.testing.expectEqualStrings("Track 1", app2.trackName(0));
+    try std.testing.expectEqualStrings("鼓", app2.trackName(1));
+    try std.testing.expectEqualStrings("Track 3", app2.trackName(2)); // 未命名 → 合成
+
+    // 旧存档（无 track_names）+ 第 40 行片段 → 跨度自动覆盖到 44，名字全默认
+    var l2 = proj;
+    l2.track_names = &.{};
+    const clips = try app2.allocator.alloc(persist.SavedClip, 1);
+    defer app2.allocator.free(clips);
+    clips[0] = .{ .track = 40, .start = 0, .len = 48, .pattern = 0 };
+    l2.clips = clips;
+    l2.notes = &.{};
+    l2.instruments = &.{};
+    l2.mixer = &.{};
+    l2.pattern_count = 1;
+    l2.pattern_names = &.{};
+
+    var app3 = App{ .allocator = std.testing.allocator };
+    defer app3.clips.deinit(app3.allocator);
+    defer app3.notes.deinit(app3.allocator);
+    defer app3.deinitAll();
+    app3.resetMixerChannels(default_mixer_channels);
+    app3.importProject(l2);
+    try std.testing.expectEqual(@as(i32, 128), app3.trackCount()); // 40 行片段低于最短行程 → 128
+    try std.testing.expectEqualStrings("Track 41", app3.trackName(40));
 }
 
 test "app: 样式名随存档导出/导入（自定义名保留）" {
@@ -10212,4 +11162,158 @@ test "模态框展开期间 bringToFront 不动作（弹窗按钮点穿回归锁
     const z1 = app.synth_win.z;
     app.bringToFront(&app.synth_win.z);
     try std.testing.expectEqual(z1, app.synth_win.z); // 模态期间：不动作
+}
+test "app: 全局区域选片段（与音符版同语义：相交判定 + 只选中一次）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.clips.append(app.allocator, .{ .track = 0, .start = 0, .len = 96, .pattern = 0 }) catch {};
+    app.clips.append(app.allocator, .{ .track = 1, .start = 200, .len = 96, .pattern = 0 }) catch {};
+    app.clips.append(app.allocator, .{ .track = 2, .start = 500, .len = 96, .pattern = 0 }) catch {};
+
+    // 区域 [50,250)：与 [0,96)、[200,296) 相交 → 两条选中；[500,596) 不选
+    app.selectClipsInRegionSong(50, 250);
+    try std.testing.expect(app.clips.items[0].selected);
+    try std.testing.expect(app.clips.items[1].selected);
+    try std.testing.expect(!app.clips.items[2].selected);
+
+    // 重选清旧选择：区域 [520,560) 只选第三条（含“音尾伸入”式相交）
+    app.selectClipsInRegionSong(520, 560);
+    try std.testing.expect(!app.clips.items[0].selected);
+    try std.testing.expect(!app.clips.items[1].selected);
+    try std.testing.expect(app.clips.items[2].selected);
+}
+
+test "app: 轨道静音——切换与存档往返" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    app.resetHistory("初始状态");
+
+    try std.testing.expect(!app.trackMuted(3));
+    app.setTrackMuted(3, true);
+    try std.testing.expect(app.trackMuted(3));
+
+    const proj = try app.exportProject();
+    defer app.freeProject(proj);
+
+    var app2 = App{ .allocator = std.testing.allocator };
+    defer app2.clips.deinit(app2.allocator);
+    defer app2.notes.deinit(app2.allocator);
+    defer app2.deinitAll();
+    app2.resetMixerChannels(default_mixer_channels);
+    app2.importProject(proj);
+    try std.testing.expect(app2.trackMuted(3));
+    try std.testing.expect(!app2.trackMuted(4));
+
+    app2.setTrackMuted(3, false);
+    try std.testing.expect(!app2.trackMuted(3));
+}
+
+test "app: 轨道行上移/下移与删除——片段/自定义名/静音整体搬；默认名随位置" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.clips.append(app.allocator, .{ .track = 1, .start = 0, .len = 48, .pattern = 0 }) catch {};
+    app.clips.append(app.allocator, .{ .track = 2, .start = 96, .len = 48, .pattern = 0 }) catch {};
+    app.setTrackMuted(1, true);
+
+    // 命名 idx1 为“鼓”
+    app.beginRenameTrack(1, 0, 0);
+    while (app.text_input.text().len > 0) app.textInputBackspace();
+    app.textInputAppend('鼓');
+    app.textInputCommit();
+    try std.testing.expectEqualStrings("鼓", app.trackName(1));
+
+    // 上移 idx2 ↔ idx1：内容 + 自定义名 + 静音随行；未命名行显示位置默认名
+    app.swapTrackRows(2, 1);
+    try std.testing.expectEqualStrings("鼓", app.trackName(2));
+    try std.testing.expectEqualStrings("Track 2", app.trackName(1));
+    try std.testing.expect(app.trackMuted(2));
+    try std.testing.expect(!app.trackMuted(1));
+    try std.testing.expectEqual(@as(i32, 2), app.clips.items[0].track); // 原 idx1 片段 → idx2
+    try std.testing.expectEqual(@as(i32, 1), app.clips.items[1].track);
+
+    // 删除 idx1（空行）→ 下方整体上移：“鼓”行来到 idx1
+    app.removeTrackRow(1);
+    try std.testing.expectEqual(@as(usize, 1), app.clips.items.len);
+    try std.testing.expectEqual(@as(i32, 1), app.clips.items[0].track);
+    try std.testing.expectEqualStrings("鼓", app.trackName(1));
+    try std.testing.expect(app.trackMuted(1));
+}
+
+test "app: 轨道重命名——空字符串恢复默认名（输入框不预填默认名）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.beginRenameTrack(1, 0, 0);
+    try std.testing.expectEqual(@as(usize, 0), app.text_input.text().len); // 未命名行：输入框留空
+    while (app.text_input.text().len > 0) app.textInputBackspace();
+    app.textInputAppend('鼓');
+    app.textInputCommit();
+    try std.testing.expectEqualStrings("鼓", app.trackName(1));
+
+    app.beginRenameTrack(1, 0, 0);
+    try std.testing.expectEqualStrings("鼓", app.text_input.text()); // 命名行：预填自定义名
+    while (app.text_input.text().len > 0) app.textInputBackspace();
+    app.textInputCommit(); // 清空提交 → 恢复默认名
+    try std.testing.expectEqualStrings("Track 2", app.trackName(1));
+}
+
+test "app: 存档 v4 稀疏轨道名——深行命名只写一对；旧密集数组垫片互通" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    app.resetHistory("初始状态");
+
+    // 深行命名（第 500 行）——导出应只有 1 对，而不是 501 条空串
+    app.playlist.view_rows = 1000; // 放开重命名守卫（正常由视图每帧写入）
+    app.beginRenameTrack(500, 0, 0);
+    while (app.text_input.text().len > 0) app.textInputBackspace();
+    app.textInputAppend('低');
+    app.textInputAppend('音');
+    app.textInputCommit();
+
+    const proj = try app.exportProject();
+    defer app.freeProject(proj);
+    try std.testing.expectEqual(@as(usize, 1), proj.track_name_rows.len);
+    try std.testing.expectEqual(@as(i32, 500), proj.track_name_rows[0]);
+    try std.testing.expectEqualStrings("低音", proj.track_names[0]);
+
+    // v4 稀疏对往返
+    var app2 = App{ .allocator = std.testing.allocator };
+    defer app2.clips.deinit(app2.allocator);
+    defer app2.notes.deinit(app2.allocator);
+    defer app2.deinitAll();
+    app2.resetMixerChannels(default_mixer_channels);
+    app2.importProject(proj);
+    try std.testing.expectEqualStrings("低音", app2.trackName(500));
+    try std.testing.expectEqualStrings("Track 500", app2.trackName(499));
+
+    // 垫片：旧档密集数组（含空串、无 rows）→ 按“跳过空串”派生行号
+    var l3 = proj;
+    l3.track_name_rows = &.{};
+    const dense = try app2.allocator.alloc([]const u8, 3);
+    defer app2.allocator.free(dense);
+    dense[0] = "";
+    dense[1] = "鼓";
+    dense[2] = "";
+    l3.track_names = dense;
+    var app3 = App{ .allocator = std.testing.allocator };
+    defer app3.clips.deinit(app3.allocator);
+    defer app3.notes.deinit(app3.allocator);
+    defer app3.deinitAll();
+    app3.resetMixerChannels(default_mixer_channels);
+    app3.importProject(l3);
+    try std.testing.expectEqualStrings("鼓", app3.trackName(1));
+    try std.testing.expectEqualStrings("Track 1", app3.trackName(0));
 }

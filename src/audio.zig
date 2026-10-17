@@ -37,11 +37,11 @@ const ma = @cImport({
 /// 每乐器每个分段发送给 VSTi 的事件上限（超出的丢弃；宁可丢事件也不分配）
 pub const vsti_batch_max = 256;
 
-/// 调音台通道数**上限**（与 app.max_mixer_channels 一致；音频层不能 import app——循环依赖）。
-/// 运行时实际通道数以 `Params.channel_count` 为准（≤ 此值）。
+/// 调音台通道数**初始容量**（与 app.max_mixer_channels 对齐；音频层不能 import app——循环依赖）。
+/// 池化后实际容量在运行时增长（见 `Params.channels_cap`）；当前通道数以 `Params.channel_count` 为准。
 pub const mixer_channels = 32;
-/// 每通道效果器槽数**上限**（与 app.max_effects_per_channel 一致）
-pub const effect_slots = 16;
+/// 每通道效果器槽数**初始容量**（与 app.max_effects_per_channel 对齐；起点 32；运行时增长见 `Params.slots_cap`）
+pub const effect_slots = 32;
 /// 每槽 EQ 段数（与 eq.band_count 一致）
 pub const eq_bands = eq.band_count;
 /// 鼓组每乐器的**层槽位上限**（槽位 = 一份合成器参数 + 绑定的音高；
@@ -89,122 +89,70 @@ pub const Params = struct {
     /// 调度事件队列（序列器）
     sched_events: *synth.SchedQueue = undefined,
     /// 每乐器的合成器参数指针（UI 每帧同步；空槽位 = null）
-    synth_ptrs: [synth.max_instruments]std.atomic.Value(?*synth.SynthParams) = [_]std.atomic.Value(?*synth.SynthParams){std.atomic.Value(?*synth.SynthParams).init(null)} ** synth.max_instruments,
+    /// 注：以下全部数组为**运行时容量**（长度 = `instruments_cap` 等，见 `initCapacity`）
+    synth_ptrs: []std.atomic.Value(?*synth.SynthParams) = &.{},
     /// 每乐器增益（音量 × 静音；UI 每帧同步）
-    instrument_gain: [synth.max_instruments]std.atomic.Value(f32) = blk: {
-        var a: [synth.max_instruments]std.atomic.Value(f32) = undefined;
-        for (&a) |*g| g.* = std.atomic.Value(f32).init(0.8);
-        break :blk a;
-    },
+    instrument_gain: []std.atomic.Value(f32) = &.{},
     /// 每乐器声像（0-1；0.5 居中；UI 每帧同步）——音符级声像的**基准**：
     /// 播放时合成有效声像（基准 + 音符偏移），见 `effectivePan`
-    instrument_pan: [synth.max_instruments]std.atomic.Value(f32) = blk: {
-        var a: [synth.max_instruments]std.atomic.Value(f32) = undefined;
-        for (&a) |*p| p.* = std.atomic.Value(f32).init(0.5);
-        break :blk a;
-    },
+    /// 每乐器声像（0-1；0.5 居中；UI 每帧同步）——音符级声像的**基准**：
+    /// 播放时合成有效声像（基准 + 音符偏移），见 `effectivePan`
+    instrument_pan: []std.atomic.Value(f32) = &.{},
     /// VSTi **panic 旗标**（UI 线程置位）：下一段对全 128 音高无条件 note-off。
     /// 用途：state 恢复（撤销/读档/载预设）可能**唤醒快照里仍在发声的声部**——
     /// 它们不在宿主活跃位图里，按位图补 off 会漏 → 永挂（实测 bug：播放中调
     /// Vital 参数后撤销，部分音符响个不停，暂停/停止无效）。
-    instrument_panic: [synth.max_instruments]std.atomic.Value(bool) = [_]std.atomic.Value(bool){std.atomic.Value(bool).init(false)} ** synth.max_instruments,
+    instrument_panic: []std.atomic.Value(bool) = &.{},
     /// 每槽 VST3 插件实例指针（混音通道 × 效果槽；null = 未加载/直通）——
     /// UI 侧惰性加载并发布；删除走“退役列表”延迟销毁（见 App.retirePlugin）
-    plugin_ptrs: [mixer_channels][effect_slots]std.atomic.Value(?*vst_host.Plugin) = [_][effect_slots]std.atomic.Value(?*vst_host.Plugin){[_]std.atomic.Value(?*vst_host.Plugin){std.atomic.Value(?*vst_host.Plugin).init(null)} ** effect_slots} ** mixer_channels,
+    plugin_ptrs: [][]std.atomic.Value(?*vst_host.Plugin) = &.{},
     /// 每槽效果器 DSP 状态盒（混响/延迟/压缩器；UI 线程分配/发布/退役——与
     /// `plugin_ptrs` 同一模式）。null = 无状态（直通/未发布）。
     /// 历史：原为每通道一份（“同类至多一个”时代）；用户要叠加相同效果 → 每槽独立。
-    fx_ptrs: [mixer_channels][effect_slots]std.atomic.Value(?*FxBox) = [_][effect_slots]std.atomic.Value(?*FxBox){[_]std.atomic.Value(?*FxBox){std.atomic.Value(?*FxBox).init(null)} ** effect_slots} ** mixer_channels,
-    /// 每乐器路由到的调音台通道（0..mixer_channels-1；UI 每帧同步）
-    instrument_channel: [synth.max_instruments]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** synth.max_instruments,
+    fx_ptrs: [][]std.atomic.Value(?*FxBox) = &.{},
+    /// 每乐器路由到的调音台通道（0..channels_cap-1；UI 每帧同步）
+    instrument_channel: []std.atomic.Value(u32) = &.{},
     /// 每乐器的 VST3 插件实例（kind == 2/VSTi；null = 未加载）——UI 侧惰性加载/发布
-    instrument_plugin: [synth.max_instruments]std.atomic.Value(?*vst_host.Plugin) = [_]std.atomic.Value(?*vst_host.Plugin){std.atomic.Value(?*vst_host.Plugin).init(null)} ** synth.max_instruments,
+    instrument_plugin: []std.atomic.Value(?*vst_host.Plugin) = &.{},
 
     // ── 鼓组（每乐器：类型 + 层列表；UI 每帧同步）──
     /// 乐器类型（0 = synth / 1 = drumkit / 2 = VST3 插件）
-    instrument_kind: [synth.max_instruments]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** synth.max_instruments,
+    instrument_kind: []std.atomic.Value(u32) = &.{},
     /// 鼓组层数（≤ kit_max_layers）
-    kit_layer_count: [synth.max_instruments]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** synth.max_instruments,
+    kit_layer_count: []std.atomic.Value(u32) = &.{},
     /// 鼓组层 → 音高（on 事件按音高分发到匹配层）。
     /// 注：off **不查它**——直接对全部层 noteOff（防“响着改映射”漏 off 悬挂）。
-    kit_layer_pitch: [synth.max_instruments][kit_max_layers]std.atomic.Value(u32) = blk: {
-        @setEvalBranchQuota(10000);
-        var a: [synth.max_instruments][kit_max_layers]std.atomic.Value(u32) = undefined;
-        for (&a) |*row| {
-            for (row) |*v| v.* = std.atomic.Value(u32).init(0);
-        }
-        break :blk a;
-    },
+    kit_layer_pitch: [][]std.atomic.Value(u32) = &.{},
     /// 鼓组层增益（多层叠加的配比）
-    kit_layer_gain: [synth.max_instruments][kit_max_layers]std.atomic.Value(f32) = blk: {
-        @setEvalBranchQuota(10000);
-        var a: [synth.max_instruments][kit_max_layers]std.atomic.Value(f32) = undefined;
-        for (&a) |*row| {
-            for (row) |*v| v.* = std.atomic.Value(f32).init(1.0);
-        }
-        break :blk a;
-    },
+    kit_layer_gain: [][]std.atomic.Value(f32) = &.{},
     /// 鼓组层合成器参数指针（层本体；UI 持有并保证地址稳定）
-    kit_layer_params: [synth.max_instruments][kit_max_layers]std.atomic.Value(?*synth.SynthParams) = blk: {
-        @setEvalBranchQuota(10000);
-        var a: [synth.max_instruments][kit_max_layers]std.atomic.Value(?*synth.SynthParams) = undefined;
-        for (&a) |*row| {
-            for (row) |*v| v.* = std.atomic.Value(?*synth.SynthParams).init(null);
-        }
-        break :blk a;
-    },
+    kit_layer_params: [][]std.atomic.Value(?*synth.SynthParams) = &.{},
 
     // ── 调音台：每通道参数（UI 写、音频线程读）──
     /// 通道增益（0-1）
-    channel_gain: [mixer_channels]std.atomic.Value(f32) = blk: {
-        var a: [mixer_channels]std.atomic.Value(f32) = undefined;
-        for (&a) |*g| g.* = std.atomic.Value(f32).init(0.8);
-        break :blk a;
-    },
+    channel_gain: []std.atomic.Value(f32) = &.{},
     /// 通道声像（0-1；0.5 = 居中）
-    channel_pan: [mixer_channels]std.atomic.Value(f32) = blk: {
-        var a: [mixer_channels]std.atomic.Value(f32) = undefined;
-        for (&a) |*g| g.* = std.atomic.Value(f32).init(0.5);
-        break :blk a;
-    },
+    channel_pan: []std.atomic.Value(f32) = &.{},
     /// 通道静音（增益已在 UI 侧合并——但保留独立标志以便 UI 同步）
-    channel_muted: [mixer_channels]std.atomic.Value(bool) = [_]std.atomic.Value(bool){std.atomic.Value(bool).init(false)} ** mixer_channels,
+    channel_muted: []std.atomic.Value(bool) = &.{},
     /// 通道 EQ 段参数（**效果器链的第 0 槽 = EQ**；频率/增益/Q——
     /// UI 每帧同步；音频线程据其重建 biquad）。
     /// 槽位元数据（kind/enabled/mix）在 `effect_chain`。
-    channel_eq: [mixer_channels][eq_bands]eq.BandParams = blk: {
-        var a: [mixer_channels][eq_bands]eq.BandParams = undefined;
-        for (&a) |*ch| ch.* = .{
-            .{ .freq = 100, .q = 1.0 },
-            .{ .freq = 500, .q = 1.0 },
-            .{ .freq = 2000, .q = 1.0 },
-            .{ .freq = 8000, .q = 1.0 },
-            .{ .freq = 12000, .q = 1.0 },
-        };
-        break :blk a;
-    },
+    channel_eq: [][]eq.BandParams = &.{},
     /// 通道 EQ 版本号（参数变化时递增；音频线程对比后重建系数）
-    channel_eq_version: [mixer_channels]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** mixer_channels,
+    channel_eq_version: []std.atomic.Value(u32) = &.{},
     /// 效果器链元数据（槽 × 通道）：kind（0 = 空、1 = EQ）、enabled、mix
-    effect_kind: [mixer_channels][effect_slots]std.atomic.Value(u32) = [_][effect_slots]std.atomic.Value(u32){[_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** effect_slots} ** mixer_channels,
-    effect_enabled: [mixer_channels][effect_slots]std.atomic.Value(bool) = [_][effect_slots]std.atomic.Value(bool){[_]std.atomic.Value(bool){std.atomic.Value(bool).init(true)} ** effect_slots} ** mixer_channels,
-    effect_mix: [mixer_channels][effect_slots]std.atomic.Value(f32) = [_][effect_slots]std.atomic.Value(f32){[_]std.atomic.Value(f32){std.atomic.Value(f32).init(1.0)} ** effect_slots} ** mixer_channels,
+    effect_kind: [][]std.atomic.Value(u32) = &.{},
+    effect_enabled: [][]std.atomic.Value(bool) = &.{},
+    effect_mix: [][]std.atomic.Value(f32) = &.{},
     /// 效果链版本（kind/enabled/mix 变化时递增）
-    effect_chain_version: [mixer_channels]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** mixer_channels,
+    effect_chain_version: []std.atomic.Value(u32) = &.{},
     /// 效果链长度（每通道：有效效果器数；UI 每帧同步）
-    effect_count: [mixer_channels]std.atomic.Value(u32) = [_]std.atomic.Value(u32){std.atomic.Value(u32).init(0)} ** mixer_channels,
-    /// 效果器参数位（每槽 5 个；含义按 kind 见 `effects.paramInfos`——
-    /// 2 = 混响 / 3 = 延迟 / 4 = 压缩器；1 = EQ 用 `channel_eq`）
-    effect_p: [mixer_channels][effect_slots][fx.max_params]std.atomic.Value(f32) = blk: {
-        @setEvalBranchQuota(20000);
-        var a: [mixer_channels][effect_slots][fx.max_params]std.atomic.Value(f32) = undefined;
-        for (&a) |*ch| {
-            for (ch) |*slot| {
-                for (slot) |*v| v.* = std.atomic.Value(f32).init(0);
-            }
-        }
-        break :blk a;
-    },
+    effect_count: []std.atomic.Value(u32) = &.{},
+    /// 效果器参数位（每槽 `fx.max_params` 个；含义按 kind 见 `effects.paramInfos`——
+    /// 2 = 混响 / 3 = 延迟 / 4 = 压缩器；1 = EQ 用 `channel_eq`）。
+    /// **扁平**：索引 =(ch * slots_cap + slot) * fx.max_params + pi（用 `fxParam`）
+    effect_p: []std.atomic.Value(f32) = &.{},
     /// 实际通道数（UI 每帧同步；音频线程只处理 0..channel_count）
     channel_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(2),
 
@@ -220,10 +168,252 @@ pub const Params = struct {
 
     // ── 音频线程回传：正在发声的音高（位掩码，UI 用于播放/试听高亮）──
     /// 音高 0-63（位 = 音高）
-    sounding_lo: [synth.max_instruments]std.atomic.Value(u64) = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** synth.max_instruments,
+    sounding_lo: []std.atomic.Value(u64) = &.{},
     /// 音高 64-127（位 = 音高 − 64）
-    sounding_hi: [synth.max_instruments]std.atomic.Value(u64) = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** synth.max_instruments,
+    sounding_hi: []std.atomic.Value(u64) = &.{},
+
+    // ── 运行时容量（initCapacity 设定；grow 只增不减）──
+    /// 乐器槽容量（乐器数组长度）
+    instruments_cap: usize = 0,
+    /// 通道容量
+    channels_cap: usize = 0,
+    /// 每通道效果槽容量
+    slots_cap: usize = 0,
+
+    /// 效果器参数原子位指针（扁平索引：(ch * slots_cap + slot) * fx.max_params + pi）
+    pub fn fxParam(self: *Params, ch: usize, slot: usize, pi: usize) *std.atomic.Value(f32) {
+        return &self.effect_p[(ch * self.slots_cap + slot) * fx.max_params + pi];
+    }
+
+    /// 初始化容量（启动/测试一次性建立全部数组；失败即返回错误，已分配部分已回滚）
+    pub fn initCapacity(self: *Params, a: std.mem.Allocator, ic: usize, cc: usize, sc: usize) !void {
+        self.instruments_cap = ic;
+        self.channels_cap = cc;
+        self.slots_cap = sc;
+        errdefer self.deinit(a);
+        self.synth_ptrs = try allocAtomicArr(?*synth.SynthParams, a, ic, null);
+        self.instrument_gain = try allocAtomicArr(f32, a, ic, 0.8);
+        self.instrument_pan = try allocAtomicArr(f32, a, ic, 0.5);
+        self.instrument_panic = try allocAtomicArr(bool, a, ic, false);
+        self.instrument_channel = try allocAtomicArr(u32, a, ic, 0);
+        self.instrument_plugin = try allocAtomicArr(?*vst_host.Plugin, a, ic, null);
+        self.instrument_kind = try allocAtomicArr(u32, a, ic, 0);
+        self.kit_layer_count = try allocAtomicArr(u32, a, ic, 0);
+        self.kit_layer_pitch = try allocAtomicRows(u32, a, ic, kit_max_layers, 0);
+        self.kit_layer_gain = try allocAtomicRows(f32, a, ic, kit_max_layers, 1.0);
+        self.kit_layer_params = try allocAtomicRows(?*synth.SynthParams, a, ic, kit_max_layers, null);
+        self.sounding_lo = try allocAtomicArr(u64, a, ic, 0);
+        self.sounding_hi = try allocAtomicArr(u64, a, ic, 0);
+        self.channel_gain = try allocAtomicArr(f32, a, cc, 0.8);
+        self.channel_pan = try allocAtomicArr(f32, a, cc, 0.5);
+        self.channel_muted = try allocAtomicArr(bool, a, cc, false);
+        self.channel_eq_version = try allocAtomicArr(u32, a, cc, 0);
+        self.plugin_ptrs = try allocAtomicRows(?*vst_host.Plugin, a, cc, sc, null);
+        self.fx_ptrs = try allocAtomicRows(?*FxBox, a, cc, sc, null);
+        self.effect_kind = try allocAtomicRows(u32, a, cc, sc, 0);
+        self.effect_enabled = try allocAtomicRows(bool, a, cc, sc, true);
+        self.effect_mix = try allocAtomicRows(f32, a, cc, sc, 1.0);
+        self.effect_chain_version = try allocAtomicArr(u32, a, cc, 0);
+        self.effect_count = try allocAtomicArr(u32, a, cc, 0);
+        self.effect_p = try allocAtomicArr(f32, a, cc * sc * fx.max_params, 0);
+        self.channel_eq = try a.alloc([]eq.BandParams, cc);
+        @memset(self.channel_eq, &.{});
+        for (self.channel_eq) |*row| {
+            row.* = try a.alloc(eq.BandParams, eq_bands);
+            @memset(row.*, .{});
+            setDefaultEqBands(row.*);
+        }
+    }
+
+    /// 释放全部容量数组（可重复调用；与 initCapacity/grow 对偶）
+    pub fn deinit(self: *Params, a: std.mem.Allocator) void {
+        freeAtomicArr(?*synth.SynthParams, a, &self.synth_ptrs);
+        freeAtomicArr(f32, a, &self.instrument_gain);
+        freeAtomicArr(f32, a, &self.instrument_pan);
+        freeAtomicArr(bool, a, &self.instrument_panic);
+        freeAtomicArr(u32, a, &self.instrument_channel);
+        freeAtomicArr(?*vst_host.Plugin, a, &self.instrument_plugin);
+        freeAtomicArr(u32, a, &self.instrument_kind);
+        freeAtomicArr(u32, a, &self.kit_layer_count);
+        freeAtomicRows(u32, a, &self.kit_layer_pitch);
+        freeAtomicRows(f32, a, &self.kit_layer_gain);
+        freeAtomicRows(?*synth.SynthParams, a, &self.kit_layer_params);
+        freeAtomicArr(u64, a, &self.sounding_lo);
+        freeAtomicArr(u64, a, &self.sounding_hi);
+        freeAtomicArr(f32, a, &self.channel_gain);
+        freeAtomicArr(f32, a, &self.channel_pan);
+        freeAtomicArr(bool, a, &self.channel_muted);
+        freeAtomicArr(u32, a, &self.channel_eq_version);
+        for (self.channel_eq) |r| if (r.len > 0) a.free(r);
+        if (self.channel_eq.len > 0) a.free(self.channel_eq);
+        self.channel_eq = &.{};
+        freeAtomicRows(?*vst_host.Plugin, a, &self.plugin_ptrs);
+        freeAtomicRows(?*FxBox, a, &self.fx_ptrs);
+        freeAtomicRows(u32, a, &self.effect_kind);
+        freeAtomicRows(bool, a, &self.effect_enabled);
+        freeAtomicRows(f32, a, &self.effect_mix);
+        freeAtomicArr(u32, a, &self.effect_chain_version);
+        freeAtomicArr(u32, a, &self.effect_count);
+        freeAtomicArr(f32, a, &self.effect_p);
+        self.instruments_cap = 0;
+        self.channels_cap = 0;
+        self.slots_cap = 0;
+    }
+
+    /// 扩容/缩容（**契约：调用方保证音频设备已暂停**——音频线程停走期间普通拷贝即安全）。
+    /// 容量只受滞回策略控制；返回后各数组长度 == 目标值，前缀值保留。
+    pub fn resize(self: *Params, a: std.mem.Allocator, ic: usize, cc: usize, sc: usize) !void {
+        if (ic != self.instruments_cap) {
+            try growAtomicArr(?*synth.SynthParams, a, &self.synth_ptrs, ic, null);
+            try growAtomicArr(f32, a, &self.instrument_gain, ic, 0.8);
+            try growAtomicArr(f32, a, &self.instrument_pan, ic, 0.5);
+            try growAtomicArr(bool, a, &self.instrument_panic, ic, false);
+            try growAtomicArr(u32, a, &self.instrument_channel, ic, 0);
+            try growAtomicArr(?*vst_host.Plugin, a, &self.instrument_plugin, ic, null);
+            try growAtomicArr(u32, a, &self.instrument_kind, ic, 0);
+            try growAtomicArr(u32, a, &self.kit_layer_count, ic, 0);
+            try growAtomicRows(u32, a, &self.kit_layer_pitch, ic, kit_max_layers, 0);
+            try growAtomicRows(f32, a, &self.kit_layer_gain, ic, kit_max_layers, 1.0);
+            try growAtomicRows(?*synth.SynthParams, a, &self.kit_layer_params, ic, kit_max_layers, null);
+            try growAtomicArr(u64, a, &self.sounding_lo, ic, 0);
+            try growAtomicArr(u64, a, &self.sounding_hi, ic, 0);
+            self.instruments_cap = ic;
+        }
+        if (cc != self.channels_cap) {
+            try growAtomicArr(f32, a, &self.channel_gain, cc, 0.8);
+            try growAtomicArr(f32, a, &self.channel_pan, cc, 0.5);
+            try growAtomicArr(bool, a, &self.channel_muted, cc, false);
+            const nq = try a.alloc([]eq.BandParams, cc);
+            @memset(nq, &.{});
+            errdefer {
+                for (nq) |r| if (r.len > 0) a.free(r);
+                a.free(nq);
+            }
+            for (nq, 0..) |*r, i| {
+                r.* = try a.alloc(eq.BandParams, eq_bands);
+                @memset(r.*, .{});
+                if (i < self.channel_eq.len) {
+                    for (r.*[0..@min(eq_bands, self.channel_eq[i].len)], 0..) |*b, k| b.* = self.channel_eq[i][k];
+                } else {
+                    setDefaultEqBands(r.*);
+                }
+            }
+            for (self.channel_eq) |r| if (r.len > 0) a.free(r);
+            if (self.channel_eq.len > 0) a.free(self.channel_eq);
+            self.channel_eq = nq;
+            try growAtomicArr(u32, a, &self.channel_eq_version, cc, 0);
+            // 每通道的效果槽家族（行 = 通道；列 = 当前槽容量）
+            try growAtomicRows(?*vst_host.Plugin, a, &self.plugin_ptrs, cc, self.slots_cap, null);
+            try growAtomicRows(?*FxBox, a, &self.fx_ptrs, cc, self.slots_cap, null);
+            try growAtomicRows(u32, a, &self.effect_kind, cc, self.slots_cap, 0);
+            try growAtomicRows(bool, a, &self.effect_enabled, cc, self.slots_cap, true);
+            try growAtomicRows(f32, a, &self.effect_mix, cc, self.slots_cap, 1.0);
+            try growAtomicArr(u32, a, &self.effect_chain_version, cc, 0);
+            try growAtomicArr(u32, a, &self.effect_count, cc, 0);
+            {
+                // effect_p 扁平：前 old_n 项布局不变（前缀拷贝）
+                const sc_cur = self.slots_cap;
+                const np2 = try allocAtomicArr(f32, a, cc * sc_cur * fx.max_params, 0);
+                const cp2 = @min(np2.len, self.effect_p.len);
+                for (np2[0..cp2], 0..) |*v, i| v.* = std.atomic.Value(f32).init(self.effect_p[i].load(.monotonic));
+                freeAtomicArr(f32, a, &self.effect_p);
+                self.effect_p = np2;
+            }
+            self.channels_cap = cc;
+        }
+        if (sc != self.slots_cap) {
+            try growAtomicRows(?*vst_host.Plugin, a, &self.plugin_ptrs, self.channels_cap, sc, null);
+            try growAtomicRows(?*FxBox, a, &self.fx_ptrs, self.channels_cap, sc, null);
+            try growAtomicRows(u32, a, &self.effect_kind, self.channels_cap, sc, 0);
+            try growAtomicRows(bool, a, &self.effect_enabled, self.channels_cap, sc, true);
+            try growAtomicRows(f32, a, &self.effect_mix, self.channels_cap, sc, 1.0);
+            const old_slots = self.slots_cap;
+            const np = try allocAtomicArr(f32, a, self.channels_cap * sc * fx.max_params, 0);
+            for (0..self.channels_cap) |ch| {
+                for (0..@min(old_slots, sc)) |slot| {
+                    for (0..fx.max_params) |pi| {
+                        const oi = (ch * old_slots + slot) * fx.max_params + pi;
+                        const ni = (ch * sc + slot) * fx.max_params + pi;
+                        np[ni] = std.atomic.Value(f32).init(self.effect_p[oi].load(.monotonic));
+                    }
+                }
+            }
+            freeAtomicArr(f32, a, &self.effect_p);
+            self.effect_p = np;
+            self.slots_cap = sc;
+        }
+    }
 };
+
+/// 容量数组分配/释放助手（Params 与 Engine 共用）
+fn allocAtomicArr(comptime T: type, a: std.mem.Allocator, n: usize, val: T) ![]std.atomic.Value(T) {
+    const s = try a.alloc(std.atomic.Value(T), n);
+    for (s) |*v| v.* = std.atomic.Value(T).init(val);
+    return s;
+}
+
+fn allocAtomicRows(comptime T: type, a: std.mem.Allocator, rows: usize, cols: usize, val: T) ![][]std.atomic.Value(T) {
+    const outer = try a.alloc([]std.atomic.Value(T), rows);
+    @memset(outer, &.{});
+    errdefer {
+        for (outer) |r| if (r.len > 0) a.free(r);
+        a.free(outer);
+    }
+    for (outer) |*r| r.* = try allocAtomicArr(T, a, cols, val);
+    return outer;
+}
+
+fn freeAtomicArr(comptime T: type, a: std.mem.Allocator, s: *[]std.atomic.Value(T)) void {
+    if (s.len > 0) a.free(s.*);
+    s.* = &.{};
+}
+
+fn freeAtomicRows(comptime T: type, a: std.mem.Allocator, s: *[][]std.atomic.Value(T)) void {
+    for (s.*) |r| if (r.len > 0) a.free(r);
+    if (s.len > 0) a.free(s.*);
+    s.* = &.{};
+}
+
+/// 扩容/缩容（名称沿史，语义 = resize）：n < len 时前缀保留、尾部丢弃
+fn growAtomicArr(comptime T: type, a: std.mem.Allocator, old: *[]std.atomic.Value(T), n: usize, val: T) !void {
+    if (n == old.len) return;
+    const s = try allocAtomicArr(T, a, n, val);
+    for (s[0..@min(n, old.len)], 0..) |*v, i| v.* = std.atomic.Value(T).init(old.*[i].load(.monotonic));
+    if (old.len > 0) a.free(old.*);
+    old.* = s;
+}
+
+/// 扩容/缩容（名称沿史，语义 = resize）：行数/列数变小=剪枝，变大=补齐
+fn growAtomicRows(comptime T: type, a: std.mem.Allocator, old: *[][]std.atomic.Value(T), rows: usize, cols: usize, val: T) !void {
+    if (rows == old.len and (rows == 0 or old.*[0].len == cols)) return;
+    const outer = try a.alloc([]std.atomic.Value(T), rows);
+    @memset(outer, &.{});
+    errdefer {
+        for (outer) |r| if (r.len > 0) a.free(r);
+        a.free(outer);
+    }
+    for (outer, 0..) |*r, i| {
+        r.* = try allocAtomicArr(T, a, cols, val);
+        if (i < old.len) {
+            for (r.*[0..@min(cols, old.*[i].len)], 0..) |*v, k| v.* = std.atomic.Value(T).init(old.*[i][k].load(.monotonic));
+        }
+    }
+    for (old.*) |r| if (r.len > 0) a.free(r);
+    if (old.len > 0) a.free(old.*);
+    old.* = outer;
+}
+
+/// 调音台 EQ 五段默认值（initCapacity/grow 共用）
+fn setDefaultEqBands(r: []eq.BandParams) void {
+    const d = [_]eq.BandParams{
+        .{ .freq = 100, .q = 1.0 },
+        .{ .freq = 500, .q = 1.0 },
+        .{ .freq = 2000, .q = 1.0 },
+        .{ .freq = 8000, .q = 1.0 },
+        .{ .freq = 12000, .q = 1.0 },
+    };
+    for (r, 0..) |*b, i| b.* = if (i < d.len) d[i] else .{};
+}
 
 pub const Engine = struct {
     device: ma.ma_device = undefined,
@@ -233,21 +423,25 @@ pub const Engine = struct {
     initialized: bool = false,
     /// 每乐器一个声部池（**仅音频线程访问**；堆分配——32 池 × 256 声部体积可观）
     synths: []synth.Synth = &.{},
-    /// 鼓组层声部池（**预分配大块**：max_instruments × kit_max_layers；
-    /// 索引 = `i * kit_max_layers + l`）。启动一次分配——无生命周期管理
-    /// （层槽位复用：层数/参数变时旧声部自然 release，无需释放池）。
-    kit_synths: []synth.KitLayerSynth = &.{},
+    /// 鼓组层声部池（**惰性**：每乐器的 16 层池按需分配，见 `App.ensureKitPool`——
+    /// 指针数组按容量维护；普通（非鼓组）乐器零开销，扩容拷贝量不再含声部状态）。
+    kit_chunks: []std.atomic.Value(?*KitPool) = &.{},
     /// VSTi 渲染中转缓冲（插件的原位写出不能直接覆盖通道缓冲——需叠加）
     vsti_scratch: []f32 = &.{},
     /// VSTi 待发送事件批（事件在**段边界以 offset 0 生效**：dispatchNote 填充，
     /// renderSegment 消费后清零——与内部合成器的样本级触发共用同一分段机制）
-    vsti_events: [synth.max_instruments][vsti_batch_max]ivstevents.Event = [_][vsti_batch_max]ivstevents.Event{[_]ivstevents.Event{.{}} ** vsti_batch_max} ** synth.max_instruments,
-    vsti_event_n: [synth.max_instruments]usize = [_]usize{0} ** synth.max_instruments,
+    vsti_events: [][]ivstevents.Event = &.{},
+    vsti_event_n: []usize = &.{},
     /// VSTi 正在发声的音高（位图；all-off 时按位补发 note-off）
-    vsti_active_lo: [synth.max_instruments]u64 = [_]u64{0} ** synth.max_instruments,
-    vsti_active_hi: [synth.max_instruments]u64 = [_]u64{0} ** synth.max_instruments,
+    vsti_active_lo: []u64 = &.{},
+    vsti_active_hi: []u64 = &.{},
     /// 每乐器上一帧的类型（类型切换边沿 → 两个池都全释音，防悬挂）
-    last_kind: [synth.max_instruments]u32 = [_]u32{0} ** synth.max_instruments,
+    last_kind: []u32 = &.{},
+
+    // ── 运行时容量（与 `Params` 同步；见 `setCapacity`）──
+    instruments_cap: usize = 0,
+    channels_cap: usize = 0,
+    slots_cap: usize = 0,
     /// 已取但未到时的调度事件（stash；按步序保留，到时再触发）
     stash: [synth.sched_drain_max]synth.SchedEvent = undefined,
     stash_n: usize = 0,
@@ -264,7 +458,7 @@ pub const Engine = struct {
     /// 布局：`[ch][slot][band][2]` 展平索引。
     slot_eq: []eq.Biquad = &.{},
     /// 每通道已应用的 EQ 版本（与 params.channel_eq_version 对比）
-    chan_eq_ver: [mixer_channels]u32 = [_]u32{0} ** mixer_channels,
+    chan_eq_ver: []u32 = &.{},
     /// 注：混响/延迟/压缩器状态已改为**每槽状态盒**（`Params.fx_ptrs`，
     /// UI 线程分配/退役）——原“每通道一份”的 `reverbs/delays/comps` 已移除
     /// （用户要叠加相同效果；Delay 每份 768KB，不能按槽预分配）。
@@ -283,11 +477,8 @@ pub const Engine = struct {
     pub fn init(self: *Engine, params: *Params, allocator: std.mem.Allocator) !void {
         self.params = params;
         self.allocator = allocator;
-        self.synths = try allocator.alloc(synth.Synth, synth.max_instruments);
-        for (self.synths) |*s| s.* = .{};
-        // 鼓组层声部池（预分配大块；≈32×16 × 9.6KB ≈ 5MB，一次分配）
-        self.kit_synths = try allocator.alloc(synth.KitLayerSynth, synth.max_instruments * kit_max_layers);
-        for (self.kit_synths) |*s| s.* = .{};
+        // 容量数组：按 Params 当前容量建立（乐器/通道/效果槽）
+        try self.setCapacity(params.instruments_cap, params.channels_cap, params.slots_cap);
         // VSTi 中转缓冲（一个渲染块大小）
         self.vsti_scratch = try allocator.alloc(f32, 2 * 4096);
         @memset(self.vsti_scratch, 0);
@@ -337,10 +528,11 @@ pub const Engine = struct {
             self.allocator.free(self.synths);
             self.synths = &.{};
         }
-        if (self.kit_synths.len > 0) {
-            self.allocator.free(self.kit_synths);
-            self.kit_synths = &.{};
+        for (self.kit_chunks) |*c| {
+            if (c.load(.monotonic)) |kp| self.allocator.destroy(kp);
         }
+        if (self.kit_chunks.len > 0) self.allocator.free(self.kit_chunks);
+        self.kit_chunks = &.{};
         if (self.vsti_scratch.len > 0) {
             self.allocator.free(self.vsti_scratch);
             self.vsti_scratch = &.{};
@@ -353,20 +545,151 @@ pub const Engine = struct {
             self.allocator.free(self.slot_eq);
             self.slot_eq = &.{};
         }
+        for (self.vsti_events) |r| if (r.len > 0) self.allocator.free(r);
+        if (self.vsti_events.len > 0) self.allocator.free(self.vsti_events);
+        self.vsti_events = &.{};
+        if (self.vsti_event_n.len > 0) self.allocator.free(self.vsti_event_n);
+        self.vsti_event_n = &.{};
+        if (self.vsti_active_lo.len > 0) self.allocator.free(self.vsti_active_lo);
+        self.vsti_active_lo = &.{};
+        if (self.vsti_active_hi.len > 0) self.allocator.free(self.vsti_active_hi);
+        self.vsti_active_hi = &.{};
+        if (self.last_kind.len > 0) self.allocator.free(self.last_kind);
+        self.last_kind = &.{};
+        if (self.chan_eq_ver.len > 0) self.allocator.free(self.chan_eq_ver);
+        self.chan_eq_ver = &.{};
+        self.instruments_cap = 0;
+        self.channels_cap = 0;
+        self.slots_cap = 0;
+    }
+
+    /// 建立/扩容引擎侧容量数组（**契约：设备未运行或已暂停**——见 `App.ensureAudioCapacity`）。
+    /// 只增不减；旧内容（声部状态/缓冲残留/EQ 滤波器）按新布局拷贝保留。
+    pub fn setCapacity(self: *Engine, ic: usize, cc: usize, sc: usize) !void {
+        const a = self.allocator;
+        if (ic != self.instruments_cap) {
+            const ns = try a.alloc(synth.Synth, ic);
+            for (ns) |*s| s.* = .{};
+            for (ns[0..@min(ic, self.synths.len)], 0..) |*s, i| s.* = self.synths[i];
+            if (self.synths.len > 0) a.free(self.synths);
+            self.synths = ns;
+            // 鼓组层声部池：惰性——只维护指针数组（Chunk 由 `App.ensureKitPool` 分配）
+            const nk = try a.alloc(std.atomic.Value(?*KitPool), ic);
+            for (nk) |*c| c.* = std.atomic.Value(?*KitPool).init(null);
+            for (nk[0..@min(ic, self.kit_chunks.len)], 0..) |*c, i| c.* = std.atomic.Value(?*KitPool).init(self.kit_chunks[i].load(.monotonic));
+            // 缩容裁掉的池就地释放（契约：设备不运行或已暂停）
+            if (self.kit_chunks.len > ic) {
+                for (self.kit_chunks[ic..]) |*c| {
+                    if (c.load(.monotonic)) |kp| a.destroy(kp);
+                }
+            }
+            if (self.kit_chunks.len > 0) a.free(self.kit_chunks);
+            self.kit_chunks = nk;
+            const ne = try a.alloc([]ivstevents.Event, ic);
+            @memset(ne, &.{});
+            errdefer {
+                for (ne) |r| if (r.len > 0) a.free(r);
+                a.free(ne);
+            }
+            for (ne, 0..) |*r, i| {
+                r.* = try a.alloc(ivstevents.Event, vsti_batch_max);
+                @memset(r.*, .{});
+                if (i < self.vsti_events.len and self.vsti_events[i].len > 0) {
+                    const cp = @min(r.len, self.vsti_events[i].len);
+                    @memcpy(r.*[0..cp], self.vsti_events[i][0..cp]);
+                }
+            }
+            for (self.vsti_events) |r| if (r.len > 0) a.free(r);
+            if (self.vsti_events.len > 0) a.free(self.vsti_events);
+            self.vsti_events = ne;
+            const nn = try a.alloc(usize, ic);
+            @memset(nn, 0);
+            @memcpy(nn[0..@min(ic, self.vsti_event_n.len)], self.vsti_event_n[0..@min(ic, self.vsti_event_n.len)]);
+            if (self.vsti_event_n.len > 0) a.free(self.vsti_event_n);
+            self.vsti_event_n = nn;
+            const nl = try a.alloc(u64, ic);
+            @memset(nl, 0);
+            @memcpy(nl[0..@min(ic, self.vsti_active_lo.len)], self.vsti_active_lo[0..@min(ic, self.vsti_active_lo.len)]);
+            if (self.vsti_active_lo.len > 0) a.free(self.vsti_active_lo);
+            self.vsti_active_lo = nl;
+            const nh = try a.alloc(u64, ic);
+            @memset(nh, 0);
+            @memcpy(nh[0..@min(ic, self.vsti_active_hi.len)], self.vsti_active_hi[0..@min(ic, self.vsti_active_hi.len)]);
+            if (self.vsti_active_hi.len > 0) a.free(self.vsti_active_hi);
+            self.vsti_active_hi = nh;
+            const nk2 = try a.alloc(u32, ic);
+            @memset(nk2, 0);
+            @memcpy(nk2[0..@min(ic, self.last_kind.len)], self.last_kind[0..@min(ic, self.last_kind.len)]);
+            if (self.last_kind.len > 0) a.free(self.last_kind);
+            self.last_kind = nk2;
+            self.instruments_cap = ic;
+        }
+        if (cc != self.channels_cap) {
+            const nb = try a.alloc(f32, cc * 2 * 4096);
+            @memset(nb, 0);
+            const cp2 = @min(nb.len, self.chan_bufs.len);
+            @memcpy(nb[0..cp2], self.chan_bufs[0..cp2]);
+            if (self.chan_bufs.len > 0) a.free(self.chan_bufs);
+            self.chan_bufs = nb;
+            const nv = try a.alloc(u32, cc);
+            @memset(nv, 0);
+            @memcpy(nv[0..@min(cc, self.chan_eq_ver.len)], self.chan_eq_ver[0..@min(cc, self.chan_eq_ver.len)]);
+            if (self.chan_eq_ver.len > 0) a.free(self.chan_eq_ver);
+            self.chan_eq_ver = nv;
+            self.channels_cap = cc;
+        }
+        if (self.slot_eq.len != cc * sc * eq_bands * 2) {
+            // slot_eq 重排：旧 (channels × slots) → 新（逐通道逐槽拷贝）
+            const old_sc = self.slots_cap;
+            const old_total = self.slot_eq.len;
+            const old_cc = if (old_sc > 0) old_total / (old_sc * eq_bands * 2) else 0;
+            const nq = try a.alloc(eq.Biquad, cc * sc * eq_bands * 2);
+            @memset(nq, .{});
+            const ccp = @min(cc, old_cc);
+            const scp = @min(sc, old_sc);
+            for (0..ccp) |ch| {
+                for (0..scp) |sl| {
+                    const o = (ch * old_sc + sl) * eq_bands * 2;
+                    const n2 = (ch * sc + sl) * eq_bands * 2;
+                    @memcpy(nq[n2 .. n2 + eq_bands * 2], self.slot_eq[o .. o + eq_bands * 2]);
+                }
+            }
+            if (self.slot_eq.len > 0) a.free(self.slot_eq);
+            self.slot_eq = nq;
+            self.slots_cap = sc;
+        }
+    }
+
+    /// 取鼓组层池的第 l 层（未分配 → null；测试也用它直取层池）
+    pub fn kitSynth(self: *const Engine, i: usize, l: usize) ?*synth.KitLayerSynth {
+        const kp = kitPool(self, i) orelse return null;
+        if (l >= kit_max_layers) return null;
+        return &kp.*[l];
     }
 };
 
+/// 鼓组层声部池：每乐器一池（`kit_max_layers` 层 × 每层 32 声部）
+pub const KitPool = [kit_max_layers]synth.KitLayerSynth;
+
+/// 取某乐器的鼓组层池（未分配 → null；惰性分配见 `App.ensureKitPool`）
+fn kitPool(engine: *const Engine, i: usize) ?*KitPool {
+    if (i >= engine.kit_chunks.len) return null;
+    return engine.kit_chunks[i].load(.acquire);
+}
+
 /// 释放**两个声部池**的全部声部（合成器 + 鼓组层）——暂停下降沿/跳转作废/
 /// 全体释音（all_off）共用。
-/// 注：漏掉 `kit_synths` 是实测 bug——暂停后鼓组的音会一直响到停止
+/// 注：漏掉鼓组层池是实测 bug——暂停后鼓组的音会一直响到停止
 /// （旧代码只遍历了 `synths`）。
 fn releaseAllVoices(engine: *Engine) void {
     for (engine.synths) |*s| synth.allOff(s);
-    for (engine.kit_synths) |*s| synth.allOff(s);
+    for (engine.kit_chunks) |*c| {
+        if (c.load(.monotonic)) |kp| for (&kp.*) |*s| synth.allOff(s);
+    }
     // VSTi：**panic 式**全体释音（全 128 音高）——位图可能已失同步
     // （如恢复唤醒的幽灵声部/批满丢事件），按位图补 off 会漏 → 用不掉挂的版本
     const params = engine.params;
-    for (0..synth.max_instruments) |i| {
+    for (0..engine.synths.len) |i| {
         if (params.instrument_kind[i].load(.monotonic) == 2) vstiPanic(engine, i);
     }
 }
@@ -522,7 +845,7 @@ fn schedEventObsolete(ev: synth.SchedEvent, gen: u32, edit_gen: u32, rescan_from
 /// 回传“正在发声的音高”（位掩码；UI 用于播放/试听高亮）。
 /// 鼓组：各层池的并集（层与垫多对一，并集即该组当前发声的音高）。
 fn publishSounding(engine: *Engine, params: *Params) void {
-    for (0..synth.max_instruments) |i| {
+    for (0..engine.synths.len) |i| {
         if (params.instrument_kind[i].load(.monotonic) == 2) {
             // VST3 乐器：直接发布 note-on 活跃位图（宿主侧无声部模型；
             // 位图由 vstiNoteOn/Off 维护——暂停/释音也经 all-off 同位清）
@@ -547,19 +870,18 @@ fn publishSounding(engine: *Engine, params: *Params) void {
                 hi |= @as(u64, 1) << @intCast(p - 64);
             }
         }
-        // 鼓组层池（未用到的池全空闲，扫描成本低）——池未分配时跳过
-        // （离线导出/测试环境可能未 alloc：防越界）
-        const kbase = i * kit_max_layers;
-        const kn = @min(kit_max_layers, engine.kit_synths.len -| kbase);
-        for (0..kn) |l| {
-            for (engine.kit_synths[kbase + l].voices) |v| {
-                if (!synth.isSounding(&v)) continue;
-                const p = v.pitch;
-                if (p < 0 or p > 127) continue;
-                if (p < 64) {
-                    lo |= @as(u64, 1) << @intCast(p);
-                } else {
-                    hi |= @as(u64, 1) << @intCast(p - 64);
+        // 鼓组层池（惰性分配；未分配 = 无声部 → 跳过）
+        if (kitPool(engine, i)) |kp| {
+            for (&kp.*) |*s| {
+                for (s.voices) |v| {
+                    if (!synth.isSounding(&v)) continue;
+                    const p = v.pitch;
+                    if (p < 0 or p > 127) continue;
+                    if (p < 64) {
+                        lo |= @as(u64, 1) << @intCast(p);
+                    } else {
+                        hi |= @as(u64, 1) << @intCast(p - 64);
+                    }
                 }
             }
         }
@@ -615,12 +937,11 @@ fn currentHostTime(engine: *Engine, params: *Params, sr: f32) vst_host.HostTime 
 /// **鼓组分支**：on 按音高分发到匹配层；off **不查映射**直接对所有层——
 /// 防“响着时改映射”漏 off → 悬挂（与调音台教训一致）。
 fn dispatchNote(engine: *Engine, ev: anytype) void {
-    if (ev.instrument >= synth.max_instruments) return;
+    if (ev.instrument >= engine.synths.len) return;
     const params = engine.params;
     const kind = params.instrument_kind[ev.instrument].load(.monotonic);
     const is_kit = kind == 1;
     const is_vsti = kind == 2;
-    const base = @as(usize, ev.instrument) * kit_max_layers;
     switch (ev.kind) {
         .on => {
             // **有效声像** = 乐器声像（基准）+ 音符级偏移（Sawdust 特色）
@@ -631,7 +952,8 @@ fn dispatchNote(engine: *Engine, ev: anytype) void {
                 const n_layers = @min(params.kit_layer_count[ev.instrument].load(.monotonic), kit_max_layers);
                 for (0..n_layers) |l| {
                     if (params.kit_layer_pitch[ev.instrument][l].load(.monotonic) != ev.pitch) continue;
-                    synth.noteOn(&engine.kit_synths[base + l], ev.pitch, ev.velocity, pan);
+                    const ks = engine.kitSynth(ev.instrument, l) orelse continue;
+                    synth.noteOn(ks, ev.pitch, ev.velocity, pan);
                 }
             } else {
                 synth.noteOn(&engine.synths[ev.instrument], ev.pitch, ev.velocity, pan);
@@ -643,7 +965,7 @@ fn dispatchNote(engine: *Engine, ev: anytype) void {
             } else if (is_kit) {
                 // 全部层都收 off（无关层空转——防漏 off）
                 const n_layers = @min(params.kit_layer_count[ev.instrument].load(.monotonic), kit_max_layers);
-                for (0..n_layers) |l| synth.noteOff(&engine.kit_synths[base + l], ev.pitch);
+                for (0..n_layers) |l| if (engine.kitSynth(ev.instrument, l)) |ks| synth.noteOff(ks, ev.pitch);
                 // 类型刚切走的边角：synth 池也发一份（空转无害）
                 synth.noteOff(&engine.synths[ev.instrument], ev.pitch);
             } else {
@@ -658,7 +980,7 @@ fn dispatchNote(engine: *Engine, ev: anytype) void {
 
 /// 展平索引取 EQ Biquad（`engine.slot_eq` 的布局：`[ch][slot][band][2]`）
 inline fn eqBiquadAt(engine: *Engine, ch: usize, slot: usize, band: usize, chan: usize) *eq.Biquad {
-    const idx = ((ch * effect_slots + slot) * eq_bands + band) * 2 + chan;
+    const idx = ((ch * engine.slots_cap + slot) * eq_bands + band) * 2 + chan;
     return &engine.slot_eq[idx];
 }
 
@@ -666,9 +988,10 @@ inline fn eqBiquadAt(engine: *Engine, ch: usize, slot: usize, band: usize, chan:
 /// `out` 已清零；本函数**累加**到 out。
 pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32, sr: f32, master: f32) void {
     const n: usize = @as(usize, frames) * 2;
-    const n_ch: usize = @min(params.channel_count.load(.monotonic), mixer_channels);
-    if (engine.chan_bufs.len < mixer_channels * 2 * 4096 or engine.slot_eq.len < mixer_channels * effect_slots * eq_bands * 2) return;
     const buf_stride: usize = 2 * 4096;
+    const n_ch: usize = @min(params.channel_count.load(.monotonic), engine.channels_cap);
+    // 容量未建立/缓冲尺寸不足（测试环境手工布局）→ 直接返回
+    if (n_ch > 0 and (engine.chan_bufs.len < n_ch * buf_stride or engine.slot_eq.len < n_ch * engine.slots_cap * eq_bands * 2)) return;
     // 本段的宿主时间（tempo/拍号/位置/ppq；VST3 插件的 ProcessContext）
     const host_time = currentHostTime(engine, params, sr);
 
@@ -686,7 +1009,7 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
     for (0..n_ch) |ci| @memset(engine.chan_bufs[ci * buf_stride ..][0..n], 0);
 
     // 2) 乐器 → 各自通道的缓冲（**按通道路由分开渲染**——通道 EQ 必须逐通道）
-    for (0..synth.max_instruments) |i| {
+    for (0..engine.synths.len) |i| {
         const kind = params.instrument_kind[i].load(.monotonic);
         const ch: usize = @min(params.instrument_channel[i].load(.monotonic), if (n_ch > 0) n_ch - 1 else 0);
         const g = params.instrument_gain[i].load(.monotonic); // 乐器音量×静音（推子前）
@@ -717,11 +1040,11 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
         if (kind == 1) {
             // 鼓组：逐层渲染叠加进同一通道缓冲（整组走同一调音台链）
             const n_layers = @min(params.kit_layer_count[i].load(.monotonic), kit_max_layers);
-            const base = i * kit_max_layers;
             for (0..n_layers) |l| {
                 const lp = params.kit_layer_params[i][l].load(.monotonic) orelse continue;
                 const lg = params.kit_layer_gain[i][l].load(.monotonic);
-                synth.render(lp, &engine.kit_synths[base + l], cbuf, frames, sr, g * lg, true);
+                const ks = engine.kitSynth(i, l) orelse continue;
+                synth.render(lp, ks, cbuf, frames, sr, g * lg, true);
             }
         } else {
             synth.render(sp, &engine.synths[i], cbuf, frames, sr, g, true);
@@ -777,7 +1100,7 @@ fn processChannelChain(engine: *Engine, params: *Params, ch_i: usize, buf: []f32
     const ver = params.channel_eq_version[ch_i].load(.monotonic);
     if (ver != engine.chan_eq_ver[ch_i]) {
         engine.chan_eq_ver[ch_i] = ver;
-        for (0..effect_slots) |slot| {
+        for (0..engine.slots_cap) |slot| {
             for (0..eq_bands) |b| {
                 const p = params.channel_eq[ch_i][b];
                 eqBiquadAt(engine, ch_i, slot, b, 0).setPeak(sr, p.freq, p.q, p.gain_db);
@@ -787,7 +1110,7 @@ fn processChannelChain(engine: *Engine, params: *Params, ch_i: usize, buf: []f32
     }
 
     // 效果器链长度（以 `effect_count` 为准）
-    const eff_n: usize = @min(params.effect_count[ch_i].load(.monotonic), effect_slots);
+    const eff_n: usize = @min(params.effect_count[ch_i].load(.monotonic), engine.slots_cap);
 
     // ── 效果器链（插件式；按槽顺序）──
     // 干湿比：效果信号与干声逐样本混合（mix = 0 为完全干声）
@@ -824,7 +1147,7 @@ fn processChannelChain(engine: *Engine, params: *Params, ch_i: usize, buf: []f32
                 const raw = params.fx_ptrs[ch_i][slot].load(.monotonic) orelse continue;
                 const box: *FxBox = @ptrCast(@alignCast(raw));
                 var p: [fx.max_params]f32 = undefined;
-                for (0..fx.max_params) |pi| p[pi] = params.effect_p[ch_i][slot][pi].load(.monotonic);
+                for (0..fx.max_params) |pi| p[pi] = params.fxParam(ch_i, slot, pi).load(.monotonic);
                 // 每拍秒数（延迟卡拍用；BPM 已钳到 ≥20，与序列器换算同一口径）
                 const beat_secs: f32 = 60.0 / @as(f32, @floatFromInt(@max(20, params.bpm.load(.monotonic))));
                 // 按**盒内 kind** 分派（链 kind 与指针更新有帧间竞态；盒是自洽的）
@@ -888,13 +1211,12 @@ fn analyzeSpectrum(engine: *Engine, params: *Params, sr: f32) void {
 /// （切 synth ⇄ drumkit 时旧类型的声部不能继续响——防悬挂）
 fn applyKindEdges(engine: *Engine) void {
     const params = engine.params;
-    for (0..synth.max_instruments) |i| {
+    for (0..engine.synths.len) |i| {
         const k = params.instrument_kind[i].load(.monotonic);
         if (k == engine.last_kind[i]) continue;
         engine.last_kind[i] = k;
         synth.allOff(&engine.synths[i]);
-        const kbase = i * kit_max_layers;
-        for (0..kit_max_layers) |l| synth.allOff(&engine.kit_synths[kbase + l]);
+        if (kitPool(engine, i)) |kp| for (&kp.*) |*s| synth.allOff(s);
         // VSTi：类型切走/切回都补 off（防悬挂）；待发批一并作废
         vstiAllOff(engine, i);
         engine.vsti_event_n[i] = 0;
@@ -1025,10 +1347,12 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
 
 test "audio: 播放中 gen 变化（跳转）释放全部声部（修“跳走后音符悬挂”）" {
     var params = Params{};
+    try params.initCapacity(std.testing.allocator, 1, 0, 0);
+    defer params.deinit(std.testing.allocator);
     var engine = Engine{ .params = &params };
-    engine.synths = try std.testing.allocator.alloc(synth.Synth, 1);
-    defer std.testing.allocator.free(engine.synths);
-    for (engine.synths) |*s| s.* = .{};
+    engine.allocator = std.testing.allocator;
+    try engine.setCapacity(1, 0, 0);
+    defer engine.deinit();
 
     var p = synth.SynthParams{}; // 默认：release ≈ 10ms、sustain 0.7
     var buf: [4800 * 2]f32 = undefined; // 0.1s @ 48k
@@ -1058,6 +1382,8 @@ test "audio: 播放中 gen 变化（跳转）释放全部声部（修“跳走�
 
 test "audio: Params 默认值" {
     var p = Params{};
+    try p.initCapacity(std.testing.allocator, 1, 1, 1);
+    defer p.deinit(std.testing.allocator);
     try std.testing.expectApproxEqAbs(@as(f32, 0.75), p.volume.load(.monotonic), 0.001);
     try std.testing.expect(!p.playing.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 1), p.sched_gen.load(.monotonic));
@@ -1086,7 +1412,12 @@ test "audio: 事件作废判定——旧代低步保留（安全界过滤）" {
 
 test "audio: stash 去重——同键更旧代被替换；同代重复保留" {
     var params = Params{};
+    try params.initCapacity(std.testing.allocator, 1, 0, 0);
+    defer params.deinit(std.testing.allocator);
     var engine = Engine{ .params = &params };
+    engine.allocator = std.testing.allocator;
+    try engine.setCapacity(1, 0, 0);
+    defer engine.deinit();
 
     // 旧副本（代 1）→ 重发副本（代 2）：后者插入时清掉前者
     const e1 = synth.SchedEvent{ .kind = .on, .pitch = 60, .instrument = 0, .step = 100, .gen = 1, .edit_gen = 1 };
@@ -1126,15 +1457,12 @@ test "audio: EQ 干湿比生效（100% 与 0% 输出显著不同——非占位�
     const energy = struct {
         fn run(alloc_: std.mem.Allocator, mix: f32) !f64 {
             var params = Params{};
+            try params.initCapacity(alloc_, 1, 2, 1);
+            defer params.deinit(alloc_);
             var engine = Engine{ .params = &params };
-            engine.synths = try alloc_.alloc(synth.Synth, 1);
-            defer alloc_.free(engine.synths);
-            engine.synths[0] = .{};
-            engine.chan_bufs = try alloc_.alloc(f32, mixer_channels * 2 * 4096);
-            defer alloc_.free(engine.chan_bufs);
-            engine.slot_eq = try alloc_.alloc(eq.Biquad, mixer_channels * effect_slots * eq_bands * 2);
-            defer alloc_.free(engine.slot_eq);
-            @memset(engine.slot_eq, .{});
+            engine.allocator = alloc_;
+            try engine.setCapacity(1, 2, 1);
+            defer engine.deinit();
 
             var sp = synth.SynthParams{ .attack = std.atomic.Value(f32).init(0.0) };
             params.channel_count.store(1, .monotonic);
@@ -1175,10 +1503,12 @@ test "audio: EQ 干湿比生效（100% 与 0% 输出显著不同——非占位�
 
 test "audio: 暂停边沿释放全部声部（修“暂停后音符一直响”）" {
     var params = Params{};
+    try params.initCapacity(std.testing.allocator, 2, 0, 0);
+    defer params.deinit(std.testing.allocator);
     var engine = Engine{ .params = &params };
-    engine.synths = try std.testing.allocator.alloc(synth.Synth, 2);
-    defer std.testing.allocator.free(engine.synths);
-    for (engine.synths) |*s| s.* = .{};
+    engine.allocator = std.testing.allocator;
+    try engine.setCapacity(2, 0, 0);
+    defer engine.deinit();
 
     // 两个乐器各发一个音（模拟播放中的状态）
     synth.noteOn(&engine.synths[0], 60, synth.default_velocity, synth.default_pan);
@@ -1219,33 +1549,29 @@ test "audio: 暂停/跳转边沿也释放鼓组层池（修“暂停后鼓声一
 
     // ① 暂停下降沿：鼓组层进入释音（旧代码只释放 synths → 鼓声悬挂）
     dispatchNote(engine, synth.NoteEvent{ .kind = .on, .pitch = 35, .instrument = 0 });
-    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(&engine.kit_synths[0]));
+    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(engine.kitSynth(0, 0).?));
     engine.was_playing = true;
     transportEdge(engine, false);
-    synth.render(&lp0, &engine.kit_synths[0], &buf, 4800, 48000, 1.0, false);
-    try std.testing.expectEqual(@as(usize, 0), synth.activeCount(&engine.kit_synths[0]));
+    synth.render(&lp0, engine.kitSynth(0, 0).?, &buf, 4800, 48000, 1.0, false);
+    try std.testing.expectEqual(@as(usize, 0), synth.activeCount(engine.kitSynth(0, 0).?));
 
     // ② 跳转（gen 变化且播放中）：同样释放层池
     dispatchNote(engine, synth.NoteEvent{ .kind = .on, .pitch = 35, .instrument = 0 });
-    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(&engine.kit_synths[0]));
+    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(engine.kitSynth(0, 0).?));
     handleGenChange(engine, engine.stash_gen + 1, true);
-    synth.render(&lp0, &engine.kit_synths[0], &buf, 4800, 48000, 1.0, false);
-    try std.testing.expectEqual(@as(usize, 0), synth.activeCount(&engine.kit_synths[0]));
+    synth.render(&lp0, engine.kitSynth(0, 0).?, &buf, 4800, 48000, 1.0, false);
+    try std.testing.expectEqual(@as(usize, 0), synth.activeCount(engine.kitSynth(0, 0).?));
 }
 
 test "audio: 频谱取自目标效果器输入（非主输出全混）" {
     const alloc = std.testing.allocator;
     var params = Params{};
+    try params.initCapacity(alloc, 2, 2, 1);
+    defer params.deinit(alloc);
     var engine = Engine{ .params = &params };
-    engine.synths = try alloc.alloc(synth.Synth, 2);
-    defer alloc.free(engine.synths);
-    engine.synths[0] = .{};
-    engine.synths[1] = .{};
-    engine.chan_bufs = try alloc.alloc(f32, mixer_channels * 2 * 4096);
-    defer alloc.free(engine.chan_bufs);
-    engine.slot_eq = try alloc.alloc(eq.Biquad, mixer_channels * effect_slots * eq_bands * 2);
-    defer alloc.free(engine.slot_eq);
-    @memset(engine.slot_eq, .{});
+    engine.allocator = alloc;
+    try engine.setCapacity(2, 2, 1);
+    defer engine.deinit();
 
     // 乐器 0 → 通道 0，乐器 1 → 通道 1；通道 0 有 1 个 EQ 槽
     var sp0 = synth.SynthParams{};
@@ -1337,24 +1663,19 @@ const KitTestEnv = struct {
 
     fn init(self: *KitTestEnv, alloc: std.mem.Allocator, with_bufs: bool) !void {
         self.* = .{};
+        try self.params.initCapacity(alloc, 4, if (with_bufs) 2 else 0, if (with_bufs) 1 else 0);
         self.engine = Engine{ .params = &self.params };
-        self.engine.synths = try alloc.alloc(synth.Synth, 1);
-        self.engine.synths[0] = .{};
-        self.engine.kit_synths = try alloc.alloc(synth.KitLayerSynth, synth.max_instruments * kit_max_layers);
-        for (self.engine.kit_synths) |*s| s.* = .{};
-        if (with_bufs) {
-            self.engine.chan_bufs = try alloc.alloc(f32, mixer_channels * 2 * 4096);
-            self.engine.slot_eq = try alloc.alloc(eq.Biquad, mixer_channels * effect_slots * eq_bands * 2);
-            @memset(self.engine.slot_eq, .{});
-        }
+        self.engine.allocator = alloc;
+        try self.engine.setCapacity(self.params.instruments_cap, self.params.channels_cap, self.params.slots_cap);
+        // 夹具：默认分配乐器 0 的鼓组层池（用例用 `kitSynth(0, l)` 直取）
+        const kp = try alloc.create(KitPool);
+        for (kp) |*s| s.* = .{};
+        self.engine.kit_chunks[0].store(kp, .monotonic);
     }
 
     fn deinit(self: *KitTestEnv, alloc: std.mem.Allocator) void {
-        alloc.free(self.engine.synths);
-        alloc.free(self.engine.kit_synths);
-        if (self.engine.chan_bufs.len > 0) alloc.free(self.engine.chan_bufs);
-        if (self.engine.slot_eq.len > 0) alloc.free(self.engine.slot_eq);
-        if (self.engine.vsti_scratch.len > 0) alloc.free(self.engine.vsti_scratch);
+        self.engine.deinit();
+        self.params.deinit(alloc);
     }
 
     /// 组 0 设为鼓组；槽位按 (音高, 参数) 逐对写入
@@ -1384,9 +1705,9 @@ test "audio: 鼓组——on 按音高分发（同音多层全触发）、off 全
 
     // on 35 → 槽位 0/1（同音高两层）都触发；槽位 2（38）不动
     dispatchNote(&env.engine, synth.NoteEvent{ .kind = .on, .pitch = 35, .instrument = 0 });
-    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(&env.engine.kit_synths[0]));
-    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(&env.engine.kit_synths[1]));
-    try std.testing.expectEqual(@as(usize, 0), synth.activeCount(&env.engine.kit_synths[2]));
+    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(env.engine.kitSynth(0, 0).?));
+    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(env.engine.kitSynth(0, 1).?));
+    try std.testing.expectEqual(@as(usize, 0), synth.activeCount(env.engine.kitSynth(0, 2).?));
 
     // 高亮并集：35；再响 38 → 两位都置
     publishSounding(&env.engine, &env.params);
@@ -1398,11 +1719,11 @@ test "audio: 鼓组——on 按音高分发（同音多层全触发）、off 全
     // off 35：**全层**都收到（不查映射）——槽位 0/1 释放、槽位 2 不受影响
     dispatchNote(&env.engine, synth.NoteEvent{ .kind = .off, .pitch = 35, .instrument = 0 });
     var buf: [4800 * 2]f32 = undefined;
-    synth.render(&lp0, &env.engine.kit_synths[0], &buf, 4800, 48000, 1.0, false);
-    synth.render(&lp1, &env.engine.kit_synths[1], &buf, 4800, 48000, 1.0, false);
-    try std.testing.expectEqual(@as(usize, 0), synth.activeCount(&env.engine.kit_synths[0]));
-    try std.testing.expectEqual(@as(usize, 0), synth.activeCount(&env.engine.kit_synths[1]));
-    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(&env.engine.kit_synths[2])); // 38 仍在响
+    synth.render(&lp0, env.engine.kitSynth(0, 0).?, &buf, 4800, 48000, 1.0, false);
+    synth.render(&lp1, env.engine.kitSynth(0, 1).?, &buf, 4800, 48000, 1.0, false);
+    try std.testing.expectEqual(@as(usize, 0), synth.activeCount(env.engine.kitSynth(0, 0).?));
+    try std.testing.expectEqual(@as(usize, 0), synth.activeCount(env.engine.kitSynth(0, 1).?));
+    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(env.engine.kitSynth(0, 2).?)); // 38 仍在响
 }
 
 test "audio: 鼓组——响着时改映射，off 仍全层下发（防漏 off 悬挂）" {
@@ -1417,7 +1738,7 @@ test "audio: 鼓组——响着时改映射，off 仍全层下发（防漏 off �
 
     // on 35 → 槽位 0 发声
     dispatchNote(&env.engine, synth.NoteEvent{ .kind = .on, .pitch = 35, .instrument = 0 });
-    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(&env.engine.kit_synths[0]));
+    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(env.engine.kitSynth(0, 0).?));
 
     // 响着时改映射：槽位 0 改成 36（模拟用户编辑）——old 35 声部还在响
     env.params.kit_layer_pitch[0][0].store(36, .monotonic);
@@ -1426,8 +1747,8 @@ test "audio: 鼓组——响着时改映射，off 仍全层下发（防漏 off �
     // （若 off 查映射，这里会漏 → 悬挂，正是实测教训的模式）
     dispatchNote(&env.engine, synth.NoteEvent{ .kind = .off, .pitch = 35, .instrument = 0 });
     var buf: [4800 * 2]f32 = undefined;
-    synth.render(&lp0, &env.engine.kit_synths[0], &buf, 4800, 48000, 1.0, false);
-    try std.testing.expectEqual(@as(usize, 0), synth.activeCount(&env.engine.kit_synths[0]));
+    synth.render(&lp0, env.engine.kitSynth(0, 0).?, &buf, 4800, 48000, 1.0, false);
+    try std.testing.expectEqual(@as(usize, 0), synth.activeCount(env.engine.kitSynth(0, 0).?));
 }
 
 test "audio: 鼓组——类型切换边沿释放两个池（防切类型悬挂）" {
@@ -1454,11 +1775,11 @@ test "audio: 鼓组——类型切换边沿释放两个池（防切类型悬挂�
     env.setLayers(&.{35}, &.{&lp0});
     params.synth_ptrs[0].store(&gate, .monotonic);
     dispatchNote(engine, synth.NoteEvent{ .kind = .on, .pitch = 35, .instrument = 0 });
-    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(&engine.kit_synths[0]));
+    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(engine.kitSynth(0, 0).?));
     params.instrument_kind[0].store(0, .monotonic);
     applyKindEdges(engine);
-    synth.render(&lp0, &engine.kit_synths[0], &buf, 4800, 48000, 1.0, false);
-    try std.testing.expectEqual(@as(usize, 0), synth.activeCount(&engine.kit_synths[0]));
+    synth.render(&lp0, engine.kitSynth(0, 0).?, &buf, 4800, 48000, 1.0, false);
+    try std.testing.expectEqual(@as(usize, 0), synth.activeCount(engine.kitSynth(0, 0).?));
 
     // **只处理边沿**：kind 未变时重复调用不误杀试听声部
     synth.noteOn(&engine.synths[0], 64, synth.default_velocity, synth.default_pan);
@@ -1622,8 +1943,8 @@ test "audio: 主通道效果链作用在汇总信号上（混响/延迟加入尾
     params.effect_kind[0][0].store(3, .monotonic); // 3 = delay
     params.effect_enabled[0][0].store(true, .monotonic);
     params.effect_mix[0][0].store(0.5, .monotonic);
-    params.effect_p[0][0][0].store(@floatFromInt(fx.delay_tempo_default), .monotonic); // 档位 1/8（BPM 120 → 0.25s）
-    params.effect_p[0][0][1].store(0.5, .monotonic); // 反馈
+    params.fxParam(0, 0, 0).store(@floatFromInt(fx.delay_tempo_default), .monotonic); // 档位 1/8（BPM 120 → 0.25s）
+    params.fxParam(0, 0, 1).store(0.5, .monotonic); // 反馈
 
     // 开声 0.2s 后立即关声（note off + 快速释放）——看主通道的 delay 尾巴
     synth.noteOn(&engine.synths[0], 69, synth.default_velocity, synth.default_pan);

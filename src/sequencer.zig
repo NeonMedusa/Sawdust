@@ -23,9 +23,19 @@ const std = @import("std");
 const model = @import("model.zig");
 const synth = @import("synth.zig");
 
+/// 静音轨道集合（App 持有；稀疏行号集合）——SONG 调度时跳过其全部片段
+pub const TrackMutes = std.AutoHashMapUnmanaged(i32, void);
+
+/// 乐器索引上限（App 按音频容量维护；超出的音符视为无效）。
+/// 只由主线程调度/重扫读取——音频线程只消费事件队列，不读本变量。
+pub var instrument_cap: usize = synth.max_instruments;
+
 pub const Scheduler = struct {
     /// 已调度到的步（exclusive；下一个未调度的步）
     scheduled_upto: i32 = 0,
+    /// **静音轨道**（App 在启动时挂上 `&app.track_muted`；null = 无静音）——
+    /// 仅主线程调度钦读（音频线程只消费事件队列，不碰本 struct）
+    muted: ?*const TrackMutes = null,
     /// generation（transport 变化时递增；音频线程据此丢弃旧事件）
     gen: u32 = 1,
     /// 编辑代（播放中编辑重扫时递增）：音频线程据此丢弃**未触发**的旧事件，
@@ -53,7 +63,7 @@ const Mapped = struct { start: i32, end: i32 };
 
 fn mapSong(clip: model.Clip, nt: model.Note) ?Mapped {
     if (nt.pitch < 0 or nt.pitch > 127) return null;
-    if (nt.instrument < 0 or nt.instrument >= synth.max_instruments) return null;
+    if (nt.instrument < 0 or nt.instrument >= @as(i32, @intCast(instrument_cap))) return null;
     if (nt.len <= 0) return null;
     // 片段与音符同为 **U=96 步**坐标：无需再乘每小节步数
     const clip_start = clip.start;
@@ -67,7 +77,7 @@ fn mapSong(clip: model.Clip, nt: model.Note) ?Mapped {
 
 fn mapPat(nt: model.Note) ?Mapped {
     if (nt.pitch < 0 or nt.pitch > 127) return null;
-    if (nt.instrument < 0 or nt.instrument >= synth.max_instruments) return null;
+    if (nt.instrument < 0 or nt.instrument >= @as(i32, @intCast(instrument_cap))) return null;
     if (nt.len <= 0) return null;
     return .{ .start = nt.step, .end = nt.step + nt.len };
 }
@@ -118,6 +128,9 @@ fn gatherRange(
 ) bool {
     if (song_mode) {
         for (clips) |clip| {
+            if (sched.muted) |mu| {
+                if (mu.contains(clip.track)) continue; // 静音轨道：其片段不调度
+            }
             for (notes) |nt| {
                 if (nt.pattern != clip.pattern) continue;
                 const m = mapSong(clip, nt) orelse continue;
@@ -158,6 +171,9 @@ fn gatherMidOns(
 ) void {
     if (song_mode) {
         for (clips) |clip| {
+            if (sched.muted) |mu| {
+                if (mu.contains(clip.track)) continue; // 静音轨道：不补挂音符
+            }
             for (notes) |nt| {
                 if (nt.pattern != clip.pattern) continue;
                 const m = mapSong(clip, nt) orelse continue;
@@ -334,7 +350,7 @@ fn diffSide(
     var seen: [128]u32 = [_]u32{0} ** 128;
     for (side_notes) |nt| {
         if (nt.pitch < 0 or nt.pitch > 127) continue;
-        if (nt.instrument < 0 or nt.instrument >= synth.max_instruments) continue;
+        if (nt.instrument < 0 or nt.instrument >= @as(i32, @intCast(instrument_cap))) continue;
         const bit = @as(u32, 1) << @intCast(nt.instrument);
         if (seen[@intCast(nt.pitch)] & bit != 0) continue;
         seen[@intCast(nt.pitch)] |= bit;
@@ -846,4 +862,30 @@ test "sequencer: 密集窗口不丢事件（gather 溢出子区间收敛）" {
     }
     try std.testing.expectEqual(@as(usize, 1200), on_count); // 一个不丢
     try std.testing.expectEqual(@as(usize, 1200), off_count);
+}
+
+test "sequencer: SONG 静音轨道——其片段不被调度" {
+    var q = synth.SchedQueue{};
+    var s = Scheduler{};
+    // 两个片段同型（轨 0 / 轨 1，各映射同一音符）——未静音时共 4 个事件
+    const clips = [_]model.Clip{
+        .{ .track = 0, .start = 0, .len = 32, .pattern = 0 },
+        .{ .track = 1, .start = 0, .len = 32, .pattern = 0 },
+    };
+    const notes = [_]model.Note{
+        .{ .step = 0, .len = 4, .pitch = 60, .pattern = 0 },
+    };
+    var mutes = TrackMutes{};
+    defer mutes.deinit(std.testing.allocator);
+    try mutes.put(std.testing.allocator, 1, {});
+    s.muted = &mutes; // 轨 1 静音
+
+    reset(&s, &q, &clips, &notes, true, 0, 0);
+    scheduleRange(&s, &q, &clips, &notes, true, 0, 0, 64);
+
+    var out: [16]synth.SchedEvent = undefined;
+    const n = drainAll(&q, &out);
+    try std.testing.expectEqual(@as(usize, 2), n); // 只剩轨 0 的 on/off
+    try std.testing.expectEqual(synth.EventKind.on, out[0].kind);
+    try std.testing.expectEqual(synth.EventKind.off, out[1].kind);
 }

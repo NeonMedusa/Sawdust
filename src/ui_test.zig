@@ -305,7 +305,194 @@ test "ui: 垂直推子——向上拖应增大" {
     ui.endFrame();
 }
 
-test "ui: 横向时间轴滚动条——拖主体到右端继续拖：滑块左缘 1:1、滑块被压缩" {
+test "ui: 垂直滚动条——内容收缩后回收 scroll（滑块不被顶出行程）" {
+    var buf: [60 * 200]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 60, .height = 200 };
+    var ui = makeUi(&fb);
+
+    // 内容不再超出 → 隐藏的同时也必须把 scroll 回收为 0（脏值会残留，实测）
+    var scroll: i32 = 500;
+    _ = ui.scrollbarV(7, 0, 0, 10, 200, &scroll, 150, 200);
+    try std.testing.expectEqual(@as(i32, 0), scroll);
+
+    // 内容收缩但还超出 → 回收到位程上界
+    scroll = 9999;
+    _ = ui.scrollbarV(7, 0, 0, 10, 200, &scroll, 400, 200); // max = 200
+    try std.testing.expectEqual(@as(i32, 200), scroll);
+
+    // 负值同样归零
+    scroll = -50;
+    _ = ui.scrollbarV(7, 0, 0, 10, 200, &scroll, 400, 200);
+    try std.testing.expectEqual(@as(i32, 0), scroll);
+
+    // 内容恰好等于视口：不隐藏（满行程滑块）、scroll 归零、不除零崩溃
+    scroll = 40;
+    _ = ui.scrollbarV(7, 0, 0, 10, 200, &scroll, 200, 200);
+    try std.testing.expectEqual(@as(i32, 0), scroll);
+}
+
+test "ui: 纵向滚动条——纯投影：拖过底缘无界悬空（地图比例 1:1、总行程不变）" {
+    var buf: [40 * 420]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 40, .height = 420 };
+    var ui = makeUi(&fb);
+    var scroll: i32 = 0;
+    const content: i32 = 600; // 地图（视口 400）
+
+    // 帧 1：按住滑块（顶缘 0、高 266；抓 y=5）
+    ui.mouse_x = 5;
+    ui.mouse_y = 5;
+    ui.mouse_down = true;
+    ui.mouse_pressed = true;
+    _ = ui.scrollbarVExt(77, 0, 0, 10, 400, &scroll, content, 400, true, &.{});
+    try std.testing.expectEqual(@as(u64, 77), ui.active_id);
+    ui.endFrame();
+
+    // 帧 2：拖到 y=395 → 地图比例 1:1：(395-5)×600/400 = 585 —— 越过底缘、悬空 185
+    ui.mouse_y = 395;
+    ui.mouse_down = true;
+    ui.mouse_pressed = false;
+    _ = ui.scrollbarVExt(77, 0, 0, 10, 400, &scroll, content, 400, true, &.{});
+    try std.testing.expectEqual(@as(i32, 585), scroll);
+    ui.endFrame();
+
+    // 帧 3：继续下拖 → 无界（同一比例）：(500-5)×600/400 = 742
+    ui.mouse_y = 500;
+    ui.mouse_down = true;
+    ui.mouse_pressed = false;
+    _ = ui.scrollbarVExt(77, 0, 0, 10, 400, &scroll, content, 400, true, &.{});
+    try std.testing.expectEqual(@as(i32, 742), scroll);
+    ui.endFrame();
+
+    // 帧 4：上拖越过地图顶 → 硬钳 0（上缘 = 绝对原点）
+    ui.mouse_y = -200;
+    ui.mouse_down = true;
+    ui.mouse_pressed = false;
+    _ = ui.scrollbarVExt(77, 0, 0, 10, 400, &scroll, content, 400, true, &.{});
+    try std.testing.expectEqual(@as(i32, 0), scroll);
+    ui.endFrame();
+}
+
+test "ui: 纵向滚动条——悬空时点空白 = 定位回地图（点击小地图）；滑块上仍可抓" {
+    var buf: [40 * 420]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 40, .height = 420 };
+    var ui = makeUi(&fb);
+    var scroll: i32 = 585; // 悬空：投影 = [390, 656] → 可见 [390, 400)
+
+    // 帧 1：悬空时点靠顶部的空白（y=100）→ 居中会出负（150−200=−50）→ **硬钳 0**（上端不允许悬空）
+    ui.mouse_x = 5;
+    ui.mouse_y = 100;
+    ui.mouse_down = true;
+    ui.mouse_pressed = true;
+    _ = ui.scrollbarVExt(78, 0, 0, 10, 400, &scroll, 600, 400, true, &.{});
+    try std.testing.expectEqual(@as(i32, 0), scroll);
+    try std.testing.expectEqual(@as(u64, 78), ui.active_id);
+    ui.endFrame();
+
+    // 帧 2：松手；再按滑块本身（新投影 [100,366) 内的 y=200）→ 正常抓住
+    ui.mouse_down = false;
+    ui.mouse_released = true;
+    _ = ui.scrollbarVExt(78, 0, 0, 10, 400, &scroll, 600, 400, true, &.{});
+    ui.endFrame();
+    ui.mouse_y = 200;
+    ui.mouse_down = true;
+    ui.mouse_pressed = true;
+    _ = ui.scrollbarVExt(78, 0, 0, 10, 400, &scroll, 600, 400, true, &.{});
+    try std.testing.expectEqual(@as(u64, 78), ui.active_id);
+    ui.endFrame();
+}
+
+test "ui: 纵向滚动条——点击小地图定位（滑块外按下）+ 按住拖动跟手" {
+    var buf: [40 * 420]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 40, .height = 420 };
+    var ui = makeUi(&fb);
+    var scroll: i32 = 0; // thumb = [0,266)
+
+    // 帧 1：点击滑块外的空白（y=300）→ 点击内容置于视口正中（450−200=250；可悬空）
+    ui.mouse_x = 5;
+    ui.mouse_y = 300;
+    ui.mouse_down = true;
+    ui.mouse_pressed = true;
+    _ = ui.scrollbarVExt(79, 0, 0, 10, 400, &scroll, 600, 400, true, &.{});
+    try std.testing.expectEqual(@as(i32, 250), scroll); // 居中定位（超出地图底 50 = 允许悬空）
+    try std.testing.expectEqual(@as(u64, 79), ui.active_id);
+    ui.endFrame();
+
+    // 帧 2：按住继续拖 → 位移式：dy=50 → 250 + 50×600/400 = 325
+    ui.mouse_y = 350;
+    ui.mouse_down = true;
+    ui.mouse_pressed = false;
+    _ = ui.scrollbarVExt(79, 0, 0, 10, 400, &scroll, 600, 400, true, &.{});
+    try std.testing.expectEqual(@as(i32, 325), scroll);
+    ui.endFrame();
+}
+
+test "ui: 纵向滚动条——超大地图下投影亚像素仍显示/可抓“一根线”" {
+    var buf: [40 * 420]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 40, .height = 420 };
+    var ui = makeUi(&fb);
+    var scroll: i32 = 0;
+
+    // 地图 40 万像素、视口 400 → 投影高 = 0.4px（floor 为 0）——显示层强制一根线 [0,1)
+    // 帧 1：按在那根线上（y=0）→ 可抓
+    ui.mouse_x = 5;
+    ui.mouse_y = 0;
+    ui.mouse_down = true;
+    ui.mouse_pressed = true;
+    _ = ui.scrollbarVExt(80, 0, 0, 10, 400, &scroll, 400000, 400, true, &.{});
+    try std.testing.expectEqual(@as(u64, 80), ui.active_id);
+    ui.endFrame();
+
+    // 帧 2：拖动 → 地图比例 1:1：(4)×400000/400 = 4000
+    ui.mouse_y = 4;
+    ui.mouse_down = true;
+    ui.mouse_pressed = false;
+    _ = ui.scrollbarVExt(80, 0, 0, 10, 400, &scroll, 400000, 400, true, &.{});
+    try std.testing.expectEqual(@as(i32, 4000), scroll);
+    ui.endFrame();
+}
+
+test "ui: 纵向滚动条——巨图模式（allow_overhang=false）：拖动不得出图、只允许往回" {
+    var buf: [40 * 420]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 40, .height = 420 };
+    var ui = makeUi(&fb);
+    var scroll: i32 = 0;
+
+    // 帧 1：拖到底 → ns 原始 585 被钳到地图底（600−400=200）
+    ui.mouse_x = 5;
+    ui.mouse_y = 5;
+    ui.mouse_down = true;
+    ui.mouse_pressed = true;
+    _ = ui.scrollbarVExt(81, 0, 0, 10, 400, &scroll, 600, 400, false, &.{});
+    ui.endFrame();
+    ui.mouse_y = 395;
+    ui.mouse_down = true;
+    ui.mouse_pressed = false;
+    _ = ui.scrollbarVExt(81, 0, 0, 10, 400, &scroll, 600, 400, false, &.{});
+    try std.testing.expectEqual(@as(i32, 200), scroll);
+    ui.endFrame();
+
+    // 帧 1.5：松手（退出拖动）
+    ui.mouse_down = false;
+    ui.mouse_released = true;
+    _ = ui.scrollbarVExt(81, 0, 0, 10, 400, &scroll, 600, 400, false, &.{});
+    ui.endFrame();
+
+    // 帧 2：从**既存悬空**中起拖（scroll=500）→ 不许再加深（钳在起拖值）
+    scroll = 500;
+    ui.mouse_y = 340; // 投影 [333,600) 可见段 [333,400) 内
+    ui.mouse_down = true;
+    ui.mouse_pressed = true;
+    _ = ui.scrollbarVExt(81, 0, 0, 10, 400, &scroll, 600, 400, false, &.{});
+    ui.endFrame();
+    ui.mouse_y = 395; // 继续下拖 → 原始更大 → 钳回 500
+    ui.mouse_down = true;
+    ui.mouse_pressed = false;
+    _ = ui.scrollbarVExt(81, 0, 0, 10, 400, &scroll, 600, 400, false, &.{});
+    try std.testing.expectEqual(@as(i32, 500), scroll);
+    ui.endFrame();
+}
+
+test "ui: 横向时间轴滚动条——拖主体越过右端：悬空（地图比例 1:1、不压缩不延长）" {
     var buf: [400 * 40]u32 = undefined;
     var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 400, .height = 40 };
     var ui = makeUi(&fb);
@@ -316,10 +503,10 @@ test "ui: 横向时间轴滚动条——拖主体到右端继续拖：滑块左�
     const h: i32 = 20;
     const view: i32 = 200;
     var scroll: i32 = 0;
-    var content: i32 = view; // 初始：内容 = 一屏（滑块满宽）
+    var content: i32 = 400; // 地图 = 400（行程 200；thumb = 200/400×380 = 190）
     var zoom: f32 = 1.0;
 
-    // 帧 1：在滑块中部按下（滑块满宽）
+    // 帧 1：按住滑块中部（thumb = 200/400×380 = 190，跨 [10,200]；抓 x+100）
     ui.mouse_x = x + 100;
     ui.mouse_y = y + 5;
     ui.mouse_down = true;
@@ -329,34 +516,25 @@ test "ui: 横向时间轴滚动条——拖主体到右端继续拖：滑块左�
     try std.testing.expectEqual(HBarMode.body, ui.drag_mode_h);
     ui.endFrame();
 
-    // 帧 2：右拖 100px（滑块已贴右端）→ 滑块左缘 1:1 跟手（左缘 10→110，宽 380→280）
-    // 内容长 = view_cw × w / thumb_w = 200 × 380 / 280 = 271（视图贴右端）
-    ui.mouse_x = x + 200;
+    // 帧 2：右拖（desired=210 → ns=210）→ 越过地图右端（行程 200）+10 悬空
+    ui.mouse_x = x + 300;
     ui.mouse_down = true;
     ui.mouse_pressed = false;
     try std.testing.expect(ui.scrollbarTimeline(7, x, y, w, h, &scroll, &content, &zoom, view, 0, 0.2, 8.0));
-    try std.testing.expectEqual(@as(i32, 271), content);
-    try std.testing.expectEqual(@as(i32, 71), scroll);
+    try std.testing.expectEqual(@as(i32, 210), scroll);
+    try std.testing.expectEqual(@as(i32, 400), content); // 地图不变（无延长、滑块不压缩）
     ui.endFrame();
 
-    // 帧 3：继续右拖 50px → desired=170（绝对屏幕坐标）→ 滑块宽 = 390-170 = 220
-    // → 内容 = 200×380/220 = 345
-    ui.mouse_x = x + 260;
-    try std.testing.expect(ui.scrollbarTimeline(7, x, y, w, h, &scroll, &content, &zoom, view, 0, 0.2, 8.0));
-    try std.testing.expectEqual(@as(i32, 345), content);
-    try std.testing.expectEqual(@as(i32, 145), scroll);
-    ui.endFrame();
-
-    // 帧 4：抬起 → 退出拖动；行程保留（不回弹）
+    // 帧 3：抬起 → 悬空保留（无回收状态；回家 = 滚回/中键拖回）
     ui.mouse_down = false;
     ui.mouse_released = true;
     _ = ui.scrollbarTimeline(7, x, y, w, h, &scroll, &content, &zoom, view, 0, 0.2, 8.0);
     try std.testing.expectEqual(@as(u64, 0), ui.active_id);
-    try std.testing.expectEqual(@as(i32, 345), content); // 松手不回弹
+    try std.testing.expectEqual(@as(i32, 210), scroll);
     ui.endFrame();
 }
 
-test "ui: 横向时间轴滚动条——陈旧膨胀自动收回（行程贴合内容右缘）" {
+test "ui: 横向时间轴滚动条——纯投影：拖过右端无界悬空、左端硬钳 0、总行程不变" {
     var buf: [400 * 40]u32 = undefined;
     var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 400, .height = 40 };
     var ui = makeUi(&fb);
@@ -367,23 +545,17 @@ test "ui: 横向时间轴滚动条——陈旧膨胀自动收回（行程贴合�
     const h: i32 = 20;
     const view: i32 = 200;
 
-    // 情景：content 之前被拖得很大（陈旧膨胀），内容右缘缩回 → 回到左端时自动收回
+    // 情景：地图 = max(时间轴, 内容下限)——投影不超宽；widget 不再书写任何跨度状态
     var scroll: i32 = 0;
     var content: i32 = 900;
     var zoom: f32 = 1.0;
     _ = ui.scrollbarTimeline(7, x, y, w, h, &scroll, &content, &zoom, view, 400, 0.2, 8.0);
-    try std.testing.expectEqual(@as(i32, 400), content); // 回到左端 → 重新贴合内容
+    try std.testing.expectEqual(@as(i32, 900), content); // 跨度状态已废：控件不写 content
     try std.testing.expectEqual(@as(i32, 0), scroll);
-    ui.endFrame();
-
-    // 内容右缘变大 → 下限抬升，content 自动跟上
-    ui.mouse_x = -100; // 鼠标远离轨道（不影响）
-    _ = ui.scrollbarTimeline(7, x, y, w, h, &scroll, &content, &zoom, view, 700, 0.2, 8.0);
-    try std.testing.expectEqual(@as(i32, 700), content);
     ui.endFrame();
 }
 
-test "ui: 横向时间轴滚动条——回到左端才回收延长（拖出的行程保留、不回弹）" {
+test "ui: 横向时间轴滚动条——拖过右端无界悬空、左拖硬钳 0" {
     var buf: [400 * 40]u32 = undefined;
     var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 400, .height = 40 };
     var ui = makeUi(&fb);
@@ -394,38 +566,37 @@ test "ui: 横向时间轴滚动条——回到左端才回收延长（拖出的�
     const h: i32 = 20;
     const view: i32 = 200;
     var scroll: i32 = 0;
-    var content: i32 = view;
+    var content: i32 = 400; // 地图 = 400（行程 200）
     var zoom: f32 = 1.0;
 
-    // 帧 1：按下（滑块满宽）
+    // 帧 1：按住滑块中部（thumb = 200/400×380 = 190，跨 [10,200]；抓 x+100）
     ui.mouse_x = x + 100;
     ui.mouse_y = y + 5;
     ui.mouse_down = true;
     ui.mouse_pressed = true;
-    _ = ui.scrollbarTimeline(7, x, y, w, h, &scroll, &content, &zoom, view, 100, 0.2, 8.0);
+    _ = ui.scrollbarTimeline(7, x, y, w, h, &scroll, &content, &zoom, view, 0, 0.2, 8.0);
+    try std.testing.expectEqual(HBarMode.body, ui.drag_mode_h);
     ui.endFrame();
 
-    // 帧 2：右拖 150px → 拖出延长（内容变大、滑块变短）
-    ui.mouse_x = x + 250;
+    // 帧 2：右拖出地图（desired=210 → ns=(210-10)×400/380=210）→ 悬空 10px
+    ui.mouse_x = x + 300;
     ui.mouse_down = true;
     ui.mouse_pressed = false;
-    _ = ui.scrollbarTimeline(7, x, y, w, h, &scroll, &content, &zoom, view, 100, 0.2, 8.0);
-    const dragged = content;
-    try std.testing.expect(dragged > 300); // 已延长
+    _ = ui.scrollbarTimeline(7, x, y, w, h, &scroll, &content, &zoom, view, 0, 0.2, 8.0);
+    try std.testing.expectEqual(@as(i32, 210), scroll);
+    try std.testing.expectEqual(@as(i32, 400), content); // 总行程不变
     ui.endFrame();
 
-    // 帧 3：松手（不在左端）→ 行程保留，不回弹
-    ui.mouse_down = false;
-    ui.mouse_released = true;
-    _ = ui.scrollbarTimeline(7, x, y, w, h, &scroll, &content, &zoom, view, 100, 0.2, 8.0);
-    try std.testing.expectEqual(dragged, content); // 不回弹
-    try std.testing.expect(content > 300);
+    // 帧 3：继续右拖 → 无界（同一比例）：(310-10)×400/380=315
+    ui.mouse_x = x + 400;
+    _ = ui.scrollbarTimeline(7, x, y, w, h, &scroll, &content, &zoom, view, 0, 0.2, 8.0);
+    try std.testing.expectEqual(@as(i32, 315), scroll);
     ui.endFrame();
 
-    // 帧 4：把 scroll 拉回 0（回到左端）→ 行程重新贴合内容（回收延长）
-    scroll = 0;
-    _ = ui.scrollbarTimeline(7, x, y, w, h, &scroll, &content, &zoom, view, 100, 0.2, 8.0);
-    try std.testing.expectEqual(@as(i32, 200), content); // 回收 = max(内容右缘, 一屏)
+    // 帧 4：左拖越出左端 → 硬钳 0（左端 = 绝对原点）
+    ui.mouse_x = x - 500;
+    _ = ui.scrollbarTimeline(7, x, y, w, h, &scroll, &content, &zoom, view, 0, 0.2, 8.0);
+    try std.testing.expectEqual(@as(i32, 0), scroll);
     ui.endFrame();
 }
 
@@ -452,13 +623,13 @@ test "ui: 横向时间轴滚动条——拖右缘 = 缩放（左端固定、滑�
     try std.testing.expectEqual(HBarMode.right, ui.drag_mode_h);
     ui.endFrame();
 
-    // 帧 2：右拖到 380 → 左缘固定（105）→ 滑块宽 275 → view_cw = 275*400/380 = 289
-    // → zoom = 200/289 ≈ 0.692（视野变大）；scroll 不变（左缘固定）
+    // 帧 2：右拖到 380（位移 +90）→ 滑块宽 = 190+90 = 280（抓取偏移保持，无按下跳变）
+    // → view_cw = 200×(280/190) ≈ 294 → zoom = 200/294 ≈ 0.680（视野变大）；scroll 不变
     ui.mouse_x = 380;
     ui.mouse_down = true;
     ui.mouse_pressed = false;
     try std.testing.expect(ui.scrollbarTimeline(7, x, y, w, h, &scroll, &content, &zoom, view, 0, 0.2, 8.0));
-    try std.testing.expectApproxEqAbs(@as(f32, 0.692), zoom, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.680), zoom, 0.011);
     try std.testing.expectEqual(@as(i32, 100), scroll);
     ui.endFrame();
 }
@@ -570,6 +741,127 @@ test "ui: 横向时间轴滚动条——拖右缘到物理下限（滑块满宽�
     try std.testing.expectApproxEqAbs(@as(f32, 0.399), zoom, 0.01);
     // 视野变宽 → 右缘内容位置不变时 scroll 被钳到 content_w - vcw = 800 - 501 = 299
     try std.testing.expectEqual(@as(i32, 299), scroll);
+    ui.endFrame();
+}
+
+test "ui: 横向滚动条——点着滑块反复按/松不漂移（位移式零位移恒等；实测回归）" {
+    var buf: [400 * 40]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 400, .height = 40 };
+    var ui = makeUi(&fb);
+    const x: i32 = 10;
+    const y: i32 = 10;
+    const w: i32 = 380;
+    const h: i32 = 20;
+    const view: i32 = 200;
+    var scroll: i32 = 37; // 亚像素投影：tx = 37×380/400 = 35.15（旧版每次点击丢分数 → 累积左移）
+    var content: i32 = 400;
+    var zoom: f32 = 1.0;
+
+    var round: u8 = 0;
+    while (round < 2) : (round += 1) {
+        ui.mouse_x = x + 50; // 在滑块 [45,235) 上
+        ui.mouse_y = y + 5;
+        ui.mouse_down = true;
+        ui.mouse_pressed = true;
+        _ = ui.scrollbarTimeline(7, x, y, w, h, &scroll, &content, &zoom, view, 0, 0.2, 8.0);
+        ui.endFrame();
+        ui.mouse_down = true;
+        ui.mouse_pressed = false;
+        _ = ui.scrollbarTimeline(7, x, y, w, h, &scroll, &content, &zoom, view, 0, 0.2, 8.0);
+        try std.testing.expectEqual(@as(i32, 37), scroll); // 零位移恒等
+        ui.endFrame();
+        ui.mouse_down = false;
+        ui.mouse_released = true;
+        _ = ui.scrollbarTimeline(7, x, y, w, h, &scroll, &content, &zoom, view, 0, 0.2, 8.0);
+        ui.endFrame();
+    }
+}
+
+test "ui: 纵向滚动条——点着滑块反复按/松不漂移（位移式零位移恒等）" {
+    var buf: [40 * 420]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 40, .height = 420 };
+    var ui = makeUi(&fb);
+    var scroll: i32 = 37; // 亚像素投影：th_top = 37×400/600 = 24.67
+
+    var round: u8 = 0;
+    while (round < 2) : (round += 1) {
+        ui.mouse_x = 5;
+        ui.mouse_y = 30; // 在滑块 [24,290) 上
+        ui.mouse_down = true;
+        ui.mouse_pressed = true;
+        _ = ui.scrollbarVExt(82, 0, 0, 10, 400, &scroll, 600, 400, true, &.{});
+        ui.endFrame();
+        ui.mouse_down = true;
+        ui.mouse_pressed = false;
+        _ = ui.scrollbarVExt(82, 0, 0, 10, 400, &scroll, 600, 400, true, &.{});
+        try std.testing.expectEqual(@as(i32, 37), scroll);
+        ui.endFrame();
+        ui.mouse_down = false;
+        ui.mouse_released = true;
+        _ = ui.scrollbarVExt(82, 0, 0, 10, 400, &scroll, 600, 400, true, &.{});
+        ui.endFrame();
+    }
+}
+
+test "ui: 横向时间轴滚动条——亚像素滑块（一根线）上按下不跳（旧“正方形”下限回归）" {
+    var buf: [400 * 40]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 400, .height = 40 };
+    var ui = makeUi(&fb);
+    const x: i32 = 10;
+    const y: i32 = 10;
+    const w: i32 = 380;
+    const h: i32 = 20;
+    const view: i32 = 200;
+    var scroll: i32 = 100000; // 投影：tw=200×380/400000=0.19 → 显示一根线 [105,106)
+    var content: i32 = 400000;
+    var zoom: f32 = 1.0;
+
+    // 帧 1：按在那根线上
+    ui.mouse_x = x + 95;
+    ui.mouse_y = y + 5;
+    ui.mouse_down = true;
+    ui.mouse_pressed = true;
+    _ = ui.scrollbarTimeline(7, x, y, w, h, &scroll, &content, &zoom, view, 0, 0.2, 8.0);
+    ui.endFrame();
+
+    // 帧 2：不动 → **零位移恒等**：zoom/scroll 都不变（旧版会跳成“正方形”、视野突扩）
+    ui.mouse_down = true;
+    ui.mouse_pressed = false;
+    _ = ui.scrollbarTimeline(7, x, y, w, h, &scroll, &content, &zoom, view, 0, 0.2, 8.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), zoom, 0.001);
+    try std.testing.expectEqual(@as(i32, 100000), scroll);
+    ui.endFrame();
+}
+
+test "ui: 横向时间轴滚动条——点击小地图定位（滑块外按下）+ 按住拖动跟手" {
+    var buf: [400 * 40]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 400, .height = 40 };
+    var ui = makeUi(&fb);
+    const x: i32 = 10;
+    const y: i32 = 10;
+    const w: i32 = 380;
+    const h: i32 = 20;
+    const view: i32 = 200;
+    var scroll: i32 = 0; // thumb = [10,200)
+    var content: i32 = 400;
+    var zoom: f32 = 1.0;
+
+    // 帧 1：点击滑块外空白（x+300）→ 点击内容置于视口正中（315−100=215；可悬空）
+    ui.mouse_x = x + 300;
+    ui.mouse_y = y + 5;
+    ui.mouse_down = true;
+    ui.mouse_pressed = true;
+    _ = ui.scrollbarTimeline(7, x, y, w, h, &scroll, &content, &zoom, view, 0, 0.2, 8.0);
+    try std.testing.expectEqual(@as(i32, 215), scroll); // 居中定位（超出地图底 15 = 允许悬空）
+    try std.testing.expectEqual(HBarMode.body, ui.drag_mode_h);
+    ui.endFrame();
+
+    // 帧 2：按住继续拖 → 滑块跟手（地图 1:1）：新左缘 204，抓偏 96 → (244−10)×400/380=246
+    ui.mouse_x = x + 330;
+    ui.mouse_down = true;
+    ui.mouse_pressed = false;
+    _ = ui.scrollbarTimeline(7, x, y, w, h, &scroll, &content, &zoom, view, 0, 0.2, 8.0);
+    try std.testing.expectEqual(@as(i32, 246), scroll);
     ui.endFrame();
 }
 
@@ -942,6 +1234,22 @@ test "view_util: 屏幕→内容像素换算（中键拖动 1:1；zoom≠1 不�
     try std.testing.expectEqual(@as(i32, 160), view_util.screenToContentPx(80, 0.5));
     // 负方向
     try std.testing.expectEqual(@as(i32, -40), view_util.screenToContentPx(-80, 2.0));
-    // zoom≈0 防御（不除零）
-    try std.testing.expectEqual(@as(i32, 1000), view_util.screenToContentPx(10, 0));
+    // **深缩放（zoom<0.01）仍严格 1:1**——旧 0.01 遗留下限会把比例冻结在 100，
+    // 实测：上千小节视野下中键拖动“内容跟不上鼠标”
+    try std.testing.expectEqual(@as(i32, 500), view_util.screenToContentPx(1, 0.002));
+    try std.testing.expectEqual(@as(i32, 2000), view_util.screenToContentPx(1, 0.0005));
+    // zoom≈0 防御（不除零；结果钳到滚动帽 1<<30）
+    try std.testing.expectEqual(@as(i32, 1 << 30), view_util.screenToContentPx(10, 0));
+}
+
+test "ui: 方形开关（toggleSquare）——命中才返回按下" {
+    var buf: [40 * 40]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 40, .height = 40 };
+    var ui = makeUi(&fb);
+    ui.mouse_x = 10;
+    ui.mouse_y = 10;
+    ui.mouse_down = true;
+    ui.mouse_pressed = true;
+    try std.testing.expect(ui.toggleSquare(true, 5, 5, 18)); // 命中（开=绿）
+    try std.testing.expect(!ui.toggleSquare(false, 100, 100, 18)); // 未命中（关=灰）
 }

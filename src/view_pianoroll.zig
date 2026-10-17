@@ -150,7 +150,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 nmini += 1;
             }
         }
-        _ = ui.scrollbarTimelineEx(10, x + 1, hsb_y, w - 2, ruler_h, &app.piano.scroll_x, &app.piano.content_w, &app.piano.zoom, view_w, min_content, dyn_zoom_min, 8.0, mini_buf[0..nmini]);
+        _ = ui.scrollbarTimelineEx(10, x + 1, hsb_y, w - 2, ruler_h, &app.piano.scroll_x, min_content, &app.piano.zoom, view_w, dyn_zoom_min, 8.0, bars_right < util.overhang_map_limit, mini_buf[0..nmini]);
     }
     ui.renderer.hline(x + 1, ruler_y, w - 2, ui.theme.panel_border);
 
@@ -192,9 +192,12 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         const saved = ui.renderer.pushClip(lane_x, ruler_y, view_w, ruler_h);
         defer ui.renderer.popClip(saved);
         var bar: i32 = @divFloor(app.piano.scroll_x, bar_w) + 1;
+        // 小节数字**分级渲染**（1-2-5 系列）：标签太密时只显 1、2、5、10… 的切点
+        const label_step: i32 = util.barLabelStep(bar_ws, 40);
         while (true) : (bar += 1) {
             const bx = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(bar - 1)) * bar_ws - scroll_s));
             if (bx > main_x + main_w) break;
+            if (@mod(bar - 1, label_step) != 0) continue;
             // 只画数字标记（小节线在内容区已有，标尺行保持干净）。
             // 若将来想加回刻度线，在此处加：
             //   ui.renderer.fillRect(bx, ruler_y, 1, ruler_h, ui.theme.grid_bar);
@@ -265,10 +268,15 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         ui.renderer.hline(keys_x, ruler_y + seg_h - 1, seg_w, ui.theme.panel_border);
     }
 
+    // 垂直缩放的“缩到底”下限（□ / Shift+滚轮共用）：音高行数固定 128，
+    // 行数多到 fit 低于固定最小值时退回 piano_key_h_min。当前行高已低于该值时
+    // 以当前为准（下限只当刹车，不反向顶大）。
+    const zoom_min_h: i32 = @min(util.zoomOutFloor(util.piano_key_h_min, util.piano_key_h_max, app.piano.lane_h, 128), app.piano.key_h);
+
     // □ 缺口：按住上下拖 = 音高行高缩放（方块本身固定不动；视口中心音高保持不动）
     {
         const old_h = app.piano.key_h;
-        if (ui.zoomSquare(13, sb_x, ruler_y, ruler_h, &app.piano.key_h, util.piano_key_h_min, util.piano_key_h_max, 2) and app.piano.key_h != old_h) {
+        if (ui.zoomSquare(13, sb_x, ruler_y, ruler_h, &app.piano.key_h, zoom_min_h, util.piano_key_h_max, 2) and app.piano.key_h != old_h) {
             const content_h_new: i32 = 128 * app.piano.key_h;
             app.piano.scroll = Ui.zoomAnchoredScroll(app.piano.scroll, lane_h, old_h, app.piano.key_h, content_h_new);
         }
@@ -474,8 +482,22 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         {
             const saved_notes = ui.renderer.pushClip(lane_x, lane_y, view_w, lane_h);
             defer ui.renderer.popClip(saved_notes);
-            for (app.notes.items, 0..) |n, ni| {
-                if (n.pattern != pattern or n.instrument != app.sel.instrument) continue;
+            // 层级（与片段同规则，用户拍板）：按左端点升序绘制（越靠右越上层）；
+            // 左端相同 → 数组序。暂存下标表排序（见 `PianoState.draw_order`）。
+            app.piano.draw_order.clearRetainingCapacity();
+            for (app.notes.items, 0..) |n0, ni0| {
+                if (n0.pattern == pattern and n0.instrument == app.sel.instrument) {
+                    app.piano.draw_order.append(app.allocator, ni0) catch {};
+                }
+            }
+            std.mem.sort(usize, app.piano.draw_order.items, app.notes.items, struct {
+                fn less(notes: []const model.Note, a: usize, b: usize) bool {
+                    if (notes[a].step != notes[b].step) return notes[a].step < notes[b].step;
+                    return a < b;
+                }
+            }.less);
+            for (app.piano.draw_order.items) |ni| {
+                const n = app.notes.items[ni];
                 const nx = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(n.step)) * step_ws - scroll_s));
                 const ny = lane_y + (127 - n.pitch) * kh - app.piano.scroll;
                 const nw = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(n.len)) * step_ws)));
@@ -741,26 +763,24 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 注：框选手势期间不命中（框选优先）
     var note_hit: ?struct { index: usize, mode: model.NoteHitMode } = null;
     if (in_lane and !app.piano.marquee_active and !ui.mods_ctrl) {
-        for (app.notes.items, 0..) |n, ni| {
-            if (n.pattern != pattern or n.instrument != app.sel.instrument) continue;
+        // 叠放（与片段同规则，用户拍板）：命中取**最顶层**
+        // （左端越右越上；同左端取数组序最大）
+        if (model.topmostNoteAt(app.notes.items, pattern, app.sel.instrument, pitch_i, step_i)) |ni| {
+            const n = app.notes.items[ni];
             const nx = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(n.step)) * step_ws - scroll_s));
-            const ny = lane_y + (127 - n.pitch) * app.piano.key_h - app.piano.scroll;
             const nw = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(n.len)) * step_ws)));
-            if (ui.mouse_x >= nx and ui.mouse_x < nx + nw and ui.mouse_y >= ny and ui.mouse_y < ny + app.piano.key_h) {
-                const near_left = ui.mouse_x <= nx + 8;
-                const near_right = ui.mouse_x >= nx + nw - 8;
-                const mode: model.NoteHitMode = if (near_left and near_right)
-                    // 窄音符两缘都近：按鼠标在音符内的相对位置就近选
-                    (if (ui.mouse_x - nx <= nx + nw - ui.mouse_x) .left else .right)
-                else if (near_left)
-                    .left
-                else if (near_right)
-                    .right
-                else
-                    .body;
-                note_hit = .{ .index = ni, .mode = mode };
-                break;
-            }
+            const near_left = ui.mouse_x <= nx + 8;
+            const near_right = ui.mouse_x >= nx + nw - 8;
+            const mode: model.NoteHitMode = if (near_left and near_right)
+                // 窄音符两缘都近：按鼠标在音符内的相对位置就近选
+                (if (ui.mouse_x - nx <= nx + nw - ui.mouse_x) .left else .right)
+            else if (near_left)
+                .left
+            else if (near_right)
+                .right
+            else
+                .body;
+            note_hit = .{ .index = ni, .mode = mode };
         }
     }
 
@@ -806,7 +826,10 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // - 拖动中换音高 → 重触发（仅当按下时已开始试听）
     // 注：Ctrl 按下（框选手势）时**不放置**——否则框选启动当帧会先放一个音符
     if (ui.mouse_pressed and in_lane and !ui.mods_ctrl and step_i >= 0 and pitch_i >= 0 and pitch_i <= 127) {
-        if (note_hit) |hit| {
+        if (note_hit) |hit0| {
+            // 叠放轮换（与片段同规则）：点中即沉到同（音高+左端点）组最底；
+            // 拖动/拉伸仍作用于它（索引用沉降后新值）。
+            const hit = .{ .index = app.sinkNoteToTieBottom(hit0.index), .mode = hit0.mode };
             const n = app.notes.items[hit.index];
             // 命中**已选中的音符** + 选区 ≥ 2 → 批量拖动/拉伸（选区整体）
             // （单击单个未选中音符 → 单选 + 单音符拖动；点已选中但选区 = 1 也走单音符）
@@ -1038,16 +1061,17 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             // 下限取 min(动态下限，当前)：内容缩短（动态下限被动抬高）时
             // 不得把视口突然放大——只拦“继续缩小”。
             app.piano.zoom_target = std.math.clamp(tgt * std.math.pow(f32, util.wheel_zoom_factor, @as(f32, @floatFromInt(ui.wheel))), @min(dyn_zoom_min, tgt), 8.0);
-            // 缩小/已到下限：把视口右缘拉回内容跨度内（全装得下 → 贴左）
+            // 缩小/已到下限：把视口右缘拉回内容跨度内（全装得下 → 贴左）——悬空量保留
             const vcw: i32 = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(view_w)) / app.piano.zoom)));
-            app.piano.scroll_x = Ui.clampScrollToSpan(app.piano.scroll_x, vcw, content_span);
+            const over: i32 = @max(0, app.piano.scroll_x - @max(0, content_span - vcw));
+            app.piano.scroll_x = Ui.clampScrollToSpan(app.piano.scroll_x, vcw, content_span) + over;
         } else if (ui.wheel_shift) {
             // Shift+滚轮：**纵向缩放**（音高行高）——只设补间目标（补间块在本段之后）
             app.piano.key_h_anchor_off = ui.mouse_y - lane_y;
             var tgt = app.piano.key_h_target;
             // 反向输入先抵消未完成的补间（同横向缩放；实测手感 bug）
             if ((ui.wheel > 0 and tgt < app.piano.key_h) or (ui.wheel < 0 and tgt > app.piano.key_h)) tgt = app.piano.key_h;
-            app.piano.key_h_target = std.math.clamp(tgt + ui.wheel * 2, util.piano_key_h_min, util.piano_key_h_max);
+                app.piano.key_h_target = std.math.clamp(tgt + ui.wheel * 2, zoom_min_h, util.piano_key_h_max);
         } else {
             // 裸滚轮：纵向滚动——只设补间目标（滚轮离散 → 逐帧平滑）
             app.piano.scroll_target = std.math.clamp(app.piano.scroll_target - util.scrollDelta(ui), 0, @max(0, content_h - lane_h));
@@ -1065,7 +1089,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             else
                 util.glideF32(p.zoom, p.zoom_target, app.frame_dt_ns, 0.03);
             if (z_new > 0 and z_new != p.zoom) {
-                p.scroll_x = Ui.zoomAnchoredScrollX(p.scroll_x, view_w, p.zoom_anchor_off, p.zoom, z_new, p.content_w, content_span);
+                const vcw_now: i32 = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(view_w)) / p.zoom)));
+                const over: i32 = @max(0, p.scroll_x - @max(0, content_span - vcw_now)); // 悬空量保留
+                p.scroll_x = Ui.zoomAnchoredScrollX(p.scroll_x, view_w, p.zoom_anchor_off, p.zoom, z_new, content_span, content_span) + over;
                 p.zoom = z_new;
             }
         }
@@ -1116,10 +1142,10 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 p.nav_active = false;
             } else {
                 // 从**原点**重算（拖出范围后回拖立即响应，不会积累死区）
-                const vcw: i32 = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(view_w)) / p.zoom)));
+                // 横向：**悬空出口**——不设地图上限（内部防溢出帽同滚动条控件）
                 // 屏幕位移 → 内容像素（/zoom）——“鼠标移 1px、内容移 1px”的 1:1
                 const dx_c = util.screenToContentPx(ui.mouse_x - p.nav_mx, p.zoom);
-                p.scroll_x = Ui.clampScrollToSpan(p.nav_scroll_x0 - dx_c, vcw, content_span);
+                p.scroll_x = std.math.clamp(p.nav_scroll_x0 - dx_c, 0, 1 << 30);
                 p.scroll = std.math.clamp(p.nav_scroll_y0 - (ui.mouse_y - p.nav_my), 0, @max(0, content_h - lane_h));
             }
         }
@@ -1148,8 +1174,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 const off_screen: f32 = util.follow_anchor_frac * @as(f32, @floatFromInt(view_w));
                 const vcw_f: f32 = @as(f32, @floatFromInt(view_w)) / p.zoom;
                 const vcw_i: i32 = @max(1, @as(i32, @intFromFloat(vcw_f)));
-                // **软锚定**（同播放列表）：有余量 → 锚点；余量耗尽 → 就势放开（不强行延长行程）
-                const follow_span: i32 = @max(content_span, p.content_w);
+                // **软锚定**（同播放列表）：有余量 → 锚点；余量耗尽 → 就势放开
+                const follow_span: i32 = content_span;
                 const target = util.followTargetScrollX(cur_px, view_w, p.zoom, off_screen, follow_span);
                 p.scroll_x = Ui.clampScrollToSpan(util.followGlide(p.scroll_x, target, app.frame_dt_ns), vcw_i, follow_span);
             }
@@ -1225,11 +1251,12 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     }
     // 乐器下拉（同样在最上层；与网格选单互斥——同时只会开一个）
     if (app.piano.inst_menu_open and inst_btn_x + 40 < x + w - 24) {
-        var names: [synth.max_instruments][]const u8 = undefined;
-        const n: usize = @min(app.instruments.items.len, synth.max_instruments);
-        for (app.instruments.items[0..n], 0..) |inst2, ii| names[ii] = inst2.name;
+        // 池化：乐器数量无上限——按实际数量堆分配名字列表（逐帧短暂持有）
+        const names = std.heap.page_allocator.alloc([]const u8, app.instruments.items.len) catch return;
+        defer std.heap.page_allocator.free(names);
+        for (app.instruments.items, 0..) |inst2, ii| names[ii] = inst2.name;
         const inst_before = app.sel.instrument;
-        _ = util.titleSelectorMenu(ui, inst_btn_x, y + util.title_h, names[0..n], &app.sel.instrument, &app.piano.inst_menu_open, inst_clicked, 170);
+        _ = util.titleSelectorMenu(ui, inst_btn_x, y + util.title_h, names, &app.sel.instrument, &app.piano.inst_menu_open, inst_clicked, 170);
         // 切换乐器 → 清选区（防跨乐器孤儿选区；见 App.setInstrument）
         if (app.sel.instrument != inst_before) app.clearNoteSelection();
     }

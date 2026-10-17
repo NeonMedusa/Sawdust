@@ -21,6 +21,8 @@ const Atomic = std.atomic.Value;
 pub const max_voices: usize = 256;
 
 /// 最大乐器数（每乐器一个独立声部池）
+/// 乐器**初始容量**（池化：运行时容量按需增长/回收，不再有人工上限；
+/// 实测：超过 16 会卡那么一下，业余用户也会经常超——起点给 32）
 pub const max_instruments: usize = 32;
 
 /// 立即事件队列容量（UI 每秒推入的事件数远小于此值）

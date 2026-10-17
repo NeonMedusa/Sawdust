@@ -32,7 +32,7 @@ pub fn drawHistory(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                     i + 1,
                     app.history.items[i].label,
                 }) catch app.history.items[i].label;
-                if (ui.listItem(1000 + i, label, x + 1, iy, w - 2, item_h, is_current, i % 2 == 1, null)) {
+                if (ui.listItem(1000 + i, label, x + 1, iy, w - 2, item_h, is_current, i % 2 == 1, null, null)) {
                     // 点击条目 = 跳转到该状态（等价于连续撤销/重做）
                     if (app.jumpHistory(i)) {
                         app.setToastWith("历史：{s}", .{app.historyLabel()});
@@ -69,9 +69,10 @@ pub fn drawPatterns(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
 
     const item_h: i32 = @as(i32, @intFromFloat(ui.font.lineHeight())) + 10;
     const list_y = y + util.title_h;
-    // 列表下方预留“添加样式”按钮行
-    const add_row_h: i32 = item_h + 4;
+    // 底部“＋ 添加样式”按钮行（下/左/右贴边；高度 = 一行）
+    const add_row_h: i32 = item_h;
     const list_h = h - util.title_h - add_row_h;
+    const add_btn_y = y + h - 1 - item_h;
     const pat_count: usize = app.pattern_items.items.len;
 
     // 列表 + 滚动条：**作用域块内** pushClip/popClip——
@@ -81,23 +82,36 @@ pub fn drawPatterns(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         const saved_clip = ui.renderer.pushClip(x + 1, list_y, w - 2, list_h);
         defer ui.renderer.popClip(saved_clip);
 
+        // 底部“＋ 添加样式”按钮行会压住列表底部半截行的**不可见部分**；而命中判定不看
+        // 裁剪 → 点“＋”会同时命中那半截行（穿透：点添加却选中了被压住的样式，实测）。
+        // 鼠标在按钮行内时，列表行的动作一律不响应（listItem 照画）。
+        const in_add_row = util.inRect(ui.mouse_x, ui.mouse_y, x + 1, add_btn_y, w - 2, item_h);
+
         var i: usize = 0;
         var iy = list_y - app.panels.pattern_scroll;
         while (i < pat_count) : (i += 1) {
             if (iy + item_h > list_y and iy < list_y + list_h) {
                 const selected = app.sel.pattern == @as(i32, @intCast(i));
-                if (ui.listItem(2000 + i, app.pattern_items.items[i], x + 1, iy, w - 2, item_h, selected, i % 2 == 1, null)) {
-                    app.sel.pattern = @intCast(i);
-                    // 钢琴卷帘开着时，点击样式 = 切换编辑对象（与“点片段→选样式”闭环）
-                    if (app.piano.pattern != null) app.piano.pattern = @intCast(i);
+                {
+                    // 底栏按钮盖住的半截行：hover/点击一起抑制——`listItem` 的高亮
+                    // 来自它自己的命中判定（不看渲染裁剪），只挡动作会“hover 穿透”（实测）；
+                    // 临时把鼠标 y 挪出屏内最省事。
+                    const prev_my = ui.mouse_y;
+                    if (in_add_row) ui.mouse_y = -100000;
+                    defer ui.mouse_y = prev_my;
+                    if (ui.listItem(2000 + i, app.pattern_items.items[i], x + 1, iy, w - 2, item_h, selected, i % 2 == 1, null, null) and !in_add_row) {
+                        app.sel.pattern = @intCast(i);
+                        // 钢琴卷帘开着时，点击样式 = 切换编辑对象（与“点片段→选样式”闭环）
+                        if (app.piano.pattern != null) app.piano.pattern = @intCast(i);
+                    }
                 }
-                // 双击样式 → 打开钢琴卷帘
-                if (ui.mouse_double and ui.hitRect(x + 1, iy, w - 2, item_h)) {
+                // 双击样式 → 打开钢琴卷帘（按钮行内不响应）
+                if (!in_add_row and ui.mouse_double and ui.hitRect(x + 1, iy, w - 2, item_h)) {
                     app.sel.pattern = @intCast(i);
                     app.openPiano(@intCast(i));
                 }
                 // 右键样式 → 重命名/删除菜单（位置快照；与机架右键同一模式）
-                if (ui.mouse_right_pressed and ui.hitRect(x + 1, iy, w - 2, item_h)) {
+                if (!in_add_row and ui.mouse_right_pressed and ui.hitRect(x + 1, iy, w - 2, item_h)) {
                     app.panels.ctx_pattern = i;
                     app.panels.ctx_pat_x = ui.mouse_x;
                     app.panels.ctx_pat_y = ui.mouse_y;
@@ -114,11 +128,9 @@ pub fn drawPatterns(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         ui.drawScrollbar(x + w - 6, list_y, 5, list_h, app.panels.pattern_scroll, content_h, list_h);
     }
 
-    // 底部：“＋ 添加样式”按钮（列表满时显示提示文本）
-    const btn_y = y + h - add_row_h + 2;
-    const btn_w = w - 10;
+    // 底部：“＋ 添加样式”按钮（下/左/右贴边；列表满时显示提示文本）
     if (pat_count < model.max_patterns) {
-        if (ui.button(2100, "＋ 添加样式", x + 5, btn_y, btn_w, item_h)) {
+        if (ui.button(2100, "＋ 添加样式", x + 1, add_btn_y, w - 2, item_h)) {
             const ni = app.addPattern();
             if (ni >= 0) {
                 app.sel.pattern = ni;
@@ -127,7 +139,7 @@ pub fn drawPatterns(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             }
         }
     } else {
-        ui.label("样式已达上限", x + 8, btn_y + 4, ui.theme.text_dim);
+        ui.label("样式已达上限", x + 8, add_btn_y + 4, ui.theme.text_dim);
     }
 }
 
@@ -195,10 +207,15 @@ pub fn drawPatternCtxMenu(ui: *Ui, app: *App) void {
                 app.panels.ctx_pattern = null;
             },
             1 => {
-                if (app.removePattern(idx)) {
-                    app.commitHistory("删除样式");
-                } else {
+                if (app.pattern_items.items.len <= 1) {
                     app.setToast("至少保留一个样式");
+                } else if (app.patternUsage(idx).notes == 0 and app.patternUsage(idx).clips == 0) {
+                    // 空样式：直接删
+                    if (app.removePattern(idx)) app.commitHistory("删除样式");
+                } else {
+                    // 非空：弹确认框（删除 + 撤销兜底）
+                    app.modal = .pattern_delete;
+                    app.struct_del_req = .{ .pattern = idx };
                 }
                 app.panels.ctx_pattern = null;
             },

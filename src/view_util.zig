@@ -145,6 +145,75 @@ pub const piano_key_h_max: i32 = 40;
 pub const track_h_min: i32 = 16; // 轨道行高范围（□ 缩放）
 pub const track_h_max: i32 = 120;
 
+/// 巨图阈值（小节数/轨道数）：达到后**拖动滑块不再允许出图**（只允许往回）；
+/// 滚轮不受此限（用户口径：滚轮任何时候都可出图）
+pub const overhang_map_limit: i32 = 10_000;
+
+/// 小节数字的**分级步长**（1-2-5 系列：1、2、5、10、20、50、…）：
+/// 返回满足 `步长 × 小节屏幕宽 ≥ min_spacing` 的**最小**档——标签太密时逐级降级；
+/// 号码按 `(bar − 1) % 步长 == 0` 切点渲染（锚定第 1 小节，即 1、1+步长、…）。
+pub fn barLabelStep(bar_ws: f32, min_spacing: f32) i32 {
+    const marks = [_]i32{ 1, 2, 5 };
+    var mult: i32 = 1;
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        const step: i32 = marks[i % 3] * mult;
+        if (@as(f32, @floatFromInt(step)) * bar_ws >= min_spacing) return step;
+        if (i % 3 == 2) mult *= 10;
+        if (mult > 100_000_000) return step; // 防呆（远处小节号码超 i32 量级，不可达）
+    }
+}
+
+test "view_util: 小节数字分级步长（1-2-5）：太密逐级降" {
+    try std.testing.expectEqual(@as(i32, 1), barLabelStep(192.0, 40)); // 足足宽
+    try std.testing.expectEqual(@as(i32, 2), barLabelStep(30.0, 40)); // 1×30<40 → 2
+    try std.testing.expectEqual(@as(i32, 2), barLabelStep(20.0, 40)); // 2×20=40
+    try std.testing.expectEqual(@as(i32, 5), barLabelStep(18.0, 40)); // 2×18<40 → 5
+    try std.testing.expectEqual(@as(i32, 10), barLabelStep(7.0, 40)); // 5×7<40 → 10
+    try std.testing.expectEqual(@as(i32, 20), barLabelStep(3.9, 40)); // 10×3.9<40 → 20
+    try std.testing.expectEqual(@as(i32, 50), barLabelStep(1.0, 40));
+}
+
+/// 垂直缩放的“缩到底”有效下限（□ 拖拽 / Shift+滚轮共用）：不允许缩过
+/// “所有行刚好填满视口”的行高——向上取整保证 `行数*行高 ≥ 视口`：不露缝隙、
+/// 滚动条不消失（向下取整会让内容比视口矮，实测）。行太少（连 `row_max` 都
+/// 填不满）→ 公式不适用，退回 `row_min`（自由缩放）；行很多（填满所需行高
+/// 低于 `row_min`）→ 退回固定的最小显示高度。
+pub fn zoomOutFloor(row_min: i32, row_max: i32, view_h: i32, rows: usize) i32 {
+    if (rows == 0) return row_min;
+    const n: i32 = @intCast(rows);
+    if (view_h <= 0) return row_min;
+    const need = @divTrunc(view_h + n - 1, n); // 向上取整
+    if (need > row_max) return row_min;
+    return @max(row_min, need);
+}
+
+test "view_util: 垂直缩放下限——向上取整保证“行总高 ≥ 视口”（不露缝、滚动条不消失）" {
+    // 5 行、视口 500：need=ceil(500/5)=100
+    try std.testing.expectEqual(@as(i32, 100), zoomOutFloor(16, 120, 500, 5));
+    // 实测形态：620/32=19.375 → 20（向下截取曾让内容矮于视口 → 露缝、滑块消失）
+    try std.testing.expectEqual(@as(i32, 20), zoomOutFloor(16, 120, 620, 32));
+    // 100 行：need=5 低于固定下限 → 退回 16
+    try std.testing.expectEqual(@as(i32, 16), zoomOutFloor(16, 120, 500, 100));
+    // 3 行：need=167 超过上限 → 公式不适用 → 退回 16
+    try std.testing.expectEqual(@as(i32, 16), zoomOutFloor(16, 120, 500, 3));
+    // 正好等于上限时也采用（临界处不掉回）
+    try std.testing.expectEqual(@as(i32, 120), zoomOutFloor(16, 120, 480, 4));
+    // 0 行 / 视口无效：防御性退回下限
+    try std.testing.expectEqual(@as(i32, 16), zoomOutFloor(16, 120, 500, 0));
+    try std.testing.expectEqual(@as(i32, 16), zoomOutFloor(16, 120, 0, 8));
+    // 不变式扫描：公式适用（need ≤ row_max）时，行总高恒 ≥ 视口
+    var rows: usize = 1;
+    while (rows <= 200) : (rows += 1) {
+        const view: i32 = 620;
+        const n: i32 = @intCast(rows);
+        const need = @divTrunc(view + n - 1, n);
+        if (need > 120) continue;
+        const floor_h = zoomOutFloor(16, 120, view, rows);
+        try std.testing.expect(n * floor_h >= view);
+    }
+}
+
 // ── 通道机架（浮动窗口）常量 ──
 pub const rack_title_h: i32 = 22; // 标题栏高
 pub const rack_row_h: i32 = 30; // 每行高
@@ -394,8 +463,14 @@ pub fn menuArrow(ui: *Ui, x: i32, y: i32, color: u32) void {
 /// 注：内容像素是整数——高倍缩放（zoom 大）下水平拖动会有
 /// ⌈zoom⌉ 像素级颗粒；zoom=1 时严格 1:1。
 pub fn screenToContentPx(dx: i32, zoom: f32) i32 {
-    const z = @max(0.01, zoom);
-    return @intFromFloat(@round(@as(f32, @floatFromInt(dx)) / z));
+    // 旧下限 0.01 是“zoom 下限 0.01 时代”的遗留（缩放系统早已改到 1e-9，
+    // 见 `Ui.zoomAnchoredScrollX` 注释）——深缩放（zoom<0.01）下这里会把换算
+    // 比例冻结在 1/0.01：中键拖动“内容跟不上鼠标”（实测：上千小节视野）。
+    // 口径统一为 1e-9；结果钳到滚动帽（1<<30）防 @intFromFloat 越界。
+    const z = @max(1e-9, zoom);
+    const v = @round(@as(f32, @floatFromInt(dx)) / z);
+    const cap: f32 = @floatFromInt(@as(i32, 1 << 30));
+    return @intFromFloat(std.math.clamp(v, -cap, cap));
 }
 
 /// 中略拆分结果：保留头部 `head` 码点 + 省略号 + 尾部 `tail` 码点
@@ -573,7 +648,7 @@ pub const follow_anchor_frac: f32 = 0.25;
 /// （`off_screen` 由调用方按 `follow_anchor_frac × 内容区宽` 换算，可为负 → 自动贴左）；
 /// 再夹在内容跨度内（装得下 → 贴左）。`view_w`/`zoom` 用于跨度上界。纯函数（单测）。
 pub fn followTargetScrollX(cur_px: f32, view_w: i32, zoom: f32, off_screen: f32, content_span: i32) i32 {
-    const z = @max(0.01, zoom);
+    const z = @max(1e-9, zoom); // 0.01 为旧下限遗留（同 `screenToContentPx`：深缩放跟随错位）
     const raw = cur_px - off_screen / z;
     const vcw = @as(f32, @floatFromInt(view_w)) / z;
     const max_s: f32 = @max(0, @as(f32, @floatFromInt(content_span)) - vcw);

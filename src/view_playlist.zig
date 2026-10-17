@@ -9,6 +9,12 @@ const util = @import("view_util.zig");
 
 /// 片段在轨道内容区的绘制矩形（x / 宽；屏幕像素，含 zoom 换算）。
 /// **边缘与格子对齐**（不缩进）；起点/终点各自取整 → 并排片段严格相接、无 1px 缝。
+/// 层序比较（用户拍板规则）：左端点升序；相同 → 数组序（越后越上层）。
+fn clipLayerLess(clips: []const model.Clip, a: usize, b: usize) bool {
+    if (clips[a].start != clips[b].start) return clips[a].start < clips[b].start;
+    return a < b;
+}
+
 /// `step_px`：一步的**内容像素宽**（浮点；U=96 下每步很小）。
 pub fn clipXW(c: model.Clip, lane_x: i32, step_px: f32, scroll_x: i32, zoom: f32) struct { x: i32, w: i32 } {
     const x0: f32 = (@as(f32, @floatFromInt(c.start)) * step_px - @as(f32, @floatFromInt(scroll_x))) * zoom;
@@ -19,6 +25,9 @@ pub fn clipXW(c: model.Clip, lane_x: i32, step_px: f32, scroll_x: i32, zoom: f32
 }
 
 /// 样式配色（minimap / 片段色块）：按序号在色相上分布，保证相邻样式颜色可区分。
+/// 静音视觉（浅灰）：轨道名与片段整体变灰
+pub const muted_gray: r_mod.Color = r_mod.rgb(150, 150, 154);
+
 pub fn patternColor(pattern: i32) r_mod.Color {
     const palette = [_]r_mod.Color{
         r_mod.rgb(90, 170, 255), // 蓝
@@ -30,6 +39,77 @@ pub fn patternColor(pattern: i32) r_mod.Color {
     };
     const idx: usize = @intCast(@mod(pattern, @as(i32, @intCast(palette.len))));
     return palette[idx];
+}
+
+/// 轨道右键菜单（重命名 / 在下方插入 / 删除）——主循环调用（同样式菜单模式）。
+pub fn drawTrackCtxMenu(ui: *Ui, app: *App) void {
+    const idx = app.panels.ctx_track orelse return;
+    if (idx >= @as(usize, @intCast(app.playlist.view_rows))) {
+        app.panels.ctx_track = null; // 目标已不存在（撤销等）→ 关闭
+        return;
+    }
+    const items = [_][]const u8{ "重命名", "上移", "下移", "清空轨道", "删除轨道" };
+    const menu_w: i32 = 150;
+    const menu_h: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
+    const mx = app.panels.ctx_trk_x;
+    const my = app.panels.ctx_trk_y;
+    ui.renderer.fillRect(mx, my, menu_w, menu_h, ui.theme.panel);
+    ui.renderer.strokeRect(mx, my, menu_w, menu_h, ui.theme.accent);
+    ui.noteOverlayRect(mx, my, menu_w, menu_h); // 遮挡插件子窗口
+
+    var clicked: ?usize = null;
+    var inside = false;
+    for (items, 0..) |item, ii| {
+        const iy = my + 2 + @as(i32, @intCast(ii)) * util.menu_item_h;
+        const hovered = util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, menu_w - 2, util.menu_item_h);
+        if (hovered) {
+            inside = true;
+            ui.renderer.fillRect(mx + 1, iy, menu_w - 2, util.menu_item_h, ui.theme.item_hover);
+        }
+        ui.label(item, mx + 8, iy + 2, ui.theme.text);
+        if (hovered and ui.mouse_pressed) clicked = ii;
+    }
+    if (clicked) |ci| {
+        switch (ci) {
+            0 => app.beginRenameTrack(idx, mx + 6, my + 4),
+            1 => {
+                // 上移：与相邻行整体交换（默认名随位置，自定义名随行）
+                if (idx > 0) {
+                    app.swapTrackRows(idx, idx - 1);
+                    app.commitHistory("上移轨道");
+                } else {
+                    app.setToast("已在最上一条");
+                }
+            },
+            2 => {
+                app.swapTrackRows(idx, idx + 1);
+                app.commitHistory("下移轨道");
+            },
+            3 => {
+                if (app.trackUsage(idx) == 0) {
+                    app.setToast("该轨道已是空的");
+                } else {
+                    // 非空：弹确认框（清空片段 + 撤销兜底；行与名字保留）
+                    app.modal = .track_clear;
+                    app.struct_del_req = .{ .track = idx };
+                }
+            },
+            4 => {
+                if (app.trackUsage(idx) == 0) {
+                    // 空行：直接删（下方整体上移）
+                    app.removeTrackRow(idx);
+                    app.commitHistory("删除轨道");
+                } else {
+                    app.modal = .track_delete;
+                    app.struct_del_req = .{ .track_row = idx };
+                }
+            },
+            else => {},
+        }
+        app.panels.ctx_track = null;
+    } else if (ui.mouse_pressed and !inside) {
+        app.panels.ctx_track = null;
+    }
 }
 
 pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
@@ -124,7 +204,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             };
             nmini += 1;
         }
-        _ = ui.scrollbarTimelineEx(8, x + 1, hsb_y, w - 2, ruler_h, &app.playlist.scroll_x, &app.playlist.content_w, &app.playlist.zoom, view_w, min_content, dyn_zoom_min, 8.0, mini_buf[0..nmini]);
+        _ = ui.scrollbarTimelineEx(8, x + 1, hsb_y, w - 2, ruler_h, &app.playlist.scroll_x, min_content, &app.playlist.zoom, view_w, dyn_zoom_min, 8.0, bars_right < util.overhang_map_limit, mini_buf[0..nmini]);
     }
     ui.renderer.hline(x + 1, ruler_y, w - 2, ui.theme.panel_border);
 
@@ -150,9 +230,12 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         const saved = ui.renderer.pushClip(lane_x, ruler_y, view_w, ruler_h);
         defer ui.renderer.popClip(saved);
         var bar: i32 = @divFloor(app.playlist.scroll_x, bar_w) + 1;
+        // 小节数字**分级渲染**（1-2-5 系列）：标签太密时只显 1、2、5、10… 的切点
+        const label_step: i32 = util.barLabelStep(bar_ws, 40);
         while (true) : (bar += 1) {
             const bx = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(bar - 1)) * bar_ws - scroll_s));
             if (bx > main_x + main_w) break;
+            if (@mod(bar - 1, label_step) != 0) continue;
             // 只画数字标记（小节线在内容区已有，标尺行保持干净）。
             // 若将来想加回刻度线，在此处加：
             //   ui.renderer.fillRect(bx, ruler_y, 1, ruler_h, ui.theme.grid_bar);
@@ -193,31 +276,48 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     ui.renderer.vline(lane_x, ruler_y, ruler_h, ui.theme.panel_border); // 轨道名列分界（标尺行）
     ui.renderer.hline(x + 1, tracks_y, w - 2, ui.theme.panel_border);
 
+    // 地图行数（**推导跨度**：max(最短行程 128, 内容下缘 + 1 + 3 行留白)；与横向“保底 4 小节 + 3 留白”对称）。
+    // 滚动条/滚轮/缩放以它为准；**悬空**（滚动越出地图）只影响滚动位置，不改地图。
+    const map_rows: i32 = app.trackCount();
+
+    // 缩放下限 = 视图恰好容纳整个行轴（与横向 `dyn_zoom_min` 同构）：缩到底时行轴恰好
+    // 填满视口——不露白、无假行程；只当“刹车”不反向顶大。
+    const zoom_min_h: i32 = @min(util.zoomOutFloor(util.track_h_min, util.track_h_max, tracks_h, @intCast(map_rows)), app.playlist.track_h);
+
     // □ 缺口：按住上下拖 = 轨道行高缩放（方块本身固定不动；视口中心内容保持不动）
+    // 悬空状态下缩放：只按新地图重钳下界、**悬空量保留**（不把视口拽回地图）
     {
         const old_h = app.playlist.track_h;
-        if (ui.zoomSquare(12, sb_x, ruler_y, ruler_h, &app.playlist.track_h, util.track_h_min, util.track_h_max, 2) and app.playlist.track_h != old_h) {
-            const content_h_new: i32 = @intCast(app.track_items.len * @as(usize, @intCast(app.playlist.track_h)));
-            app.playlist.scroll = Ui.zoomAnchoredScroll(app.playlist.scroll, tracks_h, old_h, app.playlist.track_h, content_h_new);
+        if (ui.zoomSquare(12, sb_x, ruler_y, ruler_h, &app.playlist.track_h, zoom_min_h, util.track_h_max, 2) and app.playlist.track_h != old_h) {
+            const old_content: i32 = map_rows * old_h;
+            const content_h_new: i32 = map_rows * app.playlist.track_h;
+            const over: i32 = @max(0, app.playlist.scroll - @max(0, old_content - tracks_h));
+            const anchored = Ui.zoomAnchoredScroll(app.playlist.scroll, tracks_h, old_h, app.playlist.track_h, content_h_new);
+            app.playlist.scroll = anchored + over;
         }
     }
 
     // 行高必须在 □ 缩放块**之后**捕获：否则本帧会用「旧行高 + 新滚动偏移」绘制，
     // 每步缩放都会跳一帧（实测明显上下跳变），下一帧才恢复。
     const track_h: i32 = app.playlist.track_h;
+    // 可见行数（“行轴无限延伸”的可视化）：行照常铺到视口底——**悬空时视口下方的行
+    // 也是真行**（可放置 → 地图立即扩张）。右键菜单/重命名的边界守卫读 `view_rows` 快照。
+    const rows_draw: i32 = @max(map_rows, @divTrunc(app.playlist.scroll + tracks_h + track_h - 1, @max(1, track_h)));
+    app.playlist.view_rows = rows_draw;
 
-    // 样式音域统计（每帧一次）：片段预览的纵向映射用（避免片段循环里重复扫全量音符）
-    // 样式数量上限（播放列表预览的音域统计数组按此设限）
-    const max_patterns: i32 = model.max_patterns;
-    var pat_min_pitch: [max_patterns]i32 = [_]i32{127} ** max_patterns;
-    var pat_max_pitch: [max_patterns]i32 = [_]i32{0} ** max_patterns;
-    var pat_has_notes: [max_patterns]bool = [_]bool{false} ** max_patterns;
+
+    // 样式音域统计（每帧一次）：片段预览的纵向映射用（避免片段循环里重复扫全量音符）。
+    // **按实际样式数**复用 App 缓冲（原为 `[max_patterns]` 栈数组——上限放到十亿级后
+    // 不能预分配；成本完全按真实用量）。
+    const pat_stat = app.ensurePatStats(app.pattern_items.items.len);
+    for (pat_stat) |*s| s.* = .{};
     for (app.notes.items) |n| {
-        if (n.pattern < 0 or n.pattern >= max_patterns) continue;
+        if (n.pattern < 0) continue;
         const pi: usize = @intCast(n.pattern);
-        pat_has_notes[pi] = true;
-        pat_min_pitch[pi] = @min(pat_min_pitch[pi], n.pitch);
-        pat_max_pitch[pi] = @max(pat_max_pitch[pi], n.pitch);
+        if (pi >= pat_stat.len) continue;
+        pat_stat[pi].has_notes = true;
+        pat_stat[pi].min_pitch = @min(pat_stat[pi].min_pitch, n.pitch);
+        pat_stat[pi].max_pitch = @max(pat_stat[pi].max_pitch, n.pitch);
     }
 
     // 轨道行（裁剪：滚动时不画出边界）
@@ -225,15 +325,32 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         const saved = ui.renderer.pushClip(main_x, tracks_y, main_w, tracks_h);
         defer ui.renderer.popClip(saved);
 
-        var i: usize = 0;
-        var ty = tracks_y - app.playlist.scroll;
-        while (i < app.track_items.len) : (i += 1) {
+        // 跳过不可能可见的行（行轴无上限，滚动很远时避免从 0 逐行空转）
+        var i: usize = @intCast(@max(0, @divTrunc(app.playlist.scroll, @max(1, track_h))));
+        var ty = tracks_y - app.playlist.scroll + @as(i32, @intCast(i)) * track_h;
+        while (i < @as(usize, @intCast(rows_draw))) : (i += 1) {
             if (ty + track_h > tracks_y and ty < tracks_y + tracks_h) {
                 const selected = app.sel.track == @as(i32, @intCast(i));
                 // 轨道名（左列；底色加深与内容区区分）
                 // 注：Ctrl 按下时不响应（让位给“按行框选”——起点在轨道名列的手势）
-                if (ui.listItem(3000 + i, app.track_items[i], main_x, ty, header_w, track_h, selected, i % 2 == 1, ui.theme.bg) and !ui.mods_ctrl) {
-                    app.sel.track = @intCast(i);
+                    const muted = app.trackMuted(i);
+                    // 静音方形开关（名字右侧；开=绿/关=灰）——点它切换，不点名字
+                    const btn_sz: i32 = @min(track_h - 2, @max(12, @as(i32, @intFromFloat(ui.font.lineHeight()))));
+                    const btn_x: i32 = main_x + header_w - btn_sz - 4;
+                    const btn_y: i32 = ty + @divTrunc(track_h - btn_sz, 2);
+                    const over_mute = util.inRect(ui.mouse_x, ui.mouse_y, btn_x, btn_y, btn_sz, btn_sz);
+                    if (ui.listItem(3000 + i, app.trackName(i), main_x, ty, header_w, track_h, selected, i % 2 == 1, ui.theme.bg, if (muted) muted_gray else null) and !ui.mods_ctrl and !over_mute) {
+                        app.sel.track = @intCast(i);
+                    }
+                    if (ui.toggleSquare(!muted, btn_x, btn_y, btn_sz)) { // 蓝=发声 / 灰=静音
+                        app.setTrackMuted(i, !muted);
+                        app.commitHistory(if (!muted) "静音轨道" else "取消静音轨道");
+                    }
+                // 右键轨道头 → 重命名/清空菜单（位置快照；与样式右键同一模式）
+                if (ui.mouse_right_pressed and ui.hitRect(main_x, ty, header_w, track_h)) {
+                    app.panels.ctx_track = i;
+                    app.panels.ctx_trk_x = ui.mouse_x;
+                    app.panels.ctx_trk_y = ui.mouse_y;
                 }
                 // 轨道内容区（背景 + 网格）
                 const lane_bg = if (i % 2 == 1) ui.theme.item_alt else ui.theme.panel;
@@ -262,20 +379,40 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 {
                     const saved_clips = ui.renderer.pushClip(lane_x, ty, view_w, track_h);
                     defer ui.renderer.popClip(saved_clips);
-                    for (app.clips.items) |clip| {
-                        if (clip.track != @as(i32, @intCast(i))) continue;
+                    const row_muted = app.trackMuted(i);
+                    // 层级（用户拍板）：按左端点升序绘制（越靠右越上层）；左端相同 → 数组序。
+                    // 暂存下标表排序（片段数小；表跨帧复用，见 `PlaylistState.draw_order`）。
+                    app.playlist.draw_order.clearRetainingCapacity();
+                    for (app.clips.items, 0..) |c0, ci0| {
+                        if (c0.track == @as(i32, @intCast(i))) {
+                            app.playlist.draw_order.append(app.allocator, ci0) catch {};
+                        }
+                    }
+                    std.mem.sort(usize, app.playlist.draw_order.items, app.clips.items, clipLayerLess);
+                    for (app.playlist.draw_order.items) |ci| {
+                        const clip = app.clips.items[ci];
                         const rect = clipXW(clip, lane_x, step_px, app.playlist.scroll_x, zoom);
                         const clip_x = rect.x;
                         const clip_w = rect.w;
                         if (clip_x + clip_w < lane_x or clip_x > lane_x + view_w) continue;
-                        const base = patternColor(clip.pattern);
+                        const base = if (row_muted) muted_gray else patternColor(clip.pattern);
                         // 底色 = 样式色（32% 不透明）+ 描边 = 样式色全亮；
                         // 选中片段：额外叠加橙色高亮（框选/批量操作的视觉反馈）
-                        const fill = (@as(u32, 80) << 24) | (base & 0x00FFFFFF);
-                        ui.renderer.fillRect(clip_x, ty, clip_w, track_h, fill);
-                        if (clip.selected) {
-                            const sel_fill = (@as(u32, 60) << 24) | (ui.theme.note_selected & 0x00FFFFFF);
-                            ui.renderer.fillRect(clip_x, ty, clip_w, track_h, sel_fill);
+                        //
+                        // **细线特例（≤2px——即描边会被跳过的宽度）**：整条用亮色画，
+                        // “线本身就是边框”（用户拍板 A 方案）；选中的细线用主题的
+                        // 选中橙亮色（`theme.note_selected`，缩小时选中态不丢）。
+                        const thin = clip_w <= 2;
+                        if (thin) {
+                            const line_color = if (clip.selected) ui.theme.note_selected else base;
+                            ui.renderer.fillRect(clip_x, ty, @max(1, clip_w), track_h, line_color);
+                        } else {
+                            const fill = (@as(u32, 80) << 24) | (base & 0x00FFFFFF);
+                            ui.renderer.fillRect(clip_x, ty, clip_w, track_h, fill);
+                            if (clip.selected) {
+                                const sel_fill = (@as(u32, 60) << 24) | (ui.theme.note_selected & 0x00FFFFFF);
+                                ui.renderer.fillRect(clip_x, ty, clip_w, track_h, sel_fill);
+                            }
                         }
 
                         // ── 片段内音符预览（minimap 风格）──
@@ -289,9 +426,10 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                         const inner_y = ty + 2 + label_h;
                         const inner_h = @max(2, track_h - 4 - label_h);
                         {
-                            const pi: usize = @intCast(@min(clip.pattern, max_patterns - 1));
-                            if (clip.pattern >= 0 and clip.pattern < max_patterns and pat_has_notes[pi]) {
-                                const range = model.rangeMap(pat_min_pitch[pi], pat_max_pitch[pi], 12);
+                                        const pi: usize = @intCast(@max(0, clip.pattern));
+                                        // 细线（≤2px）跳过预览：亮点不可见，且省一遍全量音符扫描
+                                        if (!thin and clip.pattern >= 0 and pi < pat_stat.len and pat_stat[pi].has_notes) {
+                                            const range = model.rangeMap(pat_stat[pi].min_pitch, pat_stat[pi].max_pitch, 12);
                                 const win_lo = clip.offset;
                                 const win_steps = clip.len;
                                 // 画**全部**乐器、全部音符（**不做“画满 N 个就停”的截断**）。
@@ -323,7 +461,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                         if (label_h > 0) {
                             var buf: [24]u8 = undefined;
                             const label_text = std.fmt.bufPrint(&buf, "样式 {d}", .{clip.pattern + 1}) catch "";
-                            ui.labelClipped(label_text, clip_x + 6, ty + 4, clip_w - 12, ui.theme.text);
+                            ui.labelClipped(label_text, clip_x + 6, ty + 4, clip_w - 12, if (row_muted) muted_gray else ui.theme.text);
                         }
                     }
                 }
@@ -425,10 +563,12 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                         app.sel.song_mode = true;
                         app.setLoopRegion(lo, hi);
                         app.selectNotesInRegionSong(lo, hi); // 选中被拖过区域的音符（全局映射）
+                        app.selectClipsInRegionSong(lo, hi); // **片段同理**（与钢琴窗对齐）
                     }
                 } else {
                     app.clearLoopRegion(); // 单击未拖动 = 取消循环
                     app.clearNoteSelection(); // 一并取消音符选区
+                    app.clearClipSelection(); // 片段选区同理（与钢琴窗对齐）
                 }
                 app.playback.loop_drag_from = null;
                 app.playback.loop_drag_moved = false;
@@ -437,12 +577,13 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 if (@abs(ui.mouse_x - app.playback.loop_drag_press_x) > 3) {
                     app.playback.loop_drag_moved = true;
                 }
-                // 拖动中**实时高亮**：区域内的音符每帧重算选中
+                // 拖动中**实时高亮**：区域内的音符/片段每帧重算选中
                 // （同框选“框内 = 选中”；不必等松手）
                 if (app.playback.loop_drag_moved) {
                     if (app.playback.loop_drag_from) |df| {
                         const cur = playlistMouseStepSnap(ui.mouse_x, lane_x, app.playlist.scroll_x, zoom, step_px, pl_snap);
                         app.selectNotesInRegionSong(@min(df, cur), @max(df, cur));
+                        app.selectClipsInRegionSong(@min(df, cur), @max(df, cur));
                     }
                 }
             }
@@ -477,8 +618,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 量化/吸附格（步）——片段移动/拉伸对齐到它
     const snap_steps: i32 = model.snapSteps(app.playlist.snap);
     const snap_step: i32 = @max(0, model.snapRound(step_i, snap_steps));
-    const track_count: i32 = @intCast(app.track_items.len);
-    const valid_track = track_i >= 0 and track_i < track_count;
+    const valid_track = track_i >= 0 and track_i < rows_draw;
 
     // ── 框选（Ctrl+左键拖；Ctrl+Shift = 追加）——片段──
     // **按行框选**：起点在**轨道名列**时切换成“整行选择”（垂直拖选轨道行、水平不限）
@@ -526,33 +666,39 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 注：框选手势期间不命中（框选优先）
     var clip_hit: ?struct { index: usize, mode: model.ClipHitMode } = null;
     if (in_lane and valid_track and !app.playlist.marquee_active and !ui.mods_ctrl) {
-        for (app.clips.items, 0..) |c, ci| {
-            if (c.track != track_i) continue;
-            if (step_i >= c.start and step_i < c.start + c.len) {
-                const rect = clipXW(c, lane_x, step_px, app.playlist.scroll_x, zoom);
-                const near_left = ui.mouse_x <= rect.x + 8;
-                const near_right = ui.mouse_x >= rect.x + rect.w - 8;
-                const mode: model.ClipHitMode = if (near_left and near_right)
-                    // 窄片段两缘都近：按鼠标在片段内的相对位置就近选
-                    (if (ui.mouse_x - rect.x <= rect.x + rect.w - ui.mouse_x) .left else .right)
-                else if (near_left)
-                    .left
-                else if (near_right)
-                    .right
-                else
-                    .body;
-                clip_hit = .{ .index = ci, .mode = mode };
-                break;
-            }
+        // 叠放（用户拍板）：命中取**最顶层**（左端越右越上；同左端取数组序最大）
+        if (model.topmostClipAt(app.clips.items, track_i, step_i)) |ci| {
+            const c = app.clips.items[ci];
+            const rect = clipXW(c, lane_x, step_px, app.playlist.scroll_x, zoom);
+            const near_left = ui.mouse_x <= rect.x + 8;
+            const near_right = ui.mouse_x >= rect.x + rect.w - 8;
+            const mode: model.ClipHitMode = if (near_left and near_right)
+                // 窄片段两缘都近：按鼠标在片段内的相对位置就近选
+                (if (ui.mouse_x - rect.x <= rect.x + rect.w - ui.mouse_x) .left else .right)
+            else if (near_left)
+                .left
+            else if (near_right)
+                .right
+            else
+                .body;
+            clip_hit = .{ .index = ci, .mode = mode };
         }
     }
 
-    // 双击片段：打开钢琴卷帘（编辑该样式）
+    // 双击片段：打开钢琴卷帘（编辑该样式）。
+    // 用**第一次按下时命中**的片段（`prev_click_clip`）——点击会触发叠放轮换，
+    // 第二次按下时命中的可能已经换人（用户双击的意图是第一次那个）。
     if (ui.mouse_double) {
-        if (clip_hit) |hit| {
-            const c = app.clips.items[hit.index];
-            app.openPiano(c.pattern);
-            return;
+        var dbl: ?usize = app.playlist.prev_click_clip;
+        if (dbl == null) {
+            if (clip_hit) |hit| dbl = hit.index;
+        }
+        if (dbl) |di| {
+            if (di < app.clips.items.len) {
+                const c = app.clips.items[di];
+                app.openPiano(c.pattern);
+                return;
+            }
         }
     }
 
@@ -588,7 +734,12 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 注：Ctrl 按下（框选手势）时不放置/拖动——否则框选启动当帧会先放一个片段
     if (ui.mouse_pressed and in_lane and !ui.mods_ctrl and valid_track) {
         app.sel.track = track_i;
-        if (clip_hit) |hit| {
+        if (clip_hit) |hit0| {
+            // 叠放轮换（用户拍板）：点中即沉到**同左端点组的最底层**——
+            // 原来的第二层顶上来，连点即轮换；随后的拖动/拉伸仍作用于它
+            // （索引用沉降后的新值；`prev_click_clip` 供双击打开用）。
+            const hit = .{ .index = app.sinkClipToTieBottom(hit0.index), .mode = hit0.mode };
+            app.playlist.prev_click_clip = hit.index;
             const c = app.clips.items[hit.index];
             app.sel.pattern = c.pattern;
             // 拉伸基准（**按下时快照**）：原起点/原长/按下步——增量式拉伸的锚
@@ -643,11 +794,11 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             // 内容超过 1 小节的样式会被截断，实测不符直觉）
             // 注：放置新片段时**取消选区**（符合直觉：新建 = 新焦点）
             app.clearClipSelection();
+            app.playlist.prev_click_clip = null;
             const new_len: i32 = app.patternEffectiveLen(app.sel.pattern);
-            if (!model.clipOverlaps(app.clips.items, app.clips.items.len, track_i, snap_step, new_len)) {
-                app.addClip(.{ .track = track_i, .start = snap_step, .len = new_len, .pattern = app.sel.pattern });
-                app.commitHistory("放置片段"); // 原子操作：立即提交
-            }
+            // 叠放实验：**不再拦截重叠**（与批量移动/音符一致）；层级按左端点自然排定
+            app.addClip(.{ .track = track_i, .start = snap_step, .len = new_len, .pattern = app.sel.pattern });
+            app.commitHistory("放置片段"); // 原子操作：立即提交
         }
     }
 
@@ -663,7 +814,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             if (app.playlist.drag_armed) {
                 const d_step = model.snapRound(step_i - app.playlist.batch_down_step, snap_steps);
                 const d_track = track_i - app.playlist.batch_down_track;
-                _ = app.moveSelectedClips(d_step, d_track, track_count);
+                _ = app.moveSelectedClips(d_step, d_track, rows_draw);
             }
         }
         // ── 批量拉伸（选区 ≥ 2 边缘拖动；全组同步，与音符一致）──
@@ -699,8 +850,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                     // **目标位置**吸附到网格（而非鼠标位置——抓取点不在格上时会脱格）
                     const target = @max(0, step_i - app.playlist.drag_grab);
                     const new_start = @max(0, model.snapRound(target, snap_steps));
-                    const new_track = std.math.clamp(track_i, 0, track_count - 1);
-                    if ((new_start != c.start or new_track != c.track) and !model.clipOverlaps(app.clips.items, ci, new_track, new_start, c.len)) {
+                    const new_track = std.math.clamp(track_i, 0, rows_draw - 1);
+                    if (new_start != c.start or new_track != c.track) { // 叠放实验：不再拦截重叠
                         c.track = new_track;
                         c.start = new_start;
                         app.dirty = true;
@@ -718,24 +869,18 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                         const delta = app.playlist.resize_down_step - step_i; // 左移为正（拉长）
                         const len = @min(model.trimLenByGrid(app.playlist.resize_orig_len, delta, snap_steps), right);
                         if (model.clipTrimLeft(c.*, right - len, min_len)) |nc| {
-                            if ((nc.start != c.start or nc.len != c.len or nc.offset != c.offset) and
-                                !model.clipOverlaps(app.clips.items, ci, nc.track, nc.start, nc.len))
-                            {
+                            // 叠放实验：不再拦截重叠
+                            if (nc.start != c.start or nc.len != c.len or nc.offset != c.offset) {
                                 c.* = nc;
                                 app.dirty = true;
                             }
                         }
                     } else {
-                        // 右缘：长度 = **原长 + k×格**（网格决定增减步长）；
-                        // 上限：同轨下一个片段之前
-                        var max_len: i32 = 1 << 20;
-                        for (app.clips.items, 0..) |o, oi| {
-                            if (oi == ci or o.track != c.track or o.start <= c.start) continue;
-                            max_len = @min(max_len, o.start - c.start);
-                        }
+                        // 右缘：长度 = **原长 + k×格**（网格决定增减步长）
+                        // 叠放实验：不再限“同轨下一片段之前”，也不再拦截重叠
                         const delta = step_i - app.playlist.resize_down_step;
-                        const new_len = std.math.clamp(model.trimLenByGrid(app.playlist.resize_orig_len, delta, snap_steps), min_len, @max(min_len, max_len));
-                        if (new_len != c.len and !model.clipOverlaps(app.clips.items, ci, c.track, c.start, new_len)) {
+                        const new_len = @max(min_len, model.trimLenByGrid(app.playlist.resize_orig_len, delta, snap_steps));
+                        if (new_len != c.len) {
                             c.len = new_len;
                             app.dirty = true;
                         }
@@ -752,7 +897,6 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     }
 
     // 纵向滚动：滚轮（主区）+ 右侧纵向滚动条
-    const content_h: i32 = @intCast(app.track_items.len * @as(usize, @intCast(track_h)));
     // 中键拖动中：屏蔽滚轮（含 Ctrl/Shift 缩放）——缩放会让锚定比例失准、
     // 拖动跟随抽动（用户约定：拖动期间只平移，不缩放）
     if (!app.playlist.nav_active and ui.hitRect(main_x, tracks_y, main_w, tracks_h)) {
@@ -768,19 +912,22 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             // 下限取 min(动态下限，当前)：内容缩短（动态下限被动抬高）时
             // 不得把视口突然放大——只拦“继续缩小”。
             app.playlist.zoom_target = std.math.clamp(tgt * std.math.pow(f32, util.wheel_zoom_factor, @as(f32, @floatFromInt(ui.wheel))), @min(dyn_zoom_min, tgt), 8.0);
-            // 缩小/已到下限：把视口右缘拉回内容跨度内（全装得下 → 贴左）
+            // 缩小/已到下限：把视口右缘拉回内容跨度内（全装得下 → 贴左）——悬空量保留
             const vcw: i32 = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(view_w)) / app.playlist.zoom)));
-            app.playlist.scroll_x = Ui.clampScrollToSpan(app.playlist.scroll_x, vcw, content_span);
+            const over: i32 = @max(0, app.playlist.scroll_x - @max(0, content_span - vcw));
+            app.playlist.scroll_x = Ui.clampScrollToSpan(app.playlist.scroll_x, vcw, content_span) + over;
         } else if (ui.wheel_shift) {
             // Shift+滚轮：**纵向缩放**（轨道行高）——只设补间目标（补间块在本段之后）
             app.playlist.track_h_anchor_off = ui.mouse_y - tracks_y;
             var tgt = app.playlist.track_h_target;
             // 反向输入先抵消未完成的补间（同横向缩放；实测手感 bug）
             if ((ui.wheel > 0 and tgt < app.playlist.track_h) or (ui.wheel < 0 and tgt > app.playlist.track_h)) tgt = app.playlist.track_h;
-            app.playlist.track_h_target = std.math.clamp(tgt + ui.wheel * 2, util.track_h_min, util.track_h_max);
+            app.playlist.track_h_target = std.math.clamp(tgt + ui.wheel * 2, zoom_min_h, util.track_h_max);
         } else {
             // 裸滚轮：纵向滚动——只设补间目标（滚轮离散 → 逐帧平滑）
-            app.playlist.scroll_target = std.math.clamp(app.playlist.scroll_target - util.scrollDelta(ui), 0, @max(0, content_h - tracks_h));
+            // 滚轮上限 = 防溢出帽——**用户拍板：垂直滚轮也可以滚到地图外**（与拖动一致）；
+            // 悬空状态不再限制滚轮下滚（旧“不得加深”规则已废）
+            app.playlist.scroll_target = std.math.clamp(app.playlist.scroll_target - util.scrollDelta(ui), 0, 1 << 30);
         }
     }
 
@@ -796,7 +943,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             else
                 util.glideF32(pl.zoom, pl.zoom_target, app.frame_dt_ns, 0.03); // τ=0.03s（用户实测手感）
             if (z_new > 0 and z_new != pl.zoom) {
-                pl.scroll_x = Ui.zoomAnchoredScrollX(pl.scroll_x, view_w, pl.zoom_anchor_off, pl.zoom, z_new, pl.content_w, content_span);
+                const vcw_now: i32 = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(view_w)) / pl.zoom)));
+                const over: i32 = @max(0, pl.scroll_x - @max(0, content_span - vcw_now)); // 悬空量保留
+                pl.scroll_x = Ui.zoomAnchoredScrollX(pl.scroll_x, view_w, pl.zoom_anchor_off, pl.zoom, z_new, content_span, content_span) + over;
                 pl.zoom = z_new;
             }
         }
@@ -816,23 +965,24 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             else
                 util.glideI32(pl.track_h, pl.track_h_target, app.frame_dt_ns, 0.03);
             if (h_new > 0 and h_new != pl.track_h) {
-                const ch_new: i32 = @intCast(app.track_items.len * @as(usize, @intCast(h_new)));
-                pl.scroll = Ui.zoomAnchoredScrollY(pl.scroll, tracks_h, pl.track_h_anchor_off, pl.track_h, h_new, ch_new);
+            const content_new: i32 = map_rows * h_new;
+            const old_map_max: i32 = @max(0, map_rows * pl.track_h - tracks_h);
+            const over: i32 = @max(0, pl.scroll - old_map_max); // 悬空量保留（不拽回地图）
+            pl.scroll = Ui.zoomAnchoredScrollY(pl.scroll, tracks_h, pl.track_h_anchor_off, pl.track_h, h_new, content_new) + over;
                 pl.track_h = h_new;
             }
         }
         pl.track_h_anim_last = pl.track_h;
         // 纵向滚动
-        const ch_now: i32 = @intCast(app.track_items.len * @as(usize, @intCast(@max(1, pl.track_h))));
-        const max_s: i32 = @max(0, ch_now - tracks_h);
-        if (pl.scroll_anim_last < 0 or pl.scroll != pl.scroll_anim_last) pl.scroll_target = pl.scroll;
-        pl.scroll_target = std.math.clamp(pl.scroll_target, 0, max_s);
+                if (pl.scroll_anim_last < 0 or pl.scroll != pl.scroll_anim_last) pl.scroll_target = pl.scroll;
+        // 滚轮上限 = 防溢出帽（垂直滚轮可出图——同拖动）
+        pl.scroll_target = std.math.clamp(pl.scroll_target, 0, 1 << 30);
         if (pl.scroll != pl.scroll_target) {
             const s_new = if (@abs(pl.scroll_target - pl.scroll) <= 1)
                 pl.scroll_target
             else
                 util.glideI32(pl.scroll, pl.scroll_target, app.frame_dt_ns, 0.03);
-            pl.scroll = std.math.clamp(s_new, 0, max_s);
+            pl.scroll = std.math.clamp(s_new, 0, 1 << 30);
         }
         pl.scroll_anim_last = pl.scroll;
     }
@@ -853,13 +1003,13 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             if (!ui.mouse_middle_down) {
                 pl.nav_active = false;
             } else {
-                // 从**原点**重算（拖出范围后回拖立即响应，不会积累死区）；
-                // 钳制与各自的滚轮/缩放路径同一公式。
-                const vcw: i32 = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(view_w)) / pl.zoom)));
+                // 从**原点**重算（拖出范围后回拖立即响应，不会积累死区）。
+                // 纵向：**悬空出口**——不设地图上限（内部防溢出帽同滚动条控件），拖出/拖回自由。
+                // 横向：同理无界（新设计：中键可把视口整个拖出地图）
                 // 屏幕位移 → 内容像素（/zoom）——“鼠标移 1px、内容移 1px”的 1:1
                 const dx_c = util.screenToContentPx(ui.mouse_x - pl.nav_mx, pl.zoom);
-                pl.scroll_x = Ui.clampScrollToSpan(pl.nav_scroll_x0 - dx_c, vcw, content_span);
-                pl.scroll = std.math.clamp(pl.nav_scroll_y0 - (ui.mouse_y - pl.nav_my), 0, @max(0, content_h - tracks_h));
+                pl.scroll_x = std.math.clamp(pl.nav_scroll_x0 - dx_c, 0, 1 << 30);
+                pl.scroll = std.math.clamp(pl.nav_scroll_y0 - (ui.mouse_y - pl.nav_my), 0, 1 << 30);
             }
         }
     }
@@ -880,16 +1030,35 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             // **软锚定**（用户拍板）：行程有余量 → 锚点；余量耗尽 → 就势放开
             // （scroll 钳在行程端，游标从锚点处自然向右漂移——在钳制发生的瞬间
             // 游标恰好位于锚点，所以过渡是连续的、不跳变）。
-            // **不强行延长行程**：曾“按需延长 content_w”永远保住锚点——缩小到底时
-            // 与缩放路径钉 0 打架、滑块行程暗自生长、松手后长途滑回（实测三连坑）。
-            // 行程 = max(时间轴（全曲+3小节留白）, 用户手动拖出的延长)。
-            const follow_span: i32 = @max(content_span, pl.content_w);
+            // 行程 = 时间轴（全曲 + 3 小节留白）——旧“手动延长”已随新设计废除。
+            const follow_span: i32 = content_span;
             const target = util.followTargetScrollX(cur_px, view_w, pl.zoom, off_screen, follow_span);
             pl.scroll_x = Ui.clampScrollToSpan(util.followGlide(pl.scroll_x, target, app.frame_dt_ns), vcw_i, follow_span);
         }
     }
 
-    _ = ui.scrollbarV(9, sb_x, tracks_y, ruler_h, tracks_h, &app.playlist.scroll, content_h, tracks_h);
+    // 纵向 minimap（与横向同一套 MiniBlock，轴换 90°）：每个片段 = 其所在行的一小条；
+    // 条在滑块列内的**横向**位置 = 该片段在曲长里的时间位置（同横向里“轨道位置”的角色）
+    var mini_vbuf: [256]Ui.MiniBlock = undefined;
+    var nmini_v: usize = 0;
+    {
+        const tden: f32 = @floatFromInt(@max(1, max_end));
+        for (app.clips.items) |c| {
+            if (nmini_v >= mini_vbuf.len) break;
+            if (c.track < 0) continue;
+            const pos64: i64 = @as(i64, c.track) * track_h; // 防御：越界轨道跳过（i32 溢出）
+            if (pos64 > std.math.maxInt(i32)) continue;
+            mini_vbuf[nmini_v] = .{
+                .pos = @intCast(pos64),
+                .len = track_h,
+                .kind = .note,
+                .y = std.math.clamp(@as(f32, @floatFromInt(c.start)) / tden, 0, 1),
+                .color = patternColor(c.pattern),
+            };
+            nmini_v += 1;
+        }
+    }
+    _ = ui.scrollbarVExt(9, sb_x, tracks_y, ruler_h, tracks_h, &app.playlist.scroll, map_rows * track_h, tracks_h, map_rows < util.overhang_map_limit, mini_vbuf[0..nmini_v]);
 
     // ── 编辑快捷键执行（框选/批量；本视图处理片段相关）──
     // Del：删除选中片段；Ctrl+A：全选片段；Ctrl+B：铺瓷砖克隆（选区转移到克隆体）；
@@ -920,7 +1089,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             },
             .paste => {
                 // 粘贴到**鼠标位置**（步吸附网格；**轨道不变**——回原轨道）
-                const n = app.pasteClips(snap_step, track_count);
+                const n = app.pasteClips(snap_step, rows_draw);
                 if (n > 0) {
                     app.setToastWith("已粘贴 {d} 个片段", .{n});
                     app.commitHistory("粘贴片段");

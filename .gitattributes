@@ -1,0 +1,25 @@
+# 换行符与文本归一化（一劳永逸）：
+# - 仓库内 canonical = LF；签出到工作区也强制 LF（eol=lf 会覆盖 core.autocrlf）
+# - git add 时自动把 CRLF 归一化掉 → 任何工具写进来的 CRLF 都不会造成噪声 diff
+# - 二进制文件显式声明，避免被文本处理（autocrlf/merge 等）碰到
+* text=auto eol=lf
+
+*.zig   text eol=lf
+*.zon   text eol=lf
+*.md    text eol=lf
+*.json  text eol=lf
+*.c     text eol=lf
+*.h     text eol=lf
+*.toml  text eol=lf
+*.gitignore text eol=lf
+*.gitmodules text eol=lf
+
+# 二进制（禁止任何文本转换）
+*.exe   binary
+*.dll   binary
+*.lib   binary
+*.obj   binary
+*.pdb   binary
+*.png   binary
+*.ico   binary
+*.saw   text eol=lf

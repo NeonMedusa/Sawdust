@@ -106,25 +106,29 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
     ui.renderer.line(x + ww - 10, y + hh - 2, x + ww - 2, y + hh - 10, ui.theme.panel_border);
     ui.renderer.line(x + ww - 6, y + hh - 2, x + ww - 2, y + hh - 6, ui.theme.panel_border);
 
-    // ── 乐器行（可滚动）──
+    // ── 乐器行（可滚动；右侧滚动条，溢出时显示——与效果器链面板同款）──
     const content_h: i32 = @intCast(app.instruments.items.len * @as(usize, @intCast(util.rack_row_h)));
     const max_scroll = @max(0, content_h - list_h);
+    const rack_sb_w: i32 = if (max_scroll > 0) 7 else 0; // 滚动条让出宽度（6+1 缝隙）
     if (util.hitUI(ui, x + 1, list_y, ww - 2, list_h)) {
         rk.scroll = std.math.clamp(rk.scroll - ui.wheel * 24, 0, max_scroll);
     }
     rk.scroll = std.math.clamp(rk.scroll, 0, max_scroll);
 
     {
-        const saved = ui.renderer.pushClip(x + 1, list_y, ww - 2, list_h);
+        const saved = ui.renderer.pushClip(x + 1, list_y, ww - 2 - rack_sb_w, list_h);
         defer ui.renderer.popClip(saved);
         var i: usize = 0;
         var ry = list_y - rk.scroll;
         while (i < app.instruments.items.len) : (i += 1) {
             if (ry + util.rack_row_h > list_y and ry < list_y + list_h) {
-                drawRow(ui, app, i, x + 1, ry, ww - 2, list_y, list_y + list_h);
+                drawRow(ui, app, i, x + 1, ry, ww - 2 - rack_sb_w, list_y, list_y + list_h);
             }
             ry += util.rack_row_h;
         }
+    }
+    if (max_scroll > 0) {
+        ui.drawScrollbar(x + ww - 7, list_y, 5, list_h, rk.scroll, content_h, list_h);
     }
 
     // ── 添加按钮：直接打开**预设面板**（统一插件+预设选择器）──
@@ -262,11 +266,8 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, x: i32, y: i32, w: i32, clip_top: i32
     var cx = x + 6;
     const cy = y + @divTrunc(util.rack_row_h - util.rack_mute_w, 2);
 
-    // 静音开关
-    const mute_hovered = util.hitUI(ui, cx, cy, util.rack_mute_w, util.rack_mute_w);
-    ui.renderer.fillRect(cx, cy, util.rack_mute_w, util.rack_mute_w, if (inst.muted) ui.theme.mute_on else ui.theme.slider_track);
-    ui.renderer.strokeRect(cx, cy, util.rack_mute_w, util.rack_mute_w, ui.theme.panel_border);
-    if (mute_hovered and ui.mouse_pressed) {
+    // 静音开关（开关：开=绿/关=灰）
+    if (ui.toggleSquare(!inst.muted, cx, cy, util.rack_mute_w)) { // 蓝=发声 / 灰=静音
         inst.muted = !inst.muted;
         app.commitHistory("切换静音"); // 开关：原子提交
     }

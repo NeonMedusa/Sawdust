@@ -65,11 +65,13 @@ pub fn main(init: std.process.Init) !u8 {
     defer font.deinit();
 
     var app = App{ .allocator = allocator };
+    app.initAudioCapacity() catch {}; // 音频容量数组（池化：乐器/通道/效果槽动态容量）
     app.main_hwnd = win.hwnd;
+    app.scheduler.muted = &app.track_muted; // 静音轨道集合挂载（SONG 调度时过滤）
     defer app.clips.deinit(allocator);
     defer app.notes.deinit(allocator);
     defer app.deinitAll();
-    app.resetPatterns(1); // 空工程基线：只有样式 1（不再铺 6 个演示样式）
+    app.resetPatterns(1); // 空工程基线：只有样式 1（不再铺 6 个演示样式）；轨道行跨度自动推导
     app.resetMixerChannels(@import("app.zig").default_mixer_channels); // 默认调音台通道（主通道 + 通道#1）
     // 数据目录（预设库）+ 首次扫描（IO 统一在帧末 pending 处理）
     {
@@ -231,6 +233,44 @@ pub fn main(init: std.process.Init) !u8 {
                 }
                 app.overwrite_req = null;
                 app.delete_req = null;
+            }
+        }
+        // 旧档升级确认（v1–v3 → v5；Enter = 确认、Esc = 取消）
+        if (app.modal == .save_upgrade) {
+            if (app.modal_choice) |choice| {
+                app.modal = null;
+                app.modal_choice = null;
+                if (choice == .save) {
+                    performUpgrade(&app, io);
+                } else {
+                    app.clearPendingUpgrade(); // 否 = 不打开（原文件保持不动）
+                }
+            }
+        }
+        // 样式/轨道清空确认（非空删除/清空；Enter = 确认、Esc = 取消）
+        if (app.modal == .pattern_delete or app.modal == .track_clear or app.modal == .track_delete) {
+            if (app.modal_choice) |choice| {
+                app.modal = null;
+                app.modal_choice = null;
+                if (choice == .save) { // 确认删除
+                    if (app.struct_del_req) |req| {
+                        switch (req) {
+                            .pattern => |pi| {
+                                if (app.removePattern(pi)) app.commitHistory("删除样式");
+                            },
+                            .track => |ti| {
+                                if (app.clearTrackData(ti) > 0) {
+                                    app.commitHistory("清空轨道");
+                                }
+                            },
+                            .track_row => |ti| {
+                                app.removeTrackRow(ti);
+                                app.commitHistory("删除轨道");
+                            },
+                        }
+                    }
+                }
+                app.struct_del_req = null;
             }
         }
 
@@ -469,7 +509,7 @@ pub fn main(init: std.process.Init) !u8 {
             ui_input.mouse_middle_pressed = false;
         }
         // 同步乐器指针/增益到音频线程（成本极低；删除乐器后自动变 null）
-        for (0..synth.max_instruments) |i| {
+        for (0..app.params.instruments_cap) |i| {
             const has = i < app.instruments.items.len;
             const inst: ?*const model.Instrument = if (has) &app.instruments.items[i] else null;
             const sp: ?*synth.SynthParams = if (has) app.instruments.items[i].synth else null;
@@ -493,6 +533,14 @@ pub fn main(init: std.process.Init) !u8 {
             app.params.instrument_kind[i].store(if (inst) |it| @intFromEnum(it.kind) else 0, .monotonic);
             // VST3 乐器实例（kind == 2；帧末 syncInstrumentPlugins 惰性加载/发布）
             app.params.instrument_plugin[i].store(if (inst) |it| it.plugin else null, .monotonic);
+            // 鼓组池惰性分配 / 清理挂起（池随乐器生存；删除/装载由帧末回收）
+            if (inst) |it| {
+                if (it.kit != null) {
+                    app.ensureKitPool(i);
+                } else if (app.engine.kit_chunks.len > i and app.engine.kit_chunks[i].load(.monotonic) != null) {
+                    app.kit_gc_pending = true; // 不再是鼓组 → 帧末释放其池
+                }
+            }
             // 鼓组：把各垫的层**展平**到 16 个槽位（垫按音高升序；槽位顺序 = 扫过垫再扫层）。
             // 槽位音高 = 垫音高（音频侧 on 事件按音高分发，多槽位同音高 = 多层叠加）
             var slot: usize = 0;
@@ -518,7 +566,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
 
         // 同步调音台通道参数（增益/声像/静音/效果链）到音频线程
-        const n_mixer: usize = @min(app.mixer_channels_state.items.len, audio.mixer_channels);
+        const n_mixer: usize = @min(app.mixer_channels_state.items.len, app.params.channels_cap);
         app.params.channel_count.store(@intCast(n_mixer), .monotonic);
         for (0..n_mixer) |ci| {
             const mc = app.mixer_channels_state.items[ci];
@@ -526,7 +574,7 @@ pub fn main(init: std.process.Init) !u8 {
             app.params.channel_pan[ci].store(mc.pan, .monotonic);
             app.params.channel_muted[ci].store(mc.muted, .monotonic);
             // 效果链长度 + 元数据（kind/enabled/mix）：逐槽对比才写
-            const eff_n: usize = @min(mc.effects.items.len, audio.effect_slots);
+            const eff_n: usize = @min(mc.effects.items.len, app.params.slots_cap);
             app.params.effect_count[ci].store(@intCast(eff_n), .monotonic);
             var chain_changed = false;
             for (0..eff_n) |slot| {
@@ -556,7 +604,7 @@ pub fn main(init: std.process.Init) !u8 {
             for (0..eff_n) |slot| {
                 const es = &mc.effects.items[slot];
                 for (0..@import("effects.zig").max_params) |pi| {
-                    app.params.effect_p[ci][slot][pi].store(es.p[pi], .monotonic);
+                    app.params.fxParam(ci, slot, pi).store(es.p[pi], .monotonic);
                 }
                 // VST3 插件实例指针（null = 未加载/直通）
                 app.params.plugin_ptrs[ci][slot].store(es.plugin, .monotonic);
@@ -615,7 +663,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
         // 同步发声音高缓存（音频线程回传的位掩码 → 当前乐器的音高集合）
         {
-            const si: usize = @intCast(std.math.clamp(app.sel.instrument, 0, @as(i32, synth.max_instruments - 1)));
+            const si: usize = @intCast(std.math.clamp(app.sel.instrument, 0, @as(i32, @intCast(app.params.instruments_cap)) - 1));
             app.sounding.set(app.params.sounding_lo[si].load(.monotonic), app.params.sounding_hi[si].load(.monotonic));
         }
 
@@ -662,6 +710,8 @@ pub fn main(init: std.process.Init) !u8 {
         if (app.file_menu_open) drawFileMenu(&ui, &app);
         // 样式右键菜单：同上（浮动窗口之后，否则会被盖住）
         if (app.panels.ctx_pattern != null) view_panels.drawPatternCtxMenu(&ui, &app);
+        // 轨道右键菜单（最外层同上——在浮动窗口之后）
+        if (app.panels.ctx_track != null) view_playlist.drawTrackCtxMenu(&ui, &app);
         // 预设浏览器（模态；同上——浮动窗口之后）
         if (app.preset_browser.open) view_presets.draw(&ui, &app, @intCast(win.fb.width), @intCast(win.fb.height));
         // 模态确认框（最上层；自绘——避开系统 MessageBox 把鼠标吸到默认按钮）
@@ -712,6 +762,7 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
         app.pollGestureHistory();
+        app.pollCapacityReclaim(); // 容量自动回收（删除/装载后滞回缩容；无声时几乎零开销）
 
         // 4.2) 帧末执行待定的文件操作（对话框在此弹出——不在事件迭代/绘制中，
         // 避免 pushEvent realloc 使迭代中的 events slice 悬空）
@@ -736,6 +787,8 @@ pub fn main(init: std.process.Init) !u8 {
                 .import_midi => importMidiWithDialog(&app, &win, io),
                 .export_midi => exportMidiWithDialog(&app, &win, io),
                 .export_wav => exportWavWithDialog(&app, &win, io),
+                .import_json => importJsonWithDialog(&app, &win, io),
+                .export_json => exportJsonWithDialog(&app, &win, io),
             }
         }
 
@@ -1809,7 +1862,7 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
             app.mixer_channels_state.items[p.ch].effects.items[p.slot].kind == .eq;
         if (is_eq) {
             app.params.spec_target_ch.store(@intCast(@min(p.ch, audio.mixer_channels - 1)), .monotonic);
-            app.params.spec_target_slot.store(@intCast(@min(p.slot, audio.effect_slots - 1)), .monotonic);
+            app.params.spec_target_slot.store(@intCast(@min(p.slot, @as(i32, @intCast(app.params.slots_cap)) - 1)), .monotonic);
         } else {
             app.params.spec_target_ch.store(-1, .monotonic);
         }
@@ -2286,20 +2339,20 @@ fn saveProject(app: *App, win: *window.Window, io: std.Io, force_dialog: bool) v
         break :blk persist.default_file_name; // 无对话框平台的回退
     };
 
-    // 导出 → 序列化 → 写文件 → 释放
+    // 导出 → 序列化（**v5 二进制默认**；JSON 保留为导入/导出通道）→ 写文件 → 释放
     const project = app.exportProject() catch |e| {
         app.setToastWith("保存失败：导出失败（{s}）", .{@errorName(e)});
         return;
     };
     defer app.freeProject(project);
 
-    const json = persist.toJson(app.allocator, project) catch |e| {
+    const bytes = persist.toBinary(app.allocator, project) catch |e| {
         app.setToastWith("保存失败：序列化失败（{s}）", .{@errorName(e)});
         return;
     };
-    defer app.allocator.free(json);
+    defer app.allocator.free(bytes);
 
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json }) catch |e| {
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes }) catch |e| {
         app.setToastWith("保存失败：写入失败（{s}）", .{@errorName(e)});
         return;
     };
@@ -3092,6 +3145,103 @@ fn saveSettings(app: *App, io: std.Io) void {
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = spath, .data = json }) catch return;
 }
 
+/// 备份名：`x.saw` → `x.bak.saw`（已存在 → `x.bak2.saw`…；无 `.saw` 后缀则追加 `.bak.saw`）
+fn uniqueBackupPath(io: std.Io, path: []const u8, buf: []u8) ?[]const u8 {
+    const cwd = std.Io.Dir.cwd();
+    const base = if (std.mem.endsWith(u8, path, ".saw")) path[0 .. path.len - 4] else path;
+    var n: usize = 1;
+    while (n < 1000) : (n += 1) {
+        const cand = if (n == 1)
+            std.fmt.bufPrint(buf, "{s}.bak.saw", .{base}) catch return null
+        else
+            std.fmt.bufPrint(buf, "{s}.bak{d}.saw", .{ base, n }) catch return null;
+        if (cwd.access(io, cand, .{})) |_| {
+            continue; // 已存在 → 下一个序号
+        } else |_| {
+            return cand; // 不存在 → 可用
+        }
+    }
+    return null;
+}
+
+/// 执行旧档升级（弹窗确认后）：读 → 内存迁移（parseAuto 链）→ import →
+/// 写 `.tmp` → 原件重命名 `.bak.saw`（碰撞加序号）→ `.tmp` 回原路径。
+/// 危险窗口 = 两次相邻重命名之间；任一步失败 → 保留原件、清理 tmp、toast 报错。
+fn performUpgrade(app: *App, io: std.Io) void {
+    const path = app.pending_upgrade_path orelse return;
+    const cwd = std.Io.Dir.cwd();
+
+    const data = cwd.readFileAlloc(io, path, app.allocator, .unlimited) catch |e| {
+        app.setToastWith("升级失败：读取失败（{s}）", .{@errorName(e)});
+        app.clearPendingUpgrade();
+        return;
+    };
+    defer app.allocator.free(data);
+
+    var parsed = persist.parseAuto(app.allocator, data) catch |e| {
+        app.setToastWith("升级失败：解析失败（{s}）", .{@errorName(e)});
+        app.clearPendingUpgrade();
+        return;
+    };
+    defer parsed.deinit();
+
+    app.importProject(parsed.value);
+
+    const project = app.exportProject() catch |e| {
+        app.setToastWith("升级失败：导出失败（{s}）", .{@errorName(e)});
+        app.clearPendingUpgrade();
+        return;
+    };
+    defer app.freeProject(project);
+    const bytes = persist.toBinary(app.allocator, project) catch |e| {
+        app.setToastWith("升级失败：序列化失败（{s}）", .{@errorName(e)});
+        app.clearPendingUpgrade();
+        return;
+    };
+    defer app.allocator.free(bytes);
+
+    // 1) 写 .tmp（同目录）
+    var tmp_buf: [1080]u8 = undefined;
+    const tmp_path = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path}) catch {
+        app.setToast("升级失败：路径过长");
+        app.clearPendingUpgrade();
+        return;
+    };
+    cwd.writeFile(io, .{ .sub_path = tmp_path, .data = bytes }) catch |e| {
+        app.setToastWith("升级失败：写入临时文件失败（{s}）", .{@errorName(e)});
+        app.clearPendingUpgrade();
+        return;
+    };
+    // 2) 原件 → 备份名（重命名，不复制——危险窗口最小）
+    var bak_buf: [1100]u8 = undefined;
+    const bak = uniqueBackupPath(io, path, &bak_buf) orelse {
+        cwd.deleteFile(io, tmp_path) catch {};
+        app.setToast("升级失败：无法确定备份名");
+        app.clearPendingUpgrade();
+        return;
+    };
+    cwd.rename(path, cwd, bak, io) catch |e| {
+        cwd.deleteFile(io, tmp_path) catch {};
+        app.setToastWith("升级失败：备份重命名失败（{s}）", .{@errorName(e)});
+        app.clearPendingUpgrade();
+        return;
+    };
+    // 3) .tmp → 原路径
+    cwd.rename(tmp_path, cwd, path, io) catch |e| {
+        // 尝试回滚（备份改回原名）；回滚失败则原文件仍在备份名下，不丢数据
+        cwd.rename(bak, cwd, path, io) catch {};
+        app.setToastWith("升级失败：替换失败（{s}）", .{@errorName(e)});
+        app.clearPendingUpgrade();
+        return;
+    };
+
+    app.setProjectPath(path);
+    app.resetHistory("打开工程（已升级）");
+    app.markSaved();
+    app.setToastWith("已升级为 v5 并备份到 {s}", .{bak});
+    app.clearPendingUpgrade();
+}
+
 /// 从指定路径加载并替换当前工程（失败时保留当前工程不变）
 fn loadProjectFromPath(app: *App, io: std.Io, path: []const u8) void {
     const data = std.Io.Dir.cwd().readFileAlloc(io, path, app.allocator, .unlimited) catch |e| {
@@ -3100,7 +3250,24 @@ fn loadProjectFromPath(app: *App, io: std.Io, path: []const u8) void {
     };
     defer app.allocator.free(data);
 
-    const parsed = persist.fromJson(app.allocator, data) catch |e| {
+    // v5 二进制 = 当前格式，直接加载。JSON（v1–v4）探针版本：
+    // v1–v3 旧档走“备份并升级”弹窗（③ 迁移流程）；过新拒绝；v4 直接加载。
+    if (!(data.len >= persist.binary_magic.len and std.mem.eql(u8, data[0..persist.binary_magic.len], persist.binary_magic))) {
+        if (persist.probeJsonVersion(app.allocator, data)) |ver| {
+            if (ver > persist.file_version) {
+                app.setToastWith("打开失败：存档版本过新（v{d}），请使用更新的 Sawdust", .{ver});
+                return;
+            }
+            if (ver < persist.file_version) {
+                app.setPendingUpgrade(path, ver);
+                app.modal = .save_upgrade;
+                app.modal_choice = null;
+                return; // 等弹窗确认（performUpgrade）；取消 = 不打开（原文件不动）
+            }
+        }
+    }
+
+    const parsed = persist.parseAuto(app.allocator, data) catch |e| {
         app.setToastWith("打开失败：解析失败（{s}）", .{@errorName(e)});
         return;
     };
@@ -3154,6 +3321,52 @@ fn importMidiWithDialog(app: *App, win: *window.Window, io: std.Io) void {
     } else {
         app.setToastWith("已导入 {d} 个音符（{d} 个乐器）；样式 {d}", .{ r.notes, r.instruments, r.pattern + 1 });
     }
+}
+
+/// JSON 过滤器（描述\0通配\0…；与 project_filter 同格式）
+const json_filter = "JSON 文件 (*.json)\x00*.json\x00所有文件 (*.*)\x00*.*\x00";
+
+/// 导入 JSON（可读/迁移格式；与“打开”同流程——旧档同样走备份升级弹窗）
+fn importJsonWithDialog(app: *App, win: *window.Window, io: std.Io) void {
+    const picked = filedialog.open(app.allocator, win.hwnd, "导入 JSON（可读/迁移格式）", json_filter) catch |e| {
+        app.setToastWith("导入失败：对话框出错（{s}）", .{@errorName(e)});
+        return;
+    };
+    const path = picked orelse {
+        if (filedialog.supported()) app.setToast("已取消导入");
+        return;
+    };
+    defer app.allocator.free(path);
+    loadProjectFromPath(app, io, path);
+}
+
+/// 导出 JSON（可读文本格式，便于迁移到其他 DAW）——不改变当前工程路径/保存态
+fn exportJsonWithDialog(app: *App, win: *window.Window, io: std.Io) void {
+    const picked = filedialog.save(app.allocator, win.hwnd, "导出 JSON（可读/迁移格式）", "song.json", json_filter) catch |e| {
+        app.setToastWith("导出失败：对话框出错（{s}）", .{@errorName(e)});
+        return;
+    };
+    const path = picked orelse {
+        if (filedialog.supported()) app.setToast("已取消导出");
+        return;
+    };
+    defer app.allocator.free(path);
+
+    const project = app.exportProject() catch |e| {
+        app.setToastWith("导出失败：导出失败（{s}）", .{@errorName(e)});
+        return;
+    };
+    defer app.freeProject(project);
+    const json = persist.toJson(app.allocator, project) catch |e| {
+        app.setToastWith("导出失败：序列化失败（{s}）", .{@errorName(e)});
+        return;
+    };
+    defer app.allocator.free(json);
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json }) catch |e| {
+        app.setToastWith("导出失败：写入失败（{s}）", .{@errorName(e)});
+        return;
+    };
+    app.setToastWith("已导出 JSON（可读格式）：{s}", .{path});
 }
 
 /// 导出 MIDI：全部片段按全局时间展开 → 写出文件。
@@ -3322,7 +3535,38 @@ fn drawModal(ui: *Ui, app: *App) void {
         .dirty_confirm => drawDirtyConfirm(ui, app, w, h),
         .preset_overwrite => drawPresetOverwrite(ui, app, w, h),
         .preset_delete => drawPresetDelete(ui, app, w, h),
+        .pattern_delete => drawDeleteConfirm(ui, app, w, h),
+            .track_clear => drawDeleteConfirm(ui, app, w, h),
+            .track_delete => drawDeleteConfirm(ui, app, w, h),
+        .save_upgrade => drawUpgradeConfirm(ui, app, w, h),
     }
+}
+
+/// 旧版存档升级确认框（备份并升级 / 取消）——③ 迁移流程（v1–v3 → v5 二进制）
+fn drawUpgradeConfirm(ui: *Ui, app: *App, w: i32, h: i32) void {
+    var l1: [96]u8 = undefined;
+    const line1 = std.fmt.bufPrint(&l1, "这是旧版存档（v{d}），升级为最新格式？", .{app.pending_upgrade_version}) catch "这是旧版存档，升级？";
+    const line2 = "会先备份原文件为 .bak.saw，然后原地升级。";
+    const tw1: i32 = @intFromFloat(ui.font.measure(line1));
+    const tw2: i32 = @intFromFloat(ui.font.measure(line2));
+    const text_w = @max(tw1, tw2);
+    const btn_w: i32 = 96;
+    const gap: i32 = 10;
+    const dlg_w = @max(text_w + 48, btn_w * 2 + gap + 32);
+    const dlg_h: i32 = 110;
+    const dx = @divTrunc(w - dlg_w, 2);
+    const dy = @divTrunc(h - dlg_h, 2);
+    ui.noteOverlayRect(dx, dy, dlg_w + 4, dlg_h + 4);
+
+    ui.renderer.fillRect(dx + 4, dy + 4, dlg_w, dlg_h, r_mod.rgb(12, 13, 16));
+    ui.renderer.fillRect(dx, dy, dlg_w, dlg_h, ui.theme.panel);
+    ui.renderer.strokeRect(dx, dy, dlg_w, dlg_h, ui.theme.accent);
+    ui.label(line1, dx + @divTrunc(dlg_w - tw1, 2), dy + 18, ui.theme.text);
+    ui.label(line2, dx + @divTrunc(dlg_w - tw2, 2), dy + 40, ui.theme.text_dim);
+
+    const labels = [_][]const u8{ "备份并升级", "取消" };
+    const choices = [_]QuitChoice{ .save, .cancel };
+    drawModalButtons(ui, app, dx, dy, dlg_w, dlg_h, &labels, &choices, 0, 0);
 }
 
 /// 脏确认框（保存/不保存/取消）——退出或打开其它工程前
@@ -3398,6 +3642,56 @@ fn drawPresetDelete(ui: *Ui, app: *App, w: i32, h: i32) void {
     var l1: [preset_mod.max_name_len + 32]u8 = undefined;
     const line1 = std.fmt.bufPrint(&l1, "删除预设「{s}」？", .{name}) catch "删除预设？";
     const line2 = "已加载它的乐器不受影响；文件删除后不可恢复。";
+    const tw1: i32 = @intFromFloat(ui.font.measure(line1));
+    const tw2: i32 = @intFromFloat(ui.font.measure(line2));
+    const text_w = @max(tw1, tw2);
+    const btn_w: i32 = 84;
+    const gap: i32 = 10;
+    const dlg_w = @max(text_w + 48, btn_w * 2 + gap + 32);
+    const dlg_h: i32 = 110;
+    const dx = @divTrunc(w - dlg_w, 2);
+    const dy = @divTrunc(h - dlg_h, 2);
+    ui.noteOverlayRect(dx, dy, dlg_w + 4, dlg_h + 4); // 裁切插件子窗口（含阴影；仅对话框范围）
+
+    ui.renderer.fillRect(dx + 4, dy + 4, dlg_w, dlg_h, r_mod.rgb(12, 13, 16));
+    ui.renderer.fillRect(dx, dy, dlg_w, dlg_h, ui.theme.panel);
+    ui.renderer.strokeRect(dx, dy, dlg_w, dlg_h, ui.theme.accent);
+    ui.label(line1, dx + @divTrunc(dlg_w - tw1, 2), dy + 18, ui.theme.text);
+    ui.label(line2, dx + @divTrunc(dlg_w - tw2, 2), dy + 40, ui.theme.text_dim);
+
+    const labels = [_][]const u8{ if (app.modal == .track_clear) "清空" else "删除", "取消" };
+    const choices = [_]QuitChoice{ .save, .cancel };
+    drawModalButtons(ui, app, dx, dy, dlg_w, dlg_h, &labels, &choices, 0, 1); // 删除/清空为主（红色）
+}
+
+/// 删除/清空确认（非空样式 / 轨道）——确认后由主循环的选择消费点执行（同样式的删除/取消）。
+fn drawDeleteConfirm(ui: *Ui, app: *App, w: i32, h: i32) void {
+    const req = app.struct_del_req orelse return;
+    var l1: [128]u8 = undefined;
+    var l2: [160]u8 = undefined;
+    var line1: []const u8 = "删除？";
+    var line2: []const u8 = "此操作可 Ctrl+Z 撤销。";
+    switch (req) {
+        .pattern => |pi| {
+            const name = if (pi < app.pattern_items.items.len) app.pattern_items.items[pi] else "?";
+            const short = name[0..@min(name.len, 24)];
+            line1 = std.fmt.bufPrint(&l1, "删除样式「{s}」？", .{short}) catch "删除样式？";
+            const usage = app.patternUsage(pi);
+            line2 = std.fmt.bufPrint(&l2, "该样式含 {d} 个音符、被 {d} 个片段引用；删除将一并移除（可 Ctrl+Z 撤销）。", .{ usage.notes, usage.clips }) catch "删除将一并移除内容。";
+        },
+        .track => |ti| {
+            const name = app.trackName(ti);
+            const short = name[0..@min(name.len, 24)];
+            line1 = std.fmt.bufPrint(&l1, "清空轨道「{s}」？", .{short}) catch "清空轨道？";
+            line2 = std.fmt.bufPrint(&l2, "该轨道上有 {d} 个片段；清空将移除这些片段（行与名字保留，可 Ctrl+Z 撤销）。", .{app.trackUsage(ti)}) catch "清空将移除这些片段。";
+        },
+        .track_row => |ti| {
+            const name = app.trackName(ti);
+            const short = name[0..@min(name.len, 24)];
+            line1 = std.fmt.bufPrint(&l1, "删除轨道「{s}」？", .{short}) catch "删除轨道？";
+            line2 = std.fmt.bufPrint(&l2, "该轨道上有 {d} 个片段；删除将一并移除，下方轨道整体上移（可 Ctrl+Z 撤销）。", .{app.trackUsage(ti)}) catch "删除将一并移除内容。";
+        },
+    }
     const tw1: i32 = @intFromFloat(ui.font.measure(line1));
     const tw2: i32 = @intFromFloat(ui.font.measure(line2));
     const text_w = @max(tw1, tw2);

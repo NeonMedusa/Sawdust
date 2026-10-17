@@ -219,6 +219,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     const list_view_h = @max(0, btn_y - list_btn_gap - list_top);
     const content_h: i32 = n_ch * (row_h + row_gap);
     const scroll_max: i32 = @max(0, content_h - list_view_h);
+    const ch_sb_w: i32 = if (scroll_max > 0) 7 else 0; // 右侧滚动条占位（溢出时）
     mw.strips_scroll = std.math.clamp(mw.strips_scroll, 0, scroll_max);
     if (util.hitUI(ui, left_x, left_y, left_w, left_h)) {
         mw.strips_scroll = std.math.clamp(mw.strips_scroll - ui.wheel * 30, 0, scroll_max);
@@ -235,7 +236,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         while (ci < n_ch) : (ci += 1) {
             const ry = list_top + ci * (row_h + row_gap) - mw.strips_scroll;
             if (ry + row_h < left_y or ry > list_top + list_view_h) continue;
-            drawStrip(ui, app, @intCast(ci), left_x + ruler_w + strip_pad_l, ry, left_w - ruler_w - strip_pad_l - strip_pad_r, row_h);
+            drawStrip(ui, app, @intCast(ci), left_x + ruler_w + strip_pad_l, ry, left_w - ruler_w - strip_pad_l - strip_pad_r - ch_sb_w, row_h);
         }
     }
     // 标尺数字（单独一层：在条左边缘，不被条裁剪）
@@ -256,12 +257,16 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
             }
         }
     }
+    // 右侧滚动条（通道列表溢出时；与效果器链面板同款）
+    if (scroll_max > 0) {
+        ui.drawScrollbar(left_x + left_w - 7, list_top, 5, list_view_h, mw.strips_scroll, content_h, list_view_h);
+    }
     // 底部固定：“+ 添加通道”
     {
         const by = btn_y;
         // 水平位置与通道条**完全对齐**（含左右留白）
         const bx = left_x + ruler_w + strip_pad_l;
-        const bw = left_w - ruler_w - strip_pad_l - strip_pad_r;
+        const bw = left_w - ruler_w - strip_pad_l - strip_pad_r - ch_sb_w;
         const hovered = util.hitUI(ui, bx, by, bw, add_ch_h);
         ui.renderer.fillRect(bx, by, bw, add_ch_h, if (hovered) ui.theme.item_hover else ui.theme.slider_track);
         ui.renderer.strokeRect(bx, by, bw, add_ch_h, ui.theme.panel_border);
@@ -273,7 +278,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
                 app.mixer_win.selected_channel = @intCast(ni);
                 app.commitHistory("添加通道");
             } else {
-                app.setToast("通道已达上限");
+                app.setToast("无法添加通道（内存不足）");
             }
         }
     }
@@ -282,6 +287,9 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     const sel_ch: usize = if (mw.selected_channel >= 0 and mw.selected_channel < n_ch) @intCast(mw.selected_channel) else 0;
     drawEffectPanel(ui, app, sel_ch, right_x, right_y, right_w, right_h);
 
+    // 本窗右键菜单展开：解除全局屏蔽，让菜单项可点（同机架模式：
+    // 上方控件用 hitUI 已被 menuIsOpen 屏蔽；菜单本体用裸 inRect 接收）
+    if (mw.ctx_effect != null or mw.ctx_channel != null or mw.ctx_pan != null) ui.input_blocked = false;
     // ── 效果器右键菜单 ──
     if (mw.ctx_effect) |ctx| {
         drawCtxMenu(ui, app, ctx);
@@ -300,7 +308,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     return true;
 }
 
-/// 横向通道条：`[M][S]` · 声像旋钮 · 通道名（定宽）· 音量推子 · 数值。
+/// 横向通道条：`[声音开关][S]` · 声像旋钮 · 通道名（定宽）· 音量推子 · 数值。
 /// 点条任意处（除控件）= 选中该通道。
 fn drawStrip(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32) void {
     const mc = &app.mixer_channels_state.items[ci];
@@ -322,14 +330,10 @@ fn drawStrip(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32) void
     var right_consumed = false;
     var cx = x + 5;
 
-    // [M] 静音
+    // 声音开关（蓝=发声 / 灰=静音；方块无字母——语义已非“M 静音”，用户要求去字）
     {
         const my = y + @divTrunc(h - mute_size, 2);
-        const hovered = util.hitUI(ui, cx, my, mute_size, mute_size);
-        ui.renderer.fillRect(cx, my, mute_size, mute_size, if (mc.muted) ui.theme.mute_on else ui.theme.slider_track);
-        ui.renderer.strokeRect(cx, my, mute_size, mute_size, ui.theme.panel_border);
-        ui.label("M", cx + 4, my + 2, if (mc.muted) ui.theme.text else ui.theme.text_dim);
-        if (hovered and ui.mouse_pressed) {
+        if (ui.toggleSquare(!mc.muted, cx, my, mute_size)) {
             mc.muted = !mc.muted;
             app.commitHistory("切换通道静音");
             consumed = true;
@@ -465,17 +469,16 @@ fn drawEffectPanel(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32
         ui.drawScrollbar(x + w - 7, rows_top, 5, rows_area_h, app.mixer_win.fx_scroll, content_h, rows_area_h);
     }
 
-    // 底部：「+ 效果器」/「链已满」
+    // 底部：「+ 效果器」（池化：无人工上限）
     {
-        const full = mc.effects.items.len >= app_mod.max_effects_per_channel;
         const by = y + h - add_h - pad_inner - 1;
-        const label: []const u8 = if (full) "链已达上限" else "+ 效果器";
+        const label: []const u8 = "+ 效果器";
         const hovered = util.hitUI(ui, x + pad_inner, by, w - pad_inner * 2, add_h);
-        ui.renderer.fillRect(x + pad_inner, by, w - pad_inner * 2, add_h, if (hovered and !full) ui.theme.item_hover else ui.theme.slider_track);
+        ui.renderer.fillRect(x + pad_inner, by, w - pad_inner * 2, add_h, if (hovered) ui.theme.item_hover else ui.theme.slider_track);
         ui.renderer.strokeRect(x + pad_inner, by, w - pad_inner * 2, add_h, ui.theme.panel_border);
         const tw: i32 = @intFromFloat(ui.font.measure(label));
-        ui.label(label, x + @divTrunc(w - tw, 2), by + 3, if (full) ui.theme.text_dim else ui.theme.text);
-        if (hovered and ui.mouse_pressed and !full) {
+        ui.label(label, x + @divTrunc(w - tw, 2), by + 3, ui.theme.text);
+        if (hovered and ui.mouse_pressed) {
             // M5：不再用下拉菜单——直接打开预设浏览器面板（内置 + 已扫描 VST3 效果）
             app.openPresetBrowser(.{ .create_effect = ci });
         }

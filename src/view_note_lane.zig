@@ -458,7 +458,15 @@ fn hitNoteIndex(
         // 命中范围放宽 2px（柱条窄时好点中）
         if (mouse_x >= bx - 2 and mouse_x < bx + bar_w + 2) {
             const dx: i32 = @intCast(@abs(mouse_x - (bx + @divTrunc(bar_w, 2))));
-            if (dx < best_dx) {
+            var take = dx < best_dx;
+            if (!take and dx == best_dx) {
+                if (best) |b| {
+                    // 同距（叠放柱条同 x）：层级规则——左端更右 / 数组序更大者在上
+                    const bn = app.notes.items[b];
+                    if (nt.step > bn.step or (nt.step == bn.step and i > b)) take = true;
+                }
+            }
+            if (take) {
                 best_dx = dx;
                 best = i;
             }
@@ -518,9 +526,23 @@ fn paintAt(
 /// 滚轮微调步长（每格滚轮改变的值）
 pub const wheel_step: i32 = 4;
 
+/// 单步增减 + 跨默认值吸附（B 方案；选区/单音符两分支共用）。
+/// 吸附仅对**细调**生效（|dv| ≤ 8 = 最多 2 格滚轮）——大跨度快滚是粗操作，
+/// 不该被默认值“磁住”（否则猛滚会被拦在半路；既有测试的 +100 格钳到 127 不变）。
+/// 动机：步长 4 与 127/1 的余数不整除（27%4、99%4、63%4 均非 0），纯钳制下
+/// 回程会错格——永远回不到 100/64（用户实测复现：**有选中时尤其明显**）。
+fn steppedValue(mode: NoteLaneMode, old: i32, dv: i32) i32 {
+    var v = old + dv;
+    if (@abs(dv) <= 8) {
+        const def: i32 = if (mode == .velocity) model.default_velocity else model.default_pan;
+        if ((old < def and v >= def) or (old > def and v <= def)) v = def;
+    }
+    return v;
+}
+
 /// Alt+滚轮：调整力度/声像。规则：
-/// - 有**选中**音符 → 全部选中的音符整体增减（轮廓保持）；
-/// - 否则 → 只调**距离鼠标最近**的一个音符。
+/// - 有**选中**音符 → 全部选中的音符整体增减（轮廓基本保持，跨默认值吸附）；
+/// - 否则 → 只调**距离鼠标最近**的一个音符（同样吸附）。
 /// `nearest` 由调用方算好（钢琴窗/编辑轨的“最近”标准不同——见
 /// `nearestNoteInPiano` / `nearestNoteInLane`）。
 /// 返回 true = 有改动（调用方用 `markWheelHistory` 记 coalesce 历史）。
@@ -536,15 +558,18 @@ pub fn altWheelAdjust(app: *App, mode: NoteLaneMode, delta_steps: i32, nearest: 
         }
     }
     if (any_selected) {
+        // 选区：整体增减（轮廓基本保持）——**同样吸附默认值**（用户实测：有选中时
+        // 滚到底再滚回必须也能精确落回 100/64；跨过瞬间多音符可能 1 格参差，
+        // 随即恢复同相——一致性优先）。
         for (app.notes.items) |*o| {
             if (!o.selected) continue;
-            setNoteValue(o, mode, noteValue(o.*, mode) + dv);
+            setNoteValue(o, mode, steppedValue(mode, noteValue(o.*, mode), dv));
         }
         return true;
     }
     if (nearest) |idx| {
         const o = &app.notes.items[idx];
-        setNoteValue(o, mode, noteValue(o.*, mode) + dv);
+        setNoteValue(o, mode, steppedValue(mode, noteValue(o.*, mode), dv));
         return true;
     }
     return false;
@@ -712,6 +737,66 @@ test "note lane: Alt+滚轮——有选区整体增减 / 无选区只调最近" 
     try std.testing.expectEqual(@as(i32, 127), app.notes.items[0].velocity);
     try std.testing.expect(altWheelAdjust(&app, .pan, -100, null));
     try std.testing.expectEqual(@as(i32, 0), app.notes.items[0].pan);
+}
+
+test "note lane: Alt+滚轮吸附默认值——滚到底再滚回精确落回（步长 4 不整除也能回）" {
+    const allocator = std.testing.allocator;
+    var app = App{ .allocator = allocator };
+    defer app.clips.deinit(allocator);
+    defer app.notes.deinit(allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(4);
+    app.addNote(.{ .step = 0, .len = 4, .pitch = 60, .pattern = 0 }); // 力度 100 / 声像 64
+
+    // 上滚到底（钳 127）→ 下滚回来：精确落回 100（跨过时吸附）
+    var guard: usize = 0;
+    while (app.notes.items[0].velocity < 127 and guard < 200) : (guard += 1) {
+        _ = altWheelAdjust(&app, .velocity, 1, 0);
+    }
+    try std.testing.expectEqual(@as(i32, 127), app.notes.items[0].velocity);
+    guard = 0;
+    while (app.notes.items[0].velocity > 100 and guard < 200) : (guard += 1) {
+        _ = altWheelAdjust(&app, .velocity, -1, 0);
+    }
+    try std.testing.expectEqual(@as(i32, 100), app.notes.items[0].velocity);
+
+    // 下滚到底（钳 1）→ 上滚回来：同样精确落回
+    guard = 0;
+    while (app.notes.items[0].velocity > 1 and guard < 200) : (guard += 1) {
+        _ = altWheelAdjust(&app, .velocity, -1, 0);
+    }
+    try std.testing.expectEqual(@as(i32, 1), app.notes.items[0].velocity);
+    guard = 0;
+    while (app.notes.items[0].velocity < 100 and guard < 200) : (guard += 1) {
+        _ = altWheelAdjust(&app, .velocity, 1, 0);
+    }
+    try std.testing.expectEqual(@as(i32, 100), app.notes.items[0].velocity);
+
+    // 声像同样受益（默认 64；步长 4 向上本会错格：127−64=63 不整除）
+    guard = 0;
+    while (app.notes.items[0].pan < 127 and guard < 200) : (guard += 1) {
+        _ = altWheelAdjust(&app, .pan, 1, 0);
+    }
+    guard = 0;
+    while (app.notes.items[0].pan > 64 and guard < 200) : (guard += 1) {
+        _ = altWheelAdjust(&app, .pan, -1, 0);
+    }
+    try std.testing.expectEqual(@as(i32, 64), app.notes.items[0].pan);
+
+    // **有选中（单音符选区）也要能滚回默认**——用户实测 bug：此前选区分支不吸附，
+    // 点选音符后滚到底再滚回永远落在 99/103（无吸附格点）。
+    app.notes.items[0].selected = true;
+    guard = 0;
+    while (app.notes.items[0].velocity < 127 and guard < 200) : (guard += 1) {
+        _ = altWheelAdjust(&app, .velocity, 1, null);
+    }
+    guard = 0;
+    while (app.notes.items[0].velocity > 100 and guard < 200) : (guard += 1) {
+        _ = altWheelAdjust(&app, .velocity, -1, null);
+    }
+    try std.testing.expectEqual(@as(i32, 100), app.notes.items[0].velocity);
+    app.notes.items[0].selected = false;
 }
 
 test "note lane: 最近音符判定——钢琴窗（矩形距离）/ 编辑轨（柱条末端距离）" {
