@@ -7,15 +7,20 @@ const Ui = @import("ui.zig").Ui;
 const app_mod = @import("app.zig");
 const App = app_mod.App;
 const util = @import("view_util.zig");
+const window_mod = @import("window.zig");
 
 const title_h: i32 = 22;
-const min_w: i32 = 360;
+const min_w: i32 = 430;
 const min_h: i32 = 260;
 const row_h: i32 = 21;
 /// 键位列宽（说明列从 `key_w` 之后开始）
 const key_w: i32 = 170;
 
-const Row = struct { sec: bool, key: []const u8, desc: []const u8 };
+/// 「关于」节的仓库链接：显示文本（紧凑）/ 实际打开地址（带协议，ShellExecute 更稳）
+const repo_display = "github.com/NeonMedusa/Sawdust";
+const repo_open: [:0]const u8 = "https://github.com/NeonMedusa/Sawdust";
+
+const Row = struct { sec: bool, key: []const u8, desc: []const u8, link: bool = false };
 const rows = [_]Row{
     .{ .sec = true, .key = "常用", .desc = "" },
     .{ .sec = false, .key = "空格", .desc = "播放 / 暂停" },
@@ -37,6 +42,10 @@ const rows = [_]Row{
     .{ .sec = true, .key = "视图", .desc = "" },
     .{ .sec = false, .key = "Ctrl + 滚轮", .desc = "横向缩放" },
     .{ .sec = false, .key = "Shift + 滚轮", .desc = "纵向缩放" },
+
+    .{ .sec = true, .key = "关于", .desc = "" },
+    .{ .sec = false, .key = "开源许可", .desc = "免费开源（MIT）" },
+    .{ .sec = false, .key = "项目仓库", .desc = repo_display, .link = true },
 };
 
 /// 返回 true = 鼠标被窗口消费
@@ -103,7 +112,19 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         }
         if (yy + row_h > y + hh - 8) break; // 装不下：后面的行不画（拉大窗口可见）
         ui.label(r.key, x + 20, yy, ui.theme.text);
-        ui.label(r.desc, x + 20 + key_w, yy, ui.theme.text_dim);
+        if (r.link) {
+            // 链接行：悬停高亮 + 下划线（链接外观）+ 单击 → 系统浏览器
+            const tw: i32 = @intFromFloat(ui.font.measure(r.desc));
+            const lx = x + 20 + key_w;
+            const hovered = util.inRect(ui.mouse_x, ui.mouse_y, lx, yy, tw, row_h);
+            const color = if (hovered) ui.theme.accent else ui.theme.text_dim;
+            ui.label(r.desc, lx, yy, color);
+            const baseline = yy + @as(i32, @intFromFloat(ui.font.ascent));
+            ui.renderer.hline(lx, baseline + 2, tw, color);
+            if (hovered and ui.mouse_pressed) window_mod.openExternalUrl(repo_open);
+        } else {
+            ui.label(r.desc, x + 20 + key_w, yy, ui.theme.text_dim);
+        }
         yy += row_h;
     }
 

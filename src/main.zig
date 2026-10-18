@@ -414,6 +414,7 @@ pub fn main(init: std.process.Init) !u8 {
                             app.params.start_step.store(from, .monotonic);
                             app.params.playing.store(true, .monotonic);
                             // 调度：作废旧事件 + 为跨起点长音符补发 on；重置调度窗口
+                            app.markGenSoft(false); // 硬切换（起播）：照旧释放（无残留声部）
                             sequencer.reset(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, app.sel.song_mode, app.sel.pattern, from);
                             app.params.sched_gen.store(app.scheduler.gen, .monotonic);
                         } else {
@@ -2138,10 +2139,11 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
     ui.renderer.vline(x, 6, util.toolbar_h - 12, ui.theme.panel_border);
     x += 10;
 
-    // SONG / PAT 切换（播放全曲 or 当前样式）——播放中切换 → 重新调度
+    // SONG / PAT 切换（播放全曲 or 当前样式）——**保位切换**（与状态栏按钮同一
+    // 路径 `switchSongModePreserving`：按锚片段映射换算、原地换坐标；
+    // 旧版直接翻模式 → 跳到另一模式“冻结的旧位置”（实测“两个模式各自记位置”））
     if (ui.toggle2(150, "SONG", "PAT", app.sel.song_mode, x, by, 92, bh)) {
-        app.sel.song_mode = !app.sel.song_mode;
-        if (app.playing) app.jumpPlaybackCursor(app.playback.cursorStep(app.sel.song_mode));
+        app.switchSongModePreserving();
     }
     x += 100;
 
@@ -2167,6 +2169,7 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
             app.params.start_frame.store(app.playback.start_frame, .monotonic);
             app.params.start_step.store(from, .monotonic);
             app.params.playing.store(true, .monotonic);
+            app.markGenSoft(false); // 硬切换（起播）：照旧释放（无残留声部）
             sequencer.reset(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, app.sel.song_mode, app.sel.pattern, from);
             app.params.sched_gen.store(app.scheduler.gen, .monotonic);
         } else {

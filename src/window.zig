@@ -644,6 +644,7 @@ const SRCCOPY: u32 = 0x00CC0020;
 const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: ?*anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -4))));
 
 extern "kernel32" fn GetModuleHandleW(?[*:0]const u16) callconv(.winapi) ?*anyopaque;
+extern "shell32" fn ShellExecuteA(?*anyopaque, [*:0]const u8, [*:0]const u8, ?[*:0]const u8, ?[*:0]const u8, i32) callconv(.winapi) ?*anyopaque;
 extern "user32" fn RegisterClassExW(*const WNDCLASSEXW) callconv(.winapi) u16;
 extern "user32" fn UnregisterClassW([*:0]const u16, ?*anyopaque) callconv(.winapi) i32;
 extern "user32" fn CreateWindowExW(u32, [*:0]const u16, [*:0]const u16, u32, i32, i32, i32, i32, ?*anyopaque, ?*anyopaque, ?*anyopaque, ?*anyopaque) callconv(.winapi) ?*anyopaque;
@@ -690,6 +691,15 @@ extern "user32" fn GetWindowRgn(?*anyopaque, ?*anyopaque) callconv(.winapi) i32;
 const RGN_DIFF: i32 = 4;
 
 // ── 非 Windows 占位（编译期隔离；移植时替换本文件）──
+
+/// 用系统默认浏览器打开 URL（帮助页「项目仓库」链接；ASCII 地址用 A 版即可）。
+/// 非 Windows：与 `Window` 同策略的编译期占位（移植时换 `xdg-open` / `open`）。
+pub fn openExternalUrl(url: [:0]const u8) void {
+    if (builtin.os.tag != .windows) {
+        @compileError("window.openExternalUrl: 需移植（Linux: xdg-open；macOS: open）");
+    }
+    _ = ShellExecuteA(null, "open", url, null, null, 1); // 1 = SW_SHOWNORMAL
+}
 
 const UnsupportedWindow = struct {
     pub fn init(allocator: std.mem.Allocator, title: []const u8, width: u32, height: u32) !UnsupportedWindow {

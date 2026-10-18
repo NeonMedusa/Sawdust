@@ -74,6 +74,10 @@ pub const Params = struct {
     start_step: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
     /// 调度 generation（reset 时递增；音频线程丢弃旧事件）
     sched_gen: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
+    /// **软切换**（保位模式切换）：下一次 `sched_gen` 变化时**不释放声部**
+    /// （单次消费——音频 `handleGenChange` 用 swap 清位）。其余路径（跳转/
+    /// 起播）在 gen 递增前写 false。发布顺序：本标志 → gen → 事件入队。
+    sched_gen_soft: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// 编辑代（播放中编辑重扫时递增）：音频线程丢弃 `edit_gen` **小于**
     /// 当前值、**且步号 >= `sched_rescan_from`** 的旧事件（= 已有重发
     /// 副本替换；低于安全界的旧副本**保留触发**）——见 `sequencer.rescanForEdit`
@@ -779,7 +783,8 @@ pub fn transportEdge(engine: *Engine, playing: bool) void {
 }
 
 /// 传输跳变（generation 变化）：作废 stash；**播放中**的跳变（`was_playing`）
-/// 还要释放全部声部。
+/// 还要释放全部声部——**除非**本次是软切换（`sched_gen_soft` 置位：保位
+/// 模式切换，声部保持发声；标志单次消费）。
 ///
 /// 为什么必须释放：跳转时音符的 note-off 可能早已在 stash 里排队，
 /// gen 递增整批作废后它被丢弃 → 已起音的声部永远收不到 off，
@@ -790,11 +795,13 @@ pub fn transportEdge(engine: *Engine, playing: bool) void {
 /// UI 推事件与 gen 存储之间有窗口（中间还有 reset 的 gather）——音频线程
 /// 可能先消费 all_off、再按**新传输参数**误触发旧 gen 的事件（新声部，
 /// 其 off 随后被作废 → 又悬挂）。这里与事件触发同线程，无窗口。
-fn handleGenChange(engine: *Engine, gen: u32, was_playing: bool) void {
+fn handleGenChange(engine: *Engine, params: *Params, gen: u32, was_playing: bool) void {
     engine.stash_n = 0;
     engine.stash_gen = gen;
     if (was_playing) {
-        releaseAllVoices(engine);
+        // 软切换（保位模式切换）：声部保持发声（见 `Params.sched_gen_soft`）。
+        // 跳转/起播路径写 false → 照旧释放（跳转必需：上面注释的悬挂依据）。
+        if (!params.sched_gen_soft.swap(false, .acq_rel)) releaseAllVoices(engine);
     }
 }
 
@@ -1273,7 +1280,7 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
     }
 
     // 4) 播放：stash 管理 + 样本级事件触发
-    if (gen != engine.stash_gen) handleGenChange(engine, gen, was_playing);
+    if (gen != engine.stash_gen) handleGenChange(engine, params, gen, was_playing);
     // 编辑代（重扫）：**不**清空 stash（有 drain 竞态会丢新事件），
     // 由触发循环按 `schedEventObsolete` 过滤——在响的音符保持发声。
     // 注：读顺序为“代后界”（界先于代发布，读到新代时界必已就位）
@@ -1365,7 +1372,7 @@ test "audio: 播放中 gen 变化（跳转）释放全部声部（修“跳走�
     engine.stash_gen = 7;
 
     // 播放中跳转（gen 变化）→ stash 作废 + 声部进入 release
-    handleGenChange(&engine, 8, true);
+    handleGenChange(&engine, &params, 8, true);
     try std.testing.expectEqual(@as(u32, 8), engine.stash_gen);
     try std.testing.expectEqual(@as(usize, 0), engine.stash_n);
     // 再渲染 0.1s：release（≈10ms）已走完 → 归零
@@ -1375,9 +1382,43 @@ test "audio: 播放中 gen 变化（跳转）释放全部声部（修“跳走�
 
     // 起播（上一块未播放）→ **不释放**（不误杀试听/释音尾音）
     synth.noteOn(&engine.synths[0], 64, synth.default_velocity, synth.default_pan);
-    handleGenChange(&engine, 9, false);
+    handleGenChange(&engine, &params, 9, false);
     synth.render(&p, &engine.synths[0], &buf, 4800, 48000, 1.0, false);
     try std.testing.expectEqual(@as(usize, 1), synth.activeCount(&engine.synths[0])); // 仍在响
+}
+
+test "audio: 软切换（sched_gen_soft）gen 变化不释放声部（保位模式切换）" {
+    var params = Params{};
+    try params.initCapacity(std.testing.allocator, 1, 0, 0);
+    defer params.deinit(std.testing.allocator);
+    var engine = Engine{ .params = &params };
+    engine.allocator = std.testing.allocator;
+    try engine.setCapacity(1, 0, 0);
+    defer engine.deinit();
+
+    var p = synth.SynthParams{};
+    var buf: [4800 * 2]f32 = undefined; // 0.1s @ 48k
+
+    // 声部正在发声（模拟保位切换时刻）
+    synth.noteOn(&engine.synths[0], 60, synth.default_velocity, synth.default_pan);
+    synth.render(&p, &engine.synths[0], &buf, 4800, 48000, 1.0, false); // 进入 sustain
+    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(&engine.synths[0]));
+    engine.stash_n = 3;
+    engine.stash_gen = 7;
+
+    // 软切换：stash 照旧作废（旧事件消失），但声部**保持发声**（不进入 release）
+    params.sched_gen_soft.store(true, .release);
+    handleGenChange(&engine, &params, 8, true);
+    try std.testing.expectEqual(@as(u32, 8), engine.stash_gen);
+    try std.testing.expectEqual(@as(usize, 0), engine.stash_n);
+    try std.testing.expect(!params.sched_gen_soft.load(.monotonic)); // 单次消费
+    synth.render(&p, &engine.synths[0], &buf, 4800, 48000, 1.0, false);
+    try std.testing.expectEqual(@as(usize, 1), synth.activeCount(&engine.synths[0])); // 仍在响（硬切换为 0）
+
+    // 标志已消费：下一次 gen 变化（无置位）= 硬切换 → 释放
+    handleGenChange(&engine, &params, 9, true);
+    synth.render(&p, &engine.synths[0], &buf, 4800, 48000, 1.0, false);
+    try std.testing.expectEqual(@as(usize, 0), synth.activeCount(&engine.synths[0]));
 }
 
 test "audio: Params 默认值" {
@@ -1558,7 +1599,7 @@ test "audio: 暂停/跳转边沿也释放鼓组层池（修“暂停后鼓声一
     // ② 跳转（gen 变化且播放中）：同样释放层池
     dispatchNote(engine, synth.NoteEvent{ .kind = .on, .pitch = 35, .instrument = 0 });
     try std.testing.expectEqual(@as(usize, 1), synth.activeCount(engine.kitSynth(0, 0).?));
-    handleGenChange(engine, engine.stash_gen + 1, true);
+    handleGenChange(engine, engine.params, engine.stash_gen + 1, true);
     synth.render(&lp0, engine.kitSynth(0, 0).?, &buf, 4800, 48000, 1.0, false);
     try std.testing.expectEqual(@as(usize, 0), synth.activeCount(engine.kitSynth(0, 0).?));
 }

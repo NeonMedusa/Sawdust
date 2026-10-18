@@ -423,6 +423,12 @@ pub const KeyMode = model.KeyMode;
 pub const PianoState = struct {
     /// 当前编辑的样式序号（null = 在播放列表视图）
     pattern: ?i32 = null,
+    /// 锚片段（PAT ⇄ SONG 位置映射）——规则：
+    /// 1) 双击片段打开 → 该片段的值快照；
+    /// 2) 点样式/换样式打开 → **离游标最近的该样式片段**（v2“窗随游标”；无片段 → null）；
+    /// 3) 关窗再开（同一样式）→ 保留原快照（游标停原位）；
+    /// 无锚 → 映射退化为 0；失效快照自动退化（见 `patOriginClip`）。
+    origin: ?model.Clip = null,
     /// 音高行高（像素；□ 缺口缩放）——默认 16：视口内行数较少、内容更大
     key_h: i32 = 16,
     /// 绘制排序暂存（音符层序下标表；跨帧复用）
@@ -578,6 +584,9 @@ pub const RackState = struct {
 /// **单一真源是 `song_step`（全局步）**：
 /// - SONG 模式：游标就是它；
 /// - PAT 模式：游标 = `piano_step`（自由设置，独立存储）；
+/// - **模式切换统一走 `switchSongModePreserving`**（工具栏与状态栏两处按钮共用）：
+///   按锚片段把当前位置换算到目标模式——两个位置始终是“同一音乐时刻”的两种坐标；
+///   无锚（样式无片段）时 PAT 侧归 0。标尺点击仍是“显式放置”（写当前模式的坐标）。
 /// - 播放推进由**音频采样时钟**（frames_played）驱动，不由渲染驱动。
 pub const Playback = struct {
     /// 全局播放位置（步；0 = 第 1 小节第 1 步）
@@ -977,7 +986,7 @@ pub const HelpWindow = struct {
     x: i32 = 420,
     y: i32 = 110,
     w: i32 = 500,
-    h: i32 = 440, // 刚好等于内容高度（18 行×21px + 节标题间距 + 边距；无滚动——冗余会让底部空一截）
+    h: i32 = 510, // 刚好等于内容高度（17 行×21px + 4 节标题间距 + 边距；无滚动——冗余会让底部空一截）
     /// Z 序（越大越靠上；点窗口即置顶）——见 `RackState.z` 注释
     z: i32 = 26,
     grab_dx: i32 = 0,
@@ -3353,6 +3362,12 @@ pub const App = struct {
         const now = self.params.frames_played.load(.monotonic);
         if (self.gesture) |*g| {
             g.last_change_frame = now; // 续接同一手势
+            // **续接的改动也要送达调度**（音符类：力度/声像/键盘移音符——
+            // 否则只到 4 小节水位线扫过才生效。实测 bug：Ctrl+A 全选后
+            // Alt+滚轮改力度“不及时生效”：续接分支只续手势、不重扫，
+            // 而钉值（静置 1s）也不重扫——只有第一滚生效）。
+            // 非音符改动（EQ 旋钮等）不重扫（判据同 `commitHistory`）。
+            if (!self.notesClipsUnchanged()) self.rescanForPlaybackEdit();
             return;
         }
         const before = self.history.items.len;
@@ -3360,11 +3375,6 @@ pub const App = struct {
         // 去重跳过（内容未变）→ 不建立手势；后续变化会再试
         if (self.history.items.len == before) return;
         self.gesture = .{ .label = label, .last_change_frame = now, .index = self.history_current };
-    }
-
-    /// 兼容旧名（滚轮调值 / 键盘连按移动音符共用；语义见 `touchGesture`）
-    pub fn markWheelHistory(self: *App, label: []const u8) void {
-        self.touchGesture(label);
     }
 
     /// 钉住进行中的手势：把当前状态重新捕获进其临时条目。
@@ -4949,8 +4959,12 @@ pub const App = struct {
         self.clearGesture(); // 进行中的手势作废（导航入口已先行钉值）
         // 容量先行：存档可能比当前容量大（扩容后重建；设备自动暂停/恢复）
         self.ensureAudioCapacity(st.instruments.len, st.mixer.len, savedMaxChainSlots(st.mixer));
-        self.kit_reset = true;
-        self.kit_gc_pending = true; // 乐器将被重建：鼓组池帧末全量重置
+        // 鼓组池重置**只在乐器重建（数量变化 → 下标重排）时**置位（见下方分支）。
+        // 原位更新（数量相同）池仍有效——池 = 纯声部状态（同 `engine.synths`），
+        // 与乐器内容无关。**无条件置位 = 实测 bug**：帧末 `pollCapacityReclaim`
+        // 会为此**暂停/恢复设备** → 撤销/重做音符编辑“卡一下 + 爆音”
+        //（直接编辑路径不置位，所以无缝）。
+        var kit_host_changed = false;
         // 拖动状态全部清空：撤销/重做后数据已换，旧拖动（及其快照/下标）
         // 会指向错误内容（下标可能越界）；用户需重新按下才能继续拖
         self.piano.drag_note = null;
@@ -4968,6 +4982,8 @@ pub const App = struct {
         if (st.instruments.len == self.instruments.items.len) {
             for (st.instruments, 0..) |*si, i| {
                 const target = &self.instruments.items[i];
+                // 宿主 kit↔非 kit 变化 → 帧末清理该槽的池（罕见；池不再对应）
+                if ((si.kind == 1) != (target.kit != null)) kit_host_changed = true;
                 if (!std.mem.eql(u8, target.name, si.name)) {
                     const dup = self.allocator.dupe(u8, si.name) catch continue;
                     self.allocator.free(target.name);
@@ -4978,6 +4994,8 @@ pub const App = struct {
                 self.applySavedInstrument(si, target, plan);
             }
         } else {
+            self.kit_reset = true;
+            self.kit_gc_pending = true; // 乐器将被重建：鼓组池帧末全量重置
             while (self.instruments.items.len > 0) {
                 self.removeInstrument(self.instruments.items.len - 1);
             }
@@ -4988,6 +5006,7 @@ pub const App = struct {
                 self.applySavedInstrument(si, target, .full); // 全新实例：整块重放
             }
         }
+        if (kit_host_changed) self.kit_gc_pending = true; // 帧末清理该槽的池（罕见路径）
         // 音符/片段
         self.notes.clearRetainingCapacity();
         for (st.notes) |n| {
@@ -6193,6 +6212,7 @@ pub const App = struct {
         self.params.frames_played.store(0, .monotonic);
         self.params.bpm.store(@intCast(bpm), .monotonic);
         self.params.steps_per_beat.store(@intCast(spb_per_beat), .monotonic);
+        self.markGenSoft(false); // 硬切换（导出起播）：照旧释放（无残留声部）
         sequencer.reset(&self.scheduler, &self.sched_events, self.clips.items, self.notes.items, true, self.sel.pattern, 0);
         self.params.sched_gen.store(self.scheduler.gen, .monotonic);
         self.params.playing.store(true, .monotonic);
@@ -6352,6 +6372,9 @@ pub const App = struct {
     /// 游标**显示用**小数步（平滑版；见 `tickCursorSmooth`）——
     /// 未播放或域不匹配时 = 冻结整数步。
     pub fn cursorDisplay(self: *const App, song_domain: bool) f32 {
+        // PAT 模式下的“SONG 域”查询 = **虚拟全局位置**（锚片段映射；仅显示用，
+        // 不写 song_step）——播放列表游标/跟随在 PAT 下位置自洽（设计 v1）。
+        if (song_domain and !self.sel.song_mode) return self.patVirtualSongStepFrac();
         if (self.playing and self.cursor_smooth_ok and self.sel.song_mode == song_domain) return self.cursor_smooth;
         return @floatFromInt(if (song_domain) self.playback.song_step else self.playback.piano_step);
     }
@@ -6467,6 +6490,13 @@ pub const App = struct {
 
     /// 跳转播放位置（播放中拖动游标 / 设置起点）：
     /// 重置传输基准（帧+步）+ 作废旧调度事件（为跨起点长音符补发 on）。
+    /// 传输代（gen）发布的前置标志：`soft=true` = **软切换**（音频侧不释放
+    /// 声部——保位模式切换用；见 `audio.handleGenChange`）。必须在 gen 递增/
+    /// 发布**之前**调用；单次消费（音频 swap 清位）。跳转/起播路径写 false。
+    pub fn markGenSoft(self: *App, soft: bool) void {
+        self.params.sched_gen_soft.store(soft, .release);
+    }
+
     pub fn jumpPlaybackCursor(self: *App, step: i32) void {
         if (self.sel.song_mode) {
             self.playback.song_step = step;
@@ -6478,9 +6508,138 @@ pub const App = struct {
         self.params.start_frame.store(self.playback.start_frame, .monotonic);
         self.params.start_step.store(step, .monotonic);
         if (self.playing) {
+            self.markGenSoft(false); // 硬切换：音频侧照旧释放全部声部（跳转必需）
             sequencer.reset(&self.scheduler, &self.sched_events, self.clips.items, self.notes.items, self.sel.song_mode, self.sel.pattern, step);
             self.params.sched_gen.store(self.scheduler.gen, .monotonic);
         }
+    }
+
+    /// 当前锚片段（PAT ⇄ SONG 位置映射用；规则见 `PianoState.origin`）：
+    /// 快照仍在（同值片段存在）→ 用它；被改/删 → 退化到动态最左片段；都没有 → null。
+    /// **按 `sel.pattern` 而非 `piano.pattern`**——PAT 播放的驱动是选中样式，
+    /// 与钢琴窗是否打开无关（实测 bug：钢琴窗关闭时映射失效、游标停在第 1 小节）。
+    pub fn patOriginClip(self: *const App) ?model.Clip {
+        const pat = self.sel.pattern;
+        if (self.piano.origin) |o| {
+            if (o.pattern == pat) {
+                for (self.clips.items) |c| {
+                    if (c.track == o.track and c.start == o.start and c.len == o.len and c.offset == o.offset and c.pattern == o.pattern) return o;
+                }
+            }
+        }
+        return model.leftmostClipFor(self.clips.items, pat);
+    }
+
+    /// 锚选择的参考位置（全局小数步）：SONG → `song_step`；PAT → 经**当前锚快照**
+    /// 把 `piano_step` 换算（不看 `sel.pattern`——改样式前后调用结果一致）；无锚 → 0。
+    pub fn anchorRefSongFrac(self: *const App) f32 {
+        if (self.sel.song_mode) return @floatFromInt(self.playback.song_step);
+        if (self.piano.origin) |o| {
+            return @max(0, @as(f32, @floatFromInt(o.start - o.offset)) + @as(f32, @floatFromInt(self.playback.piano_step)));
+        }
+        return 0;
+    }
+
+    /// 换样式（点样式/重开）时的锚：**离参考位置最近的该样式片段**（无 → null）。
+    pub fn nearestAnchorForPattern(self: *const App, pat: i32) ?model.Clip {
+        return model.nearestClipFor(self.clips.items, pat, self.anchorRefSongFrac());
+    }
+
+    /// PAT 模式下的**虚拟全局位置**（小数步；仅显示/映射用——不写 `song_step`）。
+    /// 有锚 → 锚映射；无锚 → 0（第 1 小节，规则 3）。
+    pub fn patVirtualSongStepFrac(self: *const App) f32 {
+        const local = self.cursorStepFrac(false);
+        const o = self.patOriginClip() orelse return 0;
+        return @max(0, @as(f32, @floatFromInt(o.start - o.offset)) + local);
+    }
+
+    /// 切到 PAT 时的目标局部步（SONG→PAT 反向）：song 游标在锚窗口内 → 映射；
+    /// 窗口外/无锚 → 0（“切到样式从头播”——没有诚实的对应点）。
+    pub fn patTargetLocalStep(self: *const App) i32 {
+        const o = self.patOriginClip() orelse return 0;
+        const s = self.playback.song_step;
+        if (s < o.start or s >= o.start + o.len) return 0;
+        return o.offset + (s - o.start);
+    }
+
+    /// 模式切换（**保位无缝**，用户拍板）：按锚片段映射换算目标步、原地换坐标。
+    /// PAT→SONG 时局部位置**回绕进锚片段窗口**——PAT 的循环界（音符末尾）
+    /// 可超出片段 len（放置后音符变长），直接映射会落在歌曲内容之外，被
+    /// `tickPlaybackLoop` 的自动循环抓回 0（实测“切 SONG 游标停到其他小节”）。
+    /// 播放中：位置**未变**（在锚窗口内）→ **软切换**（`seamlessSwitchPlayback`：
+    /// 不释放声部、游标处差分、窗口重扫——听感无缝）；回绕/跳位 → 一次硬跳转
+    /// （gen 重置、声部释放）。
+    pub fn switchSongModePreserving(self: *App) void {
+        if (self.sel.song_mode) {
+            // SONG → PAT：锚窗口内 → 映射（保位）；窗外/无锚 → 0（真跳位）
+            const o = self.patOriginClip();
+            const s = self.playback.song_step;
+            const in_window = if (o) |a| (s >= a.start and s < a.start + a.len) else false;
+            const target = self.patTargetLocalStep();
+            self.sel.song_mode = false;
+            if (self.playing and in_window) {
+                self.seamlessSwitchPlayback(target);
+            } else {
+                self.jumpPlaybackCursor(target);
+            }
+        } else {
+            // PAT → SONG：局部位置在锚窗口内 → 直接映射（保位）；否则回绕进窗口（跳位）
+            var target: i32 = @intFromFloat(@max(0, self.patVirtualSongStepFrac()));
+            var preserved = false;
+            if (self.patOriginClip()) |a| {
+                if (a.len > 0) {
+                    const local = self.playback.piano_step - a.offset;
+                    target = a.start + @mod(local, a.len);
+                    preserved = local >= 0 and local < a.len;
+                }
+            }
+            self.sel.song_mode = true;
+            if (self.playing and preserved) {
+                self.seamlessSwitchPlayback(target);
+            } else {
+                self.jumpPlaybackCursor(target);
+            }
+        }
+        // 切换后 `cursor_smooth` 是**旧域**的值（域检查会误认成新域 → 同一帧游标
+        // 按新域取值会拿到旧域残影，一帧错位）；以新域真值重播——连续、无残影。
+        self.cursor_smooth = self.cursorStepFrac(self.sel.song_mode);
+        self.cursor_smooth_ok = true;
+    }
+
+    /// 播放中的**软切换**（保位模式切换：`sel.song_mode` 已翻、`target` 已算）：
+    /// 换事件源但不释放声部——`switchMode` 做游标处差分 + 窗口重扫；
+    /// 传输基准换到新模式坐标（音乐位置连续）。
+    /// 发布顺序：软标志 → gen 递增 + 发布 → **最后**入队事件（音频回调若落在
+    /// “新事件已入队、新代未发布”的窗口会把它们当旧代作废——整段丢失）。
+    fn seamlessSwitchPlayback(self: *App, target: i32) void {
+        const new_mode = self.sel.song_mode;
+        const old_cur = if (new_mode) self.playback.piano_step else self.playback.song_step;
+        if (new_mode) {
+            self.playback.song_step = target;
+        } else {
+            self.playback.piano_step = target;
+        }
+        self.playback.start_step = target;
+        self.playback.start_frame = self.params.frames_played.load(.monotonic);
+        self.params.start_frame.store(self.playback.start_frame, .monotonic);
+        self.params.start_step.store(target, .monotonic);
+        self.markGenSoft(true);
+        self.scheduler.gen +%= 1;
+        self.params.sched_gen.store(self.scheduler.gen, .monotonic);
+        const horizon = target + self.steps_per_bar * 4; // 同主循环 lookahead（4 小节）
+        sequencer.switchMode(
+            &self.scheduler,
+            &self.sched_events,
+            self.clips.items,
+            self.notes.items,
+            !new_mode,
+            self.sel.pattern,
+            old_cur,
+            new_mode,
+            self.sel.pattern,
+            target,
+            horizon,
+        );
     }
 
     /// 标尺拖动跳转（**去重**）：按住鼠标时 UI 每帧都调用，
@@ -6500,15 +6659,27 @@ pub const App = struct {
     /// 防止“按住琴键时关闭视图”导致门控卡住（卡音）
     pub fn closePiano(self: *App) void {
         self.piano.pattern = null;
+        // 锚快照**保留**（关窗只是隐藏；重新打开同一样式时游标/映射停原位——
+        // 实测 bug：双击片段放游标 → 切播放列表 → 切回，SONG 游标消失）。
+        // 失效快照由 `patOriginClip` 的校验兜底（片段被改/删 → 动态最左）。
         self.piano.drag_note = null;
         self.piano.snap_menu_open = false; // 关闭视图时收起标题栏选单
         self.piano.inst_menu_open = false;
-        self.events.push(.{ .kind = .all_off });
+        // 释音：**只释放按住琴键/音符拖动的试听**（防止“按住时关闭视图”卡音——
+        // 原实现推 `all_off` 兜底，但 all_off 会连**播放中的声部**一起掐掉：
+        // 实测 bug——播放中连点视图切换按钮，每次关窗 = 全体消音 + 体感卡。
+        // `held_pitch` 是试听的唯一在按标记（琴键与音符拖动共用）。
+        if (self.piano.held_pitch) |hp| self.auditionOff(hp);
         self.piano.held_pitch = null;
     }
 
     /// 打开钢琴卷帘（编辑指定样式的音符）
     pub fn openPiano(self: *App, pattern: i32) void {
+        // 锚快照：**同一样式重开（关窗→再开）时保留**——游标/映射停原位；
+        // **换样式 → 离游标最近的片段**（规则 2 v2：窗随游标，最左只是特例）。
+        if (self.piano.origin == null or self.piano.origin.?.pattern != pattern) {
+            self.piano.origin = self.nearestAnchorForPattern(pattern);
+        }
         self.piano.pattern = pattern;
         self.piano.snap_menu_open = false; // 打开时收起上次残留的选单
         self.piano.inst_menu_open = false;
@@ -6518,6 +6689,12 @@ pub const App = struct {
         self.piano.drag_note = null;
         self.piano.scroll = (127 - 84) * self.piano.key_h; // 视野顶部从 C6 开始（下方可见 C3-C6）
         self.piano.scroll_x = 0;
+    }
+
+    /// 打开钢琴卷帘（**从片段双击**）——记录锚片段（PAT ⇄ SONG 位置映射，规则 1）
+    pub fn openPianoFromClip(self: *App, c: model.Clip) void {
+        self.openPiano(c.pattern);
+        self.piano.origin = c;
     }
 
     // ── 文本输入（就地重命名）──
@@ -7086,7 +7263,7 @@ test "app: 手势历史（滚轮类）：起手即提交临时条目 + 静置钉
     f += 1000;
     app.params.frames_played.store(f, .monotonic);
     app.mixer_channels_state.items[0].effects.append(app.allocator, .{ .kind = .eq }) catch {};
-    app.markWheelHistory("调整 EQ Q 值");
+    app.touchGesture("调整 EQ Q 值");
     try std.testing.expectEqual(base + 1, app.history.items.len);
 
     // 连续滚动：同一条（临时条目仍为起手时的快照）
@@ -7095,7 +7272,7 @@ test "app: 手势历史（滚轮类）：起手即提交临时条目 + 静置钉
         f += 1000;
         app.params.frames_played.store(f, .monotonic);
         app.mixer_channels_state.items[0].effects.append(app.allocator, .{ .kind = .eq }) catch {};
-        app.markWheelHistory("调整 EQ Q 值");
+        app.touchGesture("调整 EQ Q 值");
         app.pollGestureHistory(); // 间隔远小于 1s → 不钉
     }
     try std.testing.expectEqual(base + 1, app.history.items.len);
@@ -7112,7 +7289,7 @@ test "app: 手势历史（滚轮类）：起手即提交临时条目 + 静置钉
     f += 1000;
     app.params.frames_played.store(f, .monotonic);
     app.mixer_channels_state.items[0].effects.append(app.allocator, .{ .kind = .eq }) catch {};
-    app.markWheelHistory("调整 EQ Q 值");
+    app.touchGesture("调整 EQ Q 值");
     try std.testing.expectEqual(base + 2, app.history.items.len);
 }
 
@@ -7623,6 +7800,281 @@ test "app: cursorStepFrac——子步精度（播放中 = 起始步 + 已播放�
     try std.testing.expectEqual(@as(f32, 7), app.cursorStepFrac(true));
 }
 
+test "app: SONG→PAT 往返精确（钢琴窗放游标后切 PAT 位置不变）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    // 样式1 一前一后两个片段；双击后者 → 锚 = 后者
+    app.addClip(.{ .track = 0, .start = 0, .len = 96, .pattern = 0 });
+    app.addClip(.{ .track = 0, .start = 384, .len = 96, .pattern = 0 });
+    app.openPianoFromClip(app.clips.items[1]);
+    app.sel.pattern = 0;
+    app.sel.song_mode = true;
+    // 钢琴 SONG 标尺放置：local 50 → song = 384 + 50 = 434
+    try std.testing.expectEqual(@as(?i32, 434), model.clipLocalToSong(app.clips.items[1], 50));
+    app.playback.song_step = 434;
+    // 切 PAT → local 应 = 50（位置不变）
+    app.switchSongModePreserving();
+    try std.testing.expect(!app.sel.song_mode);
+    try std.testing.expectEqual(@as(i32, 50), app.playback.piano_step);
+    // 再切回 SONG → 仍 434（往返）
+    app.switchSongModePreserving();
+    try std.testing.expectEqual(@as(i32, 434), app.playback.song_step);
+}
+
+test "app: 关钢琴再开（同一样式）锚快照保留——双击片段放的游标切回来仍在原位" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    // 样式1 一前一后两个片段；双击后者（锚 = 后者，非动态最左）
+    app.addClip(.{ .track = 0, .start = 0, .len = 96, .pattern = 0 });
+    app.addClip(.{ .track = 0, .start = 384, .len = 96, .pattern = 0 });
+    app.openPianoFromClip(app.clips.items[1]);
+    app.sel.pattern = 0;
+    app.sel.song_mode = true;
+    app.playback.song_step = 434; // SONG 游标：后片段局部 50
+    // 切回播放列表（关钢琴）→ 再切回钢琴（同一样式；工具栏/⇄ 按钮路径）
+    app.closePiano();
+    app.openPiano(app.sel.pattern);
+    // 实测 bug：此前关窗清快照 → 重开锚退化成动态最左（start 0）→ song 434 不在
+    // 其窗口内 → SONG 游标不绘制（“游标不见了”）。现在快照保留 → 锚仍是后片段
+    try std.testing.expectEqual(@as(i32, 384), app.patOriginClip().?.start);
+    try std.testing.expect(model.clipSongToLocal(app.patOriginClip().?, app.playback.song_step) != null);
+    // 规则 2（v2：点样式打开 = 离游标最近）：游标移到前片段内（song 50）→ 锚 = 前片段
+    app.playback.song_step = 50;
+    app.closePiano();
+    app.piano.origin = null; // 模拟“从未有快照”的通用打开
+    app.openPiano(app.sel.pattern);
+    try std.testing.expectEqual(@as(i32, 0), app.patOriginClip().?.start);
+}
+
+test "app: 换样式锚 = 离游标最近——切走再切回 = 双击的片段（游标仍在其内）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(2);
+    app.resetMixerChannels(default_mixer_channels);
+    // 样式1：B(384)、C(960)；样式2：一处 480
+    app.addClip(.{ .track = 0, .start = 384, .len = 96, .pattern = 0 });
+    app.addClip(.{ .track = 0, .start = 960, .len = 96, .pattern = 0 });
+    app.addClip(.{ .track = 0, .start = 480, .len = 96, .pattern = 1 });
+    app.openPianoFromClip(app.clips.items[0]); // 双击 B
+    app.sel.song_mode = true;
+    app.playback.song_step = 434; // 游标在 B 内
+    // 换到样式2（点样式路径）：锚 = 离游标最近的该样式片段
+    app.sel.pattern = 1;
+    app.piano.pattern = 1;
+    app.piano.origin = app.nearestAnchorForPattern(1);
+    try std.testing.expectEqual(@as(i32, 480), app.patOriginClip().?.start);
+    // 切回样式1：游标仍在 B 内 → 锚回到 B（“切回来还是那个片段”——自然得到）
+    app.sel.pattern = 0;
+    app.piano.pattern = 0;
+    app.piano.origin = app.nearestAnchorForPattern(0);
+    try std.testing.expectEqual(@as(i32, 384), app.patOriginClip().?.start);
+    // 游标移到 C 内（1000）→ 锚 = C
+    app.playback.song_step = 1000;
+    app.piano.origin = app.nearestAnchorForPattern(0);
+    try std.testing.expectEqual(@as(i32, 960), app.patOriginClip().?.start);
+    // PAT 参考：经当前锚换算虚拟位置（B 锚、piano_step 50 → 434）→ 样式2 最近 = 480
+    app.sel.song_mode = false;
+    app.playback.piano_step = 50;
+    app.piano.origin = app.clips.items[0]; // 锚回 B
+    try std.testing.expectEqual(@as(i32, 480), app.nearestAnchorForPattern(1).?.start);
+    // 无片段样式（样式3）→ null（映射退化 0，规则 3 不变）
+    app.resetPatterns(3);
+    try std.testing.expect(app.nearestAnchorForPattern(2) == null);
+}
+
+test "app: 保位切换=软切换（播放中）——无重击、off 续排；非保位=硬切换" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    app.addClip(.{ .track = 0, .start = 384, .len = 96, .pattern = 0 });
+    // 跨游标长音符：局部 10..18（局部 15 处正在发声）
+    app.addNote(.{ .step = 10, .len = 8, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.openPianoFromClip(app.clips.items[0]);
+    app.sel.pattern = 0;
+    app.sel.song_mode = false;
+    app.playback.piano_step = 15;
+    app.playing = true;
+    app.params.playing.store(true, .monotonic);
+    app.playback.start_step = 15;
+    app.playback.start_frame = 0;
+    app.params.frames_played.store(15000, .monotonic);
+    const gen0 = app.scheduler.gen;
+    app.switchSongModePreserving(); // PAT 15 → SONG 384+15=399（保位 → 软）
+    try std.testing.expect(app.sel.song_mode);
+    try std.testing.expectEqual(@as(i32, 399), app.playback.song_step);
+    try std.testing.expect(app.scheduler.gen != gen0);
+    try std.testing.expectEqual(app.scheduler.gen, app.params.sched_gen.load(.monotonic));
+    try std.testing.expect(app.params.sched_gen_soft.load(.monotonic)); // 软标志（待音频消费）
+    // 事件：匹配实例不重击（无 on@399）；off 由窗口重扫续上（映射 end = 384+18 = 402）
+    var out: [128]synth.SchedEvent = undefined;
+    const n = app.sched_events.drain(&out);
+    var on399 = false;
+    var off402 = false;
+    for (out[0..n]) |ev| {
+        if (ev.step == 399 and ev.kind == .on) on399 = true;
+        if (ev.step == 402 and ev.kind == .off and ev.pitch == 60) off402 = true;
+    }
+    try std.testing.expect(!on399); // 旧行为（reset+gatherMidOns）会补 on → 重击
+    try std.testing.expect(off402); // 声部不悬挂
+    // 反向 SONG→PAT 保位：song 399 在窗口内 → piano = 15（软；标志重置模拟音频已消费）
+    app.params.sched_gen_soft.store(false, .monotonic);
+    const gen1 = app.scheduler.gen;
+    app.switchSongModePreserving();
+    try std.testing.expect(!app.sel.song_mode);
+    try std.testing.expectEqual(@as(i32, 15), app.playback.piano_step);
+    try std.testing.expect(app.scheduler.gen != gen1);
+    try std.testing.expect(app.params.sched_gen_soft.load(.monotonic));
+    // 非保位（局部 200 在窗口 [0,96) 外 → 回绕）= 硬切换：软标志清（跳位需释放声部）
+    app.playback.piano_step = 200;
+    app.switchSongModePreserving();
+    try std.testing.expect(app.sel.song_mode);
+    try std.testing.expectEqual(@as(i32, 384 + 8), app.playback.song_step); // mod(200,96)=8
+    try std.testing.expect(!app.params.sched_gen_soft.load(.monotonic));
+}
+
+test "app: 关钢琴不再推 all_off（播放中关视图不消音）——只释放在按试听" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.openPiano(0);
+    // ① 按住试听（琴键/音符拖动）时关窗：推**定向 off**（不推 all_off）
+    app.piano.held_pitch = 62;
+    app.closePiano();
+    var out: [8]synth.NoteEvent = undefined;
+    const n = app.events.drain(&out);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(synth.EventKind.off, out[0].kind);
+    try std.testing.expectEqual(@as(u8, 62), out[0].pitch);
+    // ② 无在按试听（播放中的常见情形）：**不推任何事件**——播放声部不受影响
+    app.openPiano(0);
+    app.closePiano();
+    try std.testing.expectEqual(@as(usize, 0), app.events.drain(&out));
+}
+
+test "app: 滚轮续接改力度即时重扫（修“Ctrl+A 后 Alt+滚轮改力度不及时生效”）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.addNote(.{ .step = 20, .len = 4, .pitch = 62, .pattern = 0, .instrument = 0 });
+    app.resetHistory("初始");
+    app.sel.pattern = 0;
+    app.sel.song_mode = false;
+    // 播放中（音频在步 8；音符 20 在未来 → 在已扫过的水位线窗口内）
+    app.playing = true;
+    app.params.playing.store(true, .monotonic);
+    app.playback.piano_step = 8;
+    app.playback.start_frame = 0;
+    app.playback.start_step = 0;
+    app.params.frames_played.store(8000, .monotonic);
+    sequencer.reset(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, false, 0, 0);
+    sequencer.scheduleRange(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, false, 0, 0, 32);
+    var drain: [64]synth.SchedEvent = undefined;
+    _ = app.sched_events.drain(&drain);
+    // 第一滚：起手提交临时条目（内部重扫）→ 手势建立
+    app.notes.items[0].velocity = 104;
+    app.touchGesture("调整力度");
+    try std.testing.expect(app.gesture != null);
+    const edit1 = app.scheduler.edit_gen;
+    // 第二滚（续接）：必须**重扫**（编辑代递增）且窗口内事件带新力度
+    app.notes.items[0].velocity = 108;
+    app.touchGesture("调整力度");
+    try std.testing.expect(app.scheduler.edit_gen != edit1); // ← 旧行为：不变（bug）
+    const n = app.sched_events.drain(&drain);
+    var found = false;
+    for (drain[0..n]) |ev| {
+        if (ev.kind == .on and ev.step == 20 and ev.velocity == 108) found = true;
+    }
+    try std.testing.expect(found);
+    // 对照：非音符改动（内容未变）不重扫
+    app.pinPendingGesture(); // 钉值：条目归位到最终值
+    const edit2 = app.scheduler.edit_gen;
+    app.touchGesture("调旋钮");
+    try std.testing.expectEqual(edit2, app.scheduler.edit_gen);
+}
+
+test "app: PAT ⇄ SONG 保位切换（锚片段映射）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    app.addClip(.{ .track = 0, .start = 480, .len = 96, .pattern = 0 });
+    app.addClip(.{ .track = 0, .start = 960, .len = 96, .pattern = 0 });
+    app.openPiano(0);
+    // 规则 2：无快照 → 动态最左片段
+    try std.testing.expectEqual(@as(i32, 480), app.patOriginClip().?.start);
+    // 规则 1：双击来源快照（第二个片段）
+    app.openPianoFromClip(app.clips.items[1]);
+    try std.testing.expectEqual(@as(i32, 960), app.patOriginClip().?.start);
+    // 快照失效（片段被移动）→ 退化到最左
+    app.clips.items[1].start = 2000;
+    try std.testing.expectEqual(@as(i32, 480), app.patOriginClip().?.start);
+    // 回归（实测 bug）：钢琴窗**关闭**时映射仍成立——PAT 播放用的是 sel.pattern，
+    // 与 piano.pattern 无关（此前键在 piano.pattern 上：关窗即映射失效）
+    app.closePiano();
+    app.sel.pattern = 0;
+    try std.testing.expectEqual(@as(i32, 480), app.patOriginClip().?.start);
+    app.playback.piano_step = 96;
+    try std.testing.expectApproxEqAbs(@as(f32, 576), app.patVirtualSongStepFrac(), 0.01);
+    // 虚拟位置映射：local 96 → 480 + 96 = 576（锚 = 最左，offset 0）——**显示用原始映射**
+    // （显示如实追踪 PAT 位置；回绕只在“切换”时做——见下）
+    app.sel.song_mode = false;
+    app.playback.piano_step = 96;
+    try std.testing.expectApproxEqAbs(@as(f32, 576), app.patVirtualSongStepFrac(), 0.01);
+    // 保位切换 PAT→SONG：local 95（窗内）→ song_step = 575
+    app.playback.piano_step = 95;
+    app.switchSongModePreserving();
+    try std.testing.expect(app.sel.song_mode);
+    try std.testing.expectEqual(@as(i32, 575), app.playback.song_step);
+    // SONG→PAT：游标在锚窗口内 → 映射回 20
+    app.playback.song_step = 500;
+    app.switchSongModePreserving();
+    try std.testing.expect(!app.sel.song_mode);
+    try std.testing.expectEqual(@as(i32, 20), app.playback.piano_step);
+    // 窗口外 → 0（“切到样式从头播”）
+    app.sel.song_mode = true;
+    app.playback.song_step = 3000;
+    app.switchSongModePreserving();
+    try std.testing.expectEqual(@as(i32, 0), app.playback.piano_step);
+
+    // **实测 bug 回归**：PAT 局部越出片段窗口（音符比片段长）→ 切换时**回绕进窗口**，
+    // 不被 SONG 自动循环抓回 0（此前直接映射 → 越界 → tickPlaybackLoop 跳 0）。
+    // 锚 = 最左（start 480，len 96，offset 0）；局部 150 → @mod(150,96)=54 → 534。
+    app.sel.song_mode = false;
+    app.playback.piano_step = 150;
+    app.playing = true;
+    app.playback.start_step = 150;
+    app.playback.start_frame = 0;
+    app.params.frames_played.store(0, .monotonic);
+    app.switchSongModePreserving();
+    try std.testing.expectEqual(@as(i32, 534), app.playback.song_step);
+    app.tickPlaybackLoop(); // 534 < clipsEndStep（2096）→ 不得被抓回 0
+    try std.testing.expectEqual(@as(i32, 534), app.playback.song_step);
+    app.playing = false;
+}
+
 test "app: 游标平滑——前馈+收敛（渲染帧下线性；缓冲量化不显、单调、不跳变）" {
     var app = App{ .allocator = std.testing.allocator };
     defer app.clips.deinit(app.allocator);
@@ -8069,6 +8521,10 @@ test "app: 播放中撤销/点历史——不停播，走编辑重扫（回归�
     try std.testing.expect(app.params.playing.load(.monotonic));
     try std.testing.expect(app.scheduler.edit_gen != edit0); // 重扫代递增
     try std.testing.expectEqual(app.scheduler.edit_gen, app.params.sched_edit_gen.load(.monotonic));
+    // **不置鼓组池重置/回收**（实测 bug 修复：置位会让帧末 pollCapacityReclaim
+    // 暂停/恢复设备 → 撤销/重做音符编辑“卡一下 + 爆音”；直接编辑不置位所以无缝）
+    try std.testing.expect(!app.kit_reset);
+    try std.testing.expect(!app.kit_gc_pending);
 
     // 重做 → 同样不停播
     try std.testing.expect(app.redo());
@@ -8079,6 +8535,8 @@ test "app: 播放中撤销/点历史——不停播，走编辑重扫（回归�
     try std.testing.expect(app.jumpHistory(0));
     try std.testing.expect(app.playing);
     try std.testing.expect(app.params.playing.load(.monotonic));
+    try std.testing.expect(!app.kit_reset);
+    try std.testing.expect(!app.kit_gc_pending);
 
     // 停止态跳转：不触发重扫（编辑代不变）
     app.playing = false;
@@ -8086,6 +8544,23 @@ test "app: 播放中撤销/点历史——不停播，走编辑重扫（回归�
     const edit1 = app.scheduler.edit_gen;
     try std.testing.expect(app.jumpHistory(1));
     try std.testing.expectEqual(edit1, app.scheduler.edit_gen);
+}
+
+test "app: 撤销——乐器数量变化（重建）才置鼓组池重置（设备暂停仅限罕见重建路径）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+    _ = app.addInstrument("减法合成器");
+    app.commitHistory("添加乐器");
+    // 撤销：2 → 1（重建路径）→ 置位（下标重排，池不再对应）
+    try std.testing.expect(app.undo());
+    try std.testing.expect(app.kit_reset);
+    try std.testing.expect(app.kit_gc_pending);
 }
 
 test "app: 撤销/重做——快照式（放置/删除/修改 + redo 截断 + 选区无关）" {

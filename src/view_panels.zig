@@ -102,12 +102,20 @@ pub fn drawPatterns(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                     if (ui.listItem(2000 + i, app.pattern_items.items[i], x + 1, iy, w - 2, item_h, selected, i % 2 == 1, null, null) and !in_add_row) {
                         app.sel.pattern = @intCast(i);
                         // 钢琴卷帘开着时，点击样式 = 切换编辑对象（与“点片段→选样式”闭环）
-                        if (app.piano.pattern != null) app.piano.pattern = @intCast(i);
+                        // 换样式 = 规则 2 v2：锚 = 离游标最近（窗随游标）；点同一样式不动锚
+                        if (app.piano.pattern) |pp| {
+                            const pi: i32 = @intCast(i);
+                            if (pp != pi) {
+                                app.piano.pattern = pi;
+                                app.piano.origin = app.nearestAnchorForPattern(pi);
+                            }
+                        }
                     }
                 }
                 // 双击样式 → 打开钢琴卷帘（按钮行内不响应）
                 if (!in_add_row and ui.mouse_double and ui.hitRect(x + 1, iy, w - 2, item_h)) {
                     app.sel.pattern = @intCast(i);
+                    // 锚：换样式 → 离游标最近；同一样式 → 保留（openPiano 内部）
                     app.openPiano(@intCast(i));
                 }
                 // 右键样式 → 重命名/删除菜单（位置快照；与机架右键同一模式）

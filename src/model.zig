@@ -299,6 +299,42 @@ pub fn leftmostClipFor(clips: []const Clip, pattern: i32) ?Clip {
     return best;
 }
 
+/// 离参考位置（全局小数步）最近的该样式片段（PAT/SONG 锚选择用）：
+/// 窗口含参考位置者优先；否则取“窗口边缘到参考位置”距离最小者；
+/// 等距 → 更左者（稳定、可预测）；无片段 → null。
+pub fn nearestClipFor(clips: []const Clip, pattern: i32, ref_song: f32) ?Clip {
+    var best: ?Clip = null;
+    var best_dist: f32 = std.math.floatMax(f32);
+    for (clips) |c| {
+        if (c.pattern != pattern) continue;
+        const ws: f32 = @floatFromInt(c.start);
+        const we: f32 = @floatFromInt(c.start + c.len);
+        const dist: f32 = if (ref_song < ws) ws - ref_song else if (ref_song >= we) ref_song - we else 0;
+        // 更近者胜；等距取更左（含“两窗口都含参考位置”的重叠情形）
+        if (best == null or dist < best_dist or (dist == best_dist and c.start < best.?.start)) {
+            best = c;
+            best_dist = dist;
+        }
+    }
+    return best;
+}
+
+test "nearestClipFor: 含参考位置优先；否则最近；等距最左" {
+    var clips = [_]Clip{
+        .{ .track = 0, .start = 0, .len = 96, .pattern = 0 },
+        .{ .track = 0, .start = 384, .len = 96, .pattern = 0 },
+        .{ .track = 0, .start = 480, .len = 96, .pattern = 1 },
+    };
+    // 含参考位置（434 ∈ [384,480)）→ 该片段
+    try std.testing.expectEqual(@as(i32, 384), nearestClipFor(&clips, 0, 434).?.start);
+    // 窗外 → 边缘距离最近（ref 300：到 [0,96) 距离 204；到 [384,480) 距离 84 → 384）
+    try std.testing.expectEqual(@as(i32, 384), nearestClipFor(&clips, 0, 300).?.start);
+    // 等距（ref 240：两窗口边缘距离都 144）→ 更左
+    try std.testing.expectEqual(@as(i32, 0), nearestClipFor(&clips, 0, 240).?.start);
+    // 无该样式片段 → null
+    try std.testing.expect(nearestClipFor(&clips, 9, 0) == null);
+}
+
 /// 全局步 → 片段内的**局部**步（不在片段可见范围内 → null）。
 /// 注：片段与音符现已同为 **U=96 步**坐标，无需再乘每小节步数。
 pub fn clipSongToLocal(c: Clip, song_step: i32) ?i32 {

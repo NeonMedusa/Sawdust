@@ -6,6 +6,9 @@
 //! - 音频线程按播放步边界精确触发（时序不受 UI 帧率抖动影响）；
 //! - transport 变化（开始/跳转）→ `reset`：gen 递增作废旧事件，并为
 //!   「跨起点的长音符」补发 note-on（从音符中间开始播放会触发它）；
+//! - 保位模式切换 → `switchMode`：gen 递增（**软切换**——音频不释放声部，
+//!   见 `Params.sched_gen_soft`），旧模式@旧游标 vs 新模式@新游标差分
+//!   （匹配不发事件）+ 窗口重扫；调用方负责 gen 递增与发布顺序（先 gen 后事件）；
 //! - 播放中**编辑提交** → `rescanForEdit`：`edit_gen` 递增（音频线程作废
 //!   **未触发**的旧事件，但**不**打断在响声部），跨游标实例差分补 on/off，
 //!   并按新数据重扫 `[安全界, 水位线)`（安全界 = 音频**确定没走到**的步，
@@ -313,9 +316,9 @@ pub fn rescanForEdit(
 
     // ── 1) 跨游标差分（键 = 音高+乐器；每侧各自去重，每键每侧恰处理一次）──
     // 旧侧：旧多新少 → 移除 → off@cur
-    diffSide(&evs, &n, old_clips, old_notes, clips, notes, song_mode, pattern, cur, sched, false);
+    diffSide(&evs, &n, old_clips, old_notes, clips, notes, song_mode, pattern, cur, song_mode, pattern, cur, cur, sched, false);
     // 新侧：新多旧少 → 新增 → on@cur
-    diffSide(&evs, &n, clips, notes, old_clips, old_notes, song_mode, pattern, cur, sched, true);
+    diffSide(&evs, &n, clips, notes, old_clips, old_notes, song_mode, pattern, cur, song_mode, pattern, cur, cur, sched, true);
 
     std.mem.sort(synth.SchedEvent, evs[0..n], {}, synth.schedEventLess);
     for (evs[0..n]) |ev| queue.push(ev);
@@ -328,11 +331,12 @@ pub fn rescanForEdit(
     }
 }
 
-/// `rescanForEdit` 的差分单侧：遍历 `side_notes` 中跨游标的音符，对每个
-/// **本侧首次出现**的（音高, 乐器）键计算两侧跨游标实例数差；
-/// `emit_on` 时新侧多于旧侧 → 补 `on@cur`；否则旧侧多于新侧 → 补 `off@cur`。
-/// （去重是**每侧各自**的：同一键可能在两侧都被处理，但差值符号唯一，
-/// 只有一侧会真正发出事件。）
+/// `rescanForEdit`/`switchMode` 的差分单侧：遍历 `side_notes` 中**本侧首次
+/// 出现**的（音高, 乐器）键，计算两侧跨游标实例数差（两侧的模式/游标可不同：
+/// 编辑重扫时同侧同游标；模式切换时旧模式@旧游标 vs 新模式@新游标）；
+/// `emit_on` 时新侧多于旧侧 → 补 `on@emit_step`；否则旧侧多于新侧 → 补
+/// `off@emit_step`。（去重是**每侧各自**的：同一键可能在两侧都被处理，
+/// 但差值符号唯一，只有一侧会真正发出事件。）
 fn diffSide(
     evs: []synth.SchedEvent,
     n: *usize,
@@ -340,9 +344,13 @@ fn diffSide(
     side_notes: []const model.Note,
     other_clips: []const model.Clip,
     other_notes: []const model.Note,
-    song_mode: bool,
-    pattern: i32,
-    cur: i32,
+    side_song_mode: bool,
+    side_pattern: i32,
+    side_cur: i32,
+    other_song_mode: bool,
+    other_pattern: i32,
+    other_cur: i32,
+    emit_step: i32,
     sched: *const Scheduler,
     emit_on: bool,
 ) void {
@@ -355,21 +363,21 @@ fn diffSide(
         if (seen[@intCast(nt.pitch)] & bit != 0) continue;
         seen[@intCast(nt.pitch)] |= bit;
 
-        const side_c = crossingCount(side_clips, side_notes, song_mode, pattern, nt.pitch, nt.instrument, cur);
-        const other_c = crossingCount(other_clips, other_notes, song_mode, pattern, nt.pitch, nt.instrument, cur);
+        const side_c = crossingCount(side_clips, side_notes, side_song_mode, side_pattern, nt.pitch, nt.instrument, side_cur);
+        const other_c = crossingCount(other_clips, other_notes, other_song_mode, other_pattern, nt.pitch, nt.instrument, other_cur);
         if (emit_on) {
             // 新侧：新增（新 > 旧）——带**该音符的力度/声像**（跨游标立即发声）
             var k: usize = 0;
             while (k < side_c -| other_c) : (k += 1) {
-                var ev = makeEv(nt, .on, cur, sched);
-                ev.step = cur;
+                var ev = makeEv(nt, .on, emit_step, sched);
+                ev.step = emit_step;
                 if (!pushEv(evs, n, ev)) return;
             }
         } else {
             // 旧侧：移除（旧 > 新）
             var k: usize = 0;
             while (k < side_c -| other_c) : (k += 1) {
-                if (!pushEv(evs, n, makeKeyEv(nt.pitch, nt.instrument, .off, cur, sched))) return;
+                if (!pushEv(evs, n, makeKeyEv(nt.pitch, nt.instrument, .off, emit_step, sched))) return;
             }
         }
     }
@@ -394,6 +402,46 @@ fn crossingCount(clips: []const model.Clip, notes: []const model.Note, song_mode
         }
     }
     return c;
+}
+
+/// 保位模式切换（播放中）：换事件源但**不释放声部**（软切换——调用方在
+/// gen 递增前置 `params.sched_gen_soft`，并**先发布 gen、再调用本函数**：
+/// 否则音频回调恰落在“新事件已入队、新代未发布”的窗口会把它们当旧代作废）。
+/// **调用方负责 `gen` 递增**（本函数只推事件 + 维护水位线）。
+///
+/// 事件构造（旧模式@旧游标 vs 新模式@新游标，键 = 音高+乐器、按实例数）：
+/// - 仅旧侧有 → `off@新游标`（释放：如 SONG→PAT 时其他轨的音符）；
+/// - 仅新侧有 → `on@新游标`（起音：如 PAT→SONG 时其他轨的音符）；
+/// - 两侧匹配（锚映射下就是同一实例）→ **不发事件**：声部继续发声，
+///   其 off 由窗口重扫自然补发（end >= 新游标+1，必在窗口内）。
+///
+/// 窗口重扫 `[新游标+1, 地平线)`：stash 已被 gen 变化清空（旧副本不存在），
+/// 必须整段重发；起点 +1 与差分的 on@游标 不重叠（同 `rescanForEdit`）。
+pub fn switchMode(
+    sched: *Scheduler,
+    queue: *synth.SchedQueue,
+    clips: []const model.Clip,
+    notes: []const model.Note,
+    old_song_mode: bool,
+    old_pattern: i32,
+    old_cur: i32,
+    new_song_mode: bool,
+    new_pattern: i32,
+    new_cur: i32,
+    horizon: i32,
+) void {
+    var evs: [max_gather]synth.SchedEvent = undefined;
+    var n: usize = 0;
+    // 差分：旧侧（仅旧有 → off@新游标）+ 新侧（仅新有 → on@新游标）
+    diffSide(&evs, &n, clips, notes, clips, notes, old_song_mode, old_pattern, old_cur, new_song_mode, new_pattern, new_cur, new_cur, sched, false);
+    diffSide(&evs, &n, clips, notes, clips, notes, new_song_mode, new_pattern, new_cur, old_song_mode, old_pattern, old_cur, new_cur, sched, true);
+    std.mem.sort(synth.SchedEvent, evs[0..n], {}, synth.schedEventLess);
+    for (evs[0..n]) |ev| queue.push(ev);
+
+    sched.scheduled_upto = new_cur;
+    if (horizon > new_cur + 1) {
+        scheduleRange(sched, queue, clips, notes, new_song_mode, new_pattern, new_cur + 1, horizon);
+    }
 }
 
 // ── 测试 ──
@@ -888,4 +936,54 @@ test "sequencer: SONG 静音轨道——其片段不被调度" {
     try std.testing.expectEqual(@as(usize, 2), n); // 只剩轨 0 的 on/off
     try std.testing.expectEqual(synth.EventKind.on, out[0].kind);
     try std.testing.expectEqual(synth.EventKind.off, out[1].kind);
+}
+
+test "sequencer: switchMode——匹配实例不发事件（保声部）、off 由窗口重扫补发" {
+    var q = synth.SchedQueue{};
+    var s = Scheduler{};
+    // 样式0：跨游标长音符（局部 10..18）+ 后续音符（20..24）；样式1：另一条跨游标音符
+    const notes = [_]model.Note{
+        .{ .step = 10, .len = 8, .pitch = 60, .pattern = 0, .instrument = 0 },
+        .{ .step = 20, .len = 4, .pitch = 62, .pattern = 0, .instrument = 0 },
+        .{ .step = 12, .len = 20, .pitch = 64, .pattern = 1, .instrument = 0 },
+    };
+    // SONG：轨0 样式0 片段 [100,196)；轨1 样式1 片段 [100,196)
+    const clips = [_]model.Clip{
+        .{ .track = 0, .start = 100, .len = 96, .pattern = 0 },
+        .{ .track = 1, .start = 100, .len = 96, .pattern = 1 },
+    };
+    // SONG@115 → PAT 样式0@15：60 两侧匹配（不发）；64（样式1）仅旧侧 → off@15
+    switchMode(&s, &q, &clips, &notes, true, 0, 115, false, 0, 15, 15 + 4 * 96);
+    var out: [128]synth.SchedEvent = undefined;
+    const n = drainAll(&q, &out);
+    var off15 = false;
+    var on_at_15 = false;
+    var off18 = false; // 匹配实例 60 的 off：**新模式（PAT）坐标**局部 end = 18（窗口重扫补发）
+    var on20 = false; // 后续音符 62：局部 on = 20
+    for (out[0..n]) |ev| {
+        if (ev.step == 15 and ev.kind == .off and ev.pitch == 64) off15 = true;
+        if (ev.step == 15 and ev.kind == .on) on_at_15 = true;
+        if (ev.step == 18 and ev.kind == .off and ev.pitch == 60) off18 = true;
+        if (ev.step == 20 and ev.kind == .on and ev.pitch == 62) on20 = true;
+    }
+    try std.testing.expect(off15);
+    try std.testing.expect(!on_at_15); // **无重击**（旧行为会补 on@游标）
+    try std.testing.expect(off18); // 声部不悬挂（off 已续排，新模式坐标）
+    try std.testing.expect(on20);
+    try std.testing.expectEqual(@as(i32, 15 + 4 * 96), s.scheduled_upto);
+
+    // 反向：PAT 样式0@15 → SONG@115：64 仅新侧 → on@115（起音）；60 匹配（不发）
+    var q2 = synth.SchedQueue{};
+    var s2 = Scheduler{};
+    switchMode(&s2, &q2, &clips, &notes, false, 0, 15, true, 0, 115, 115 + 4 * 96);
+    var out2: [128]synth.SchedEvent = undefined;
+    const n2 = drainAll(&q2, &out2);
+    var on115_64 = false;
+    var on115_60 = false;
+    for (out2[0..n2]) |ev| {
+        if (ev.step == 115 and ev.kind == .on and ev.pitch == 64) on115_64 = true;
+        if (ev.step == 115 and ev.kind == .on and ev.pitch == 60) on115_60 = true;
+    }
+    try std.testing.expect(on115_64); // 其他轨起音
+    try std.testing.expect(!on115_60); // 匹配实例不重击
 }

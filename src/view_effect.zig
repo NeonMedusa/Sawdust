@@ -405,7 +405,7 @@ fn drawEqGraph(ui: *Ui, app: *App, es: *app_mod.EffectSlot, gx: i32, gy: i32, gw
                 es.bands[bi].q = nq;
                 // **滚轮类 coalesce**：连续滚动只记最后一条（静默 0.6s 后提交）——
                 // 否则每次滚动都产生一条历史（实测：操作历史刷屏）
-                app.markWheelHistory("调整 EQ Q 值");
+                app.touchGesture("调整 EQ Q 值");
             }
             // **消费滚轮**：面板浮在混音台上，不置 0 会让下层（通道条/效果链滚动）也跟着动
             ui.wheel = 0;

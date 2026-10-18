@@ -458,6 +458,15 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                         // 极窄的片段描边会把填充完全包成灰色。
                         if (clip_w > 2) ui.renderer.strokeRect(clip_x, ty, clip_w, track_h, base);
                         if (clip.selected and clip_w > 2) ui.renderer.strokeRect(clip_x, ty, clip_w, track_h, ui.theme.note_selected);
+                        // PAT 模式：锚片段高亮（“你正在播的就是它”——游标位置的解释；
+                        // 按 sel.pattern——PAT 播放的驱动样式）
+                        if (!app.sel.song_mode and !thin and clip.pattern == app.sel.pattern) {
+                            if (app.patOriginClip()) |o| {
+                                if (o.track == clip.track and o.start == clip.start and o.len == clip.len and o.offset == clip.offset) {
+                                    ui.renderer.strokeRect(clip_x, ty, clip_w, track_h, ui.theme.accent);
+                                }
+                            }
+                        }
                         if (label_h > 0) {
                             var buf: [24]u8 = undefined;
                             const label_text = std.fmt.bufPrint(&buf, "样式 {d}", .{clip.pattern + 1}) catch "";
@@ -534,10 +543,15 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         const saved_cursor = ui.renderer.pushClip(lane_x, ruler_y, view_w, ruler_h + tracks_h);
         defer ui.renderer.popClip(saved_cursor);
 
-        // **平滑小数步**（渲染帧线性滑动；音频缓冲量化被吸收——实测“游标还是抖”的终解）
-        const bar_frac: f32 = app.cursorDisplay(true) / @as(f32, @floatFromInt(spb));
-        const cx = lane_x + @as(i32, @intFromFloat(bar_frac * bar_ws - scroll_s));
-        util.drawCursor(ui, cx, ruler_y, ruler_h, tracks_y + tracks_h, app.playing);
+        // **唯一游标**：PAT 且无锚（样式没有任何片段实例）时，游标在“没有歌曲
+        // 位置的 PAT 里”——播放列表不画幽灵游标（否则它凭空停在第一小节）
+        const ghost = !app.sel.song_mode and app.patOriginClip() == null;
+        if (!ghost) {
+            // **平滑小数步**（渲染帧线性滑动；音频缓冲量化被吸收——实测“游标还是抖”的终解）
+            const bar_frac: f32 = app.cursorDisplay(true) / @as(f32, @floatFromInt(spb));
+            const cx = lane_x + @as(i32, @intFromFloat(bar_frac * bar_ws - scroll_s));
+            util.drawCursor(ui, cx, ruler_y, ruler_h, tracks_y + tracks_h, app.playing);
+        }
 
         // 交互（仅标尺行）：按下 → 直接设置位置并进入拖动；拖动中跟随鼠标
         // （`menu_click` 门控：点选单条目的那一帧不得穿透到标尺）
@@ -689,16 +703,18 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 用**第一次按下时命中**的片段（`prev_click_clip`）——点击会触发叠放轮换，
     // 第二次按下时命中的可能已经换人（用户双击的意图是第一次那个）。
     if (ui.mouse_double) {
-        var dbl: ?usize = app.playlist.prev_click_clip;
-        if (dbl == null) {
-            if (clip_hit) |hit| dbl = hit.index;
-        }
-        if (dbl) |di| {
-            if (di < app.clips.items.len) {
-                const c = app.clips.items[di];
-                app.openPiano(c.pattern);
-                return;
+        // **必须当前双击点命中片段**才打开（实测 bug：双击播放按钮打开了钢琴窗——
+        // `prev_click_clip` 残留 + 此前无命中门槛，双击任意位置都会开“上次点的片段”）。
+        // `prev_click_clip` 只用于消解“叠放轮换换人”的歧义（第一次按下的那个）。
+        if (clip_hit) |hit| {
+            var dbl: ?usize = app.playlist.prev_click_clip;
+            if (dbl) |di| {
+                if (di >= app.clips.items.len) dbl = null; // 已被删除 → 退回当前命中
             }
+            const di = dbl orelse hit.index;
+            const c = app.clips.items[di];
+            app.openPianoFromClip(c); // 记录锚片段（PAT ⇄ SONG 位置映射，规则 1）
+            return;
         }
     }
 
@@ -1021,7 +1037,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     {
         const pl = &app.playlist;
         const nav = pl.nav_active or ui.active_id == 8;
-        if (pl.follow_playhead and app.playing and !nav) {
+        // 幽灵游标（PAT 无锚）不跟随：否则视角会追着第一小节的幻影跑
+        const ghost = !app.sel.song_mode and app.patOriginClip() == null;
+        if (pl.follow_playhead and app.playing and !nav and !ghost) {
             const cur_px: f32 = app.cursorDisplay(true) * @as(f32, @floatFromInt(util.piano_step_w)); // 平滑小数步（同游标绘制）
             // 锚点口径 = **内容区（网格区）**（用户确认以网格区为准）
             const off_screen: f32 = util.follow_anchor_frac * @as(f32, @floatFromInt(view_w));

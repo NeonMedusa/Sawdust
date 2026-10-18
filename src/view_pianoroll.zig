@@ -163,10 +163,25 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     const bar_ws: f32 = @as(f32, @floatFromInt(bar_w)) * zoom; // 屏幕上的小节宽
     const scroll_s: f32 = @as(f32, @floatFromInt(app.piano.scroll_x)) * zoom; // 屏幕上的滚动量
 
+    // 窗外暗化（用户拍板设计）：SONG 模式 + 锚窗口存在 → 窗外网格/音符暗化
+    // （暗示“片段外的音符不出声”）；PAT 不暗化；无锚（样式无片段）不暗化。
+    // 实现：内容画完后在窗外区域盖两条半透明 scrim（**半跨界音符自动被切段**——
+    // 只盖到窗口边界），再画窗口右缘分界线。
+    const dim_x: ?[2]i32 = blk: {
+        if (!app.sel.song_mode) break :blk null;
+        const o = app.patOriginClip() orelse break :blk null;
+        if (o.len <= 0) break :blk null;
+        const x0 = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(o.offset)) * step_ws - scroll_s));
+        const x1 = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(o.offset + o.len)) * step_ws - scroll_s));
+        break :blk .{ x0, x1 };
+    };
+
     // 循环区域在**本视图的局部坐标**（本视图时间轴 = 当前样式最左片段的局部轴）：
     // - PAT：`loop_pat` 即局部步，直接用；
-    // - SONG：`loop_song` 是全局步，经最左片段换算（同一参照系）
-    const loop_clip: ?model.Clip = if (app.sel.song_mode) model.leftmostClipFor(app.clips.items, pattern) else null;
+    // - SONG：`loop_song` 是全局步，经**锚片段**换算（统一到锚——双击的片段；
+    //   无快照 → 回退最左，行为与旧版一致。实测 bug：双击后面片段打开，
+    //   标尺放游标却跑到第一个片段上——旧版此处用最左片段）
+    const loop_clip: ?model.Clip = if (app.sel.song_mode) app.patOriginClip() else null;
     const loop_local: ?[2]i32 = blk: {
         const lr = app.loopRegion() orelse break :blk null;
         if (!app.sel.song_mode) break :blk lr;
@@ -528,6 +543,18 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             }
         }
 
+        // 窗外暗化（见顶部 `dim_x`）：内容之后盖 scrim（半跨界音符自动被切段）；
+        // 右缘分界线 1px（比色带更清晰）
+        if (dim_x) |dx| {
+            const scrim: u32 = (@as(u32, 120) << 24) | 0x000000;
+            if (dx[0] > lane_x) ui.renderer.fillRect(lane_x, lane_y, @min(dx[0], lane_x + view_w) - lane_x, lane_h, scrim);
+            if (dx[1] < lane_x + view_w) {
+                const s0 = @max(dx[1], lane_x);
+                ui.renderer.fillRect(s0, lane_y, lane_x + view_w - s0, lane_h, scrim);
+            }
+            if (dx[1] >= lane_x and dx[1] <= lane_x + view_w) ui.renderer.vline(dx[1], lane_y, lane_h, ui.theme.text_dim);
+        }
+
         // 框选矩形（半透明填充 + 描边；画在音符之上）
         if (app.piano.marquee_active) {
             const mx0 = @min(app.piano.marquee_x0, ui.mouse_x);
@@ -567,7 +594,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
 
         if (app.sel.song_mode) {
             // SONG：找当前样式最左片段 → 全局步换算为局部步；无片段/不在范围内不显示
-            if (model.leftmostClipFor(app.clips.items, pattern)) |c| {
+                // SONG 模式片段参照 = **锚**（双击的片段；无快照回退最左）——
+                // 标尺拖动/游标绘制/换算统一到锚（实测 bug：双击后片段后放游标跑到第一个片段）
+                if (app.patOriginClip()) |c| {
                 if (model.clipSongToLocal(c, app.playback.song_step) != null) {
                     // **平滑小数步**（渲染帧线性；音频缓冲量化被吸收——实测“游标还是抖”的终解）
                     const local_f: f32 = app.cursorDisplay(true) - @as(f32, @floatFromInt(c.start)) + @as(f32, @floatFromInt(c.offset));
@@ -1042,7 +1071,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         const mode = app.piano.lane_mode;
         const near = view_note_lane.nearestNoteInPiano(app, ui.mouse_x, ui.mouse_y, lane_x, lane_y, step_ws, scroll_s, app.piano.key_h, app.piano.scroll, pattern);
         if (view_note_lane.altWheelAdjust(app, mode, ui.wheel, near)) {
-            app.markWheelHistory(if (mode == .velocity) "调整力度" else "调整声像");
+                app.touchGesture(if (mode == .velocity) "调整力度" else "调整声像");
         }
         ui.wheel = 0; // 消费
     }
@@ -1161,7 +1190,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         // **平滑小数步**（子步 + 渲染侧前馈/收敛；音频缓冲量化不显——实测“游标还是抖”的终解。
         // 与游标绘制同一映射。）
         const cur_step: ?f32 = if (app.sel.song_mode) blk: {
-            const c = model.leftmostClipFor(app.clips.items, pattern) orelse break :blk null;
+            const c = app.patOriginClip() orelse break :blk null;
             if (model.clipSongToLocal(c, app.playback.song_step) == null) break :blk null;
             break :blk app.cursorDisplay(true) - @as(f32, @floatFromInt(c.start)) + @as(f32, @floatFromInt(c.offset));
         } else app.cursorDisplay(false);
@@ -1240,7 +1269,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         else
             app.nudgeSelectedNotes(mv.d_step, mv.d_pitch);
         if (changed) {
-            app.markWheelHistory("移动音符");
+                app.touchGesture("移动音符");
         }
         app.pending_move = null;
     }

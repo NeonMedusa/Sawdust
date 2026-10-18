@@ -14,7 +14,10 @@ https://drive.google.com/drive/folders/1vHJcw6CiEt24WLKBgtTzmiMKY8IMpbfF?usp=sha
 
 已经是一个**可以拿来写东西**的工作站——从编曲到混音的全流程闭环都在：
 
-- **音序器**：SONG / PAT 双模式、循环播放、BPM 与拍号（工具栏拖动调整）
+- **VST3 插件**：效果器与乐器（加载 / 插件界面 / 参数编辑 / 状态随工程存档与撤销 /
+  BPM 同步），多输出 VSTi（如 SFLT），扫描管理器 + 预设浏览器
+- **音序器**：SONG / PAT 双模式（**保位无缝切换**：播放中切换不释音、不重击）、
+  循环播放、BPM 与拍号（工具栏拖动调整）
 - **钢琴卷帘**：绘图 / 移动 / 复制音符，网格选择，力度与声像编辑轨
 - **播放列表**：多轨片段编排（拖拽 / 复制 / 裁剪），时间轴缩放与滚动
 - **调音台**：动态增删通道、声像 / 推子 / 静音；**每通道效果链**
@@ -38,37 +41,27 @@ https://drive.google.com/drive/folders/1vHJcw6CiEt24WLKBgtTzmiMKY8IMpbfF?usp=sha
 
 界面自绘（零 GUI 框架）：窗口、控件、图标形状全部像素级绘制。
 
+## 路线图（下一步）
+- [x] VST3 插件（效果器 + 乐器：参数编辑 / 插件界面 / 状态存档与撤销 / BPM 同步 /
+  多输出 VSTi（SFLT）/ 扫描管理器 + 预设浏览器）
+- [ ] 音频文件（WAV/MP3）加载与波形缓存
+- [ ] 自动化曲线（声像、音量、颤音、bpm变速等等等，还有 MIDI 通道声像的完整还原）
+- [ ] 音频、音符录制
+- [ ] 将自带的减法合成器升级成更强大的波表合成器
+- [ ] 更多效果器（合唱 / 失真 / 滤波器……）
+- [ ] 跨平台（Linux: X11/Wayland；macOS: Cocoa）
+- [ ] asio支持
+
+
 ## 构建与运行
 
-需要 **Zig 0.16**。依赖手动放在 `libs/`（不用包管理器）：
-
-```
-libs/stb/stb_truetype.h        # 字形光栅化（Public Domain）
-libs/miniaudio/miniaudio.h     # 音频 I/O（Public Domain / MIT-0）
-libs/zig-vst3/                 # VST3 绑定（submodule；MIT）
-```
-
-> 仓库含 submodule（`libs/zig-vst3`）：克隆请用 `git clone --recursive`；
-> 已克隆的仓库补 `git submodule update --init` 即可。
+**环境：Windows + Zig 0.16**（仓库含 submodule，克隆必须带 `--recursive`）：
 
 ```bash
-zig build                 # 调试构建 → zig-out/bin/Sawdust.exe（**单文件**）
+git clone --recursive https://github.com/NeonMedusa/Sawdust.git
+cd Sawdust
 zig build run             # 构建并运行
-zig build test            # 单元测试
-zig build -Doptimize=ReleaseFast
 ```
-
-> 注：插件管理器的扫描以**独立进程运行自身 exe**（`Sawdust.exe --vst-scan …`，同二进制
-> 自举）——坏插件崩溃隔离在 worker 进程里；发布只需一个 exe。
-
-## 快捷键
-
-| 键 | 作用 |
-|---|---|
-| `空格` | 播放 / 暂停 |
-| `Ctrl+Z` / `Ctrl+Alt+Z` | 撤销 / 重做 |
-| `Ctrl+S` / `Ctrl+Shift+S` | 保存 / 另存为 |
-| `Ctrl+O` | 打开工程 |
 
 ## 架构
 
@@ -100,18 +93,6 @@ VST3 宿主见 `docs/plugin-hosting.md`。
 
 **平台支持**：目前仅 Windows。`src/window.zig` 有非 Windows 的编译期占位
 （会给出明确的编译错误指向需要移植的文件）。
-
-## 路线图（下一步）
-
-- [ ] 音频文件（WAV/MP3）加载与波形缓存
-- [ ] 自动化曲线（声像、音量、颤音、bpm变速等等等，还有 MIDI 通道声像的完整还原）
-- [ ] 音频、音符录制
-- [ ] 更多效果器（合唱 / 失真 / 滤波器……）
-- [ ] 跨平台（Linux: X11/Wayland；macOS: Cocoa）
-- [x] VST3 插件（效果器 + 乐器：参数编辑 / 插件界面 / 状态存档与撤销 / BPM 同步 /
-  多输出 VSTi（SFLT）/ 扫描管理器 + 预设浏览器）
-- [ ] asio支持
-- [ ] 更加强大的波表合成器
 
 ## 开发工具
 

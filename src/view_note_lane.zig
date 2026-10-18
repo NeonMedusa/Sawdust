@@ -9,7 +9,9 @@
 //! - Alt+滚轮 = 调力度/声像（有选区 → 全部选中整体增减；否则最近柱条末端）；
 //! - 双击重置默认；右键不响应（防误删）；
 //! - 拖动中不逐帧重扫调度（防事件风暴）；松手由调用方提交历史
-//!   （`commitHistory` → `rescanForEdit`，正在响的音符改值下次触发生效）。
+//!   （`commitHistory` → `rescanForEdit`，正在响的音符改值下次触发生效）；
+//! - **Alt+滚轮走手势合并**（`touchGesture`：起手提交 + 静置钉值）——
+//!   每一滚（含续接）即时重扫调度（修“不及时生效”）。
 
 const std = @import("std");
 const r_mod = @import("render.zig");
@@ -131,6 +133,14 @@ pub fn draw(
 
     // 当前模式（**在 toggle2 之后读**——点击切换本帧就生效）
     const mode = app.piano.lane_mode;
+    // 窗外暗化（同钢琴窗设计）：SONG 模式 + 锚窗口 → 窗外柱条/网格暗化；
+    // PAT/无锚不暗化。内容画完后盖 scrim（半跨界柱条自动被切段）。
+    const dim_x: ?[2]i32 = blk: {
+        if (!app.sel.song_mode) break :blk null;
+        const o = app.patOriginClip() orelse break :blk null;
+        if (o.len <= 0) break :blk null;
+        break :blk .{ barX(o.offset, track_x, step_ws, scroll_s), barX(o.offset + o.len, track_x, step_ws, scroll_s) };
+    };
     const in_track = ui.hitRect(track_x, y, track_w, h);
 
     // ── Alt+滚轮：调力度/声像 ──
@@ -141,7 +151,7 @@ pub fn draw(
         const near = nearestNoteInLane(app, ui.mouse_x, ui.mouse_y, track_x, step_ws, scroll_s, pattern, bar_w, top, avail, mode);
         wheel_changed = altWheelAdjust(app, mode, ui.wheel, near);
         if (wheel_changed) {
-            app.markWheelHistory(if (mode == .velocity) "调整力度" else "调整声像");
+            app.touchGesture(if (mode == .velocity) "调整力度" else "调整声像");
         }
         ui.wheel = 0; // 消费（防下层钢琴窗再滚一次）
     }
@@ -300,6 +310,16 @@ pub fn draw(
                 top + @divTrunc(avail, 2) - panBarH(v, avail);
             ui.renderer.fillRect(bx, tip_y - @divTrunc(bar_w, 2), bar_w, bar_w, white);
         }
+        // 窗外暗化（见顶部 `dim_x`）：内容之后盖 scrim；右缘分界线 1px
+        if (dim_x) |dx| {
+            const scrim: u32 = (@as(u32, 120) << 24) | 0x000000;
+            if (dx[0] > track_x) ui.renderer.fillRect(track_x, y, @min(dx[0], track_x + track_w) - track_x, h, scrim);
+            if (dx[1] < track_x + track_w) {
+                const s0 = @max(dx[1], track_x);
+                ui.renderer.fillRect(s0, y, track_x + track_w - s0, h, scrim);
+            }
+            if (dx[1] >= track_x and dx[1] <= track_x + track_w) ui.renderer.vline(dx[1], y, h, ui.theme.text_dim);
+        }
         // 悬停：白描边（最后画；方块已在上层，描边只绕柱体轮廓）
         if (hover_idx) |hi_idx| {
             const nt = app.notes.items[hi_idx];
@@ -328,7 +348,8 @@ pub fn draw(
         var show = true;
         if (app.sel.song_mode) {
             show = false;
-            if (model.leftmostClipFor(app.clips.items, pattern)) |c| {
+            // SONG 模式片段参照 = **锚**（双击的片段；无快照回退最左）——与钢琴窗统一
+        if (app.patOriginClip()) |c| {
                 if (model.clipSongToLocal(c, app.playback.song_step) != null) {
                     cur_f = app.cursorDisplay(true) - @as(f32, @floatFromInt(c.start)) + @as(f32, @floatFromInt(c.offset));
                     show = true;
@@ -545,7 +566,7 @@ fn steppedValue(mode: NoteLaneMode, old: i32, dv: i32) i32 {
 /// - 否则 → 只调**距离鼠标最近**的一个音符（同样吸附）。
 /// `nearest` 由调用方算好（钢琴窗/编辑轨的“最近”标准不同——见
 /// `nearestNoteInPiano` / `nearestNoteInLane`）。
-/// 返回 true = 有改动（调用方用 `markWheelHistory` 记 coalesce 历史）。
+/// 返回 true = 有改动（调用方用 `touchGesture` 记 coalesce 历史）。
 pub fn altWheelAdjust(app: *App, mode: NoteLaneMode, delta_steps: i32, nearest: ?usize) bool {
     const dv = delta_steps * wheel_step;
     if (dv == 0) return false;
