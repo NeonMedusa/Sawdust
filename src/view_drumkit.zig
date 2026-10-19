@@ -3,8 +3,9 @@
 //! - 左：GM 35-81 全列表 **∪ 所有已映射音高**（合并升序；自定义音高也能编辑）；
 //!   未映射行暗色、已映射行左缘强调条 + 右端 ●；点击选中。
 //! - 右：垫名（点击就地改名；空 = GM/音名默认）+ [试听]（按住响、松开停）；
-//!   层列表：来源名 / 增益（上下拖动）/ [编辑]（转交合成器窗口编辑该层）/ [×]；
-//!   底部 [＋ 从预设添加][＋ 空层]。
+//!   层列表：来源名 / 增益（上下拖动）/ [编辑]（层窗口：减法=参数面板 /
+//!   VST3=插件界面）/ [×]；
+//!   底部 [＋ 添加乐器]（统一预设面板：减法/VST3，不列鼓组）。
 //!
 //! 数据改动全部经 App 的鼓组 API（退役/历史语义在那边统一处理）；
 //! 预设文件 IO 走 `pending_preset` 在 main 帧末执行（本模块不碰 io）。
@@ -329,7 +330,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
                 const it = std.fmt.bufPrint(&ib, "{d}", .{li + 1}) catch "";
                 ui.labelCentered(it, rx + 4, rry, layer_row_h - 2, ui.theme.text_dim);
                 var lb: [96]u8 = undefined;
-                const pdisp = presetDisplayName(layer.source_preset);
+                const pdisp = if (layer.kind == .vst3) layer.source_preset else presetDisplayName(layer.source_preset);
                 const full = if (pdisp.len > 0)
                     (std.fmt.bufPrint(&lb, "{s} · {s}", .{ layer.kind.displayName(), pdisp }) catch pdisp)
                 else
@@ -373,6 +374,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         }
 
         if (edit_req) |li| {
+            // 层窗口：减法层 = 参数面板；VST3 层 = **插件界面**（嵌入托管，同乐器）
             app.synth_win.target = .{ .kit_layer_replace = .{
                 .instrument = inst_idx,
                 .pitch = sel,

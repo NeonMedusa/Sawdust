@@ -36,14 +36,18 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
 
     // 约束在屏幕内（VST3 嵌入：尺寸固定=插件尺寸，松约束；其余：常规最小尺寸）
     var vst3_pl: ?*vst_host.Plugin = null;
-    target_is_vst3_check: {
-        const ii: i32 = switch (sw.target) {
-            .instrument => |v| v,
-            else => break :target_is_vst3_check,
-        };
-        if (ii < 0 or ii >= @as(i32, @intCast(app.instruments.items.len))) break :target_is_vst3_check;
-        const inst = &app.instruments.items[@intCast(ii)];
-        if (inst.kind == .vst3) vst3_pl = inst.plugin;
+    switch (sw.target) {
+        .instrument => |ii| {
+            if (ii >= 0 and ii < @as(i32, @intCast(app.instruments.items.len))) {
+                const inst = &app.instruments.items[@intCast(ii)];
+                if (inst.kind == .vst3) vst3_pl = inst.plugin;
+            }
+        },
+        .kit_layer_replace => |ref| {
+            if (app.kitLayerPtr(ref.instrument, ref.pitch, ref.layer)) |ly| {
+                if (ly.kind == .vst3) vst3_pl = ly.plugin;
+            }
+        },
     }
     const embedded = vst3_pl != null and vst3_pl.?.view != null;
     const expect_ui = vst3_pl != null and !vst3_pl.?.editor_no_ui;
@@ -103,7 +107,12 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
             else
                 null;
             const pname = model.drumKeyLabel(&nb, kit, ref.pitch);
-            break :blk std.fmt.bufPrint(&tbuf, "减法合成器 — {s} · {s} 层{d}", .{ iname, pname, ref.layer + 1 }) catch "减法合成器";
+            const is_vst3_layer = blk2: {
+                if (app.kitLayerPtr(ref.instrument, ref.pitch, ref.layer)) |ly| break :blk2 ly.kind == .vst3;
+                break :blk2 false;
+            };
+            const kind_label: []const u8 = if (is_vst3_layer) "VST3 乐器" else "减法合成器";
+            break :blk std.fmt.bufPrint(&tbuf, "{s} — {s} · {s} 层{d}", .{ kind_label, iname, pname, ref.layer + 1 }) catch "层";
         },
     };
     ui.label(title, x + 8, y + 4, ui.theme.text);
@@ -113,7 +122,10 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     // 见 main 的 loadVst3Preset/saveVst3Preset
     const target_is_vst3 = vst3_pl != null or switch (sw.target) {
         .instrument => |ii| (ii >= 0 and ii < @as(i32, @intCast(app.instruments.items.len)) and app.instruments.items[@intCast(ii)].kind == .vst3),
-        else => false,
+        .kit_layer_replace => |ref| blk: {
+            const ly = app.kitLayerPtr(ref.instrument, ref.pitch, ref.layer) orelse break :blk false;
+            break :blk ly.kind == .vst3;
+        },
     };
     {
         const save_w: i32 = 62;
@@ -222,10 +234,17 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         switch (sw.target) {
             .instrument => |ii| {
                 if (ii >= 0 and ii < @as(i32, @intCast(app.instruments.items.len))) {
-                    drawVst3Body(ui, app, &app.instruments.items[@intCast(ii)], ii, &sw.param_scroll, x, y, ww, hh);
+                    const inst = &app.instruments.items[@intCast(ii)];
+                    drawVst3Body(ui, app, inst.plugin, inst.name, inst.pluginPath(), inst.load_failed, .{ .kind = .instrument, .a = @intCast(@min(ii, std.math.maxInt(u16))) }, 9600, &sw.param_scroll, x, y, ww, hh);
                 }
             },
-            else => {},
+            .kit_layer_replace => |ref| {
+                if (app.kitLayerPtr(ref.instrument, ref.pitch, ref.layer)) |ly| {
+                    const disp: []const u8 = if (ly.source_preset.len > 0) ly.source_preset else "VST3 乐器层";
+                    const slot: u16 = if (app.kitLayerSlot(@intCast(@max(0, ref.instrument)), ref.pitch, ref.layer)) |s| @intCast(@min(s, std.math.maxInt(u16))) else 0;
+                    drawVst3Body(ui, app, ly.plugin, disp, ly.pluginPath(), ly.load_failed, .{ .kind = .kit_layer, .a = @intCast(@max(0, ref.instrument)), .b = slot }, 9800 + @as(u64, slot), &sw.param_scroll, x, y, ww, hh);
+                }
+            },
         }
         return util.inRect(ui.mouse_x, ui.mouse_y, x, y, ww, hh);
     }
@@ -334,24 +353,38 @@ fn fmtPercent(v: i32, buf: []u8) []const u8 {
 /// 振荡器行（一行一个）：开关 / 序号 / 波形按钮 / 音量旋钮 /
 /// 合奏数量（0-16）/ 合奏散布（0-100%）——两个数值控件与 BPM 同款
 /// （上下拖动、光标冻结隐藏）
-/// VST3 乐器体：嵌入中（子窗口覆盖内容区）不画；否则信息行 + 参数列表兜底
-/// （无界面插件走列表；“打开界面”按钮已移除——用户拍板：简单易用流派）
-fn drawVst3Body(ui: *Ui, app: *App, inst: *model.Instrument, ii: i32, scroll_p: *i32, x: i32, y: i32, ww: i32, hh: i32) void {
-    if (inst.plugin) |p| {
+/// VST3 乐器/鼓组层的插件体：嵌入中（子窗口覆盖内容区）不画；否则信息行 + 参数列表兜底
+/// （无界面插件走列表）。`ref`/`id_base` 决定参数编辑记账归属与控件 id 段。
+fn drawVst3Body(
+    ui: *Ui,
+    app: *App,
+    pl_opt: ?*vst_host.Plugin,
+    display_name: []const u8,
+    path: []const u8,
+    load_failed: bool,
+    ref: PluginSlotRef,
+    id_base: u64,
+    scroll_p: *i32,
+    x: i32,
+    y: i32,
+    ww: i32,
+    hh: i32,
+) void {
+    if (pl_opt) |p| {
         if (p.view != null) return; // 嵌入中：子窗口覆盖内容区
     }
     const body_y = y + win_title_h;
     var yy = body_y + 10;
-    ui.label(inst.name, x + 10, yy, ui.theme.text);
+    ui.label(display_name, x + 10, yy, ui.theme.text);
     yy += 22;
-    ui.labelClipped(inst.pluginPath(), x + 10, yy, ww - 20, ui.theme.text_dim);
+    ui.labelClipped(path, x + 10, yy, ww - 20, ui.theme.text_dim);
     yy += 22;
-    const pl = inst.plugin;
+    const pl = pl_opt;
     if (pl) |p| {
         var b: [64]u8 = undefined;
         ui.label(std.fmt.bufPrint(&b, "{s} · 延迟 {d} 样本", .{ p.name(), p.latency }) catch "", x + 10, yy, ui.theme.text_dim);
     } else {
-        if (inst.load_failed) {
+        if (load_failed) {
             ui.label("（插件加载失败——将自动重试；文件恢复后自动加载）", x + 10, yy, ui.theme.danger);
         } else {
             ui.label("（插件未加载）", x + 10, yy, ui.theme.text_dim);
@@ -361,8 +394,7 @@ fn drawVst3Body(ui: *Ui, app: *App, inst: *model.Instrument, ii: i32, scroll_p: 
     yy += 24;
     ui.renderer.hline(x + 8, yy, ww - 16, ui.theme.panel_border);
     yy += 8;
-    const iref = PluginSlotRef{ .kind = .instrument, .a = @intCast(@min(ii, std.math.maxInt(u16))) };
-    util.drawPluginParamList(ui, app, pl, inst.load_failed, scroll_p, iref, 9600, x + 10, body_y, ww - 20, hh - win_title_h, yy);
+    util.drawPluginParamList(ui, app, pl, load_failed, scroll_p, ref, id_base, x + 10, body_y, ww - 20, hh - win_title_h, yy);
 }
 
 fn drawOscRow(ui: *Ui, app: *App, p: *synth.SynthParams, oi: usize, x: i32, y: i32, w: i32) void {

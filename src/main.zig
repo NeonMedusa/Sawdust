@@ -553,13 +553,19 @@ pub fn main(init: std.process.Init) !u8 {
                             app.params.kit_layer_pitch[i][slot].store(pad.pitch, .monotonic);
                             app.params.kit_layer_gain[i][slot].store(ly.gain, .monotonic);
                             app.params.kit_layer_params[i][slot].store(ly.params, .monotonic);
+                            // VST3 层：实例指针**先于** kind 发布（音频侧 kind==2 时指针
+                            // 必然已是新值——避免“新 kind + 旧退役实例”窗口）
+                            app.params.kit_layer_plugin[i][slot].store(if (ly.kind == .vst3) ly.plugin else null, .monotonic);
+                            app.params.kit_layer_kind[i][slot].store(@intFromEnum(ly.kind), .monotonic);
                             slot += 1;
                         }
                     }
                 }
             }
-            // 清掉多余旧槽位（层数减少时防旧指针/旧音高残留）
+            // 清掉多余旧槽位（层数减少时防旧指针/旧音高残留；同样指针先清、kind 后清）
             while (slot < audio.kit_max_layers) : (slot += 1) {
+                app.params.kit_layer_plugin[i][slot].store(null, .monotonic);
+                app.params.kit_layer_kind[i][slot].store(0, .monotonic);
                 app.params.kit_layer_pitch[i][slot].store(0, .monotonic);
                 app.params.kit_layer_params[i][slot].store(null, .monotonic);
             }
@@ -862,6 +868,7 @@ pub fn main(init: std.process.Init) !u8 {
     syncPluginSlots(&app);
     // 4.4d) VST3 乐器实例同步（惰性加载 + 编辑器编辑轮询）
     syncInstrumentPlugins(&app);
+    app.syncKitLayerPlugins();
     // 4.4e) VST3 插件界面嵌入同步（面板 → 子窗口；遮挡→隐藏；见函数注释）
     syncPluginEditors(&app, &ui, @intCast(win.fb.width), @intCast(win.fb.height));
 
@@ -1041,7 +1048,7 @@ fn loadPreset(app: *App, io: std.Io, intent: PresetIntent, cat: usize, choice: P
         },
         .preset => |idx| {
             if (idx >= c.presets.items.len) return;
-            // 层上下文只接受减法预设文件（防御：UI 已把鼓组分类置灰）
+            // 内置分类：层只接受减法（鼓组禁自嵌套；VST3 分类走上方独立流程）
             const is_layer_ctx = switch (intent) {
                 .create_kit_layer => true,
                 .replace => |t| switch (t) {
@@ -1137,17 +1144,100 @@ fn loadVst3Preset(app: *App, io: std.Io, intent: PresetIntent, cat: usize, choic
         .change_instrument => |i| i,
         .replace => |t| switch (t) {
             .instrument => |i| i,
-            .kit_layer_replace => {
-                app.setToast("鼓组层暂不支持 VST3 插件");
-                return;
-            },
+            .kit_layer_replace => null, // 鼓组层：下方专用分支
         },
-        .create_kit_layer => {
-            app.setToast("鼓组层暂不支持 VST3 插件");
-            return;
-        },
+        .create_kit_layer => null, // 鼓组层：下方专用分支
         .create_effect, .replace_effect => null, // 走下方效果分支
     };
+
+    // ── 鼓组层意图（create_kit_layer / replace.kit_layer_replace）：VST3 乐器层 ──
+    // 层 = 乐器槽（`docs/drumkit.md` §7）：创建/换插件与乐器同惯例；实例帧末
+    // 惰性加载（`syncKitLayerPlugins`）。层无插件界面（v1）。
+    switch (intent) {
+        .create_kit_layer => |ref| {
+            if (path.len == 0) {
+                app.setToast("插件未安装/未扫描到——请在插件管理里扫描或添加文件");
+                return;
+            }
+            var sbuf2: [preset_mod.max_name_len + 96]u8 = undefined;
+            const src = if (is_default) label else (std.fmt.bufPrint(&sbuf2, "{s}/{s}", .{ label, patch_name }) catch label);
+            if (!app.kitLayerAddVst3(ref.instrument, ref.pitch, path, src)) {
+                app.setToastWith("添加失败（层数已满？上限 {d}）", .{audio.kit_max_layers});
+                return;
+            }
+            if (has_state) {
+                // 新层（无实例）→ 状态入 pending，帧末加载后应用（一条历史捕获两者）
+                const kit = app.instruments.items[@intCast(ref.instrument)].kit.?;
+                if (kit.find(ref.pitch)) |pad| {
+                    if (pad.layers.items.len > 0) {
+                        const ly = &pad.layers.items[pad.layers.items.len - 1];
+                        ly.clearPendingState(app.allocator);
+                        ly.pending_state = comp;
+                        ly.pending_state_ctrl = ctrl;
+                        comp = null;
+                        ctrl = null; // 所有权移交（defer 不再释放）
+                    }
+                }
+            }
+            app.commitHistory(if (is_default) "添加乐器" else "添加乐器（预设）");
+            openKitLayerWindow(app, ref.instrument, ref.pitch); // 顺势展示插件界面（加载后出现）
+            app.setToastWith("已添加 VST3 乐器层：{s}（{s}）", .{ label, patch_name });
+            return;
+        },
+        .replace => |t| switch (t) {
+            .kit_layer_replace => |ref| {
+                const ly = app.kitLayerPtr(ref.instrument, ref.pitch, ref.layer) orelse {
+                    app.setToast("目标层已不存在");
+                    return;
+                };
+                const same = blk: {
+                    if (ly.kind == .vst3) {
+                        if (ly.plugin) |pl| break :blk app.pluginInstanceMatchesCategory(pl, cid);
+                    }
+                    break :blk false;
+                };
+                if (same) {
+                    if (has_state) {
+                        ly.plugin.?.restoreState(comp orelse &.{}, ctrl orelse &.{});
+                        // 同乐器路径：恢复后全 128 panic（防幽灵声部永挂）
+                        if (app.kitLayerSlot(@intCast(ref.instrument), ref.pitch, ref.layer)) |slot| {
+                            app.params.kit_layer_panic[@intCast(ref.instrument)][slot].store(true, .release);
+                        }
+                        _ = app.kitLayerSetSource(ref.instrument, ref.pitch, ref.layer, patch_name);
+                        app.commitHistory("加载预设");
+                        app.setToastWith("已加载插件预设：{s}", .{patch_name});
+                    } else {
+                        app.setToast("（默认音色在新建层或换插件时生效）");
+                    }
+                    return;
+                }
+                if (path.len == 0) {
+                    app.setToast("插件未安装/未扫描到——请在插件管理里扫描或添加文件");
+                    return;
+                }
+                // 换插件：旧实例退役（帧末按新路径惰性加载）；状态入 pending
+                if (ly.plugin) |pl| {
+                    ly.plugin = null;
+                    app.retirePlugin(pl);
+                }
+                ly.clearPendingState(app.allocator);
+                ly.kind = .vst3;
+                ly.setPluginPath(path);
+                if (has_state) {
+                    ly.pending_state = comp;
+                    ly.pending_state_ctrl = ctrl;
+                    comp = null;
+                    ctrl = null;
+                }
+                _ = app.kitLayerSetSource(ref.instrument, ref.pitch, ref.layer, if (is_default) "" else patch_name);
+                app.commitHistory(if (is_default) "更换层乐器" else "更换层乐器并载入预设");
+                app.setToastWith("已切换层乐器：{s}（{s}）", .{ label, patch_name });
+                return;
+            },
+            .instrument => {},
+        },
+        else => {},
+    }
 
     // ── 效果器意图（create_effect / replace_effect）──
     if (intent == .create_effect or intent == .replace_effect) {
@@ -1502,6 +1592,8 @@ fn applyLayerChoice(app: *App, ref: PresetTarget.KitLayerRef, patch: ?*const per
         app.setToast("目标层已不存在");
         return;
     };
+    // 目标层若为 VST3 → 换回减法（插件退役；防“显示减法预设但仍响插件”）
+    app.kitLayerClearVst3(ref.instrument, ref.pitch, ref.layer);
     if (patch) |p| {
         persist.importSynth(p, lp);
     } else {
@@ -1552,13 +1644,19 @@ fn savePreset(app: *App, io: std.Io, source: PresetSaveSource, raw_name: []const
     switch (source) {
         .params => |target| {
             // VST3 乐器 → 独立保存流程（状态快照 + 身份字段；分类 `vst3_<cid>`）
-            const vst3_ii: ?i32 = switch (target) {
-                .instrument => |i| if (i >= 0 and i < @as(i32, @intCast(app.instruments.items.len)) and
-                    app.instruments.items[@intCast(i)].kind == .vst3) @as(?i32, i) else null,
-                .kit_layer_replace => null,
+            const vst3_target: ?PresetTarget = switch (target) {
+                .instrument => |i| blk: {
+                    if (i >= 0 and i < @as(i32, @intCast(app.instruments.items.len)) and
+                        app.instruments.items[@intCast(i)].kind == .vst3) break :blk target;
+                    break :blk null;
+                },
+                .kit_layer_replace => |ref| blk: {
+                    const ly = app.kitLayerPtr(ref.instrument, ref.pitch, ref.layer) orelse break :blk null;
+                    break :blk if (ly.kind == .vst3) target else null;
+                },
             };
-            if (vst3_ii) |i| {
-                saveVst3Preset(app, io, root, i, clean, overwrite);
+            if (vst3_target) |t| {
+                saveVst3Preset(app, io, root, t, clean, overwrite);
                 return;
             }
             const params = app.resolvePresetTarget(target) orelse {
@@ -1604,7 +1702,7 @@ fn savePreset(app: *App, io: std.Io, source: PresetSaveSource, raw_name: []const
                 app.setToast("导出套鼓失败（内存不足？）");
                 return;
             };
-            defer app.freeSavedKit(&snapshot);
+            defer app.freeSavedKit(&snapshot, false);
             const file = preset_mod.File{ .plugin = preset_mod.plugin_drumkit, .kit = snapshot };
             preset_mod.saveFile(io, app.allocator, root, preset_mod.plugin_drumkit, clean, file, overwrite) catch |e| {
                 if (e == error.AlreadyExists and !overwrite) {
@@ -1723,12 +1821,27 @@ fn saveVst3EffectPreset(app: *App, io: std.Io, root: []const u8, es: *app_mod.Ef
 /// VST3 乐器预设保存：`plugin = vst3_<cid>`（CID **从活实例实时取**，不依赖
 /// 扫描缓存——未扫描过的插件也能存）；状态 base64（组件+控制器）入档。
 /// 首次保存自动创建分类目录；与内置流程共用重名/覆写/关联名逻辑。
-fn saveVst3Preset(app: *App, io: std.Io, root: []const u8, ii: i32, clean: []const u8, overwrite: bool) void {
-    if (ii < 0 or ii >= @as(i32, @intCast(app.instruments.items.len))) return;
-    const inst = &app.instruments.items[@intCast(ii)];
-    const pl = inst.plugin orelse {
-        app.setToast("插件未加载，无法保存预设（稍候重试或检查插件路径）");
-        return;
+fn saveVst3Preset(app: *App, io: std.Io, root: []const u8, target: PresetTarget, clean: []const u8, overwrite: bool) void {
+    // 解析目标：插件实例 + 路径（乐器本体 / 鼓组 VST3 层）
+    const pl: *vst_host.Plugin = switch (target) {
+        .instrument => |ii| blk: {
+            if (ii < 0 or ii >= @as(i32, @intCast(app.instruments.items.len))) return;
+            break :blk app.instruments.items[@intCast(ii)].plugin orelse {
+                app.setToast("插件未加载，无法保存预设（稍候重试或检查插件路径）");
+                return;
+            };
+        },
+        .kit_layer_replace => |ref| blk: {
+            const ly = app.kitLayerPtr(ref.instrument, ref.pitch, ref.layer) orelse return;
+            break :blk ly.plugin orelse {
+                app.setToast("插件未加载，无法保存预设（稍候重试或检查插件路径）");
+                return;
+            };
+        },
+    };
+    const path: []const u8 = switch (target) {
+        .instrument => |ii| app.instruments.items[@intCast(ii)].pluginPath(),
+        .kit_layer_replace => |ref| (app.kitLayerPtr(ref.instrument, ref.pitch, ref.layer) orelse return).pluginPath(),
     };
     var hb: [32]u8 = undefined;
     var canon: [32]u8 = undefined;
@@ -1741,7 +1854,10 @@ fn saveVst3Preset(app: *App, io: std.Io, root: []const u8, ii: i32, clean: []con
     }
     var dir_buf2: [200]u8 = undefined;
     const dir = app.presetDirForCategory(id, pl.name(), &dir_buf2);
-    const st = app.captureVst3StateB64(ii) orelse {
+    const st = switch (target) {
+        .instrument => |ii| app.captureVst3StateB64(ii),
+        .kit_layer_replace => |ref| app.captureLayerVst3StateB64(ref),
+    } orelse {
         app.setToast("捕获插件状态失败");
         return;
     };
@@ -1754,19 +1870,31 @@ fn saveVst3Preset(app: *App, io: std.Io, root: []const u8, ii: i32, clean: []con
         .plugin = id,
         .name = pl.name(),
         .vendor = pl.vendor(),
-        .last_path = inst.pluginPath(),
+        .last_path = path,
         .vst3_state = st.comp,
         .vst3_state_ctrl = st.ctrl,
     };
     preset_mod.saveFile(io, app.allocator, root, dir, clean, file, overwrite) catch |e| {
         if (e == error.AlreadyExists and !overwrite) {
-            app.setOverwritePrompt(.{ .params = .{ .instrument = ii } }, clean);
+            app.setOverwritePrompt(.{ .params = target }, clean);
             return;
         }
         saveFailed(app, e);
         return;
     };
-    _ = app.setInstrumentPresetName(@intCast(ii), clean);
+    // 名称落点：乐器 → 关联预设名；鼓组层 → 来源名（展示用）+ 一条历史
+    switch (target) {
+        .instrument => |ii| {
+            _ = app.setInstrumentPresetName(@intCast(ii), clean);
+        },
+        .kit_layer_replace => |ref| {
+            var sbuf: [preset_mod.max_name_len * 2 + 4]u8 = undefined;
+            const src = std.fmt.bufPrint(&sbuf, "{s}/{s}", .{ id, clean }) catch clean;
+            if (app.kitLayerSetSource(ref.instrument, ref.pitch, ref.layer, src)) {
+                app.commitHistory("保存预设");
+            }
+        },
+    }
     if (overwrite) {
         app.setToastWith("已覆写预设：{s}", .{clean});
     } else {
@@ -2489,6 +2617,8 @@ fn syncInstrumentPlugins(app: *App) void {
     }
 }
 
+/// 鼓组 VST3 层的实例惰性加载/状态应用（每帧帧末；同 `syncInstrumentPlugins` 惯例）。
+/// 层数量少，不做乐器级的参数缓存/编辑器增量（v1：层无插件界面）。
 /// VST3 插件界面嵌入同步（每帧帧末，**决策见 `tmp/vst-ui-embed-plan.md`**）：
 /// - 乐器面板（.instrument 目标）/ 效果面板（插件槽）打开 → 把插件编辑器**子窗口**
 ///   挂进面板内容区（面板尺寸固定 = 插件尺寸 + 自绘 chrome）；
@@ -2569,7 +2699,19 @@ fn collectEditorPresents(app: *App, win: *window.Window) void {
                     }
                 }
             },
-            else => {},
+            .kit_layer_replace => |ref| {
+                if (app.kitLayerPtr(ref.instrument, ref.pitch, ref.layer)) |ly| {
+                    if (ly.kind == .vst3) {
+                        if (ly.plugin) |pl| {
+                            if (pl.editorPresentInfo()) |info| {
+                                win.exclude_hwnd[win.exclude_n] = info.hwnd;
+                                win.exclude_pos[win.exclude_n] = .{ info.x, info.y, info.w, info.h };
+                                win.exclude_n += 1;
+                            }
+                        }
+                    }
+                }
+            },
         }
     }
     if (app.mixer_win.panel) |panel| {
@@ -2602,7 +2744,12 @@ fn syncPluginEditors(app: *App, ui: *Ui, fw: i32, fh: i32) void {
                     if (inst.kind == .vst3) instr_pl = inst.plugin;
                 }
             },
-            else => {},
+            .kit_layer_replace => |ref| {
+                // 鼓组 VST3 层：同槽位面板托管插件界面
+                if (app.kitLayerPtr(ref.instrument, ref.pitch, ref.layer)) |ly| {
+                    if (ly.kind == .vst3) instr_pl = ly.plugin;
+                }
+            },
         }
     }
     var fx_pl: ?*vst_host.Plugin = null;
@@ -2620,6 +2767,16 @@ fn syncPluginEditors(app: *App, ui: *Ui, fw: i32, fh: i32) void {
     for (app.instruments.items) |*inst| {
         if (inst.plugin) |pl| {
             if (pl.view != null and pl != instr_pl and pl != fx_pl) pl.closeEditor();
+        }
+        if (inst.kit) |kit| {
+            for (kit.pads.items) |*pad| {
+                for (pad.layers.items) |*ly| {
+                    if (ly.kind != .vst3) continue;
+                    if (ly.plugin) |pl| {
+                        if (pl.view != null and pl != instr_pl and pl != fx_pl) pl.closeEditor();
+                    }
+                }
+            }
         }
     }
     for (app.mixer_channels_state.items) |*mc| {

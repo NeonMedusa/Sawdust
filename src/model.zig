@@ -140,15 +140,17 @@ pub const KeyMode = enum(u8) { piano = 0, drum = 1 };
 /// 乐器类型
 pub const InstrumentKind = enum(u8) { synth = 0, drumkit = 1, vst3 = 2 };
 
-/// 鼓组层的乐器类型（层 = 乐器槽）：目前仅减法合成器；
+/// 鼓组层的乐器类型（层 = 乐器槽）：减法合成器 / VST3 乐器；
 /// 采样器/FM 将来实装。**不含鼓组**——禁止自嵌套（`docs/drumkit.md` §7）。
-/// 将来按它分派渲染引擎与预设分类（现在单引擎 → 无分派）。
+/// 数值与 `InstrumentKind` 对齐（1 = 鼓组，被禁，不设成员）。
 pub const LayerKind = enum(u8) {
     subtractive = 0,
+    vst3 = 2,
 
     pub fn displayName(self: LayerKind) []const u8 {
         return switch (self) {
             .subtractive => "减法合成器",
+            .vst3 => "VST3 乐器",
         };
     }
 };
@@ -157,14 +159,64 @@ pub const LayerKind = enum(u8) {
 /// **内嵌副本**（非按名引用）：鼓组自包含——工程不依赖 data 目录、
 /// 预设删改不悬空（见 `docs/drumkit.md` §5.3）。
 pub const DrumLayer = struct {
-    /// 乐器类型（层 = 乐器槽；目前仅减法合成器）
+    /// 乐器类型（层 = 乐器槽；减法 / VST3——鼓组被禁）
     kind: LayerKind = .subtractive,
-    /// 合成器参数（堆分配、地址稳定——音频线程读）
+    /// 合成器参数（堆分配、地址稳定——音频线程读；VST3 层不读，字段统一仍分配）
     params: *synth.SynthParams,
     /// 层内增益（多层叠加的配比；0-1）
     gain: f32 = 1.0,
     /// 来源预设名（展示用；`分类/名字` 格式；空 = 手调/空层）
     source_preset: []u8,
+
+    // ── VST3 层（kind == .vst3；字段/惯例同 `Instrument` 的插件段）──
+    /// 插件路径（固定缓冲零分配；同 Instrument/EffectSlot 惯例）
+    plugin_path: [512]u8 = [_]u8{0} ** 512,
+    plugin_path_len: u16 = 0,
+    /// 运行时插件实例（**不存档**；main 侧 `syncKitLayerPlugins` 惰性加载/退役回收）
+    plugin: ?*vst_host.Plugin = null,
+    /// 加载失败标记（运行时，不存档；周期重试——文件恢复→自动加载）
+    load_failed: bool = false,
+    /// 重试节流（帧递减；>0 时不发起加载）
+    fail_wait: u16 = 0,
+    /// 待恢复的插件音色（存档/撤销解码；实例就绪后应用一次）
+    pending_state: ?[]u8 = null,
+    pending_state_ctrl: ?[]u8 = null,
+    /// 最后已知类 CID（32 hex 文本；0 长 = 未知）——重绑定自愈/存档身份
+    plugin_cid: [32]u8 = [_]u8{0} ** 32,
+    plugin_cid_len: u8 = 0,
+
+    pub fn pluginCid(self: *const DrumLayer) []const u8 {
+        return self.plugin_cid[0..self.plugin_cid_len];
+    }
+    pub fn setPluginCid(self: *DrumLayer, text: []const u8) void {
+        const n = @min(text.len, self.plugin_cid.len);
+        @memcpy(self.plugin_cid[0..n], text[0..n]);
+        self.plugin_cid_len = @intCast(n);
+    }
+
+    /// 释放待恢复状态（层被移除/切换类型前必须调用）
+    pub fn clearPendingState(self: *DrumLayer, allocator: std.mem.Allocator) void {
+        if (self.pending_state) |b| allocator.free(b);
+        if (self.pending_state_ctrl) |b| allocator.free(b);
+        self.pending_state = null;
+        self.pending_state_ctrl = null;
+    }
+
+    pub fn pluginPath(self: *const DrumLayer) []const u8 {
+        return self.plugin_path[0..self.plugin_path_len];
+    }
+    pub fn setPluginPath(self: *DrumLayer, path: []const u8) void {
+        const n = @min(path.len, self.plugin_path.len);
+        const same = self.plugin_path_len == n and std.mem.eql(u8, self.plugin_path[0..n], path[0..n]);
+        @memcpy(self.plugin_path[0..n], path[0..n]);
+        self.plugin_path_len = @intCast(n);
+        // 路径真变化 → 重置加载失败态（新文件允许立即尝试；同路径保留节流）
+        if (!same) {
+            self.load_failed = false;
+            self.fail_wait = 0;
+            self.plugin_cid_len = 0; // 身份失效：加载成功后回填
+        }
+    }
 };
 
 /// 鼓垫：一个音高 → 一或多个层

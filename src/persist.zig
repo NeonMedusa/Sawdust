@@ -142,13 +142,21 @@ pub const SavedSynth = struct {
 
 /// 存档中的鼓组层（每垫一份内嵌合成器参数；见 `docs/drumkit.md` §8）
 pub const SavedDrumLayer = struct {
-    /// 乐器类型（0 = 减法合成器；旧存档缺失 → 0）
+    /// 乐器类型（0 = 减法合成器 / 2 = VST3；旧存档缺失 → 0）
     kind: u32 = 0,
     synth: SavedSynth = .{},
     /// 层内增益（多层叠加的配比）
     gain: f32 = 1.0,
     /// 来源预设名（`分类/名字`；展示用，空 = 手调/空层）
     source_preset: []const u8 = "",
+    // ── VST3 层（kind == 2；字段/惯例同 `SavedInstrument` 插件段）──
+    /// 插件路径（空 = 非插件层/未定位）
+    plugin_path: []const u8 = "",
+    /// 插件类 CID（32 hex；空 = 未知）——重绑定自愈的匹配身份
+    plugin_cid: []const u8 = "",
+    /// 音色状态（base64 文本；组件/控制器各一份；空 = 无）
+    plugin_state: []const u8 = "",
+    plugin_state_ctrl: []const u8 = "",
 };
 
 /// 存档中的鼓垫（一个音高 + 名字 + 层列表）
@@ -1033,6 +1041,16 @@ test "persist: 全字段非默认往返（防手写序列化漏字段）" {
     try expectRoundtrip(SavedMixerChannel, .{ .name = "鼓组", .volume = 0.111, .pan = 0.222, .muted = true, .effects = &chain });
     var lyrs = [_]SavedDrumLayer{.{ .kind = 1, .synth = .{ .attack = 0.1 }, .gain = 0.5, .source_preset = "kit/k" }};
     try expectRoundtrip(SavedDrumLayer, lyrs[0]);
+    // VST3 层：插件字段全量往返（路径/CID/状态 base64）
+    try expectRoundtrip(SavedDrumLayer, .{
+        .kind = 2,
+        .gain = 0.75,
+        .source_preset = "Vital/pad",
+        .plugin_path = "C:/v/Vital.vst3",
+        .plugin_cid = "0102030405060708090a0b0c0d0e0f10",
+        .plugin_state = "AQID",
+        .plugin_state_ctrl = "BAUG",
+    });
     var pads = [_]SavedDrumPad{.{ .pitch = 36, .name = "Kick", .layers = &lyrs }};
     try expectRoundtrip(SavedDrumPad, pads[0]);
     try expectRoundtrip(SavedDrumKit, .{ .pads = &pads });

@@ -33,8 +33,12 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
     const body_y = y + util.rack_title_h;
     const body_h = hh - util.rack_title_h;
     const add_btn_h = util.rack_add_h;
+    const add_pad: i32 = 5; // 添加按钮四周留白（列表可视区与按钮都按它让位）
     const list_y = body_y + 1;
-    const list_h = @max(0, body_h - add_btn_h - 2);
+    // 列表可视区：**完全让开**添加按钮（按钮高 + 留白 + 1px 缝隙）——
+    // 旧式 `- add_btn_h - 2` 比按钮顶低 4px：滚到底时最后一行底部被按钮
+    // 盖住一小条（实测；虽还能点，视觉上不干净）。
+    const list_h = @max(0, body_h - add_btn_h - add_pad - 2);
 
     // 菜单模态：任何下拉菜单展开（或帧首展开）时，窗口自身的非菜单控件全部让位
     // （否则菜单项点击会穿透到下面的行/按钮）。
@@ -132,8 +136,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
     }
 
     // ── 添加按钮：直接打开**预设面板**（统一插件+预设选择器）──
-    // 左右各留 5px 边距（原 1px）
-    const add_pad: i32 = 5;
+    // 四周留白 = `add_pad`（布局段声明；列表可视区已按它让位）
     const add_x = x + add_pad;
     const add_y = y + hh - add_btn_h - add_pad;
     const add_w = ww - add_pad * 2;

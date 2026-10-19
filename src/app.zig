@@ -105,10 +105,10 @@ pub const HistoryState = struct {
 
 /// 插件槽引用（历史参数增量的目标）
 pub const PluginSlotRef = struct {
-    kind: enum { instrument, fx },
-    /// instrument：乐器下标；fx：通道下标
+    kind: enum { instrument, fx, kit_layer },
+    /// instrument / kit_layer：乐器下标；fx：通道下标
     a: u16 = 0,
-    /// instrument 恒 0；fx：槽位
+    /// instrument 恒 0；fx：槽位；kit_layer：**展平层槽位**（`App.kitLayerSlot`）
     b: u16 = 0,
 };
 
@@ -723,6 +723,9 @@ pub const SynthWindow = struct {
     param_scroll: i32 = 0,
 };
 
+/// 鼓组 VST3 层插件重试节流（帧）——`App.syncKitLayerPlugins` 用
+const kit_plugin_retry_frames: u16 = 240;
+
 /// 鼓组编辑器（浮动窗口）状态——左音高列表 + 右垫详情（`docs/drumkit.md` §7）
 pub const DrumKitWindow = struct {
     open: bool = false,
@@ -1161,6 +1164,8 @@ pub const App = struct {
     /// 插件状态脏标（**捕获复用**判据，见 `markSlotStateDirty`）：自上次历史
     /// 捕获后该槽插件状态是否变过。未变槽快照/全等判定不再 getState（撤销卡顿根治）
     instr_state_dirty: []bool = &.{},
+    /// 鼓组层状态脏标（乐器容量 × `kit_max_layers`；VST3 层参数编辑/状态记账用）
+    kit_layer_state_dirty: [][]bool = &.{},
     fx_state_dirty: [][]bool = &.{},
     /// 容量自动回收挂起（删除/装载后置位；帧末 `pollCapacityReclaim` 合并处理）
     shrink_pending: bool = false,
@@ -1886,10 +1891,16 @@ pub const App = struct {
         self.retired_synths.append(self.allocator, sp) catch {};
     }
 
-    /// 释放鼓垫内容（层参数进退役、名字/预设名释放；不含 pad 自身）
+    /// 释放鼓垫内容（层参数进退役、VST3 层插件退役/待恢复状态释放；
+    /// 名字/预设名释放；不含 pad 自身）
     fn deinitPadContents(self: *App, pad: *model.DrumPad) void {
-        for (pad.layers.items) |ly| {
+        for (pad.layers.items) |*ly| {
             self.retireSynth(ly.params);
+            if (ly.plugin) |pl| {
+                ly.plugin = null;
+                self.retirePlugin(pl);
+            }
+            ly.clearPendingState(self.allocator);
             self.allocator.free(ly.source_preset);
         }
         pad.layers.deinit(self.allocator);
@@ -1969,16 +1980,17 @@ pub const App = struct {
             si.plugin_state = comp_b64;
             si.plugin_state_ctrl = ctrl_b64;
         }
-        if (inst.kit) |kit| si.kit = try self.exportDrumKit(kit);
+        if (inst.kit) |kit| si.kit = try self.exportDrumKit(kit, pooled, self.instrumentIndexOf(inst));
         return si;
     }
 
-    fn exportDrumKit(self: *App, kit: *const model.DrumKit) !persist.SavedDrumKit {
+    fn exportDrumKit(self: *App, kit: *const model.DrumKit, pooled: bool, inst_idx: ?usize) !persist.SavedDrumKit {
         const pads = try self.allocator.alloc(persist.SavedDrumPad, kit.pads.items.len);
         var np: usize = 0;
+        var flat: usize = 0; // 展平槽位（复用/脏标寻址；与 syncParams 同序）
         errdefer {
             for (pads[0..np]) |p| {
-                for (p.layers) |ly| self.allocator.free(ly.source_preset);
+                for (p.layers) |ly| self.freeSavedLayer(&ly, pooled);
                 self.allocator.free(p.layers);
                 self.allocator.free(p.name);
             }
@@ -1988,7 +2000,7 @@ pub const App = struct {
             const layers = try self.allocator.alloc(persist.SavedDrumLayer, pad.layers.items.len);
             var nl: usize = 0;
             errdefer {
-                for (layers[0..nl]) |ly| self.allocator.free(ly.source_preset);
+                for (layers[0..nl]) |ly| self.freeSavedLayer(&ly, pooled);
                 self.allocator.free(layers);
             }
             for (pad.layers.items, 0..) |layer, li| {
@@ -1998,7 +2010,39 @@ pub const App = struct {
                     .gain = layer.gain,
                     .source_preset = try self.allocator.dupe(u8, layer.source_preset),
                 };
+                if (layer.kind == .vst3) {
+                    // 路径 / CID / 音色状态——**捕获复用（去重池）**：层未脏且来向
+                    // 条目同位置同路径 → 沿用其状态文本（intern 同块）；否则现取
+                    if (layer.pluginPath().len > 0) {
+                        layers[li].plugin_path = try self.allocator.dupe(u8, layer.pluginPath());
+                    }
+                    if (layer.plugin) |pl| {
+                        var cb: [32]u8 = undefined;
+                        layers[li].plugin_cid = try self.allocator.dupe(u8, pl.cidHex(&cb));
+                        var reused = false;
+                        if (inst_idx) |ii| {
+                            if (self.reuseLayerState(&layer, ii, pad.pitch, li, flat, pooled)) |r| {
+                                layers[li].plugin_state = if (r.comp.len > 0) self.adoptStateB64(try self.allocator.dupe(u8, r.comp), pooled) else "";
+                                layers[li].plugin_state_ctrl = if (r.ctrl.len > 0) self.adoptStateB64(try self.allocator.dupe(u8, r.ctrl), pooled) else "";
+                                reused = true;
+                            }
+                        }
+                        if (!reused) {
+                            const s1 = try capturePluginStateB64(self.allocator, pl, true);
+                            layers[li].plugin_state = self.adoptStateB64(s1, pooled);
+                            const s2 = try capturePluginStateB64(self.allocator, pl, false);
+                            layers[li].plugin_state_ctrl = self.adoptStateB64(s2, pooled);
+                        }
+                    } else {
+                        if (layer.pluginCid().len == 32) {
+                            layers[li].plugin_cid = try self.allocator.dupe(u8, layer.pluginCid());
+                        }
+                        layers[li].plugin_state = self.adoptStateB64(try b64Encode(self.allocator, if (layer.pending_state) |b| b else &.{}), pooled);
+                        layers[li].plugin_state_ctrl = self.adoptStateB64(try b64Encode(self.allocator, if (layer.pending_state_ctrl) |b| b else &.{}), pooled);
+                    }
+                }
                 nl += 1;
+                flat += 1;
             }
             pads[i] = .{
                 .pitch = pad.pitch,
@@ -2008,6 +2052,19 @@ pub const App = struct {
             np += 1;
         }
         return .{ .pads = pads };
+    }
+
+    /// 释放一份存档层（`exportDrumKit`/`freeSavedKit` 共用；池化态经 state_pool 归还）
+    fn freeSavedLayer(self: *App, ly: *const persist.SavedDrumLayer, pooled: bool) void {
+        self.allocator.free(ly.source_preset);
+        if (ly.plugin_path.len > 0) self.allocator.free(ly.plugin_path);
+        if (ly.plugin_cid.len > 0) self.allocator.free(ly.plugin_cid);
+        if (ly.plugin_state.len > 0) {
+            if (pooled) self.state_pool.release(self.allocator, ly.plugin_state) else self.allocator.free(ly.plugin_state);
+        }
+        if (ly.plugin_state_ctrl.len > 0) {
+            if (pooled) self.state_pool.release(self.allocator, ly.plugin_state_ctrl) else self.allocator.free(ly.plugin_state_ctrl);
+        }
     }
 
     /// 释放存档乐器（与 `exportInstrument` 对称；历史快照/工程释放共用）
@@ -2022,14 +2079,14 @@ pub const App = struct {
         if (si.plugin_state_ctrl.len > 0) {
             if (pooled) self.state_pool.release(self.allocator, si.plugin_state_ctrl) else self.allocator.free(si.plugin_state_ctrl);
         }
-        self.freeSavedKit(&si.kit);
+        self.freeSavedKit(&si.kit, pooled);
     }
 
     /// 释放套鼓快照（导出/保存路径用；与 `exportDrumKit` 对称）
-    pub fn freeSavedKit(self: *App, sk: *const persist.SavedDrumKit) void {
+    pub fn freeSavedKit(self: *App, sk: *const persist.SavedDrumKit, pooled: bool) void {
         for (sk.pads) |pad| {
             self.allocator.free(pad.name);
-            for (pad.layers) |ly| self.allocator.free(ly.source_preset);
+            for (pad.layers) |ly| self.freeSavedLayer(&ly, pooled);
             self.allocator.free(pad.layers);
         }
         self.allocator.free(sk.pads);
@@ -2040,7 +2097,7 @@ pub const App = struct {
     pub fn exportKitForSave(self: *App, idx: usize) ?persist.SavedDrumKit {
         if (idx >= self.instruments.items.len) return null;
         const kit = self.instruments.items[idx].kit orelse return null;
-        return self.exportDrumKit(kit) catch null;
+        return self.exportDrumKit(kit, false, null) catch null;
     }
 
     /// 把套鼓快照载入乐器（**替换**现有套鼓内容；非鼓组也允许——先建空 kit）。
@@ -2053,41 +2110,189 @@ pub const App = struct {
             kit.* = .{};
             inst.kit = kit;
         }
-        self.importDrumKit(sk, inst.kit.?);
+        self.importDrumKit(sk, inst.kit.?, idx, 0, 0);
         self.dirty = true;
         return true;
     }
 
     /// 把存档鼓组恢复到 `kit`（清空重建；失败时尽量保留已恢复部分——
-    /// 宁可部分丢也不 use-after-free）
-    fn importDrumKit(self: *App, sk: *const persist.SavedDrumKit, kit: *model.DrumKit) void {
+    /// 宁可部分丢也不 use-after-free）。
+    /// **实例救援 + 参数回放**（撤销/重做/载入共用）：新结构某位置（同垫音高、同层序）
+    /// 的旧活实例若与新层同 kind+路径 → **保留实例**（不重建、不退役；编辑器窗口不闪断），
+    /// 状态按计划应用：skip（与来向条目同状态）/ replay（旋钮级撤销——`replayPlanFor`）/
+    /// full（整块 pending）。`inst_idx`/`prev_idx`/`target_idx`：历史上下文
+    /// （载入无历史 → prev==target，计划退化为 full）。
+    fn importDrumKit(self: *App, sk: *const persist.SavedDrumKit, kit: *model.DrumKit, inst_idx: ?usize, prev_idx: usize, target_idx: usize) void {
+        // ① 救援扫描 + **摘取**（旧层仍在时把插件与身份摘出；旧层置空防退役）
+        //    **状态计划在此算**：ref 经旧结构解析（`slotPlugin` 仍能找到该层实例）——
+        //    放在重建中段算会因结构已清而永远解析不到 → 回放永不生效
+        const Rescue = struct {
+            pitch: u8,
+            li: usize,
+            kind: model.LayerKind,
+            plugin: *vst_host.Plugin,
+            used: bool = false,
+            plan_skip: bool = false,
+            plan_job: ?ReplayJob = null,
+            path: [512]u8 = [_]u8{0} ** 512,
+            path_len: u16 = 0,
+            cid: [32]u8 = [_]u8{0} ** 32,
+            cid_len: u8 = 0,
+        };
+        var rescues: [audio.kit_max_layers]Rescue = undefined;
+        var n_rescues: usize = 0;
+        var old_flat: usize = 0; // 旧结构展平槽位（ref 寻址；与 syncParams 同序）
+        for (kit.pads.items) |*pad| {
+            for (pad.layers.items, 0..) |*ly, li| {
+                if (n_rescues >= audio.kit_max_layers) break;
+                const pl = ly.plugin orelse {
+                    old_flat += 1;
+                    continue;
+                };
+                var r = Rescue{
+                    .pitch = pad.pitch,
+                    .li = li,
+                    .kind = ly.kind,
+                    .plugin = pl,
+                    .path = ly.plugin_path,
+                    .path_len = ly.plugin_path_len,
+                    .cid = ly.plugin_cid,
+                    .cid_len = ly.plugin_cid_len,
+                };
+                // 计划：目标条目同位置层（sk） vs 来向条目同位置层
+                if (inst_idx) |ii| {
+                    if (prev_idx != target_idx and prev_idx < self.history.items.len) {
+                        const tgt_sl: ?persist.SavedDrumLayer = findSavedLayer(sk, pad.pitch, li);
+                        if (tgt_sl) |sl| {
+                            const psi = &self.history.items[prev_idx];
+                            if (ii < psi.instruments.len and psi.instruments[ii].kind == 1) {
+                                if (findSavedLayer(&psi.instruments[ii].kit, pad.pitch, li)) |pl0| {
+                                    if (std.mem.eql(u8, sl.plugin_path, pl0.plugin_path) and
+                                        stateBlobsEqual(sl.plugin_state, sl.plugin_state_ctrl, pl0.plugin_state, pl0.plugin_state_ctrl))
+                                    {
+                                        r.plan_skip = true;
+                                    }
+                                }
+                            }
+                            if (!r.plan_skip) {
+                                const ref = PluginSlotRef{
+                                    .kind = .kit_layer,
+                                    .a = @intCast(@min(ii, std.math.maxInt(u16))),
+                                    .b = @intCast(@min(old_flat, std.math.maxInt(u16))),
+                                };
+                                if (self.replayPlanFor(ref, prev_idx, target_idx)) |job| r.plan_job = job;
+                            }
+                        }
+                    }
+                }
+                rescues[n_rescues] = r;
+                ly.plugin = null; // 摘走（下面清空时不退役）
+                n_rescues += 1;
+                old_flat += 1;
+            }
+        }
+        // ② 清空旧内容（未被救援的插件在此退役）
         for (kit.pads.items) |*pad| self.deinitPadContents(pad);
         kit.pads.clearRetainingCapacity();
+        // ③ 重建（逐层：位置+路径匹配 → 实例救援；否则新建 + pending）
         for (sk.pads) |sp| {
+            const pitch: u8 = @intCast(@min(sp.pitch, 127));
             var pad = model.DrumPad{
-                .pitch = @intCast(@min(sp.pitch, 127)),
+                .pitch = pitch,
                 .name = self.allocator.dupe(u8, sp.name) catch continue,
             };
-            for (sp.layers) |sl| {
+            for (sp.layers, 0..) |sl, li| {
                 const lp = self.allocator.create(synth.SynthParams) catch continue;
                 lp.* = .{};
                 persist.importSynth(&sl.synth, lp);
                 const src: []u8 = self.allocator.dupe(u8, sl.source_preset) catch &.{};
-                // 未知类型（未来存档）→ 退回减法（现阶段唯一引擎；参数照常载入）
+                // 未知类型（未来存档）→ 退回减法（现阶段可用引擎；参数照常载入）
                 const kind = std.enums.fromInt(model.LayerKind, sl.kind) orelse model.LayerKind.subtractive;
-                pad.layers.append(self.allocator, .{ .kind = kind, .params = lp, .gain = sl.gain, .source_preset = src }) catch {
+                var layer = model.DrumLayer{ .kind = kind, .params = lp, .gain = sl.gain, .source_preset = src };
+                if (kind == .vst3) {
+                    layer.setPluginPath(sl.plugin_path);
+                    layer.setPluginCid(sl.plugin_cid);
+                    // 救援查找：(音高, 层序) + 同 kind + 同路径
+                    var ri: ?usize = null;
+                    for (rescues[0..n_rescues], 0..) |r, k| {
+                        if (!r.used and r.pitch == pitch and r.li == li and r.kind == kind and
+                            std.mem.eql(u8, r.path[0..r.path_len], sl.plugin_path))
+                        {
+                            ri = k;
+                            break;
+                        }
+                    }
+                    if (ri) |k| {
+                        // 实例救援：挂旧实例（编辑器窗口保持），状态按**摘取前算好的计划**应用
+                        const r = &rescues[k];
+                        r.used = true;
+                        layer.plugin = r.plugin;
+                        layer.plugin_path = r.path;
+                        layer.plugin_path_len = r.path_len;
+                        layer.plugin_cid = r.cid;
+                        layer.plugin_cid_len = r.cid_len;
+                        const ref = PluginSlotRef{
+                            .kind = .kit_layer,
+                            .a = @intCast(@min(inst_idx orelse 0, std.math.maxInt(u16))),
+                            .b = 0,
+                        };
+                        if (r.plan_skip) {
+                            // 状态未变：不碰实例
+                        } else if (r.plan_job) |job| {
+                            if (runReplay(r.plugin, job)) {
+                                // 回放后实例 = 目标状态
+                                if (inst_idx) |ii| {
+                                    if (self.kitLayerSlot(ii, pitch, li)) |slot| {
+                                        self.markSlotStateClean(.{ .kind = .kit_layer, .a = @intCast(@min(ii, std.math.maxInt(u16))), .b = @intCast(@min(slot, std.math.maxInt(u16))) });
+                                    }
+                                }
+                            } else {
+                                // ID 失配/前提破坏 → 整块兜底
+                                layer.pending_state = b64Decode(self.allocator, sl.plugin_state);
+                                layer.pending_state_ctrl = b64Decode(self.allocator, sl.plugin_state_ctrl);
+                                self.markSlotStateDirty(ref);
+                            }
+                        } else {
+                            layer.pending_state = b64Decode(self.allocator, sl.plugin_state);
+                            layer.pending_state_ctrl = b64Decode(self.allocator, sl.plugin_state_ctrl);
+                            self.markSlotStateDirty(ref);
+                        }
+                    } else {
+                        // 新建：状态入 pending（实例帧末惰性加载——syncKitLayerPlugins）
+                        layer.pending_state = b64Decode(self.allocator, sl.plugin_state);
+                        layer.pending_state_ctrl = b64Decode(self.allocator, sl.plugin_state_ctrl);
+                    }
+                }
+                pad.layers.append(self.allocator, layer) catch {
                     self.retireSynth(lp);
+                    if (layer.plugin) |pl| self.retirePlugin(pl);
+                    layer.clearPendingState(self.allocator);
+                    self.allocator.free(src);
                 };
             }
             kit.pads.append(self.allocator, pad) catch {
                 self.deinitPadContents(&pad);
             };
         }
+        // ④ 未被用到的救援实例 → 退役（结构变化后多余的旧层）
+        for (rescues[0..n_rescues]) |r| {
+            if (!r.used) self.retirePlugin(r.plugin);
+        }
         std.mem.sort(model.DrumPad, kit.pads.items, {}, struct {
             fn less(_: void, a: model.DrumPad, b: model.DrumPad) bool {
                 return a.pitch < b.pitch;
             }
         }.less);
+    }
+
+    /// 存档鼓组里按（音高, 层序）找层（找不到 → null）——实例救援/计划用
+    fn findSavedLayer(sk: *const persist.SavedDrumKit, pitch: u8, li: usize) ?persist.SavedDrumLayer {
+        for (sk.pads) |sp| {
+            if (sp.pitch != @as(u32, pitch)) continue;
+            if (li < sp.layers.len) return sp.layers[li];
+            return null;
+        }
+        return null;
     }
 
     /// 两份 base64 插件状态是否同内容：池化共享 → 指针相等快路径；否则内容比较。
@@ -2100,7 +2305,7 @@ pub const App = struct {
     /// 把存档乐器恢复到已存在的 `target`（名字除外——由调用方处理；
     /// 历史恢复/工程导入共用，防两处逻辑分叉）。
     /// `plan`：撤销/重做逐槽决定的状态应用方式（skip 不动 / replay 参数回放 / full 整块）
-    fn applySavedInstrument(self: *App, si: *const persist.SavedInstrument, target: *model.Instrument, plan: ApplyPlan) void {
+    fn applySavedInstrument(self: *App, si: *const persist.SavedInstrument, target: *model.Instrument, plan: ApplyPlan, prev_idx: usize, target_idx: usize) void {
         target.volume = si.volume;
         target.pan = si.pan;
         target.muted = si.muted;
@@ -2168,7 +2373,7 @@ pub const App = struct {
                 kit.* = .{};
                 target.kit = kit;
             }
-            self.importDrumKit(&si.kit, target.kit.?);
+            self.importDrumKit(&si.kit, target.kit.?, self.instrumentIndexOf(target), prev_idx, target_idx);
             target.kind = .drumkit;
         } else {
             if (target.kit) |kit| {
@@ -2346,6 +2551,160 @@ pub const App = struct {
         return true;
     }
 
+    /// 添加 **VST3 乐器层**（实例帧末惰性加载——`syncKitLayerPlugins`）。
+    /// 返回是否成功（越界/层数满 → false）。一条历史的调用方负责提交。
+    pub fn kitLayerAddVst3(self: *App, inst_idx: i32, pitch: u8, path: []const u8, source: []const u8) bool {
+        if (inst_idx < 0 or inst_idx >= @as(i32, @intCast(self.instruments.items.len))) return false;
+        const inst = &self.instruments.items[@intCast(inst_idx)];
+        const kit0 = inst.kit orelse return false;
+        if (kit0.totalLayers() >= @import("audio.zig").kit_max_layers) return false;
+        const pad = self.kitPadEnsure(inst_idx, pitch) orelse return false;
+        const lp = self.allocator.create(synth.SynthParams) catch return false;
+        lp.* = .{};
+        const src: []u8 = self.allocator.dupe(u8, source) catch &.{};
+        var layer = model.DrumLayer{ .kind = .vst3, .params = lp, .gain = 1.0, .source_preset = src };
+        layer.setPluginPath(path);
+        pad.layers.append(self.allocator, layer) catch {
+            self.retireSynth(lp);
+            self.allocator.free(src);
+            return false;
+        };
+        self.ensureKitVsti(@intCast(inst_idx));
+        self.dirty = true;
+        return true;
+    }
+
+    /// 取/建某乐器的鼓组 VST3 层状态（惰性；契约：设备暂停窗口内——同 `ensureKitPool`）。
+    /// 仅当该鼓组确实含 VST3 层时分配。
+    pub fn ensureKitVsti(self: *App, i: usize) void {
+        if (i >= self.engine.kit_vsti.len) return; // 容量未覆盖（sync 前 ensureAudioCapacity 已跑）
+        if (self.engine.kit_vsti[i].load(.monotonic) != null) return;
+        if (i >= self.instruments.items.len) return;
+        const kit = self.instruments.items[i].kit orelse return;
+        var has_vst3 = false;
+        outer: for (kit.pads.items) |pad| {
+            for (pad.layers.items) |ly| {
+                if (ly.kind == .vst3) {
+                    has_vst3 = true;
+                    break :outer;
+                }
+            }
+        }
+        if (!has_vst3) return;
+        const kv = self.allocator.create(audio.KitVstiState) catch return;
+        for (&kv.evts) |*b| b.n = 0;
+        @memset(&kv.active_lo, 0);
+        @memset(&kv.active_hi, 0);
+        self.engine.kit_vsti[i].store(kv, .release);
+    }
+
+    /// 把鼓组层从 VST3 换回减法（插件退役/待恢复状态释放；路径清空）。
+    /// 减法预设应用前必须调——否则“显示减法预设但仍响插件”（实测隐患）。
+    pub fn kitLayerClearVst3(self: *App, inst_idx: i32, pitch: u8, layer: usize) void {
+        const ly = self.kitLayerPtr(inst_idx, pitch, layer) orelse return;
+        if (ly.kind != .vst3) return;
+        if (ly.plugin) |pl| {
+            ly.plugin = null;
+            self.retirePlugin(pl);
+        }
+        ly.clearPendingState(self.allocator);
+        ly.kind = .subtractive;
+        ly.setPluginPath("");
+    }
+
+    /// 鼓组层的展平槽位号（与 `syncParams` 展平序一致：垫按音高升序、层按序；
+    /// 找不到/越界 → null）。VST3 层 panic 旗标等按槽位寻址。
+    pub fn kitLayerSlot(self: *const App, inst_idx: usize, pitch: u8, layer_idx: usize) ?usize {
+        if (inst_idx >= self.instruments.items.len) return null;
+        const kit = self.instruments.items[inst_idx].kit orelse return null;
+        var slot: usize = 0;
+        for (kit.pads.items) |pad| {
+            for (pad.layers.items, 0..) |_, li| {
+                if (pad.pitch == pitch and li == layer_idx) return slot;
+                slot += 1;
+                if (slot >= @import("audio.zig").kit_max_layers) return null;
+            }
+        }
+        return null;
+    }
+
+    /// 鼓组层指针（越界/无垫/无层 → null）
+    pub fn kitLayerPtr(self: *App, inst_idx: i32, pitch: u8, layer: usize) ?*model.DrumLayer {
+        if (inst_idx < 0 or inst_idx >= @as(i32, @intCast(self.instruments.items.len))) return null;
+        const kit = self.instruments.items[@intCast(inst_idx)].kit orelse return null;
+        const pad = kit.find(pitch) orelse return null;
+        if (layer >= pad.layers.items.len) return null;
+        return &pad.layers.items[layer];
+    }
+
+    /// 鼓组 VST3 层的实例惰性加载/状态应用/编辑轮询（每帧帧末；同
+    /// `main.syncInstrumentPlugins` 惯例）。放在 App 里（而非 main）：**测试可直调**——
+    /// 回声/幽灵条目这类行为需要走真实帧末路径才能复现（实测教训）。
+    pub fn syncKitLayerPlugins(self: *App) void {
+        const sr: f64 = @floatFromInt(@max(1, self.params.sample_rate));
+        for (self.instruments.items, 0..) |*inst, ii| {
+            if (inst.kind != .drumkit) continue;
+            const kit = inst.kit orelse continue;
+            for (kit.pads.items) |*pad| {
+                for (pad.layers.items, 0..) |*ly, li| {
+                    if (ly.kind != .vst3) continue;
+                    if (ly.plugin == null) {
+                        if (ly.pluginPath().len == 0) continue;
+                        if (ly.fail_wait > 0) {
+                            ly.fail_wait -= 1;
+                            continue;
+                        }
+                        ly.fail_wait = kit_plugin_retry_frames;
+                        const pz = self.allocator.dupeZ(u8, ly.pluginPath()) catch continue;
+                        defer self.allocator.free(pz);
+                        ly.plugin = vst_host.loadPlugin(self.allocator, pz, sr, 4096, .instrument) catch |e| {
+                            if (!ly.load_failed) {
+                                ly.load_failed = true;
+                                self.setToastWith("鼓组层插件“{s}”加载失败：{s}（将自动重试，文件恢复后自动加载）", .{ std.fs.path.basename(ly.pluginPath()), @errorName(e) });
+                            }
+                            continue;
+                        };
+                        ly.fail_wait = 0;
+                        // 回填类 CID（身份：重绑定自愈/存档）
+                        _ = ly.plugin.?.cidHex(&ly.plugin_cid);
+                        ly.plugin_cid_len = 32;
+                        if (ly.load_failed) {
+                            ly.load_failed = false;
+                            self.setToastWith("鼓组层插件已恢复加载：{s}", .{ly.plugin.?.name()});
+                        } else {
+                            self.setToastWith("已加载鼓组层插件：{s}", .{ly.plugin.?.name()});
+                        }
+                    }
+                    const pl = ly.plugin orelse continue;
+                    // 参数缓存一次建齐（撤销“参数回放”的旧值依据；restoreState 内置重建）——
+                    // 缺它 → 插件内编辑无法记增量 → 历史只靠结构信号（实测：首操作后无历史）
+                    if (!pl.param_cache_valid) pl.refreshParamCache();
+                    // 待恢复音色（工程加载/撤销恢复后首次就绪时应用一次；幂等）
+                    if (ly.pending_state != null or ly.pending_state_ctrl != null) {
+                        pl.restoreState(ly.pending_state orelse &.{}, ly.pending_state_ctrl orelse &.{});
+                        ly.clearPendingState(self.allocator);
+                        // 防挂音 panic：恢复可能唤醒快照里仍在发声的声部——
+                        // 音频侧下一段对该层全 128 补 off（槽位 = params 展平序）
+                        if (self.kitLayerSlot(ii, pad.pitch, li)) |slot| {
+                            self.params.kit_layer_panic[ii][slot].store(true, .release);
+                            // 恢复完成 = 该层按“已采纳”处理：插件恢复后的 getState 回声字节
+                            // 与存档常不同（Vital 实症）——留着脏标会把回声当差异 → 幽灵
+                            // 历史条目（乐器级同款处理）
+                            self.markSlotStateClean(PluginSlotRef{ .kind = .kit_layer, .a = @intCast(ii), .b = @intCast(slot) });
+                        }
+                    }
+                    // 插件 GUI 内编辑 → 参数增量记录 + 手势（起手提交 + 静置钉值）
+                    // （同 `syncInstrumentPlugins`；层 ref = (乐器, 展平槽位)）
+                    if (self.kitLayerSlot(ii, pad.pitch, li)) |slot| {
+                        const lref = PluginSlotRef{ .kind = .kit_layer, .a = @intCast(ii), .b = @intCast(slot) };
+                        self.drainSlotEditorEdits(lref, pl);
+                        if (pl.takeDirtyNotice()) self.notePluginStructural(lref);
+                    }
+                }
+            }
+        }
+    }
+
     /// 清空后的**无名空垫**清理：无层且无名 = 无信息可保留 → 移除
     /// （有名空垫保留——名字是用户信息；用户反馈：清空层后不应留“幽灵垫”）。
     /// 返回是否清理了。可撤销（快照含垫本身）。
@@ -2370,8 +2729,10 @@ pub const App = struct {
         const kit = inst.kit orelse return false;
         const pad = kit.find(pitch) orelse return false;
         if (layer_idx >= pad.layers.items.len) return false;
-        const ly = pad.layers.orderedRemove(layer_idx);
+        var ly = pad.layers.orderedRemove(layer_idx);
         self.retireSynth(ly.params);
+        if (ly.plugin) |pl| self.retirePlugin(pl);
+        ly.clearPendingState(self.allocator);
         self.allocator.free(ly.source_preset);
         // 清空后的无名空垫一并移除（见 pruneEmptyPad）
         _ = self.pruneEmptyPad(kit, pitch);
@@ -2459,13 +2820,25 @@ pub const App = struct {
                 }
             }
         }
-        // VST3 乐器实例：引擎已停 → 同步卸载
+        // VST3 乐器实例：引擎已停 → 同步卸载（**含鼓组 VST3 层实例**——
+        // 旧版漏了层：退出时不析构、测试分配器报泄漏；层清理晚于退役列表冲刷）
         for (self.instruments.items) |*inst| {
             if (inst.plugin) |pl| {
                 inst.plugin = null;
                 vst_host.unloadPlugin(self.allocator, pl);
             }
             inst.clearPendingState(self.allocator);
+            if (inst.kit) |kit| {
+                for (kit.pads.items) |*pad| {
+                    for (pad.layers.items) |*ly| {
+                        if (ly.plugin) |pl| {
+                            ly.plugin = null;
+                            vst_host.unloadPlugin(self.allocator, pl);
+                        }
+                        ly.clearPendingState(self.allocator);
+                    }
+                }
+            }
         }
         for (self.retired_plugins.items) |r| vst_host.unloadPlugin(self.allocator, r.pl);
         self.retired_plugins.deinit(self.allocator);
@@ -2506,6 +2879,9 @@ pub const App = struct {
         self.preset_lib.deinit(self.allocator);
         if (self.instr_state_dirty.len > 0) self.allocator.free(self.instr_state_dirty);
         self.instr_state_dirty = &.{};
+        for (self.kit_layer_state_dirty) |r| if (r.len > 0) self.allocator.free(r);
+        if (self.kit_layer_state_dirty.len > 0) self.allocator.free(self.kit_layer_state_dirty);
+        self.kit_layer_state_dirty = &.{};
         for (self.fx_state_dirty) |r| if (r.len > 0) self.allocator.free(r);
         if (self.fx_state_dirty.len > 0) self.allocator.free(self.fx_state_dirty);
         self.fx_state_dirty = &.{};
@@ -2596,9 +2972,12 @@ pub const App = struct {
             std.mem.eql(u8, plugin, preset_mod.plugin_drumkit);
     }
 
-    /// 该插件是否可作为**鼓垫层**：目前仅减法（**不含鼓组**——禁自嵌套）。
-    pub fn pluginSupportedAsLayer(plugin: []const u8) bool {
-        return std.mem.eql(u8, plugin, preset_mod.plugin_subtractive);
+    /// 该插件是否可作为**鼓垫层**：减法合成器 + VST3 乐器分类
+    /// （**不含鼓组**——禁自嵌套；层 = 乐器槽，`docs/drumkit.md` §7）。
+    pub fn pluginSupportedAsLayer(self: *const App, plugin: []const u8) bool {
+        if (std.mem.eql(u8, plugin, preset_mod.plugin_subtractive)) return true;
+        if (std.mem.eql(u8, plugin, preset_mod.plugin_drumkit)) return false;
+        return self.presetCategoryInstalledRole(plugin, true); // VST3 乐器分类
     }
 
     /// VST3 分类可用性（**角色过滤**）：缓存条目或活实例需匹配角色
@@ -2636,7 +3015,7 @@ pub const App = struct {
     /// - `fx_*` → 仅效果意图；
     /// - `vst3_*` → 需已安装且角色匹配（乐器意图需能作乐器；效果意图需能作效果器）；
     /// - 内置乐器（subtractive/drumkit/fm/sampler）→ 仅乐器意图；
-    /// - 层上下文（鼓垫/鼓组层）：仅减法合成器。
+    /// - 层上下文（鼓垫/鼓组层）：减法 + **VST3 乐器**（禁鼓组——自嵌套）。
     pub fn presetCategoryRelevant(self: *const App, intent: PresetIntent, id: []const u8) bool {
         const is_effect_intent = switch (intent) {
             .create_effect, .replace_effect => true,
@@ -2651,10 +3030,10 @@ pub const App = struct {
             else => false,
         };
         if (fxKindFromCategory(id) != null) return is_effect_intent;
-        if (preset_mod.vst3CidFromCategory(id) != null) {
-            if (is_layer_ctx) return false; // 层上下文只做减法
-            return self.presetCategoryInstalledRole(id, !is_effect_intent);
-        }
+    if (preset_mod.vst3CidFromCategory(id) != null) {
+        // 层上下文 = 乐器角色（VST3 乐器可入层；效果器分类由 role 拦下）
+        return self.presetCategoryInstalledRole(id, !is_effect_intent);
+    }
         if (is_effect_intent) return false;
         if (is_layer_ctx) return std.mem.eql(u8, id, preset_mod.plugin_subtractive);
         return true; // 乐器意图：全部内置（含未实装占位，保持既有置灰提示）
@@ -2771,7 +3150,7 @@ pub const App = struct {
 
     /// 该意图下此分类是否**可选**（否则左栏置灰、点击只提示）：
     /// **面板已统一**——任何入口都能选任意已实装插件（跨插件即换插件）；
-    /// 仅两类被拦：未实装插件（FM/VST3）与层上下文的鼓组（禁自嵌套）。
+    /// 仅两类被拦：未实装插件（FM/未扫描 VST3）与层上下文的鼓组（禁自嵌套）。
     pub fn presetCategorySelectable(self: *const App, intent: PresetIntent, plugin: []const u8) bool {
         // 内建效果分类（fx_*）：仅效果意图可选
         if (fxKindFromCategory(plugin) != null) {
@@ -2795,7 +3174,26 @@ pub const App = struct {
                         }
                         break :blk self.presetCategoryInstalledRole(plugin, true);
                     },
-                    .kit_layer_replace => false, // 鼓组层仅减法合成器
+                    .kit_layer_replace => |ref| blk: {
+                        // 层 = 乐器槽：VST3 乐器可选；替换目标就是该插件（即使暂未安装）
+                        // → 可选（预设存 pending，插件回归后自动应用）
+                        if (ref.instrument >= 0 and ref.instrument < @as(i32, @intCast(self.instruments.items.len))) {
+                            const inst = &self.instruments.items[@intCast(ref.instrument)];
+                            if (inst.kit) |kit| {
+                                if (kit.find(ref.pitch)) |pad| {
+                                    if (ref.layer < pad.layers.items.len) {
+                                        const ly = &pad.layers.items[ref.layer];
+                                        if (ly.kind == .vst3) {
+                                            if (ly.plugin) |pl| {
+                                                if (self.pluginInstanceMatchesCategory(pl, cid)) break :blk true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        break :blk self.presetCategoryInstalledRole(plugin, true);
+                    },
                 },
                 .replace_effect => |r| blk: {
                     if (r.ch < self.mixer_channels_state.items.len and
@@ -2808,7 +3206,7 @@ pub const App = struct {
                     }
                     break :blk self.presetCategoryInstalledRole(plugin, false);
                 },
-                .create_kit_layer => false, // 鼓组层仅减法合成器
+                .create_kit_layer => self.presetCategoryInstalledRole(plugin, true), // VST3 乐器分类（层 = 乐器槽）
                 .create_instrument, .change_instrument => self.presetCategoryInstalledRole(plugin, true),
                 .create_effect => self.presetCategoryInstalledRole(plugin, false),
             };
@@ -2816,10 +3214,10 @@ pub const App = struct {
         return switch (intent) {
             .replace => |t| switch (t) {
                 .instrument => pluginSupportedAsInstrument(plugin),
-                .kit_layer_replace => pluginSupportedAsLayer(plugin),
+                .kit_layer_replace => self.pluginSupportedAsLayer(plugin),
             },
             .create_instrument, .change_instrument => pluginSupportedAsInstrument(plugin),
-            .create_kit_layer => pluginSupportedAsLayer(plugin),
+            .create_kit_layer => self.pluginSupportedAsLayer(plugin),
             .create_effect, .replace_effect => false, // 效果意图：仅 fx_* / VST3 效果分类
         };
     }
@@ -2837,7 +3235,20 @@ pub const App = struct {
                 }
                 return preset_mod.plugin_subtractive;
             },
-            .kit_layer_replace => return preset_mod.plugin_subtractive,
+            .kit_layer_replace => |ref| {
+                // 层 = 乐器槽：VST3 层的锚 = 该层插件分类（浏览器打开时定位）
+                if (self.kitLayerPtr(ref.instrument, ref.pitch, ref.layer)) |ly| {
+                    if (ly.kind == .vst3) {
+                        if (ly.plugin) |pl| {
+                            var hb: [32]u8 = undefined;
+                            var canon: [32]u8 = undefined;
+                            const cc = self.canonicalCategoryCid(pl.cidHex(&hb), &canon);
+                            return preset_mod.vst3CategoryId(cc, &self.preset_anchor_buf);
+                        }
+                    }
+                }
+                return preset_mod.plugin_subtractive;
+            },
         }
     }
 
@@ -3035,9 +3446,24 @@ pub const App = struct {
 
     /// 捕获乐器的 VST3 状态（base64，组件+控制器）；插件未加载 → null。
     /// 返回切片非空时调用方释放。
-    pub fn captureVst3StateB64(self: *App, ii: i32) ?struct { comp: []const u8, ctrl: []const u8 } {
+    /// 插件状态捕获（base64 对；乐器/鼓组层共用类型——避免匿名结构类型不兼容）
+    pub const CapturedStateB64 = struct { comp: []const u8, ctrl: []const u8 };
+
+    pub fn captureVst3StateB64(self: *App, ii: i32) ?CapturedStateB64 {
         if (ii < 0 or ii >= @as(i32, @intCast(self.instruments.items.len))) return null;
         const pl = self.instruments.items[@intCast(ii)].plugin orelse return null;
+        const comp = capturePluginStateB64(self.allocator, pl, true) catch return null;
+        const ctrl = capturePluginStateB64(self.allocator, pl, false) catch {
+            if (comp.len > 0) self.allocator.free(comp);
+            return null;
+        };
+        return .{ .comp = comp, .ctrl = ctrl };
+    }
+
+    /// 捕获鼓组 VST3 层的插件状态（base64；插件未加载 → null）——保存预设用
+    pub fn captureLayerVst3StateB64(self: *App, ref: PresetTarget.KitLayerRef) ?CapturedStateB64 {
+        const ly = self.kitLayerPtr(ref.instrument, ref.pitch, ref.layer) orelse return null;
+        const pl = ly.plugin orelse return null;
         const comp = capturePluginStateB64(self.allocator, pl, true) catch return null;
         const ctrl = capturePluginStateB64(self.allocator, pl, false) catch {
             if (comp.len > 0) self.allocator.free(comp);
@@ -3450,6 +3876,27 @@ pub const App = struct {
         return .{ .comp = psi.plugin_state, .ctrl = psi.plugin_state_ctrl };
     }
 
+    /// 捕获复用（**鼓组层**）：层未脏且来向条目同位置（音高+层序）同路径 →
+    /// 沿用其状态文本（池共享；O(1)）——同 `reuseInstrumentState`。
+    /// `slot` = 展平槽位（脏标寻址）；`inst_idx` = 乐器下标。
+    fn reuseLayerState(self: *const App, ly: *const model.DrumLayer, inst_idx: usize, pitch: u8, li: usize, slot: usize, pooled: bool) ?ReusePair {
+        if (!pooled) return null;
+        if (self.history.items.len == 0) return null;
+        if (inst_idx >= self.kit_layer_state_dirty.len or slot >= self.kit_layer_state_dirty[inst_idx].len) return null;
+        if (self.kit_layer_state_dirty[inst_idx][slot]) return null;
+        const prev = &self.history.items[self.history_current];
+        if (inst_idx >= prev.instruments.len) return null;
+        const psi = &prev.instruments[inst_idx];
+        for (psi.kit.pads) |pp| {
+            if (pp.pitch != @as(u32, pitch)) continue;
+            if (li >= pp.layers.len) return null;
+            const pl0 = pp.layers[li];
+            if (!std.mem.eql(u8, ly.pluginPath(), pl0.plugin_path)) return null;
+            return .{ .comp = pl0.plugin_state, .ctrl = pl0.plugin_state_ctrl };
+        }
+        return null;
+    }
+
     /// 捕获复用（效果器槽）：同 `reuseInstrumentState`
     fn reuseFxState(self: *const App, ch: usize, slot: usize, es: *const EffectSlot, pooled: bool) ?ReusePair {
         if (!pooled) return null;
@@ -3606,6 +4053,12 @@ pub const App = struct {
         try self.engine.setCapacity(synth.max_instruments, max_mixer_channels, audio.effect_slots);
         self.instr_state_dirty = try a.alloc(bool, synth.max_instruments);
         @memset(self.instr_state_dirty, false);
+        self.kit_layer_state_dirty = try a.alloc([]bool, synth.max_instruments);
+        @memset(self.kit_layer_state_dirty, &.{});
+        for (self.kit_layer_state_dirty) |*r| {
+            r.* = try a.alloc(bool, audio.kit_max_layers);
+            @memset(r.*, false);
+        }
         self.fx_state_dirty = try a.alloc([]bool, max_mixer_channels);
         @memset(self.fx_state_dirty, &.{});
         for (self.fx_state_dirty) |*r| {
@@ -3658,6 +4111,10 @@ pub const App = struct {
                 if (c.load(.monotonic)) |kp| self.allocator.destroy(kp);
                 c.store(null, .monotonic);
             }
+            for (self.engine.kit_vsti) |*c| {
+                if (c.load(.monotonic)) |kv| self.allocator.destroy(kv);
+                c.store(null, .monotonic);
+            }
             self.kit_shift_log.clearRetainingCapacity();
         } else {
             for (self.kit_shift_log.items) |idx| {
@@ -3678,6 +4135,28 @@ pub const App = struct {
             if (!needed) {
                 self.allocator.destroy(kp);
                 self.engine.kit_chunks[i].store(null, .monotonic);
+            }
+        }
+        // 鼓组 VST3 层状态清理（宿主不再是鼓组 / 不再含 VST3 层 → 释放）
+        var ik: usize = 0;
+        while (ik < self.engine.kit_vsti.len) : (ik += 1) {
+            const kv = self.engine.kit_vsti[ik].load(.monotonic) orelse continue;
+            var needed = false;
+            if (ik < self.instruments.items.len) {
+                if (self.instruments.items[ik].kit) |kit| {
+                    outer: for (kit.pads.items) |pad| {
+                        for (pad.layers.items) |ly| {
+                            if (ly.kind == .vst3) {
+                                needed = true;
+                                break :outer;
+                            }
+                        }
+                    }
+                }
+            }
+            if (!needed) {
+                self.allocator.destroy(kv);
+                self.engine.kit_vsti[ik].store(null, .monotonic);
             }
         }
     }
@@ -3721,6 +4200,25 @@ pub const App = struct {
             @memcpy(n[0..self.instr_state_dirty.len], self.instr_state_dirty);
             if (self.instr_state_dirty.len > 0) a.free(self.instr_state_dirty);
             self.instr_state_dirty = n;
+        }
+        // 鼓组层状态脏标（乐器容量 × kit_max_layers）
+        const kl_rows = @max(ic, self.kit_layer_state_dirty.len);
+        var kl_need = ic > self.kit_layer_state_dirty.len;
+        if (!kl_need and self.kit_layer_state_dirty.len > 0 and self.kit_layer_state_dirty[0].len < audio.kit_max_layers) kl_need = true;
+        if (kl_need) {
+            const kr = a.alloc([]bool, kl_rows) catch return;
+            @memset(kr, &.{});
+            for (0..kl_rows) |i| {
+                kr[i] = a.alloc(bool, audio.kit_max_layers) catch return;
+                @memset(kr[i], false);
+                if (i < self.kit_layer_state_dirty.len and self.kit_layer_state_dirty[i].len > 0) {
+                    const cp = @min(audio.kit_max_layers, self.kit_layer_state_dirty[i].len);
+                    @memcpy(kr[i][0..cp], self.kit_layer_state_dirty[i][0..cp]);
+                }
+            }
+            for (self.kit_layer_state_dirty) |r| if (r.len > 0) a.free(r);
+            if (self.kit_layer_state_dirty.len > 0) a.free(self.kit_layer_state_dirty);
+            self.kit_layer_state_dirty = kr;
         }
         const need_rows = @max(cc, self.fx_state_dirty.len);
         var need = cc > self.fx_state_dirty.len;
@@ -4040,6 +4538,11 @@ pub const App = struct {
                     self.fx_state_dirty[ref.a][ref.b] = true;
                 }
             },
+            .kit_layer => {
+                if (ref.a < self.kit_layer_state_dirty.len and ref.b < self.kit_layer_state_dirty[ref.a].len) {
+                    self.kit_layer_state_dirty[ref.a][ref.b] = true;
+                }
+            },
         }
     }
 
@@ -4058,6 +4561,11 @@ pub const App = struct {
                     ref.a < self.fx_state_dirty.len and ref.b < self.fx_state_dirty[ref.a].len)
                 {
                     self.fx_state_dirty[ref.a][ref.b] = false;
+                }
+            },
+            .kit_layer => {
+                if (ref.a < self.kit_layer_state_dirty.len and ref.b < self.kit_layer_state_dirty[ref.a].len) {
+                    self.kit_layer_state_dirty[ref.a][ref.b] = false;
                 }
             },
         }
@@ -4095,6 +4603,19 @@ pub const App = struct {
                 if (ref.b >= ch.effects.items.len) return null;
                 return ch.effects.items[ref.b].plugin;
             },
+            .kit_layer => {
+                if (ref.a >= self.instruments.items.len) return null;
+                const kit = self.instruments.items[ref.a].kit orelse return null;
+                var slot: usize = 0;
+                for (kit.pads.items) |pad| {
+                    for (pad.layers.items) |ly| {
+                        if (slot == ref.b) return ly.plugin;
+                        slot += 1;
+                        if (slot >= @import("audio.zig").kit_max_layers) return null;
+                    }
+                }
+                return null;
+            },
         }
     }
 
@@ -4120,7 +4641,8 @@ pub const App = struct {
     }
 
     /// 手势标签的“归属名”：乐器 → 乐器槽名（如“Solokey”）；效果器 → 通道名
-    /// （自定义优先，未命名用调音台同款占位名“主通道/通道#N”）；都取不到 → 插件名。
+    /// （自定义优先，未命名用调音台同款占位名“主通道/通道#N”）；鼓组层 →
+    /// “乐器名 · 层N”；都取不到 → 插件名。
     fn gestureOwnerName(self: *App, ref: PluginSlotRef, pl: *vst_host.Plugin, buf: []u8) []const u8 {
         switch (ref.kind) {
             .instrument => {
@@ -4132,6 +4654,14 @@ pub const App = struct {
             .fx => {
                 if (ref.a < self.mixer_channels_state.items.len) {
                     return self.mixer_channels_state.items[ref.a].displayName(ref.a, buf);
+                }
+            },
+            .kit_layer => {
+                if (ref.a < self.instruments.items.len) {
+                    const n = self.instruments.items[ref.a].name;
+                    if (n.len > 0) {
+                        return std.fmt.bufPrint(buf, "{s} · 层{d}", .{ n, ref.b + 1 }) catch n;
+                    }
                 }
             },
         }
@@ -4738,19 +5268,33 @@ pub const App = struct {
             // 乐器类型/鼓组内容也要比较（否则鼓组编辑被判“无变化”）
             if (a.kind != @intFromEnum(b.kind)) return false;
             if (a.kit.pads.len != (if (b.kit) |k| k.pads.items.len else 0)) return false;
-            if (b.kit) |k| {
-                for (a.kit.pads, k.pads.items) |sa, ba| {
-                    if (sa.pitch != ba.pitch) return false;
-                    if (!std.mem.eql(u8, sa.name, ba.name)) return false;
-                    if (sa.layers.len != ba.layers.items.len) return false;
-                    for (sa.layers, ba.layers.items) |sl, bl| {
-                        if (sl.gain != bl.gain) return false;
-                        if (!std.mem.eql(u8, sl.source_preset, bl.source_preset)) return false;
-                        const cur = persist.exportSynth(bl.params);
-                        if (!std.meta.eql(sl.synth, cur)) return false;
+        if (b.kit) |k| {
+            var flat: usize = 0; // 展平槽位（脏标寻址；与 syncParams 同序）
+            for (a.kit.pads, k.pads.items) |sa, ba| {
+                if (sa.pitch != ba.pitch) return false;
+                if (!std.mem.eql(u8, sa.name, ba.name)) return false;
+                if (sa.layers.len != ba.layers.items.len) return false;
+                for (sa.layers, ba.layers.items) |sl, bl| {
+                    if (sl.kind != @intFromEnum(bl.kind)) return false;
+                    if (sl.gain != bl.gain) return false;
+                    if (!std.mem.eql(u8, sl.source_preset, bl.source_preset)) return false;
+                    // VST3 层：路径/CID + **脏时与活实例比较音色**——否则插件内参数
+                    // 编辑被判“无变化”，静默丢弃历史条目（同乐器级机制）
+                    if (bl.kind == .vst3) {
+                        if (!std.mem.eql(u8, sl.plugin_path, bl.pluginPath())) return false;
+                        if (!std.mem.eql(u8, sl.plugin_cid, bl.pluginCid())) return false;
+                        if (ii < self.kit_layer_state_dirty.len and flat < self.kit_layer_state_dirty[ii].len and
+                            self.kit_layer_state_dirty[ii][flat])
+                        {
+                            if (!self.layerStateMatchesLive(&bl, sl.plugin_state, sl.plugin_state_ctrl)) return false;
+                        }
                     }
+                    const cur = persist.exportSynth(bl.params);
+                    if (!std.meta.eql(sl.synth, cur)) return false;
+                    flat += 1;
                 }
             }
+        }
             // **合成器参数也要比较**——否则 ADSR/滤波等改动会被判为“无变化”，
             // 静默丢弃历史条目（实测 bug：调 ADSR 不产生历史）
             const cur = persist.exportSynth(b.synth);
@@ -4991,7 +5535,7 @@ pub const App = struct {
                 }
                 // 逐槽状态应用计划（skip / 参数回放 / 整块）
                 const plan = self.planInstrumentApply(i, prev_idx, target_idx, si, target);
-                self.applySavedInstrument(si, target, plan);
+                self.applySavedInstrument(si, target, plan, prev_idx, target_idx);
             }
         } else {
             self.kit_reset = true;
@@ -5003,7 +5547,7 @@ pub const App = struct {
                 const idx = self.addInstrument(si.name);
                 if (idx < 0) continue;
                 const target = &self.instruments.items[@intCast(idx)];
-                self.applySavedInstrument(si, target, .full); // 全新实例：整块重放
+                self.applySavedInstrument(si, target, .full, target_idx, target_idx); // 全新实例：整块重放
             }
         }
         if (kit_host_changed) self.kit_gc_pending = true; // 帧末清理该槽的池（罕见路径）
@@ -5695,6 +6239,21 @@ pub const App = struct {
         return std.mem.eql(u8, live_c, top_comp) and std.mem.eql(u8, live_k, top_ctrl);
     }
 
+    /// 实时**鼓组层**插件状态（base64）是否与快照一致（commitHistory 去重用）
+    fn layerStateMatchesLive(self: *const App, ly: *const model.DrumLayer, top_comp: []const u8, top_ctrl: []const u8) bool {
+        const live_c = if (ly.plugin) |pl|
+            (capturePluginStateB64(self.allocator, pl, true) catch return false)
+        else
+            (b64Encode(self.allocator, if (ly.pending_state) |x| x else &.{}) catch return false);
+        defer if (live_c.len > 0) self.allocator.free(live_c);
+        const live_k = if (ly.plugin) |pl|
+            (capturePluginStateB64(self.allocator, pl, false) catch return false)
+        else
+            (b64Encode(self.allocator, if (ly.pending_state_ctrl) |x| x else &.{}) catch return false);
+        defer if (live_k.len > 0) self.allocator.free(live_k);
+        return std.mem.eql(u8, live_c, top_comp) and std.mem.eql(u8, live_k, top_ctrl);
+    }
+
     /// 实时插件状态（base64）是否与快照中的一致（commitHistory 去重用；含结构改动）
     fn pluginStateMatchesLive(self: *const App, es: *const EffectSlot, top_comp: []const u8, top_ctrl: []const u8) bool {
         const live_c = captureSlotStateB64(self.allocator, es, true) catch return false;
@@ -5808,7 +6367,7 @@ pub const App = struct {
             const idx = self.addInstrument(inst.name);
             if (idx < 0) continue;
             const target = &self.instruments.items[@intCast(idx)];
-            self.applySavedInstrument(inst, target, .full);
+            self.applySavedInstrument(inst, target, .full, 0, 0);
         }
 
         // 全局设置
@@ -7892,6 +8451,184 @@ test "app: 换样式锚 = 离游标最近——切走再切回 = 双击的片段
     try std.testing.expect(app.nearestAnchorForPattern(2) == null);
 }
 
+test "app: 鼓组 VST3 层——添加/展平槽位/导出导入往返/相等比较/换回减法" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    const inst = app.addDrumkit("鼓组");
+    try std.testing.expectEqual(@as(i32, 0), inst);
+    app.resetHistory("初始状态");
+
+    // 减法层（35）+ VST3 层（35）+ 减法层（38）：展平槽位 = 0,1,2
+    try std.testing.expect(app.kitLayerAdd(inst, 35, null, ""));
+    try std.testing.expect(app.kitLayerAddVst3(inst, 35, "C:/v/Vital.vst3", "Vital"));
+    try std.testing.expect(app.kitLayerAdd(inst, 38, null, ""));
+    app.commitHistory("添加层");
+
+    const kit = app.instruments.items[0].kit.?;
+    try std.testing.expectEqual(@as(usize, 3), kit.totalLayers());
+    const vl = &kit.find(35).?.layers.items[1];
+    try std.testing.expect(vl.kind == .vst3);
+    try std.testing.expectEqualStrings("C:/v/Vital.vst3", vl.pluginPath());
+    try std.testing.expectEqualStrings("Vital", vl.source_preset);
+    // 展平槽位（与 params 展平序一致；VST3 panic 旗标等按它寻址）
+    try std.testing.expectEqual(@as(?usize, 1), app.kitLayerSlot(0, 35, 1));
+    try std.testing.expectEqual(@as(?usize, 2), app.kitLayerSlot(0, 38, 0));
+    // kit_vsti 惰性状态（含 VST3 层 → 已建立；测试环境无插件实例，加载静默失败）
+    try std.testing.expect(app.engine.kit_vsti[0].load(.monotonic) != null);
+
+    // 导出 → 导入往返：VST3 字段保留（无实例 → 路径/来源）
+    var sk = app.exportKitForSave(0).?;
+    defer app.freeSavedKit(&sk, false);
+    try std.testing.expectEqual(@as(u32, 2), sk.pads[0].layers[1].kind);
+    try std.testing.expectEqualStrings("C:/v/Vital.vst3", sk.pads[0].layers[1].plugin_path);
+    try std.testing.expectEqualStrings("Vital", sk.pads[0].layers[1].source_preset);
+    try std.testing.expect(app.loadKitInto(0, &sk));
+    const kit2 = app.instruments.items[0].kit.?;
+    try std.testing.expectEqual(@as(usize, 3), kit2.totalLayers());
+    try std.testing.expect(kit2.find(35).?.layers.items[1].kind == .vst3);
+    try std.testing.expectEqualStrings("C:/v/Vital.vst3", kit2.find(35).?.layers.items[1].pluginPath());
+
+    // 相等比较：无变化提交被去重；**VST3 路径变化** → 判“有变化”（防静默丢历史）
+    const before = app.history.items.len;
+    app.commitHistory("无变化提交");
+    try std.testing.expectEqual(before, app.history.items.len);
+    kit2.find(35).?.layers.items[1].setPluginPath("C:/v/Other.vst3");
+    app.commitHistory("换路径");
+    try std.testing.expectEqual(before + 1, app.history.items.len);
+
+    // 换回减法（插件退役/路径清空）——减法预设应用前必须走它
+    app.kitLayerClearVst3(0, 35, 1);
+    try std.testing.expect(kit2.find(35).?.layers.items[1].kind == .subtractive);
+    try std.testing.expectEqualStrings("", kit2.find(35).?.layers.items[1].pluginPath());
+
+    // 撤销两次：换路径 → 添加层（3 层）→ 初始状态（无层）
+    try std.testing.expect(app.undo());
+    try std.testing.expectEqual(@as(usize, 3), app.instruments.items[0].kit.?.totalLayers());
+    try std.testing.expect(app.undo());
+    try std.testing.expectEqual(@as(usize, 0), app.instruments.items[0].kit.?.totalLayers());
+}
+
+test "app: 鼓组 VST3 层槽位引用——slotPlugin 解析 + 层脏标置位/清除" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    const inst = app.addDrumkit("鼓组");
+    try std.testing.expectEqual(@as(i32, 0), inst);
+    app.resetHistory("初始状态");
+    // 层序：35 减法 / 35 VST3 / 38 减法 → 展平槽位 0 / 1 / 2
+    try std.testing.expect(app.kitLayerAdd(inst, 35, null, ""));
+    try std.testing.expect(app.kitLayerAddVst3(inst, 35, "C:/v/Vital.vst3", "Vital"));
+    try std.testing.expect(app.kitLayerAdd(inst, 38, null, ""));
+    // slotPlugin：槽位 → 层插件（测试环境无实例 → null）；越界/无垫 → null
+    try std.testing.expectEqual(@as(?usize, 1), app.kitLayerSlot(0, 35, 1));
+    try std.testing.expect(app.slotPlugin(.{ .kind = .kit_layer, .a = 0, .b = 1 }) == null);
+    try std.testing.expect(app.slotPlugin(.{ .kind = .kit_layer, .a = 0, .b = 99 }) == null);
+    try std.testing.expect(app.slotPlugin(.{ .kind = .kit_layer, .a = 7, .b = 0 }) == null);
+    // 层脏标（编辑器参数记账路径）：置位 → 清除
+    app.markSlotStateDirty(.{ .kind = .kit_layer, .a = 0, .b = 1 });
+    try std.testing.expect(app.kit_layer_state_dirty[0][1]);
+    app.markSlotStateClean(.{ .kind = .kit_layer, .a = 0, .b = 1 });
+    try std.testing.expect(!app.kit_layer_state_dirty[0][1]);
+}
+
+test "app: 鼓组两层 VST3 各自编辑 → 历史各自成条 + 撤销 + 无幽灵（Vital 优先/自带测试插件兑底）" {
+    const alloc = std.testing.allocator;
+    // 优先 Vital（用户实症：恢复后 getState 回声字节与存档不同）；无 → 自带测试插件；都无 → 跳过
+    const vital_path = "C:\\Program Files\\Common Files\\VST3\\Vital.vst3";
+    const sine_path = "libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll";
+    var dll: []const u8 = vital_path;
+    var pz = alloc.dupeZ(u8, dll) catch return;
+    var pl1 = vst_host.loadPlugin(alloc, pz, 48000, 4096, .instrument) catch blk: {
+        alloc.free(pz);
+        dll = sine_path;
+        pz = alloc.dupeZ(u8, dll) catch return;
+        break :blk vst_host.loadPlugin(alloc, pz, 48000, 4096, .instrument) catch return;
+    };
+    defer alloc.free(pz);
+    const pl2 = vst_host.loadPlugin(alloc, pz, 48000, 4096, .instrument) catch return;
+    // 注：两个实例挂到层上后**归 App 所有**（deinitAll 经退役链统一销毁）——不手动 unload
+
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    const inst = app.addDrumkit("鼓组");
+    try std.testing.expectEqual(@as(i32, 0), inst);
+    try std.testing.expect(app.kitLayerAddVst3(inst, 35, dll, "P"));
+    try std.testing.expect(app.kitLayerAddVst3(inst, 38, dll, "P"));
+    {
+        const kit = app.instruments.items[0].kit.?;
+        kit.find(35).?.layers.items[0].plugin = pl1;
+        kit.find(38).?.layers.items[0].plugin = pl2;
+    }
+    pl1.refreshParamCache();
+    pl2.refreshParamCache();
+    app.resetHistory("初始");
+
+    const ref38 = PluginSlotRef{ .kind = .kit_layer, .a = 0, .b = 1 };
+    const ref35 = PluginSlotRef{ .kind = .kit_layer, .a = 0, .b = 0 };
+
+    // 编辑 38 的参数 → 一条历史
+    try std.testing.expect(pl2.params.len > 0);
+    app.setPluginParamHost(ref38, pl2, 0, 0.9);
+    app.pinPendingGesture();
+    try std.testing.expectEqual(@as(usize, 2), app.history.items.len); // 初始 + 38 编辑
+
+    // 编辑 35 的参数 → **必须再出一条**（复现点：旧行为被“无变化”吞掉）
+    app.setPluginParamHost(ref35, pl1, 0, 0.9);
+    app.pinPendingGesture();
+    try std.testing.expectEqual(@as(usize, 3), app.history.items.len); // 初始 + 38 编辑 + 35 编辑
+
+    // 撤销 35 编辑：参数回放（同路径+有增量）或整块 pending 二者必居其一
+    try std.testing.expect(app.undo());
+    const replayed35 = if (pl1.cacheGet(0)) |v| @abs(v - 0.9) > 0.01 else false;
+    try std.testing.expect(replayed35 or app.instruments.items[0].kit.?.find(35).?.layers.items[0].pending_state != null);
+    // 38 的编辑应还在（未被连带回退）——活实例或 pending 任一侧保持 0.9
+    const kept38 = if (pl2.cacheGet(0)) |v| @abs(v - 0.9) < 0.01 else false;
+    const pend38 = app.instruments.items[0].kit.?.find(38).?.layers.items[0].pending_state != null;
+    try std.testing.expect(kept38 or pend38);
+
+    // 帧末同步（真实路径）：应用 pending + “已采纳”记账（清脏标）
+    app.syncKitLayerPlugins();
+    // **回声不得造幽灵条目**（Vital 实症：恢复后 getState 字节与存档不同——
+    // 旧行为：留着脏标 → 下一次提交把回声当差异 → 幽灵条目 → “撤销无反应”）
+    const n_before = app.history.items.len;
+    app.commitHistory("无变化");
+    try std.testing.expectEqual(n_before, app.history.items.len);
+}
+
+test "app: 鼓组 VST3 层状态去重池（历史捕获）——同内容复用同块" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    const inst = app.addDrumkit("鼓组");
+    try std.testing.expectEqual(@as(i32, 0), inst);
+    try std.testing.expect(app.kitLayerAddVst3(inst, 35, "C:/v/Vital.vst3", "Vital"));
+    // 模拟“已恢复的状态”（测试无实例 → pending 分支经 b64 编码入池）
+    app.instruments.items[0].kit.?.find(35).?.layers.items[0].pending_state = try std.testing.allocator.dupe(u8, "STATEBYTES");
+    app.resetHistory("初始");
+    // 与层无关的改动（增益）→ 第二条目；层状态未变 → 池内同块（指针相等）
+    app.instruments.items[0].kit.?.find(35).?.layers.items[0].gain = 0.5;
+    app.commitHistory("改增益");
+    try std.testing.expectEqual(@as(usize, 2), app.history.items.len);
+    const s0 = app.history.items[0].instruments[0].kit.pads[0].layers[0].plugin_state;
+    const s1 = app.history.items[1].instruments[0].kit.pads[0].layers[0].plugin_state;
+    try std.testing.expect(s0.len > 0);
+    try std.testing.expectEqual(s0.ptr, s1.ptr);
+}
+
 test "app: 保位切换=软切换（播放中）——无重击、off 续排；非保位=硬切换" {
     var app = App{ .allocator = std.testing.allocator };
     defer app.clips.deinit(app.allocator);
@@ -9970,7 +10707,7 @@ test "app: 套鼓快照——导出/载入/释放（自包含副本；替换现�
 
     // 导出快照（深拷贝）
     const snap = app.exportKitForSave(@intCast(a)).?;
-    defer app.freeSavedKit(&snap);
+    defer app.freeSavedKit(&snap, false);
     try std.testing.expectEqual(@as(usize, 2), snap.pads.len);
     try std.testing.expectEqual(@as(u32, 35), snap.pads[0].pitch);
     try std.testing.expectEqualStrings("底鼓", snap.pads[0].name);
@@ -10720,7 +11457,7 @@ test "工程加载恢复后：插件回声字节不算编辑（单击不产生�
 
     // 模拟“加载工程走一遍恢复”：pending(来自 E0) → 恢复 → **按已采纳标 clean**（修复后契约）
     const si = app.history.items[0].instruments[0];
-    app.applySavedInstrument(&si, &app.instruments.items[idx], .full);
+    app.applySavedInstrument(&si, &app.instruments.items[idx], .full, 0, 0);
     const inst = &app.instruments.items[idx];
     const archive_raw = try std.testing.allocator.dupe(u8, inst.pending_state orelse &.{}); // 存档原始字节
     defer std.testing.allocator.free(archive_raw);
@@ -10996,7 +11733,7 @@ test "VST3 乐器：换路径清零旧 pending（防参数灌到别的乐器）�
     var si = persist.SavedInstrument{ .kind = 2 };
     si.plugin_path = "C:\\x\\new.vst3";
     si.plugin_state = ""; // 新乐器无音色
-    app.applySavedInstrument(&si, &app.instruments.items[0], .full);
+    app.applySavedInstrument(&si, &app.instruments.items[0], .full, 0, 0);
     const inst2 = &app.instruments.items[0];
     try std.testing.expectEqualStrings("C:\\x\\new.vst3", inst2.pluginPath());
     try std.testing.expect(inst2.pending_state == null); // 旧 pending 已释放（否则测试分配器报泄漏）
@@ -11221,10 +11958,17 @@ test "VST3 预设：分类标签/可用性/路径解析（扫描缓存驱动）"
     try std.testing.expect(app.vst3CategoryPath(id2) == null);
     try std.testing.expectEqualStrings("减法合成器", app.presetCategoryLabel("subtractive"));
 
-    // 可选性：create 意图需已安装；鼓组层上下文拒绝 VST3
+    // 可选性：create 意图需已安装；**鼓组层接受 VST3 乐器分类**（层 = 乐器槽）——
+    // 未安装仍拒绝；鼓组分类仍拒绝（禁自嵌套）
     try std.testing.expect(app.presetCategorySelectable(.create_instrument, id));
     try std.testing.expect(!app.presetCategorySelectable(.create_instrument, id2));
-    try std.testing.expect(!app.presetCategorySelectable(.{ .create_kit_layer = .{ .instrument = 0, .pitch = 35 } }, id));
+    try std.testing.expect(app.presetCategorySelectable(.{ .create_kit_layer = .{ .instrument = 0, .pitch = 35 } }, id));
+    try std.testing.expect(!app.presetCategorySelectable(.{ .create_kit_layer = .{ .instrument = 0, .pitch = 35 } }, id2));
+    // 可见性：层上下文列出 VST3 乐器分类（已装；未装/鼓组仍隐藏）
+    try std.testing.expect(app.presetCategoryRelevant(.{ .create_kit_layer = .{ .instrument = 0, .pitch = 35 } }, id));
+    try std.testing.expect(!app.presetCategoryRelevant(.{ .create_kit_layer = .{ .instrument = 0, .pitch = 35 } }, id2));
+    try std.testing.expect(!app.presetCategoryRelevant(.{ .create_kit_layer = .{ .instrument = 0, .pitch = 35 } }, preset_mod.plugin_drumkit));
+    try std.testing.expect(!app.presetCategorySelectable(.{ .create_kit_layer = .{ .instrument = 0, .pitch = 35 } }, preset_mod.plugin_drumkit));
 }
 
 test "VST3 乐器：applyVst3Instrument 清 pending/退役旧实例，保留名字与路由" {
@@ -11476,17 +12220,21 @@ test "预设浏览：可见性规则（乐器/效果互不可见；未安装 VST
     app.resetMixerChannels(1);
     app.resetHistory("初始");
 
-    // 缓存：一个纯效果插件（已安装）
+    // 缓存：一个纯效果插件 + 一个乐器插件（均已安装）
     const fx_cid = "0de7aef2de004e4f544f4249424d3750";
+    const in_cid = "0102030405060708090a0b0c0d0e0f10";
     const jsonl = try std.fmt.allocPrint(std.testing.allocator,
         "{{\"t\":\"begin\",\"n\":1}}\n" ++
         "{{\"t\":\"ok\",\"path\":\"C:/v/Nova\",\"dll\":\"C:/v/Nova\",\"name\":\"Nova\",\"role\":\"effect\",\"classes\":[{{\"cid\":\"{s}\",\"kind\":\"effect\"}}]}}\n" ++
-        "{{\"t\":\"end\",\"ok\":1,\"err\":0}}\n", .{fx_cid});
+        "{{\"t\":\"ok\",\"path\":\"C:/v/Vita\",\"dll\":\"C:/v/Vita\",\"name\":\"Vita\",\"role\":\"instrument\",\"classes\":[{{\"cid\":\"{s}\",\"kind\":\"instrument\"}}]}}\n" ++
+        "{{\"t\":\"end\",\"ok\":1,\"err\":0}}\n", .{ fx_cid, in_cid });
     defer std.testing.allocator.free(jsonl);
     app.plugin_cache = plugin_db.Cache.parseJsonl(std.testing.allocator, jsonl);
 
     var idbuf: [48]u8 = undefined;
+    var idbuf2: [48]u8 = undefined;
     const id_nova = preset_mod.vst3CategoryId(fx_cid, &idbuf);
+    const id_vita = preset_mod.vst3CategoryId(in_cid, &idbuf2);
     const id_missing = "vst3_ff030405060708090a0b0c0d0e0f10ff";
 
     // 乐器意图：内置可见；效果不可见；纯效果插件不可见；未安装隐藏
@@ -11500,11 +12248,17 @@ test "预设浏览：可见性规则（乐器/效果互不可见；未安装 VST
     try std.testing.expect(app.presetCategoryRelevant(.{ .create_effect = 0 }, id_nova));
     try std.testing.expect(!app.presetCategoryRelevant(.{ .create_effect = 0 }, "subtractive"));
     try std.testing.expect(!app.presetCategoryRelevant(.{ .create_effect = 0 }, id_missing));
-    // 层上下文：仅减法
+    // 层上下文：减法 + **VST3 乐器分类**（已装）；鼓组/效果仍不可见；
+    // 替换意图同规则（层 = 乐器槽）
     const layer_intent = PresetIntent{ .create_kit_layer = .{ .instrument = 0, .pitch = 35 } };
     try std.testing.expect(app.presetCategoryRelevant(layer_intent, "subtractive"));
+    try std.testing.expect(app.presetCategoryRelevant(layer_intent, id_vita));
+    try std.testing.expect(app.presetCategorySelectable(layer_intent, id_vita));
     try std.testing.expect(!app.presetCategoryRelevant(layer_intent, "drumkit"));
     try std.testing.expect(!app.presetCategoryRelevant(layer_intent, "fx_reverb"));
+    const layer_replace = PresetIntent{ .replace = .{ .kit_layer_replace = .{ .instrument = 0, .pitch = 35, .layer = 0 } } };
+    try std.testing.expect(app.presetCategorySelectable(layer_replace, id_vita));
+    try std.testing.expect(!app.presetCategorySelectable(layer_replace, "drumkit"));
 }
 
 test "VST3 乐器：多输出插件（SFLT，系统装有才跑）加载 + 处理不崩" {

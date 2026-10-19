@@ -131,6 +131,12 @@ pub const Params = struct {
     kit_layer_gain: [][]std.atomic.Value(f32) = &.{},
     /// 鼓组层合成器参数指针（层本体；UI 持有并保证地址稳定）
     kit_layer_params: [][]std.atomic.Value(?*synth.SynthParams) = &.{},
+    /// 鼓组层类型（`model.LayerKind`：0 = 减法 / 2 = VST3）
+    kit_layer_kind: [][]std.atomic.Value(u32) = &.{},
+    /// 鼓组层 VST3 插件实例指针（kind == 2 时有效；UI 发布，音频线程 acquire 读）
+    kit_layer_plugin: [][]std.atomic.Value(?*vst_host.Plugin) = &.{},
+    /// 鼓组层 VST3 防挂音 panic（状态恢复后置位：下一段对该层全 128 补 off）
+    kit_layer_panic: [][]std.atomic.Value(bool) = &.{},
 
     // ── 调音台：每通道参数（UI 写、音频线程读）──
     /// 通道增益（0-1）
@@ -206,6 +212,9 @@ pub const Params = struct {
         self.kit_layer_pitch = try allocAtomicRows(u32, a, ic, kit_max_layers, 0);
         self.kit_layer_gain = try allocAtomicRows(f32, a, ic, kit_max_layers, 1.0);
         self.kit_layer_params = try allocAtomicRows(?*synth.SynthParams, a, ic, kit_max_layers, null);
+        self.kit_layer_kind = try allocAtomicRows(u32, a, ic, kit_max_layers, 0);
+        self.kit_layer_plugin = try allocAtomicRows(?*vst_host.Plugin, a, ic, kit_max_layers, null);
+        self.kit_layer_panic = try allocAtomicRows(bool, a, ic, kit_max_layers, false);
         self.sounding_lo = try allocAtomicArr(u64, a, ic, 0);
         self.sounding_hi = try allocAtomicArr(u64, a, ic, 0);
         self.channel_gain = try allocAtomicArr(f32, a, cc, 0.8);
@@ -242,6 +251,9 @@ pub const Params = struct {
         freeAtomicRows(u32, a, &self.kit_layer_pitch);
         freeAtomicRows(f32, a, &self.kit_layer_gain);
         freeAtomicRows(?*synth.SynthParams, a, &self.kit_layer_params);
+        freeAtomicRows(u32, a, &self.kit_layer_kind);
+        freeAtomicRows(?*vst_host.Plugin, a, &self.kit_layer_plugin);
+        freeAtomicRows(bool, a, &self.kit_layer_panic);
         freeAtomicArr(u64, a, &self.sounding_lo);
         freeAtomicArr(u64, a, &self.sounding_hi);
         freeAtomicArr(f32, a, &self.channel_gain);
@@ -279,6 +291,9 @@ pub const Params = struct {
             try growAtomicRows(u32, a, &self.kit_layer_pitch, ic, kit_max_layers, 0);
             try growAtomicRows(f32, a, &self.kit_layer_gain, ic, kit_max_layers, 1.0);
             try growAtomicRows(?*synth.SynthParams, a, &self.kit_layer_params, ic, kit_max_layers, null);
+            try growAtomicRows(u32, a, &self.kit_layer_kind, ic, kit_max_layers, 0);
+            try growAtomicRows(?*vst_host.Plugin, a, &self.kit_layer_plugin, ic, kit_max_layers, null);
+            try growAtomicRows(bool, a, &self.kit_layer_panic, ic, kit_max_layers, false);
             try growAtomicArr(u64, a, &self.sounding_lo, ic, 0);
             try growAtomicArr(u64, a, &self.sounding_hi, ic, 0);
             self.instruments_cap = ic;
@@ -430,6 +445,9 @@ pub const Engine = struct {
     /// 鼓组层声部池（**惰性**：每乐器的 16 层池按需分配，见 `App.ensureKitPool`——
     /// 指针数组按容量维护；普通（非鼓组）乐器零开销，扩容拷贝量不再含声部状态）。
     kit_chunks: []std.atomic.Value(?*KitPool) = &.{},
+    /// 鼓组 VST3 层状态（每层事件批 + 发声位图；**惰性**——仅含 VST3 层的
+    /// 鼓组分配；生命周期同鼓组池：设备暂停窗口内创建/释放，见 `App.ensureKitVsti`）
+    kit_vsti: []std.atomic.Value(?*KitVstiState) = &.{},
     /// VSTi 渲染中转缓冲（插件的原位写出不能直接覆盖通道缓冲——需叠加）
     vsti_scratch: []f32 = &.{},
     /// VSTi 待发送事件批（事件在**段边界以 offset 0 生效**：dispatchNote 填充，
@@ -537,6 +555,11 @@ pub const Engine = struct {
         }
         if (self.kit_chunks.len > 0) self.allocator.free(self.kit_chunks);
         self.kit_chunks = &.{};
+        for (self.kit_vsti) |*c| {
+            if (c.load(.monotonic)) |kv| self.allocator.destroy(kv);
+        }
+        if (self.kit_vsti.len > 0) self.allocator.free(self.kit_vsti);
+        self.kit_vsti = &.{};
         if (self.vsti_scratch.len > 0) {
             self.allocator.free(self.vsti_scratch);
             self.vsti_scratch = &.{};
@@ -589,6 +612,18 @@ pub const Engine = struct {
             }
             if (self.kit_chunks.len > 0) a.free(self.kit_chunks);
             self.kit_chunks = nk;
+            // 鼓组 VST3 层状态：惰性——只维护指针数组（Chunk 由 `App.ensureKitVsti` 分配）
+            const nv = try a.alloc(std.atomic.Value(?*KitVstiState), ic);
+            for (nv) |*c| c.* = std.atomic.Value(?*KitVstiState).init(null);
+            for (nv[0..@min(ic, self.kit_vsti.len)], 0..) |*c, i| c.* = std.atomic.Value(?*KitVstiState).init(self.kit_vsti[i].load(.monotonic));
+            // 缩容裁掉的状态就地释放（契约：设备不运行或已暂停）
+            if (self.kit_vsti.len > ic) {
+                for (self.kit_vsti[ic..]) |*c| {
+                    if (c.load(.monotonic)) |kv| a.destroy(kv);
+                }
+            }
+            if (self.kit_vsti.len > 0) a.free(self.kit_vsti);
+            self.kit_vsti = nv;
             const ne = try a.alloc([]ivstevents.Event, ic);
             @memset(ne, &.{});
             errdefer {
@@ -675,6 +710,25 @@ pub const Engine = struct {
 /// 鼓组层声部池：每乐器一池（`kit_max_layers` 层 × 每层 32 声部）
 pub const KitPool = [kit_max_layers]synth.KitLayerSynth;
 
+/// 鼓组 VST3 层的每层运行态：事件批（音频线程段内写/消费）+ 发声位图
+/// （暂停/all-off 按位补发 note-off——同乐器级 VSTi 惯例）。
+pub const KitVstiState = struct {
+    evts: [kit_max_layers]EvtBuf,
+    active_lo: [kit_max_layers]u64 = [_]u64{0} ** kit_max_layers,
+    active_hi: [kit_max_layers]u64 = [_]u64{0} ** kit_max_layers,
+
+    pub const EvtBuf = struct {
+        events: [vsti_batch_max]ivstevents.Event = undefined,
+        n: usize = 0,
+    };
+};
+
+/// 取某乐器的鼓组 VST3 层状态（未分配 → null；惰性分配见 `App.ensureKitVsti`）
+fn kitVstiState(engine: *const Engine, i: usize) ?*KitVstiState {
+    if (i >= engine.kit_vsti.len) return null;
+    return engine.kit_vsti[i].load(.acquire);
+}
+
 /// 取某乐器的鼓组层池（未分配 → null；惰性分配见 `App.ensureKitPool`）
 fn kitPool(engine: *const Engine, i: usize) ?*KitPool {
     if (i >= engine.kit_chunks.len) return null;
@@ -695,6 +749,15 @@ fn releaseAllVoices(engine: *Engine) void {
     const params = engine.params;
     for (0..engine.synths.len) |i| {
         if (params.instrument_kind[i].load(.monotonic) == 2) vstiPanic(engine, i);
+    }
+    // 鼓组 VST3 层：同样 panic 式全体释音（仅在有实例的层；位图可能失同步）
+    for (0..engine.kit_vsti.len) |i| {
+        const n_layers = @min(params.kit_layer_count[i].load(.monotonic), kit_max_layers);
+        for (0..n_layers) |l| {
+            if (params.kit_layer_kind[i][l].load(.monotonic) != 2) continue;
+            if (params.kit_layer_plugin[i][l].load(.acquire) == null) continue;
+            kitLayerVstiPanic(engine, i, l);
+        }
     }
 }
 
@@ -753,6 +816,64 @@ fn vstiNoteOff(engine: *Engine, i: usize, pitch: u8) void {
 fn vstiPanic(engine: *Engine, i: usize) void {
     var p: u16 = 0;
     while (p < 128) : (p += 1) vstiNoteOff(engine, i, @intCast(p));
+}
+
+// ── 鼓组 VST3 层（每层一份事件批 + 位图；同乐器级 VSTi 惯例）──
+
+/// 鼓组 VST3 层：置位/清除发声位图
+fn kitLayerVstiActiveSet(engine: *Engine, i: usize, l: usize, pitch: u8, on: bool) void {
+    const st = kitVstiState(engine, i) orelse return;
+    if (pitch < 64) {
+        const bit = @as(u64, 1) << @intCast(pitch);
+        if (on) st.active_lo[l] |= bit else st.active_lo[l] &= ~bit;
+    } else {
+        const bit = @as(u64, 1) << @intCast(pitch - 64);
+        if (on) st.active_hi[l] |= bit else st.active_hi[l] &= ~bit;
+    }
+}
+
+/// 鼓组 VST3 层：追加事件到该层批（满则丢弃——宁可丢事件不分配）
+fn kitLayerVstiPush(engine: *Engine, i: usize, l: usize, ev: ivstevents.Event) void {
+    const st = kitVstiState(engine, i) orelse return;
+    const b = &st.evts[l];
+    if (b.n >= b.events.len) return;
+    b.events[b.n] = ev;
+    b.n += 1;
+}
+
+fn kitLayerVstiNoteOn(engine: *Engine, i: usize, l: usize, pitch: u8, velocity: u8) void {
+    kitLayerVstiActiveSet(engine, i, l, pitch, true);
+    kitLayerVstiPush(engine, i, l, .{
+        .sampleOffset = 0,
+        .type = @intFromEnum(ivstevents.Event.EventTypes.kNoteOnEvent),
+        .data = .{ .noteOn = .{
+            .channel = 0,
+            .pitch = @intCast(pitch),
+            .velocity = @as(f32, @floatFromInt(@max(1, velocity))) / 127.0,
+            .length = 0,
+            .noteId = -1,
+        } },
+    });
+}
+
+fn kitLayerVstiNoteOff(engine: *Engine, i: usize, l: usize, pitch: u8) void {
+    kitLayerVstiActiveSet(engine, i, l, pitch, false);
+    kitLayerVstiPush(engine, i, l, .{
+        .sampleOffset = 0,
+        .type = @intFromEnum(ivstevents.Event.EventTypes.kNoteOffEvent),
+        .data = .{ .noteOff = .{
+            .channel = 0,
+            .pitch = @intCast(pitch),
+            .velocity = 0,
+            .noteId = -1,
+        } },
+    });
+}
+
+/// 鼓组 VST3 层：全 128 音高补 off（panic 式——位图可能失同步）
+fn kitLayerVstiPanic(engine: *Engine, i: usize, l: usize) void {
+    var p: u16 = 0;
+    while (p < 128) : (p += 1) kitLayerVstiNoteOff(engine, i, l, @intCast(p));
 }
 
 /// VSTi：按位图补发全部 note-off（暂停/跳转/切类型/全体释音共用）
@@ -892,6 +1013,13 @@ fn publishSounding(engine: *Engine, params: *Params) void {
                 }
             }
         }
+        // 鼓组 VST3 层：位图并集（惰性状态；未分配 = 无层 → 跳过）
+        if (kitVstiState(engine, i)) |st| {
+            for (0..kit_max_layers) |l| {
+                lo |= st.active_lo[l];
+                hi |= st.active_hi[l];
+            }
+        }
         params.sounding_lo[i].store(lo, .monotonic);
         params.sounding_hi[i].store(hi, .monotonic);
     }
@@ -959,6 +1087,13 @@ fn dispatchNote(engine: *Engine, ev: anytype) void {
                 const n_layers = @min(params.kit_layer_count[ev.instrument].load(.monotonic), kit_max_layers);
                 for (0..n_layers) |l| {
                     if (params.kit_layer_pitch[ev.instrument][l].load(.monotonic) != ev.pitch) continue;
+                    // VST3 层：事件转发到该层插件（实例未就绪 → 跳过）
+                    if (params.kit_layer_kind[ev.instrument][l].load(.monotonic) == 2) {
+                        if (params.kit_layer_plugin[ev.instrument][l].load(.acquire) != null) {
+                            kitLayerVstiNoteOn(engine, ev.instrument, l, ev.pitch, ev.velocity);
+                        }
+                        continue;
+                    }
                     const ks = engine.kitSynth(ev.instrument, l) orelse continue;
                     synth.noteOn(ks, ev.pitch, ev.velocity, pan);
                 }
@@ -972,7 +1107,15 @@ fn dispatchNote(engine: *Engine, ev: anytype) void {
             } else if (is_kit) {
                 // 全部层都收 off（无关层空转——防漏 off）
                 const n_layers = @min(params.kit_layer_count[ev.instrument].load(.monotonic), kit_max_layers);
-                for (0..n_layers) |l| if (engine.kitSynth(ev.instrument, l)) |ks| synth.noteOff(ks, ev.pitch);
+                for (0..n_layers) |l| {
+                    if (params.kit_layer_kind[ev.instrument][l].load(.monotonic) == 2) {
+                        if (params.kit_layer_plugin[ev.instrument][l].load(.acquire) != null) {
+                            kitLayerVstiNoteOff(engine, ev.instrument, l, ev.pitch);
+                        }
+                        continue;
+                    }
+                    if (engine.kitSynth(ev.instrument, l)) |ks| synth.noteOff(ks, ev.pitch);
+                }
                 // 类型刚切走的边角：synth 池也发一份（空转无害）
                 synth.noteOff(&engine.synths[ev.instrument], ev.pitch);
             } else {
@@ -1048,8 +1191,28 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
             // 鼓组：逐层渲染叠加进同一通道缓冲（整组走同一调音台链）
             const n_layers = @min(params.kit_layer_count[i].load(.monotonic), kit_max_layers);
             for (0..n_layers) |l| {
-                const lp = params.kit_layer_params[i][l].load(.monotonic) orelse continue;
                 const lg = params.kit_layer_gain[i][l].load(.monotonic);
+                if (params.kit_layer_kind[i][l].load(.monotonic) == 2) {
+                    // VST3 层：中转缓冲 → 增益 × 等功率平衡 → 叠加（同乐器级 VSTi；
+                    // 音符级声像不适用——插件只收音高/力度，声像 = 乐器声像平衡）
+                    const pl = params.kit_layer_plugin[i][l].load(.acquire) orelse continue;
+                    const st = kitVstiState(engine, i) orelse continue;
+                    if (engine.vsti_scratch.len < n) continue;
+                    // state 恢复防挂音（UI 置旗标）：本段先全 128 补 off
+                    if (params.kit_layer_panic[i][l].swap(false, .acq_rel)) kitLayerVstiPanic(engine, i, l);
+                    const sc = engine.vsti_scratch[0..n];
+                    @memset(sc, 0);
+                    pl.processInstrument(sc, frames, st.evts[l].events[0..st.evts[l].n], host_time);
+                    st.evts[l].n = 0;
+                    const bg = balanceGains(params.instrument_pan[i].load(.monotonic));
+                    var k2: usize = 0;
+                    while (k2 < n) : (k2 += 2) {
+                        cbuf[k2] += sc[k2] * g * lg * bg[0];
+                        cbuf[k2 + 1] += sc[k2 + 1] * g * lg * bg[1];
+                    }
+                    continue;
+                }
+                const lp = params.kit_layer_params[i][l].load(.monotonic) orelse continue;
                 const ks = engine.kitSynth(i, l) orelse continue;
                 synth.render(lp, ks, cbuf, frames, sr, g * lg, true);
             }
