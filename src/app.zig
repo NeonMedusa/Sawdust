@@ -12,6 +12,9 @@ const sequencer = @import("sequencer.zig");
 const persist = @import("persist.zig");
 const ivstevents = @import("zig_vst3").pluginterfaces.vst.ivstevents;
 const midi = @import("midi.zig");
+const miniaudio = @cImport({
+    @cInclude("miniaudio.h");
+});
 const eq = @import("eq.zig");
 const fx = @import("effects.zig");
 const plugin_db = @import("plugin_db.zig");
@@ -22,6 +25,7 @@ const wav = @import("wav.zig"); // 导出音频（24-bit PCM WAV 写出器）
 pub const Clip = model.Clip;
 pub const Note = model.Note;
 pub const Instrument = model.Instrument;
+
 pub const NoteHitMode = model.NoteHitMode;
 
 /// 界面布局（可调参数，持久状态）
@@ -29,6 +33,15 @@ pub const Layout = struct {
     left_w: i32 = 0,
     mid_w: i32 = 0,
     initialized: bool = false,
+    /// 三栏区域几何（每帧布局时写回；拖入文件的区域命中用）
+    body_y: i32 = 0,
+    body_h: i32 = 0,
+    /// 播放列表面板矩形（x/w）——与绘制同一套坐标（避免两处漂移）
+    playlist_x: i32 = 0,
+    playlist_w: i32 = 0,
+    /// 样式面板矩形（x/w）
+    patterns_x: i32 = 0,
+    patterns_w: i32 = 0,
 
     pub fn initIfNeeded(self: *Layout, total_w: i32) void {
         if (self.initialized) return;
@@ -75,6 +88,74 @@ pub const BatchSnap = struct { step: i32, len: i32, pitch: i32, offset: i32 = 0 
 /// 存音符/片段/乐器/样式数/全局设置。
 /// 乐器恢复的指针安全：数量相同 → **原位更新**（指针身份不变，音频线程安全）；
 /// 数量不同 → 重建（旧指针进退役列表——**不释放**，防音频线程 use-after-free）。
+/// 音频资产（会话态；解码结果 + 波形峰值。工程切换时在**设备暂停窗口**统一释放）
+pub const AudioAsset = struct {
+    /// 绝对路径（加载时记录）
+    path: []u8,
+    /// 不可变采样数据（发布给音频线程的指针来源；本结构不移动）
+    data: audio.SampleData,
+    /// 波形峰值分桶（混合声道 min/max；UI 绘制用）
+    peaks: []Peak,
+    /// 每桶帧数
+    peak_frames: u32,
+
+    pub const Peak = struct { min: f32, max: f32 };
+};
+
+/// 音频样式（编号 = 下标；与音符样式对称：**通道/增益共享给全部片段实例**）
+pub const AudioStyle = struct {
+    name: []u8,
+    /// 绝对路径（会话态；存档转相对工程目录）
+    path: []u8,
+    /// 资产下标（`audio_assets`；-1 = 未加载/失败）
+    asset: i32 = -1,
+    channel: i32 = 0,
+    gain: f32 = 1.0,
+    /// 播放速度（1 = 原速；v1 变速变调）
+    speed: f32 = 1.0,
+};
+
+/// 退役中的音频播放表（音频线程可能仍在读旧指针；帧末倒计时后释放）
+pub const RetiredAudioTable = struct { tbl: *const audio.AudioTable, countdown: u8 };
+
+/// 波形窗口试听（UI 侧状态；音频线程经 `Params.preview_*` 播放并回写游标）
+pub const PreviewState = struct {
+    asset: i32 = -1,
+    channel: u16 = 0,
+    gain: f32 = 1.0,
+    pos: i32 = -1,
+    playing: bool = false,
+    /// 用户意图（播放中或暂停中）；**暂停/停止时不从音频线程回读游标**（否则暂停按钮
+    /// 永远弹不回播放——实测 bug：音频线程仍报 ≥0 的暂停点）
+    active: bool = false,
+    /// 拖拽定位中（松手才真正跳转；拖拽期间音频照旧播、不回读游标）
+    seeking: bool = false,
+};
+
+/// 音频资产解码目标采样率（引擎采样率未知时兜底——实际以 `params.sample_rate` 为准）
+const audio_fallback_rate = 48000;
+
+/// 波形窗口（音频片段 / 鼓组采样器层：同一面板，见 `docs/audio-files.md` §7）
+/// 波形窗口目标：鼓组采样器层
+pub const WaveLayerRef = struct { instrument: i32, pitch: u8, layer: usize };
+
+pub const WaveWindow = struct {
+    open: bool = false,
+    x: i32 = 420,
+    y: i32 = 150,
+    w: i32 = 580,
+    h: i32 = 260,
+    z: i32 = 25,
+    grab_dx: i32 = 0,
+    grab_dy: i32 = 0,
+    /// 目标：音频片段下标（互斥于 layer）
+    clip: ?usize = null,
+    /// 目标：鼓组采样器层
+    layer: ?WaveLayerRef = null,
+    /// 目标：音频样式（双击样式列表的“♪”行；只是展示/试听——trim 以片段为准）
+    style: ?usize = null,
+};
+
 pub const HistoryState = struct {
     /// 操作名（如“放置音符”；堆分配，由 App 管理生命周期）
     label: []u8,
@@ -84,6 +165,8 @@ pub const HistoryState = struct {
     instruments: []persist.SavedInstrument,
     /// 调音台通道快照（含效果链；条数 = 快照时的通道数）
     mixer: []persist.SavedMixerChannel,
+    /// 音频样式快照（绝对路径；下标 = 片段 `audio_style` 引用）
+    audio_styles: []persist.SavedAudioStyle,
     /// 样式名字快照（每项堆分配；长度 = 样式数）——重命名/增删样式也要能撤销
     /// （只存 `pattern_count` 不够：`resetPatterns` 会重建默认名，自定义名丢失）
     pattern_names: [][]u8,
@@ -320,9 +403,9 @@ pub const Selection = struct {
     track: i32 = 0,
     /// 当前编辑的乐器（钢琴卷帘归属；0 起，-1 = 无）
     instrument: i32 = 0,
-    /// SONG（播放全曲）还是 PAT（播放当前样式）——默认 PAT（启动/打开工程时；
-    /// 点播放列表标尺会自动切回 SONG）
-    song_mode: bool = false,
+    /// SONG（播放全曲）还是 PAT（播放当前样式）——**默认 SONG**（用户拍板；
+    /// 点音符样式/钢琴卷帘会自动切到 PAT 编辑视图）
+    song_mode: bool = true,
 };
 
 /// 播放列表视图状态
@@ -346,6 +429,14 @@ pub const PlaylistState = struct {
     /// 可见行数快照（视图每帧写入；行轴无限延伸——悬空时视口下方的行也是真行）。
     /// 供右键菜单/重命名等边界守卫读用（滚动越出地图后行号可以超出推导跨度）
     view_rows: i32 = 128,
+    /// 轨道内容区几何（每帧绘制写回；拖入文件的落点换算用）
+    geom: struct {
+        lane_x: i32 = 0,
+        tracks_y: i32 = 0,
+        view_w: i32 = 0,
+        tracks_h: i32 = 0,
+        track_h: i32 = 1,
+    } = .{},
     /// 横向缩放（屏幕像素 / 内容像素）
     zoom: f32 = 1.0,
     /// **缩放补间目标**（Ctrl+滚轮只设目标；`zoom` 逐帧平滑逼近——滚轮离散跳变生硬）
@@ -382,6 +473,8 @@ pub const PlaylistState = struct {
     /// 增量式拉伸以它为锚（长度 = 原长 + k×格；`model.trimLenByGrid`）
     resize_orig_start: i32 = 0,
     resize_orig_len: i32 = 0,
+    /// 拉伸基准：原采样内起点（音频片段左缘拉伸用；按下时快照）
+    resize_orig_trim: i32 = 0,
     /// 按下时的鼠标内容步——拉伸位移（delta）的基准
     resize_down_step: i32 = 0,
     /// 拖动死区（像素）：按下后位移超过 3px 才真正编辑——
@@ -627,7 +720,7 @@ pub const Playback = struct {
 /// 交互：字符追加；退格删末尾一个 code point；回车 = 提交；ESC = 取消；
 /// 点击输入框外 = 提交（吞掉该次点击）。
 pub const TextInput = struct {
-    pub const Target = enum { instrument, mixer_channel, pattern, track, preset_name, kit_pad_name, preset_rename, preset_search };
+    pub const Target = enum { instrument, mixer_channel, pattern, track, preset_name, kit_pad_name, preset_rename, preset_search, audio_style };
 
     active: bool = false,
     target: Target = .instrument,
@@ -688,10 +781,19 @@ pub const SoundingPitches = struct {
 pub const PanelsState = struct {
     history_scroll: i32 = 0,
     pattern_scroll: i32 = 0,
+    /// 音频样式列表独立滚动位置（与音符样式分开）
+    audio_scroll: i32 = 0,
+    /// 样式面板当前页：false = 音符样式 / true = 音频样式
+    /// （**两家族分家**：SONG/PAT/钢琴窗只看 `sel.pattern`，音频样式保持双击开采样器）
+    patterns_tab_audio: bool = false,
     /// 历史栏：上次跟随的当前条目（**变化时才自动滚动**——否则用户无法手动滚动查看）
     history_follow: usize = 0,
     /// 样式右键菜单：目标样式序号（null = 未展开）
     ctx_pattern: ?usize = null,
+    /// 音频样式右键菜单：目标序号（null = 未展开）
+    ctx_audio_style: ?usize = null,
+    ctx_aud_x: i32 = 0,
+    ctx_aud_y: i32 = 0,
     /// 样式右键菜单位置（**打开时快照**——不跟鼠标跑，否则永远点不到）
     ctx_pat_x: i32 = 0,
     ctx_pat_y: i32 = 0,
@@ -963,6 +1065,11 @@ pub const ExportWav = struct {
     step_frames: u64,
     total_frames: u64,
     done: u64,
+    /// 导出诊断：已渲染块数 / 开始时的派发事件计数
+    blocks: u64 = 0,
+    dbg0: u64 = 0,
+    /// 导出日志（纯文本；完成时写成 `<wav>.log`——现场排障用）
+    log_buf: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 },
     /// 开始时间（纳秒；预留剩余时间估算）
     t0_ns: i64,
     /// 取消请求（对话框按钮 / Esc 置位；下一帧步进时清理）
@@ -1175,6 +1282,30 @@ pub const App = struct {
     kit_reset: bool = false,
     /// 鼓组池删除位移日志（removeInstrument 记录 idx；帧末按序重放左移）
     kit_shift_log: std.ArrayListUnmanaged(usize) = .{ .items = &.{}, .capacity = 0 },
+    /// 音频资产池（会话存活；工程切换时统一释放）
+    audio_assets: std.ArrayListUnmanaged(AudioAsset) = .{ .items = &.{}, .capacity = 0 },
+    /// 音频样式（片段共享的通道/增益）
+    audio_styles: std.ArrayListUnmanaged(AudioStyle) = .{ .items = &.{}, .capacity = 0 },
+    /// 播放表重建用的复用缓冲（逐帧重新计算；容量保留）
+    audio_scratch: std.ArrayListUnmanaged(audio.AudioTableRow) = .{ .items = &.{}, .capacity = 0 },
+    /// 退役中的旧播放表（倒计时回收；见 `reapRetiredAudioTables`）
+    audio_tables_retired: std.ArrayListUnmanaged(RetiredAudioTable) = .{ .items = &.{}, .capacity = 0 },
+    /// 波形窗口试听（全局单实例）
+    preview: PreviewState = .{},
+    /// 主输出电平表（帧末 pollOutMeter 更新）：当前峰值 / 回落保持值
+    out_peak: f32 = 0,
+    out_peak_hold: f32 = 0,
+    /// 削波（|x|>1）采样数保持计数（>0 时状态栏显示"过载"；以后波形标红复用）
+    out_over_hold: u32 = 0,
+    /// 选中待放置的音频样式（♪ 行单击选中；-1 = 未选）
+    audio_style_sel: i32 = -1,
+    /// 波形窗口“样式模式”的占位 trim（无片段上下文；不可编辑）
+    wave_trim_dummy: [2]i32 = .{ 0, 0 },
+    /// 基准目录（打开工程时设置；相对音频路径按它解析）
+    base_dir: [1024]u8 = [_]u8{0} ** 1024,
+    base_dir_len: usize = 0,
+    /// 待处理的“加载采样”（鼓垫层）——文件对话框在 main 帧初执行
+    pending_load_sample: ?struct { instrument: i32, pitch: u8, layer: ?usize } = null,
     /// 编辑器打开计数（上一帧）——从 N 变 N-1 = 有人关窗 → 手势结束（钉值）
     editors_open_prev: usize = 0,
 
@@ -1291,6 +1422,8 @@ pub const App = struct {
     mixer_win: MixerWindow = .{},
     effect_win: EffectWindow = .{},
     help_win: HelpWindow = .{},
+    /// 波形窗口（音频片段 / 鼓组采样器层）
+    wave_win: WaveWindow = .{},
     settings_win: SettingsWindow = .{},
     plugin_mgr: PluginMgrWindow = .{},
     /// 本帧浮动窗口的**绘制顺序与最终矩形**（`main.drawApp` 逐帧填写；与绘制严格同序：
@@ -2041,6 +2174,14 @@ pub const App = struct {
                         layers[li].plugin_state_ctrl = self.adoptStateB64(try b64Encode(self.allocator, if (layer.pending_state_ctrl) |b| b else &.{}), pooled);
                     }
                 }
+                if (layer.kind == .sampler) {
+                    var rel_buf2: [1024]u8 = undefined;
+                    const sp2 = self.audioPathForSave(layer.assetPath(), &rel_buf2);
+                    if (sp2.len > 0) layers[li].asset_path = try self.allocator.dupe(u8, sp2);
+                    layers[li].trim_start = layer.trim_start;
+                    layers[li].trim_len = layer.trim_len;
+                    layers[li].speed = layer.speed;
+                }
                 nl += 1;
                 flat += 1;
             }
@@ -2059,6 +2200,7 @@ pub const App = struct {
         self.allocator.free(ly.source_preset);
         if (ly.plugin_path.len > 0) self.allocator.free(ly.plugin_path);
         if (ly.plugin_cid.len > 0) self.allocator.free(ly.plugin_cid);
+        if (ly.asset_path.len > 0) self.allocator.free(ly.asset_path);
         if (ly.plugin_state.len > 0) {
             if (pooled) self.state_pool.release(self.allocator, ly.plugin_state) else self.allocator.free(ly.plugin_state);
         }
@@ -2209,6 +2351,16 @@ pub const App = struct {
                 // 未知类型（未来存档）→ 退回减法（现阶段可用引擎；参数照常载入）
                 const kind = std.enums.fromInt(model.LayerKind, sl.kind) orelse model.LayerKind.subtractive;
                 var layer = model.DrumLayer{ .kind = kind, .params = lp, .gain = sl.gain, .source_preset = src };
+                if (kind == .sampler) {
+                    var path_buf2: [1024]u8 = undefined;
+                    const resolved = self.resolveAudioPath(sl.asset_path, &path_buf2) orelse sl.asset_path;
+                    layer.setAssetPath(resolved);
+                    layer.asset_idx = self.loadAudioAsset(resolved) orelse -1;
+                    layer.load_failed = layer.asset_idx < 0;
+                    layer.trim_start = sl.trim_start;
+                    layer.trim_len = sl.trim_len;
+                    layer.speed = if (sl.speed > 0) sl.speed else 1.0;
+                }
                 if (kind == .vst3) {
                     layer.setPluginPath(sl.plugin_path);
                     layer.setPluginCid(sl.plugin_cid);
@@ -2705,6 +2857,608 @@ pub const App = struct {
         }
     }
 
+    // ── 音频资产 / 样式 / 片段 / 播放表（见 `docs/audio-files.md`）──
+
+    /// 当前 BPM/拍号下的**每步帧数**（音频片段 trim ↔ 步换算用）
+    pub fn framesPerStep(self: *const App) u64 {
+        const sr: u64 = if (self.params.sample_rate > 0) @intCast(self.params.sample_rate) else audio_fallback_rate;
+        const bpm2: u64 = @max(20, @as(u64, @intCast(std.math.clamp(self.bpm, 20, 999))));
+        const spb2: u64 = @intCast(@max(1, model.stepsPerBeat(self.time_den)));
+        return @max(1, sr * 60 / (bpm2 * spb2));
+    }
+
+    /// 设置基准目录（打开工程时从文件路径取父目录；相对音频路径按它解析）
+    pub fn setBaseDirFromPath(self: *App, path: []const u8) void {
+        const dir = std.fs.path.dirname(path) orelse "";
+        const n = @min(dir.len, self.base_dir.len);
+        @memcpy(self.base_dir[0..n], dir[0..n]);
+        self.base_dir_len = n;
+    }
+
+    /// 存档内的音频路径 → 实际路径（绝对路径原样返回；相对路径拼基准目录）。
+    /// 返回 null = 无法解析（空路径）。
+    pub fn resolveAudioPath(self: *const App, stored: []const u8, buf: []u8) ?[]const u8 {
+        if (stored.len == 0) return null;
+        const is_abs = if (stored.len >= 2 and stored[1] == ':') true else (stored[0] == '/' or stored[0] == '\\');
+        if (is_abs) return stored;
+        const base = self.base_dir[0..self.base_dir_len];
+        if (base.len == 0) return stored;
+        return std.fmt.bufPrint(buf, "{s}{c}{s}", .{ base, std.fs.path.sep, stored }) catch null;
+    }
+
+    /// 保存时的音频路径：在基准目录内 → 相对路径（便携）；否则原样绝对
+    pub fn audioPathForSave(self: *const App, abs: []const u8, buf: []u8) []const u8 {
+        _ = buf;
+        const base = self.base_dir[0..self.base_dir_len];
+        if (base.len == 0) return abs;
+        if (std.mem.startsWith(u8, abs, base) and abs.len > base.len + 1 and
+            (abs[base.len] == '\\' or abs[base.len] == '/'))
+        {
+            return abs[base.len + 1 ..];
+        }
+        return abs;
+    }
+
+    pub fn findAssetByPath(self: *const App, path: []const u8) ?usize {
+        for (self.audio_assets.items, 0..) |*asset, i| {
+            if (std.mem.eql(u8, asset.path, path)) return i;
+        }
+        return null;
+    }
+
+    /// 解码音频文件进资产池（按路径去重；f32 立体声@**文件原生率**）。
+    /// 失败/超限 → null；上限 = 30 分钟（v1 整文件进内存）。
+    ///
+    /// **P1 提速**：解码时**不重采样**（省一遍全量 SRC）；移动平均峰值
+    /// **与解码合并成一遍**（桶大于 32 帧时只取 16 个等距点估计包络——
+    /// 只影响显示精度，不影响声音）。播放侧靠 `SampleData.ratio` 换算采样帧。
+    pub fn loadAudioAsset(self: *App, path: []const u8) ?i32 {
+        if (path.len == 0) return null;
+        if (self.findAssetByPath(path)) |i| return @intCast(i);
+        const a = self.allocator;
+        // 宽字符路径（中文路径必须——同 VST3 加载的坑）
+        var wbuf: [1024]u16 = undefined;
+        const wbuf_out = std.unicode.utf8ToUtf16Le(&wbuf, path) catch return null;
+        if (wbuf_out + 1 > wbuf.len) return null;
+        wbuf[wbuf_out] = 0;
+        const eng_sr: u32 = if (self.params.sample_rate > 0) @intCast(self.params.sample_rate) else audio_fallback_rate;
+        // 采样率传 0 = 不重采样（原生率直出）
+        const cfg = miniaudio.ma_decoder_config_init(miniaudio.ma_format_f32, 2, 0);
+        var dec: miniaudio.ma_decoder = undefined;
+        if (miniaudio.ma_decoder_init_file_w(@ptrCast(&wbuf[0]), &cfg, &dec) != miniaudio.MA_SUCCESS) return null;
+        defer _ = miniaudio.ma_decoder_uninit(&dec);
+        var native_sr: miniaudio.ma_uint32 = eng_sr;
+        var ch_out: miniaudio.ma_uint32 = 2;
+        var fmt_out: miniaudio.ma_format = miniaudio.ma_format_f32;
+        if (miniaudio.ma_decoder_get_data_format(&dec, &fmt_out, &ch_out, &native_sr, null, 0) != miniaudio.MA_SUCCESS) return null;
+        if (native_sr == 0) native_sr = eng_sr;
+        var total: miniaudio.ma_uint64 = 0;
+        if (miniaudio.ma_decoder_get_length_in_pcm_frames(&dec, &total) != miniaudio.MA_SUCCESS) return null;
+        const max_frames: u64 = @as(u64, native_sr) * 60 * 30;
+        if (total == 0 or total > max_frames) return null;
+        const nframes: usize = @intCast(total);
+        const frames = a.alloc(f32, nframes * 2) catch return null;
+        errdefer a.free(frames);
+        // 峰值：桶大小先算（目标 ~4096 桶；桶大时抽样——与解码单遍完成）
+        const bucket: usize = @max(1, nframes / 4096);
+        const npeaks: usize = (nframes + bucket - 1) / bucket;
+        const peaks = a.alloc(AudioAsset.Peak, npeaks) catch {
+            a.free(frames);
+            return null;
+        };
+        errdefer a.free(peaks);
+        const stride: usize = if (bucket > 32) @max(1, bucket / 16) else 1;
+        var got_total: usize = 0;
+        while (got_total < nframes) {
+            var got: miniaudio.ma_uint64 = 0;
+            const want: miniaudio.ma_uint64 = @intCast(nframes - got_total);
+            if (miniaudio.ma_decoder_read_pcm_frames(&dec, frames.ptr + got_total * 2, want, &got) != miniaudio.MA_SUCCESS) break;
+            if (got == 0) break;
+            // 本块新帧的峰值（单遍；跨块桶用“先到先算”近似——桶与块边界很小的误差可接受）
+            const s0 = got_total;
+            const s1 = got_total + @as(usize, @intCast(got));
+            var pi = s0 / bucket;
+            while (pi < npeaks and pi * bucket < s1) : (pi += 1) {
+                const b0 = @max(s0, pi * bucket);
+                const b1 = @min(s1, (pi + 1) * bucket);
+                if (b1 <= b0) continue;
+                var mn: f32 = 1;
+                var mx: f32 = -1;
+                var fi = b0;
+                while (fi < b1) : (fi += stride) {
+                    const m = (frames[fi * 2] + frames[fi * 2 + 1]) * 0.5;
+                    mn = @min(mn, m);
+                    mx = @max(mx, m);
+                }
+                if (mn > mx) {
+                    mn = 0;
+                    mx = 0;
+                }
+                if (b0 == pi * bucket) {
+                    peaks[pi] = .{ .min = mn, .max = mx };
+                } else { // 跨块桶：取更宽的包络
+                    peaks[pi] = .{ .min = @min(peaks[pi].min, mn), .max = @max(peaks[pi].max, mx) };
+                }
+            }
+            got_total = s1;
+        }
+        if (got_total == 0) return null;
+        // 未解码到的尾部桶：置零
+        var pz = got_total / bucket;
+        while (pz < npeaks) : (pz += 1) peaks[pz] = .{ .min = 0, .max = 0 };
+        const path_dup = a.dupe(u8, path) catch {
+            a.free(frames);
+            a.free(peaks);
+            return null;
+        };
+        errdefer a.free(path_dup);
+        self.audio_assets.append(a, .{
+            .path = path_dup,
+            .data = .{ .frames = frames, .frame_count = got_total, .ratio = @floatCast(@as(f64, @floatFromInt(native_sr)) / @as(f64, @floatFromInt(eng_sr))) },
+            .peaks = peaks,
+            .peak_frames = @intCast(bucket),
+        }) catch {
+            a.free(path_dup);
+            a.free(frames);
+            a.free(peaks);
+            return null;
+        };
+        return @intCast(self.audio_assets.items.len - 1);
+    }
+
+    /// 释放全部资产（**契约：先暂停设备**——音频线程可能正在读；工程切换/退出时用）
+    pub fn resetAudioAssets(self: *App) void {
+        for (self.audio_assets.items) |*asset| {
+            self.allocator.free(asset.path);
+            if (asset.data.frames.len > 0) self.allocator.free(asset.data.frames);
+            if (asset.peaks.len > 0) self.allocator.free(asset.peaks);
+        }
+        self.audio_assets.deinit(self.allocator);
+        self.audio_assets = .{ .items = &.{}, .capacity = 0 };
+        self.params.preview_asset.store(null, .release);
+        self.preview = .{};
+    }
+
+    pub fn audioStyleFindByPath(self: *const App, path: []const u8) ?usize {
+        for (self.audio_styles.items, 0..) |*st, i| {
+            if (std.mem.eql(u8, st.path, path)) return i;
+        }
+        return null;
+    }
+
+    /// 新建音频样式（同路径去重；名称缺省 = 文件名）
+    pub fn audioStyleAdd(self: *App, path: []const u8, name: []const u8) ?i32 {
+        if (self.audioStyleFindByPath(path)) |i| return @intCast(i);
+        const a = self.allocator;
+        const nm = if (name.len > 0) name else std.fs.path.basename(path);
+        const nd = a.dupe(u8, nm) catch return null;
+        const pd = a.dupe(u8, path) catch {
+            a.free(nd);
+            return null;
+        };
+        const ai = self.loadAudioAsset(path) orelse -1;
+        self.audio_styles.append(a, .{ .name = nd, .path = pd, .asset = ai, .channel = 0, .gain = 1.0 }) catch {
+            a.free(nd);
+            a.free(pd);
+            return null;
+        };
+        return @intCast(self.audio_styles.items.len - 1);
+    }
+
+    /// 样式 → 资产（无效 → null）
+    pub fn audioStyleAsset(self: *const App, style: usize) ?*AudioAsset {
+        if (style >= self.audio_styles.items.len) return null;
+        const si = self.audio_styles.items[style].asset;
+        if (si < 0 or si >= @as(i32, @intCast(self.audio_assets.items.len))) return null;
+        return &self.audio_assets.items[@intCast(si)];
+    }
+
+/// 删除音频样式后**修正所有索引引用**：引用它的片段一并删除（与音符样式删除同语义），
+/// 更大的索引前移；选择/波形窗口/右键菜单同步跟随。返回被连带删除的片段数。
+fn remapAudioStyleRefs(self: *App, removed: i32) usize {
+    var dropped: usize = 0;
+    var i: usize = 0;
+    while (i < self.clips.items.len) {
+        const c = &self.clips.items[i];
+        if (c.audio_style == removed) {
+            _ = self.clips.swapRemove(i);
+            dropped += 1;
+            continue;
+        }
+        if (c.audio_style > removed) c.audio_style -= 1;
+        i += 1;
+    }
+    if (self.audio_style_sel == removed) {
+        self.audio_style_sel = -1;
+    } else if (self.audio_style_sel > removed) {
+        self.audio_style_sel -= 1;
+    }
+    if (self.panels.ctx_audio_style) |s| {
+        if (s == removed) {
+            self.panels.ctx_audio_style = null;
+        } else if (s > removed) {
+            self.panels.ctx_audio_style = s - 1;
+        }
+    }
+    if (self.wave_win.open) {
+        if (self.wave_win.style) |s| {
+            if (s == removed) {
+                self.wave_win.open = false; // 正看着被删的样式 → 关闭
+            } else if (s > removed) {
+                self.wave_win.style = s - 1;
+            }
+        }
+        if (self.wave_win.clip != null) self.wave_win.open = false; // 片段下标会移位：直接关
+    }
+    return dropped;
+}
+
+/// 删除音频样式（**顺序删除**以保持索引语义；连带删除引用它的片段）。
+/// 返回连带删除的片段数（>=0）；越界返回 null。调用方负责 commitHistory。
+pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
+    if (idx >= self.audio_styles.items.len) return null;
+    const st = self.audio_styles.items[idx];
+    _ = self.audio_styles.orderedRemove(idx);
+    self.allocator.free(st.name);
+    self.allocator.free(st.path);
+    const dropped = self.remapAudioStyleRefs(@intCast(idx));
+    self.dirty = true;
+    return dropped;
+}
+
+    /// 片段 → 资产（音频片段有效 → 资产的采样数据）
+    pub fn clipAudioData(self: *const App, c: model.Clip) ?*const audio.SampleData {
+        if (!c.isAudio()) return null;
+        const asset = self.audioStyleAsset(@intCast(c.audio_style)) orelse return null;
+        return &asset.data;
+    }
+
+    /// 在播放列表放入一个音频片段（自然时长按当前 BPM 折算；v1 不变速）
+    pub fn audioClipAdd(self: *App, style_idx: i32, track: i32, start: i32) ?usize {
+        if (style_idx < 0 or style_idx >= @as(i32, @intCast(self.audio_styles.items.len))) return null;
+        var steps: i32 = 4;
+        if (self.audioStyleAsset(@intCast(style_idx))) |asset| {
+            const sr: u64 = if (self.params.sample_rate > 0) self.params.sample_rate else audio_fallback_rate;
+            const bpm2: u64 = @max(20, @as(u64, @intCast(std.math.clamp(self.bpm, 20, 999))));
+            const spb2: u64 = @intCast(@max(1, model.stepsPerBeat(self.time_den)));
+            const step_frames: u64 = @max(1, sr * 60 / (bpm2 * spb2));
+            const fr: u64 = asset.data.engFrames();
+            steps = @intCast(@max(1, fr / step_frames));
+        }
+        self.addClip(.{
+            .track = track,
+            .start = @max(0, start),
+            .len = steps,
+            .pattern = 0,
+            .audio_style = style_idx,
+        });
+        return self.clips.items.len - 1;
+    }
+
+    /// 帧末：重建并发布音频片段播放表（脏才重建；旧表退役倒计时）
+    /// 帧末：重建并发布音频片段播放表。
+    ///
+    /// **每帧重新计算 + 逐字段比对，内容变了才发布**（不做脏标门控）——
+    /// 历史的脏标复用曾经漏置/提前消费，导致“拖入后首次不响、动一下片段或切
+    /// PAT/SONG 才响”（实测 bug）。行数很少，逐帧比对成本可忽略；顺带能捕捉
+    /// **资产列表扩容后指针失效**（指针变了 → 重发）。
+    pub fn rebuildAudioTable(self: *App) void {
+        const a = self.allocator;
+        self.reapRetiredAudioTables();
+        // 目标行：PAT 模式恒为空（音频片段只在 SONG 模式发声——用户拍板）
+        self.audio_scratch.clearRetainingCapacity();
+        if (self.sel.song_mode) {
+            for (self.clips.items) |c| {
+                if (!c.isAudio()) continue;
+                // **跟随轨道静音开关**（与音符片段同语义：静音轨道的片段整段不发声）
+                if (c.track >= 0 and self.trackMuted(@intCast(c.track))) continue;
+                if (c.audio_style < 0 or c.audio_style >= @as(i32, @intCast(self.audio_styles.items.len))) continue;
+                const asset = self.audioStyleAsset(@intCast(c.audio_style)) orelse continue;
+                const st = self.audio_styles.items[@intCast(c.audio_style)];
+                self.audio_scratch.append(a, .{
+                    .start = c.start,
+                    .len = c.len,
+                    .asset = &asset.data,
+                    .trim_start = c.trim_start,
+                    .trim_len = c.trim_len,
+                    .channel = @intCast(std.math.clamp(st.channel, 0, 65535)),
+                    .gain = st.gain,
+                    .speed = st.speed,
+                }) catch return; // OOM：保留旧表，下帧重试
+            }
+        }
+        // 与已发布表逐字段比对（结构体有 padding，不能用 mem.eql）
+        var same = false;
+        if (self.params.audio_table.load(.acquire)) |cur| {
+            same = cur.rows.len == self.audio_scratch.items.len;
+            if (same) {
+                for (cur.rows, self.audio_scratch.items) |x, y| {
+                    if (x.start != y.start or x.len != y.len or x.asset != y.asset or
+                        x.trim_start != y.trim_start or x.trim_len != y.trim_len or
+                        x.channel != y.channel or x.gain != y.gain or x.speed != y.speed)
+                    {
+                        same = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if (same) {
+            return;
+        }
+        const tbl = a.create(audio.AudioTable) catch return;
+        tbl.* = .{ .rows = a.dupe(audio.AudioTableRow, self.audio_scratch.items) catch {
+            a.destroy(tbl);
+            return;
+        } };
+        if (self.params.audio_table.swap(tbl, .acq_rel)) |old| {
+            self.audio_tables_retired.append(a, .{ .tbl = old, .countdown = 3 }) catch {
+                if (old.rows.len > 0) a.free(@constCast(old.rows));
+                a.destroy(@constCast(old));
+            };
+        }
+    }
+
+    fn reapRetiredAudioTables(self: *App) void {
+        var i: usize = 0;
+        while (i < self.audio_tables_retired.items.len) {
+            const r = &self.audio_tables_retired.items[i];
+            if (r.countdown == 0) {
+                if (r.tbl.rows.len > 0) self.allocator.free(@constCast(r.tbl.rows));
+                self.allocator.destroy(@constCast(r.tbl));
+                _ = self.audio_tables_retired.swapRemove(i);
+            } else {
+                r.countdown -= 1;
+                i += 1;
+            }
+        }
+    }
+
+    /// 释放全部播放表（退出时；需先停音频）
+    fn deinitAudioTables(self: *App) void {
+        if (self.params.audio_table.swap(null, .acq_rel)) |tbl| {
+            if (tbl.rows.len > 0) self.allocator.free(@constCast(tbl.rows));
+            self.allocator.destroy(@constCast(tbl));
+        }
+        var i: usize = 0;
+        while (i < self.audio_tables_retired.items.len) : (i += 1) {
+            const r = self.audio_tables_retired.items[i];
+            if (r.tbl.rows.len > 0) self.allocator.free(r.tbl.rows);
+            self.allocator.destroy(r.tbl);
+        }
+        self.audio_tables_retired.deinit(self.allocator);
+        self.audio_tables_retired = .{ .items = &.{}, .capacity = 0 };
+        self.audio_scratch.deinit(self.allocator);
+        self.audio_scratch = .{ .items = &.{}, .capacity = 0 };
+    }
+
+    /// 采样器层：资产指针（声部渲染用）
+    pub fn kitLayerAssetData(self: *const App, ly: *const model.DrumLayer) ?*const audio.SampleData {
+        if (ly.asset_idx < 0 or ly.asset_idx >= @as(i32, @intCast(self.audio_assets.items.len))) return null;
+        return &self.audio_assets.items[@intCast(ly.asset_idx)].data;
+    }
+
+    /// 添加 **采样器层**（一次性原速；v1 不跟随音高）。返回是否成功。
+    pub fn kitLayerAddSampler(self: *App, inst_idx: i32, pitch: u8, path: []const u8) bool {
+        if (inst_idx < 0 or inst_idx >= @as(i32, @intCast(self.instruments.items.len))) return false;
+        const inst = &self.instruments.items[@intCast(inst_idx)];
+        const kit0 = inst.kit orelse return false;
+        if (kit0.totalLayers() >= @import("audio.zig").kit_max_layers) return false;
+        const pad = self.kitPadEnsure(inst_idx, pitch) orelse return false;
+        const lp = self.allocator.create(synth.SynthParams) catch return false;
+        lp.* = .{};
+        const src: []u8 = self.allocator.dupe(u8, std.fs.path.basename(path)) catch &.{};
+        var layer = model.DrumLayer{ .kind = .sampler, .params = lp, .gain = 1.0, .source_preset = src };
+        layer.setAssetPath(path);
+        layer.asset_idx = self.loadAudioAsset(path) orelse -1;
+        layer.load_failed = layer.asset_idx < 0;
+        pad.layers.append(self.allocator, layer) catch {
+            self.retireSynth(lp);
+            self.allocator.free(src);
+            return false;
+        };
+        self.ensureKitSampler(@intCast(inst_idx));
+        self.dirty = true;
+        return true;
+    }
+
+    /// 给已有采样器层换采样（对话框结果）：重置 trim；返回是否加载成功
+    pub fn kitSamplerSetSample(self: *App, inst_idx: i32, pitch: u8, layer: usize, path: []const u8) bool {
+        const ly = self.kitLayerPtr(inst_idx, pitch, layer) orelse return false;
+        if (ly.kind != .sampler) return false;
+        ly.setAssetPath(path);
+        ly.asset_idx = self.loadAudioAsset(path) orelse -1;
+        ly.load_failed = ly.asset_idx < 0;
+        ly.trim_start = 0;
+        ly.trim_len = 0;
+        if (self.allocator.dupe(u8, std.fs.path.basename(path))) |nm| {
+            self.allocator.free(ly.source_preset);
+            ly.source_preset = nm;
+        } else |_| {}
+        self.dirty = true;
+        return ly.asset_idx >= 0;
+    }
+
+    /// 取/建某乐器的鼓组采样器层状态（惰性；契约：设备暂停窗口内——同 `ensureKitPool`）
+    pub fn ensureKitSampler(self: *App, i: usize) void {
+        if (i >= self.engine.kit_sampler.len) return;
+        if (self.engine.kit_sampler[i].load(.monotonic) != null) return;
+        if (i >= self.instruments.items.len) return;
+        const kit = self.instruments.items[i].kit orelse return;
+        var has = false;
+        outer: for (kit.pads.items) |pad| {
+            for (pad.layers.items) |ly| {
+                if (ly.kind == .sampler) {
+                    has = true;
+                    break :outer;
+                }
+            }
+        }
+        if (!has) return;
+        const ks = self.allocator.create(audio.KitSamplerState) catch return;
+        ks.* = .{};
+        self.engine.kit_sampler[i].store(ks, .release);
+    }
+
+    /// 打开音频**样式**波形窗口（双击样式列表的“♪”行；trim 不可编辑）
+    pub fn openWaveForStyle(self: *App, style: usize) void {
+        if (style >= self.audio_styles.items.len) return;
+        self.wave_win = .{ .open = true, .x = self.wave_win.x, .y = self.wave_win.y, .w = self.wave_win.w, .h = self.wave_win.h, .z = self.wave_win.z, .style = style };
+        self.bringToFront(&self.wave_win.z);
+    }
+
+    // ── 波形窗口试听（全局单实例；音频线程播放并回写游标）──
+
+    /// 打开音频片段波形窗口
+    pub fn openWaveForClip(self: *App, idx: usize) void {
+        if (idx >= self.clips.items.len or !self.clips.items[idx].isAudio()) return;
+        self.wave_win = .{ .open = true, .x = self.wave_win.x, .y = self.wave_win.y, .w = self.wave_win.w, .h = self.wave_win.h, .z = self.wave_win.z, .clip = idx };
+        self.bringToFront(&self.wave_win.z);
+    }
+
+    /// 打开鼓组采样器层波形窗口
+    pub fn openWaveForLayer(self: *App, inst_idx: i32, pitch: u8, layer: usize) void {
+        const ly = self.kitLayerPtr(inst_idx, pitch, layer) orelse return;
+        if (ly.kind != .sampler) return;
+        self.wave_win = .{ .open = true, .x = self.wave_win.x, .y = self.wave_win.y, .w = self.wave_win.w, .h = self.wave_win.h, .z = self.wave_win.z, .layer = .{ .instrument = inst_idx, .pitch = pitch, .layer = layer } };
+        self.bringToFront(&self.wave_win.z);
+    }
+
+    pub fn previewStart(self: *App, asset: i32, start: i32, len: i32, channel: i32, gain: f32, speed: f32) void {
+        if (asset < 0 or asset >= @as(i32, @intCast(self.audio_assets.items.len))) return;
+        const data = self.audio_assets.items[@intCast(asset)].data;
+        if (data.frame_count == 0) return;
+        const s = std.math.clamp(start, 0, @as(i32, @intCast(data.engFrames() - 1)));
+        self.preview = .{
+            .asset = asset,
+            .channel = @intCast(std.math.clamp(channel, 0, 65535)),
+            .gain = gain,
+            .active = true,
+            .pos = s,
+            .playing = true,
+        };
+        self.params.preview_asset.store(&self.audio_assets.items[@intCast(asset)].data, .release);
+        self.params.preview_start.store(s, .monotonic);
+        self.params.preview_len.store(len, .monotonic);
+        self.params.preview_gain.store(gain, .monotonic);
+        self.params.preview_speed.store(std.math.clamp(speed, 0.25, 4.0), .monotonic);
+        self.params.preview_channel.store(self.preview.channel, .monotonic);
+        self.params.preview_pos.store(s, .monotonic);
+        self.params.preview_playing.store(true, .monotonic);
+    }
+
+    pub fn previewStop(self: *App) void {
+        self.preview.playing = false;
+        self.preview.active = false;
+        self.preview.pos = 0; // 停止 = 游标归位开头（白线可见）
+        self.params.preview_playing.store(false, .monotonic);
+        self.params.preview_pos.store(-1, .monotonic);
+    }
+
+    /// 暂停试听：停播但**保留暂停点**（再按播放从该处继续）
+    pub fn previewPause(self: *App) void {
+        self.preview.playing = false;
+        self.preview.active = false;
+        self.params.preview_playing.store(false, .monotonic);
+    }
+
+    /// 音频样式速度（片段波形绘制/引擎共用）
+    pub fn audioStyleSpeed(self: *const App, clip: model.Clip) f32 {
+        if (clip.audio_style >= 0 and @as(usize, @intCast(clip.audio_style)) < self.audio_styles.items.len) return self.audio_styles.items[@intCast(clip.audio_style)].speed;
+        return 1.0;
+    }
+
+    /// 帧末：取回音频线程回写的试听游标
+    pub fn pollPreview(self: *App) void {
+        if (!self.preview.active or self.preview.seeking) return; // 暂停/停止/拖拽中：保留本地游标
+        const p = self.params.preview_pos.load(.monotonic);
+        if (p < 0) { // 音频线程自然播完 → **游标回到开头**（用户拍板）
+            self.preview.active = false;
+            self.preview.playing = false;
+            self.preview.pos = 0;
+            return;
+        }
+
+        self.preview.pos = p;
+    }
+    /// 帧末：取主输出峰值/削波计数（状态栏电平表；削波显示保持 ~0.5s）
+    pub fn pollOutMeter(self: *App) void {
+        const p = self.params.out_peak.load(.monotonic);
+        self.out_peak = p;
+        self.out_peak_hold = @max(self.out_peak_hold * 0.9, p);
+        const over = self.params.out_over.swap(0, .monotonic);
+        if (over > 0) {
+            self.out_over_hold = 30; // ≈0.5s @60fps
+        } else if (self.out_over_hold > 0) {
+            self.out_over_hold -= 1;
+        }
+    }
+
+    // ── 音频样式：历史/存档的导出导入 ──
+
+    /// 导出音频样式（`relative` = 存档用相对路径；历史快照用绝对路径）
+    fn exportAudioStyles(self: *App, alloc: std.mem.Allocator, relative: bool) ![]persist.SavedAudioStyle {
+        const out = try alloc.alloc(persist.SavedAudioStyle, self.audio_styles.items.len);
+        var n: usize = 0;
+        errdefer {
+            for (out[0..n]) |*s| self.freeSavedAudioStyle(s);
+            alloc.free(out);
+        }
+        for (self.audio_styles.items) |*st| {
+            var rel_buf: [1024]u8 = undefined;
+            const p = if (relative) self.audioPathForSave(st.path, &rel_buf) else st.path;
+            out[n] = .{
+                .name = try alloc.dupe(u8, st.name),
+                .path = try alloc.dupe(u8, p),
+                .channel = st.channel,
+                .gain = st.gain,
+                .speed = st.speed,
+            };
+            n += 1;
+        }
+        return out;
+    }
+
+    fn freeSavedAudioStyle(self: *App, s: *const persist.SavedAudioStyle) void {
+        self.allocator.free(s.name);
+        self.allocator.free(s.path);
+    }
+
+    fn freeSavedAudioStyles(self: *App, styles: []persist.SavedAudioStyle) void {
+        for (styles) |*s| self.freeSavedAudioStyle(s);
+        self.allocator.free(styles);
+    }
+
+    /// 导入音频样式表（**整表替换**，下标与存档一致；相对路径按基准目录解析）
+    pub fn importAudioStyles(self: *App, styles: []const persist.SavedAudioStyle) void {
+        for (self.audio_styles.items) |*st| {
+            self.allocator.free(st.name);
+            self.allocator.free(st.path);
+        }
+        self.audio_styles.clearRetainingCapacity();
+        for (styles) |s| {
+            var path_buf: [1024]u8 = undefined;
+            const resolved = self.resolveAudioPath(s.path, &path_buf) orelse s.path;
+            const nd = self.allocator.dupe(u8, s.name) catch continue;
+            const pd = self.allocator.dupe(u8, resolved) catch {
+                self.allocator.free(nd);
+                continue;
+            };
+            const ai = self.loadAudioAsset(resolved) orelse -1;
+            self.audio_styles.append(self.allocator, .{
+                .name = nd,
+                .path = pd,
+                .asset = ai,
+                .channel = s.channel,
+                .gain = s.gain,
+                .speed = s.speed,
+            }) catch {
+                self.allocator.free(nd);
+                self.allocator.free(pd);
+            };
+        }
+    }
+
     /// 清空后的**无名空垫**清理：无层且无名 = 无信息可保留 → 移除
     /// （有名空垫保留——名字是用户信息；用户反馈：清空层后不应留“幽灵垫”）。
     /// 返回是否清理了。可撤销（快照含垫本身）。
@@ -2886,6 +3640,14 @@ pub const App = struct {
         if (self.fx_state_dirty.len > 0) self.allocator.free(self.fx_state_dirty);
         self.fx_state_dirty = &.{};
         self.engine.deinit(); // 音频引擎容量池（无设备/重复调用均幂等）
+        self.deinitAudioTables();
+        self.resetAudioAssets();
+        for (self.audio_styles.items) |*st| {
+            self.allocator.free(st.name);
+            self.allocator.free(st.path);
+        }
+        self.audio_styles.deinit(self.allocator);
+        self.audio_styles = .{ .items = &.{}, .capacity = 0 };
         self.params.deinit(self.allocator);
         self.kit_shift_log.deinit(self.allocator);
         self.kit_shift_log = .{ .items = &.{}, .capacity = 0 };
@@ -4115,6 +4877,10 @@ pub const App = struct {
                 if (c.load(.monotonic)) |kv| self.allocator.destroy(kv);
                 c.store(null, .monotonic);
             }
+            for (self.engine.kit_sampler) |*c| {
+                if (c.load(.monotonic)) |ks| self.allocator.destroy(ks);
+                c.store(null, .monotonic);
+            }
             self.kit_shift_log.clearRetainingCapacity();
         } else {
             for (self.kit_shift_log.items) |idx| {
@@ -4157,6 +4923,28 @@ pub const App = struct {
             if (!needed) {
                 self.allocator.destroy(kv);
                 self.engine.kit_vsti[ik].store(null, .monotonic);
+            }
+        }
+        // 鼓组采样器层状态清理（宿主不再是鼓组 / 不再含采样器层 → 释放）
+        var iks: usize = 0;
+        while (iks < self.engine.kit_sampler.len) : (iks += 1) {
+            const ks = self.engine.kit_sampler[iks].load(.monotonic) orelse continue;
+            var needed = false;
+            if (iks < self.instruments.items.len) {
+                if (self.instruments.items[iks].kit) |kit| {
+                    outer2: for (kit.pads.items) |pad| {
+                        for (pad.layers.items) |ly| {
+                            if (ly.kind == .sampler) {
+                                needed = true;
+                                break :outer2;
+                            }
+                        }
+                    }
+                }
+            }
+            if (!needed) {
+                self.allocator.destroy(ks);
+                self.engine.kit_sampler[iks].store(null, .monotonic);
             }
         }
     }
@@ -4828,6 +5616,7 @@ pub const App = struct {
         // （测试分配器会把 0 长度分配记为泄漏）
         self.freeSavedMixerChannels(st.mixer, true);
         self.allocator.free(st.mixer);
+        self.freeSavedAudioStyles(st.audio_styles);
         for (st.instruments) |*si| self.freeSavedInstrument(si, true);
         self.allocator.free(st.instruments);
         for (st.pattern_names) |nm| self.allocator.free(nm);
@@ -5225,12 +6014,15 @@ pub const App = struct {
         errdefer self.allocator.free(recs0);
         // 已捕获（本次全部槽都已“现取或复用”）→ 插件状态脏标清零
         self.clearAllStateDirty();
+        const astyles = try self.exportAudioStyles(self.allocator, false);
+        errdefer self.freeSavedAudioStyles(astyles);
         return .{
             .label = label_copy,
             .notes = notes,
             .clips = clips,
             .instruments = insts,
             .mixer = mixer,
+            .audio_styles = astyles,
             .pattern_names = pat_names,
             .track_names = trk_names,
             .track_muted = muted_list,
@@ -5255,10 +6047,19 @@ pub const App = struct {
             // （与 ADSR 同一个坑：调了值但不产生历史）
             if (a.velocity != b.velocity or a.pan != b.pan) return false;
         }
-        for (st.clips, self.clips.items) |a, b| {
-            if (a.track != b.track or a.start != b.start or a.len != b.len or
-                a.pattern != b.pattern or a.offset != b.offset) return false;
-        }
+    for (st.clips, self.clips.items) |a, b| {
+        if (a.track != b.track or a.start != b.start or a.len != b.len or
+            a.pattern != b.pattern or a.offset != b.offset) return false;
+        // 音频片段字段（样式引用/trim）也要比较——否则粗剪/换源被判“无变化”
+        if (a.audio_style != b.audio_style or a.trim_start != b.trim_start or a.trim_len != b.trim_len) return false;
+    }
+    // 音频样式（名称/路径/通道/增益）——否则调样式推子会被判“无变化”丢历史
+    if (st.audio_styles.len != self.audio_styles.items.len) return false;
+    for (st.audio_styles, self.audio_styles.items) |a, b| {
+        if (!std.mem.eql(u8, a.name, b.name)) return false;
+        if (!std.mem.eql(u8, a.path, b.path)) return false;
+        if (a.channel != b.channel or a.gain != b.gain or a.speed != b.speed) return false;
+    }
         if (st.instruments.len != self.instruments.items.len) return false;
         for (st.instruments, self.instruments.items, 0..) |a, b, ii| {
             if (a.volume != b.volume or a.pan != b.pan or a.muted != b.muted or
@@ -5358,6 +6159,7 @@ pub const App = struct {
     /// 若当前状态与所在快照等价（忽略选区）→ 不产生新条目（防“点了没动”噪音）。
     pub fn commitHistory(self: *App, label: []const u8) void {
         if (self.history.items.len > 0 and self.stateEqualsCurrent()) return;
+        // 片段/音频样式可能变 → 播放表重建（帧末；廉价标记）
         // 播放中：**仅当音符/片段真的变化**才重扫调度窗口。
         // EQ/通道音量/声像等编辑不改变调度事件（事件只带时间/力度/声像/
         // 乐器），重扫纯属浪费且有害——它会重发游标附近的事件，音频对
@@ -5580,6 +6382,7 @@ pub const App = struct {
             prev_idx,
             target_idx,
         );
+        self.importAudioStyles(st.audio_styles);
         // 选择钳制
         if (self.sel.pattern >= self.patternCount()) self.sel.pattern = self.patternCount() - 1;
         // 钢琴卷帘：目标样式可能已被撤销到不存在 → 钳到有效范围
@@ -5914,6 +6717,27 @@ pub const App = struct {
             _ = self.track_muted.remove(key);
         }
         self.dirty = true;
+        if (self.scheduler.muted == null) self.scheduler.muted = &self.track_muted;
+        self.setToast(if (muted) "轨道已静音" else "已取消静音");
+        // **播放中立即生效**（实测 bug：播放中点静音，该轨音符仍在响）——
+        // 补 off@游标（只动这条轨）+ 编辑代递增作废未触发副本 + 重扫窗口（带新静音集）
+        if (self.playing) {
+            const cur = self.playback.cursorStep(self.sel.song_mode);
+            sequencer.muteTrackLive(
+                &self.scheduler,
+                &self.sched_events,
+                self.clips.items,
+                self.notes.items,
+                self.sel.song_mode,
+                self.sel.pattern,
+                key,
+                cur,
+                muted,
+            );
+            // 发布序：先安全界、后编辑代（同 rescanForPlaybackEdit）
+            self.params.sched_rescan_from.store(self.scheduler.rescan_from, .monotonic);
+            self.params.sched_edit_gen.store(self.scheduler.edit_gen, .monotonic);
+        }
     }
 
     /// 以列表重建静音集合（历史/存档用；先清空）
@@ -6078,7 +6902,7 @@ pub const App = struct {
     /// 先于菜单绘制、当时又未被屏蔽）。
     pub fn menuIsOpen(self: *const App) bool {
         return self.rack.ctx_instrument != null or
-            self.file_menu_open or self.panels.ctx_pattern != null or
+            self.file_menu_open or self.panels.ctx_pattern != null or self.panels.ctx_audio_style != null or
             self.panels.ctx_track != null or
             self.preset_browser.open or
             self.mixer_win.ctx_effect != null or self.mixer_win.ctx_channel != null or self.mixer_win.ctx_pan != null;
@@ -6121,9 +6945,9 @@ pub const App = struct {
         const alloc = self.allocator;
         const clips = try alloc.alloc(persist.SavedClip, self.clips.items.len);
         errdefer alloc.free(clips);
-        for (self.clips.items, 0..) |c, i| {
-            clips[i] = .{ .track = c.track, .start = c.start, .len = c.len, .pattern = c.pattern, .offset = c.offset };
-        }
+    for (self.clips.items, 0..) |c, i| {
+        clips[i] = .{ .track = c.track, .start = c.start, .len = c.len, .pattern = c.pattern, .offset = c.offset, .audio_style = c.audio_style, .trim_start = c.trim_start, .trim_len = c.trim_len };
+    }
         const notes = try alloc.alloc(persist.SavedNote, self.notes.items.len);
         errdefer alloc.free(notes);
         for (self.notes.items, 0..) |n, i| {
@@ -6139,8 +6963,11 @@ pub const App = struct {
             insts[i] = try self.exportInstrument(inst, false);
             ni += 1;
         }
-        // 调音台通道（增益/声像/静音/效果链）——共用 `exportMixerChannels`
-        const mix = try self.exportMixerChannels(alloc, true, false);
+    // 调音台通道（增益/声像/静音/效果链）——共用 `exportMixerChannels`
+    const mix = try self.exportMixerChannels(alloc, true, false);
+    // 音频样式（相对路径——工程文件夹便携；未在基准目录下 → 保留绝对）
+    const astyles = try self.exportAudioStyles(alloc, true);
+    errdefer self.freeSavedAudioStyles(astyles);
         // 样式名字（自定义名随工程保存；旧版加载方忽略）
         const pat_names = try alloc.alloc([]const u8, self.pattern_items.items.len);
         var pn: usize = 0;
@@ -6205,11 +7032,12 @@ pub const App = struct {
             .track_names = trk_names,
             .track_name_rows = trk_rows,
             .track_muted = muted_list,
-            .clips = clips,
-            .notes = notes,
-            .instruments = insts,
-            .mixer = mix,
-        };
+        .clips = clips,
+        .notes = notes,
+        .instruments = insts,
+        .mixer = mix,
+        .audio_styles = astyles,
+    };
     }
 
     /// 释放 `exportProject` 返回的存档（含内部字符串）
@@ -6336,6 +7164,9 @@ pub const App = struct {
             self.freeSavedMixerChannels(p.mixer, false);
             self.allocator.free(p.mixer);
         }
+        // 注：**不要**加 `if (len > 0)`——`alloc(T, 0)` 也必须配对 free（同 `freeHistoryState`）
+        const styles: []persist.SavedAudioStyle = @constCast(p.audio_styles);
+        self.freeSavedAudioStyles(styles);
     }
 
     /// 用存档替换当前工程内容（先清空旧数据）
@@ -6357,8 +7188,26 @@ pub const App = struct {
         }
 
         // 恢复
+        // 音频样式先于片段导入（片段经下标引用；相对路径按基准目录解析）
+        self.importAudioStyles(p.audio_styles);
         for (p.clips) |c| {
-            self.addClip(.{ .track = c.track, .start = c.start, .len = c.len, .pattern = c.pattern, .offset = c.offset });
+            self.addClip(.{ .track = c.track, .start = c.start, .len = c.len, .pattern = c.pattern, .offset = c.offset, .audio_style = c.audio_style, .trim_start = c.trim_start, .trim_len = c.trim_len });
+    }
+    // 容错：片段引用了不存在的音频样式（手工改档/旧 bug）→ 丢弃，避免“隐形空片段”
+    {
+        var bad: usize = 0;
+        const n_styles: i32 = @intCast(self.audio_styles.items.len);
+        var ci: usize = 0;
+        while (ci < self.clips.items.len) {
+            const c = &self.clips.items[ci];
+            if (c.isAudio() and (c.audio_style < 0 or c.audio_style >= n_styles)) {
+                _ = self.clips.swapRemove(ci);
+                bad += 1;
+                continue;
+            }
+            ci += 1;
+        }
+        if (bad > 0) self.setToastWith("有 {d} 个音频片段引用了不存在的样式，已丢弃", .{bad});
         }
         for (p.notes) |n| {
             self.addNote(.{ .step = n.step, .len = n.len, .pitch = n.pitch, .pattern = n.pattern, .instrument = n.instrument, .velocity = n.velocity, .pan = n.pan });
@@ -6413,7 +7262,7 @@ pub const App = struct {
         self.playback.start_step = 0;
         self.piano.pattern = null;
         // 打开工程后回到 PAT（默认工作模式；点播放列表标尺会自动切 SONG）
-        self.sel.song_mode = false;
+        self.sel.song_mode = true; // 打开工程后默认 SONG（用户拍板）
     }
 
     // ── MIDI 导入 / 导出（转换逻辑；文件 IO 在 main 接线）──
@@ -6789,9 +7638,23 @@ pub const App = struct {
             .step_frames = step_frames,
             .total_frames = total_frames,
             .done = 0,
+            .dbg0 = self.engine.dbg_dispatched,
+            .log_buf = .{ .items = &.{}, .capacity = 0 },
             .t0_ns = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds),
         };
         self.export_win = .{}; // 进度窗复位（首帧居中）
+        // 导出日志头（完成时写入 `<wav>.log`——现场排障用）
+        if (self.export_wav) |*ew| {
+            var hb: [256]u8 = undefined;
+            const h = std.fmt.bufPrint(&hb, "begin gen={d} edit_gen={d} start_step={d} start_frame={d} bpm={d} spb={d} step_frames={d} total={d} sr={d}", .{
+                self.scheduler.gen, self.scheduler.edit_gen,
+                self.params.start_step.load(.monotonic), self.params.start_frame.load(.monotonic),
+                self.params.bpm.load(.monotonic), self.params.steps_per_beat.load(.monotonic),
+                step_frames, total_frames, sr,
+            }) catch "";
+            ew.log_buf.appendSlice(self.allocator, h) catch {};
+            ew.log_buf.appendSlice(self.allocator, "\n") catch {};
+        }
     }
 
     /// 主循环每帧推进（时间预算内分块渲染；完成后自动收尾）。
@@ -6825,6 +7688,17 @@ pub const App = struct {
             audio.renderBlock(&self.engine, &self.params, &obuf, n, @floatFromInt(self.params.sample_rate));
             try ew.writer.writeFrames(obuf[0 .. n * 2]);
             ew.done += n;
+            ew.blocks += 1;
+            if (ew.blocks % 32 == 0) {
+                var lb: [192]u8 = undefined;
+                const ls = std.fmt.bufPrint(&lb, "blk={d} fp={d} stash={d} disp={d} peak={d:.3} pl={}", .{
+                    ew.blocks, self.params.frames_played.load(.monotonic),
+                    self.engine.stash_n, self.engine.dbg_dispatched -| ew.dbg0,
+                    self.params.out_peak.load(.monotonic), self.params.playing.load(.monotonic),
+                }) catch "";
+                ew.log_buf.appendSlice(self.allocator, ls) catch {};
+                ew.log_buf.appendSlice(self.allocator, "\n") catch {};
+            }
             if (budget_ns != std.math.maxInt(i64)) {
                 const now: i64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
                 if (now - t0 >= budget_ns) return; // 本帧预算用尽（下一帧继续）
@@ -6836,9 +7710,15 @@ pub const App = struct {
 
     /// 完成：toast → 恢复快照/设备 → 释放（状态机消费）。
     fn exportWavDone(self: *App, io: std.Io) void {
-        _ = io;
-        self.setToastWith("已导出音频：{s}", .{self.export_wav.?.path});
-        self.exportWavRestore();
+        const ev_n = self.engine.dbg_dispatched -| self.export_wav.?.dbg0;
+        // 落盘导出日志（<wav>.log——现场排障用）
+        if (self.export_wav) |*ew| {
+            var pb: [1080]u8 = undefined;
+            if (std.fmt.bufPrint(&pb, "{s}.log", .{ew.path}) catch null) |lp| {
+                std.Io.Dir.cwd().writeFile(io, .{ .sub_path = lp, .data = ew.log_buf.items }) catch {};
+            }
+        }
+        self.setToastWith("已导出（块 {d} · 事件 {d}）：{s}", .{ self.export_wav.?.blocks, ev_n, self.export_wav.?.path });
         self.exportWavFree();
     }
 
@@ -6888,6 +7768,7 @@ pub const App = struct {
             for (ew.states.items) |s| s.blobs.deinit(self.allocator);
             ew.states.deinit(self.allocator);
             self.allocator.free(ew.path);
+        self.export_wav.?.log_buf.deinit(self.allocator);
         }
         self.export_wav = null;
     }
@@ -7350,6 +8231,25 @@ pub const App = struct {
         ti.view_off = 0;
     }
 
+/// 打开音频样式重命名输入框（位置由调用方给；复用文本输入基建——支持中文 IME）
+pub fn beginRenameAudioStyle(self: *App, idx: usize, x: i32, y: i32) void {
+    if (idx >= self.audio_styles.items.len) return;
+    const ti = &self.text_input;
+    ti.active = true;
+    ti.target = .audio_style;
+    ti.index = idx;
+    ti.x = x;
+    ti.y = y;
+    const name = self.audio_styles.items[idx].name;
+    const n = @min(name.len, ti.buf.len);
+    @memcpy(ti.buf[0..n], name[0..n]);
+    ti.len = n;
+    ti.cursor = n;
+    ti.sel_anchor = null;
+    ti.drag_active = false;
+    ti.view_off = 0;
+}
+
     /// 追加一个字符（UTF-8；在**光标处插入**——有选区则先删除选区）
     pub fn textInputAppend(self: *App, cp: u21) void {
         const ti = &self.text_input;
@@ -7501,6 +8401,21 @@ pub const App = struct {
                     }
                 }
             },
+        .audio_style => {
+            if (ti.index < self.audio_styles.items.len) {
+                const st = &self.audio_styles.items[ti.index];
+                // 空串 → 恢复默认名（文件名）
+                const want: []const u8 = if (val.len > 0) val else std.fs.path.basename(st.path);
+                if (want.len > 0 and !std.mem.eql(u8, st.name, want)) {
+                    if (self.allocator.dupe(u8, want)) |c| {
+                        self.allocator.free(st.name);
+                        st.name = c;
+                        self.dirty = true;
+                        self.commitHistory("重命名音频样式");
+                    } else |_| {}
+                }
+            }
+        },
             .pattern => {
                 if (ti.index < self.pattern_items.items.len and val.len > 0) {
                     const old = self.pattern_items.items[ti.index];
@@ -8510,6 +9425,150 @@ test "app: 鼓组 VST3 层——添加/展平槽位/导出导入往返/相等比
     try std.testing.expectEqual(@as(usize, 3), app.instruments.items[0].kit.?.totalLayers());
     try std.testing.expect(app.undo());
     try std.testing.expectEqual(@as(usize, 0), app.instruments.items[0].kit.?.totalLayers());
+}
+
+test "app: 音频资产/样式/片段——解码/去重/播放表/撤销/采样层/存档往返（生成 WAV）" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.dir.close(io);
+    const dirp = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(dirp);
+    const wav_path = try std.fmt.allocPrint(alloc, "{s}/a.wav", .{dirp});
+    defer alloc.free(wav_path);
+    // 写 16bit PCM 立体声 4800 帧（0.1s@48k 正弦）
+    {
+        var w = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+        defer w.deinit(alloc);
+        const data_bytes: u32 = 4800 * 4;
+        try w.appendSlice(alloc, "RIFF");
+        try w.appendSlice(alloc, std.mem.asBytes(&(@as(u32, 36) + data_bytes)));
+        try w.appendSlice(alloc, "WAVEfmt ");
+        try w.appendSlice(alloc, std.mem.asBytes(&@as(u32, 16)));
+        try w.appendSlice(alloc, std.mem.asBytes(&@as(u16, 1)));
+        try w.appendSlice(alloc, std.mem.asBytes(&@as(u16, 2)));
+        try w.appendSlice(alloc, std.mem.asBytes(&@as(u32, 48000)));
+        try w.appendSlice(alloc, std.mem.asBytes(&@as(u32, 48000 * 4)));
+        try w.appendSlice(alloc, std.mem.asBytes(&@as(u16, 4)));
+        try w.appendSlice(alloc, std.mem.asBytes(&@as(u16, 16)));
+        try w.appendSlice(alloc, "data");
+        try w.appendSlice(alloc, std.mem.asBytes(&data_bytes));
+        var i: usize = 0;
+        while (i < 4800) : (i += 1) {
+            const s: i16 = @intFromFloat(@sin(@as(f64, @floatFromInt(i)) * 0.03) * 12000.0);
+            try w.appendSlice(alloc, std.mem.asBytes(&s));
+            try w.appendSlice(alloc, std.mem.asBytes(&s));
+        }
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = wav_path, .data = w.items }) catch return error.IoFailure;
+    }
+
+    var app = App{ .allocator = alloc };
+    app.sel.song_mode = true; // 音频片段只在 SONG 模式发声/入表（PAT 发布空表）
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    app.resetHistory("初始");
+
+    // 解码 + 去重
+    const ai = app.loadAudioAsset(wav_path) orelse return error.AssetLoadFailed;
+    try std.testing.expectEqual(@as(usize, 4800), app.audio_assets.items[@intCast(ai)].data.frame_count);
+    try std.testing.expect(app.audio_assets.items[@intCast(ai)].peaks.len > 0);
+    try std.testing.expectEqual(@as(?i32, ai), app.loadAudioAsset(wav_path));
+    // 原生率解码（不重采样）：24kHz 文件 → frame_count 是原生帧；ratio = 0.5；
+    // engFrames 换算回引擎域（UI/trim 的单位），与 48k 文件等长
+    {
+        const wav2 = try std.fmt.allocPrint(alloc, "{s}/b24.wav", .{dirp});
+        defer alloc.free(wav2);
+        var w = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+        defer w.deinit(alloc);
+        const data_bytes: u32 = 2400 * 4;
+        try w.appendSlice(alloc, "RIFF");
+        try w.appendSlice(alloc, std.mem.asBytes(&(@as(u32, 36) + data_bytes)));
+        try w.appendSlice(alloc, "WAVEfmt ");
+        try w.appendSlice(alloc, std.mem.asBytes(&@as(u32, 16)));
+        try w.appendSlice(alloc, std.mem.asBytes(&@as(u16, 1)));
+        try w.appendSlice(alloc, std.mem.asBytes(&@as(u16, 2)));
+        try w.appendSlice(alloc, std.mem.asBytes(&@as(u32, 24000)));
+        try w.appendSlice(alloc, std.mem.asBytes(&@as(u32, 24000 * 4)));
+        try w.appendSlice(alloc, std.mem.asBytes(&@as(u16, 4)));
+        try w.appendSlice(alloc, std.mem.asBytes(&@as(u16, 16)));
+        try w.appendSlice(alloc, "data");
+        try w.appendSlice(alloc, std.mem.asBytes(&data_bytes));
+        var j24: usize = 0;
+        while (j24 < 2400) : (j24 += 1) {
+            const s2: i16 = @intFromFloat(@sin(@as(f64, @floatFromInt(j24)) * 0.06) * 12000.0);
+            try w.appendSlice(alloc, std.mem.asBytes(&s2));
+            try w.appendSlice(alloc, std.mem.asBytes(&s2));
+        }
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = wav2, .data = w.items }) catch return error.IoFailure;
+        const ai2 = app.loadAudioAsset(wav2) orelse return error.AssetLoadFailed;
+        const d2 = &app.audio_assets.items[@intCast(ai2)].data;
+        try std.testing.expectEqual(@as(usize, 2400), d2.frame_count);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.5), d2.ratio, 1e-3);
+        try std.testing.expectEqual(@as(usize, 4800), d2.engFrames());
+    }
+
+    // 样式 + 片段 + 播放表
+    const style = app.audioStyleAdd(wav_path, "") orelse return error.StyleFailed;
+    const ci = app.audioClipAdd(style, 0, 0) orelse return error.ClipFailed;
+    try std.testing.expect(app.clips.items[ci].isAudio());
+    try std.testing.expect(app.clips.items[ci].len >= 1);
+    app.commitHistory("导入音频");
+    app.rebuildAudioTable();
+    const tbl = app.params.audio_table.load(.monotonic).?;
+    try std.testing.expectEqual(@as(usize, 1), tbl.rows.len);
+    try std.testing.expect(tbl.rows[0].asset != null);
+    // 无变化 → **不重发**（逐字段比对；指针不变）
+    app.rebuildAudioTable();
+    try std.testing.expect(tbl == app.params.audio_table.load(.monotonic).?);
+    // PAT 模式 → 空表；回 SONG → 行回来（每帧重算，不依赖脏标）
+    app.sel.song_mode = false;
+    app.rebuildAudioTable();
+    try std.testing.expectEqual(@as(usize, 0), app.params.audio_table.load(.monotonic).?.rows.len);
+    app.sel.song_mode = true;
+    app.rebuildAudioTable();
+    try std.testing.expectEqual(@as(usize, 1), app.params.audio_table.load(.monotonic).?.rows.len);
+    // 轨道静音 → 音频片段也静音（与音符片段同语义）；取消静音 → 行回来
+    app.setTrackMuted(0, true);
+    app.rebuildAudioTable();
+    try std.testing.expectEqual(@as(usize, 0), app.params.audio_table.load(.monotonic).?.rows.len);
+    app.setTrackMuted(0, false);
+    app.rebuildAudioTable();
+    try std.testing.expectEqual(@as(usize, 1), app.params.audio_table.load(.monotonic).?.rows.len);
+
+    // 样式增益改动 → 历史；撤销还原（样式级共享语义）
+    app.audio_styles.items[@intCast(style)].gain = 0.5;
+    app.commitHistory("调整音频增益");
+    try std.testing.expectEqual(@as(usize, 3), app.history.items.len);
+    try std.testing.expect(app.undo());
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), app.audio_styles.items[@intCast(style)].gain, 1e-6);
+
+    // 采样器层
+    const inst = app.addDrumkit("鼓组");
+    try std.testing.expect(app.kitLayerAddSampler(inst, 35, wav_path));
+    const ly = &app.instruments.items[0].kit.?.find(35).?.layers.items[0];
+    try std.testing.expect(ly.kind == .sampler);
+    try std.testing.expect(ly.asset_idx >= 0);
+
+    // 存档往返（绝对路径保留；样式/片段/层均重建）
+    const proj = try app.exportProject();
+    defer app.freeProject(proj);
+    var app2 = App{ .allocator = alloc };
+    defer app2.clips.deinit(alloc);
+    defer app2.notes.deinit(alloc);
+    defer app2.deinitAll();
+    app2.importProject(proj);
+    try std.testing.expectEqual(@as(usize, 1), app2.audio_styles.items.len);
+    var found_audio_clip = false;
+    for (app2.clips.items) |c| {
+        if (c.isAudio()) found_audio_clip = true;
+    }
+    try std.testing.expect(found_audio_clip);
+    const ly2 = &app2.instruments.items[0].kit.?.find(35).?.layers.items[0];
+    try std.testing.expect(ly2.kind == .sampler);
+    try std.testing.expect(ly2.asset_idx >= 0);
 }
 
 test "app: 鼓组 VST3 层槽位引用——slotPlugin 解析 + 层脏标置位/清除" {
@@ -12545,4 +13604,130 @@ test "app: 存档 v4 稀疏轨道名——深行命名只写一对；旧密集�
     app3.importProject(l3);
     try std.testing.expectEqualStrings("鼓", app3.trackName(1));
     try std.testing.expectEqualStrings("Track 1", app3.trackName(0));
+}
+
+test "app: SONG 下静音轨道不调度其音符片段" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    app.scheduler.muted = &app.track_muted; // 与 main 同一条挂载线
+    app.clips.append(app.allocator, .{ .track = 0, .start = 0, .len = 32, .pattern = 0 }) catch {};
+    app.notes.append(app.allocator, .{ .step = 0, .len = 4, .pitch = 60, .pattern = 0 }) catch {};
+    app.sel.song_mode = true;
+
+    sequencer.reset(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, true, 0, 0);
+    sequencer.scheduleRange(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, true, 0, 0, 64);
+    
+
+    // 清空队列，静音轨道 0 后重扫
+    var tmpq: [512]synth.SchedEvent = undefined;
+    _ = app.sched_events.drain(&tmpq);
+    app.setTrackMuted(0, true);
+    sequencer.reset(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, true, 0, 0);
+    sequencer.scheduleRange(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, true, 0, 0, 64);
+    
+    var outq: [512]synth.SchedEvent = undefined;
+    try std.testing.expectEqual(@as(usize, 0), app.sched_events.drain(&outq));
+}
+
+test "app: 音频样式重命名——只改名字；空串恢复文件名" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    // 两个假样式（asset = -1：仅名字/路径，不碰磁盘）
+    try app.audio_styles.append(alloc, .{ .name = try alloc.dupe(u8, "A"), .path = try alloc.dupe(u8, "a.wav") });
+    try app.audio_styles.append(alloc, .{ .name = try alloc.dupe(u8, "B"), .path = try alloc.dupe(u8, "sub/kick.wav") });
+    app.audio_styles.items[1].gain = 0.5;
+    app.audio_styles.items[1].speed = 1.5;
+    app.audio_styles.items[1].channel = 2;
+    app.resetHistory("初始");
+
+    app.beginRenameAudioStyle(1, 0, 0);
+    while (app.text_input.text().len > 0) app.textInputBackspace();
+    for ("Kick") |ch| app.textInputAppend(ch);
+    app.textInputCommit();
+    try std.testing.expectEqualStrings("Kick", app.audio_styles.items[1].name);
+    // 其余字段原样
+    try std.testing.expectEqual(@as(f32, 0.5), app.audio_styles.items[1].gain);
+    try std.testing.expectEqual(@as(f32, 1.5), app.audio_styles.items[1].speed);
+    try std.testing.expectEqual(@as(i32, 2), app.audio_styles.items[1].channel);
+    try std.testing.expectEqualStrings("sub/kick.wav", app.audio_styles.items[1].path);
+
+    // 空串 → 默认名 = 文件名
+    app.beginRenameAudioStyle(1, 0, 0);
+    while (app.text_input.text().len > 0) app.textInputBackspace();
+    app.textInputCommit();
+    try std.testing.expectEqualStrings("kick.wav", app.audio_styles.items[1].name);
+}
+
+test "app: 删除音频样式——片段连带删除、索引前移、撤销恢复" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    for (0..3) |i| {
+        const nm = try std.fmt.allocPrint(alloc, "S{d}", .{i});
+        const pth = try std.fmt.allocPrint(alloc, "s{d}.wav", .{i});
+        try app.audio_styles.append(alloc, .{ .name = nm, .path = pth });
+    }
+    // 三个音频片段（各引用一个样式）+ 一个音符片段（audio_style = -1）
+    app.addClip(.{ .track = 0, .start = 0, .len = 8, .pattern = 0, .audio_style = 0 });
+    app.addClip(.{ .track = 1, .start = 0, .len = 8, .pattern = 0, .audio_style = 1 });
+    app.addClip(.{ .track = 2, .start = 0, .len = 8, .pattern = 0, .audio_style = 2 });
+    app.addClip(.{ .track = 3, .start = 0, .len = 8, .pattern = 0 });
+    app.resetHistory("初始");
+    app.audio_style_sel = 2;
+
+    const dropped = app.removeAudioStyle(1).?;
+    try std.testing.expectEqual(@as(usize, 1), dropped);
+    try std.testing.expectEqual(@as(usize, 2), app.audio_styles.items.len);
+    try std.testing.expectEqual(@as(usize, 3), app.clips.items.len); // 音符片段 + 两个音频片段
+    // 前移：原 style2 → 1；原 style0 仍 0
+    var seen0 = false;
+    var seen1 = false;
+    var note_clip = false;
+    for (app.clips.items) |c| {
+        if (c.isAudio()) {
+            if (c.audio_style == 0) seen0 = true;
+            if (c.audio_style == 1) seen1 = true;
+        } else note_clip = true;
+    }
+    try std.testing.expect(seen0 and seen1 and note_clip);
+    try std.testing.expectEqual(@as(i32, 1), app.audio_style_sel); // 选择随索引前移
+    app.commitHistory("删除音频样式");
+
+    // 撤销 → 样式与片段全部恢复
+    try std.testing.expect(app.undo());
+    try std.testing.expectEqual(@as(usize, 3), app.audio_styles.items.len);
+    try std.testing.expectEqual(@as(usize, 4), app.clips.items.len);
+}
+
+test "app: 存档容错——片段引用不存在的音频样式 → 加载时丢弃" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    const clips = [_]persist.SavedClip{.{
+        .track = 0,
+        .start = 0,
+        .len = 8,
+        .pattern = 0,
+        .audio_style = 5, // 越界：工程里没有任何音频样式
+    }};
+    const proj = persist.Project{ .clips = @constCast(&clips), .pattern_count = 1 };
+    app.importProject(proj);
+    try std.testing.expectEqual(@as(usize, 0), app.clips.items.len);
 }

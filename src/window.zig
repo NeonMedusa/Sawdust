@@ -75,6 +75,8 @@ const WindowsWindow = struct {
     fb: Framebuffer = .{ .pixels = &.{}, .width = 0, .height = 0 },
     allocator: std.mem.Allocator,
     should_quit: bool = false,
+    /// 待消费的拖入文件路径（UTF-8；WM_DROPFILES 收集，App 帧初取走）
+    dropped: std.ArrayListUnmanaged([]u8) = .{ .items = &.{}, .capacity = 0 },
     /// 当前系统光标（避免重复设置）
     cursor_kind: @import("ui.zig").CursorKind = .arrow,
     /// 当前光标句柄（WM_SETCURSOR 时重设，防止系统改回默认）
@@ -154,10 +156,20 @@ const WindowsWindow = struct {
         self.hdc_mem = CreateCompatibleDC(@ptrCast(self.hdc_window));
         if (self.hdc_mem == null) return error.CreateDCFailed;
 
+        // 接受系统文件拖入（WM_DROPFILES）
+        DragAcceptFiles(self.hwnd, 1);
+
         try self.resizeFramebuffer(width, height);
     }
 
+    pub fn takeDropped(self: *WindowsWindow) ?[]u8 {
+        if (self.dropped.items.len == 0) return null;
+        return self.dropped.orderedRemove(0);
+    }
+
     pub fn deinit(self: *WindowsWindow) void {
+        for (self.dropped.items) |p| self.allocator.free(p);
+        self.dropped.deinit(self.allocator);
         // 恢复系统计时器精度（与 init 的 timeBeginPeriod(1) 配对）
         _ = timeEndPeriod(1);
         if (self.hbitmap) |hb| {
@@ -389,6 +401,28 @@ const WindowsWindow = struct {
         const self: ?*WindowsWindow = if (userdata != 0) @ptrFromInt(@as(usize, @intCast(userdata))) else null;
 
         switch (msg) {
+            WM_DROPFILES => {
+                // 系统文件拖入：收集路径（UTF-16 → UTF-8），App 帧初消费
+                if (self) |s| {
+                    const hdrop: ?*anyopaque = @ptrFromInt(wparam);
+                    const n = DragQueryFileW(hdrop, 0xFFFFFFFF, null, 0);
+                    var i: u32 = 0;
+                    while (i < n) : (i += 1) {
+                        var wbuf: [1024]u16 = undefined;
+                        const got = DragQueryFileW(hdrop, i, &wbuf, wbuf.len);
+                        if (got == 0 or got >= wbuf.len) continue;
+                        const wlen: usize = @intCast(got);
+                        var u8buf: [4096]u8 = undefined;
+                        const u8len = std.unicode.utf16LeToUtf8(&u8buf, wbuf[0..wlen]) catch continue;
+                        const dup = s.allocator.dupe(u8, u8buf[0..u8len]) catch continue;
+                        s.dropped.append(s.allocator, dup) catch {
+                            s.allocator.free(dup);
+                        };
+                    }
+                    DragFinish(hdrop);
+                }
+                return 0;
+            },
             WM_CLOSE => {
                 if (self) |s| s.should_quit = true;
                 return 0;
@@ -622,6 +656,7 @@ const WM_DESTROY: u32 = 0x0002;
 const WM_SIZE: u32 = 0x0005;
 const WM_SETCURSOR: u32 = 0x0020;
 const WM_MOUSEMOVE: u32 = 0x0200;
+const WM_DROPFILES: u32 = 0x0233;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_LBUTTONUP: u32 = 0x0202;
 const WM_LBUTTONDBLCLK: u32 = 0x0203;
@@ -644,6 +679,9 @@ const SRCCOPY: u32 = 0x00CC0020;
 const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: ?*anyopaque = @ptrFromInt(@as(usize, @bitCast(@as(isize, -4))));
 
 extern "kernel32" fn GetModuleHandleW(?[*:0]const u16) callconv(.winapi) ?*anyopaque;
+extern "shell32" fn DragAcceptFiles(hwnd: ?*anyopaque, accept: i32) callconv(.winapi) void;
+extern "shell32" fn DragQueryFileW(hdrop: ?*anyopaque, ifile: u32, lpsz: ?[*]u16, cch: u32) callconv(.winapi) u32;
+extern "shell32" fn DragFinish(hdrop: ?*anyopaque) callconv(.winapi) void;
 extern "shell32" fn ShellExecuteA(?*anyopaque, [*:0]const u8, [*:0]const u8, ?[*:0]const u8, ?[*:0]const u8, i32) callconv(.winapi) ?*anyopaque;
 extern "user32" fn RegisterClassExW(*const WNDCLASSEXW) callconv(.winapi) u16;
 extern "user32" fn UnregisterClassW([*:0]const u16, ?*anyopaque) callconv(.winapi) i32;
@@ -708,6 +746,10 @@ const UnsupportedWindow = struct {
         _ = width;
         _ = height;
         @compileError("窗口层尚未移植到该平台：请实现 src/window.zig 的对应后端（Linux: X11/Wayland；macOS: Cocoa）");
+    }
+    pub fn takeDropped(self: *UnsupportedWindow) ?[]u8 {
+        _ = self;
+        return null;
     }
     pub fn deinit(self: *UnsupportedWindow) void {
         _ = self;

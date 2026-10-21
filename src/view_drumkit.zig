@@ -374,14 +374,19 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         }
 
         if (edit_req) |li| {
-            // 层窗口：减法层 = 参数面板；VST3 层 = **插件界面**（嵌入托管，同乐器）
-            app.synth_win.target = .{ .kit_layer_replace = .{
-                .instrument = inst_idx,
-                .pitch = sel,
-                .layer = li,
-            } };
-            app.synth_win.open = true;
-            app.bringToFront(&app.synth_win.z);
+            // 层窗口：减法 = 参数面板；VST3 = 插件界面；采样器 = 波形窗口
+            const is_sampler = if (li < layers.len) layers[li].kind == .sampler else false;
+            if (is_sampler) {
+                app.openWaveForLayer(inst_idx, sel, li);
+            } else {
+                app.synth_win.target = .{ .kit_layer_replace = .{
+                    .instrument = inst_idx,
+                    .pitch = sel,
+                    .layer = li,
+                } };
+                app.synth_win.open = true;
+                app.bringToFront(&app.synth_win.z);
+            }
         }
         if (del_req) |li| {
             if (app.kitLayerRemove(inst_idx, sel, li)) {
@@ -402,6 +407,23 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         ui.labelCentered("+ 添加乐器", rx + @divTrunc(bw - tw, 2), by2, btn_h, ui.theme.text);
         if (hovered and ui.mouse_pressed) {
             app.openPresetBrowser(.{ .create_kit_layer = .{ .instrument = inst_idx, .pitch = sel } });
+        }
+    }
+
+    // ── 底部（第二个）：[＋ 采样] → 文件对话框（wav/flac/mp3/ogg）──
+    {
+        const by2 = body_y + body_h - 8 - btn_h;
+        const bw: i32 = 110;
+        const bx = rx + 148;
+        if (bx + bw < rx + rw - 8) {
+            const hovered = util.hitUI(ui, bx, by2, bw, btn_h);
+            ui.renderer.fillRect(bx, by2, bw, btn_h, if (hovered) ui.theme.item_hover else ui.theme.slider_track);
+            ui.renderer.strokeRect(bx, by2, bw, btn_h, ui.theme.panel_border);
+            const tw: i32 = @intFromFloat(ui.font.measure("+ 采样"));
+            ui.labelCentered("+ 采样", bx + @divTrunc(bw - tw, 2), by2, btn_h, ui.theme.text);
+            if (hovered and ui.mouse_pressed) {
+                app.pending_load_sample = .{ .instrument = inst_idx, .pitch = sel, .layer = null };
+            }
         }
     }
 

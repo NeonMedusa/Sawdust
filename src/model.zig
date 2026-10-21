@@ -24,10 +24,21 @@ pub const Clip = struct {
     track: i32, // 轨道序号（0 起）
     start: i32, // 起始步（全局坐标，0 起；U=96 单位）
     len: i32, // 可见长度（步，>= 1）
-    pattern: i32, // 样式序号（0 起）
+    pattern: i32, // 样式序号（0 起；音频片段恒 0）
     offset: i32 = 0, // 左缘对应的局部步（0 = 从片段自身第 1 步开始）
+    /// **音频片段**：引用的音频样式序号（>= 0 = 音频片段；-1 = 样式片段）——
+    /// 音频片段不消费 `pattern`/`offset`（时间轴与采样内 trim 各自独立）
+    audio_style: i32 = -1,
+    /// 音频片段：采样内起点（帧）
+    trim_start: i32 = 0,
+    /// 音频片段：采样内长度（帧；<= 0 = 用到素材末尾）
+    trim_len: i32 = 0,
     /// 框选/批量操作选中（**瞬态**：不存档）
     selected: bool = false,
+
+    pub fn isAudio(self: *const Clip) bool {
+        return self.audio_style >= 0;
+    }
 };
 
 /// 钢琴卷帘中的音符（**局部坐标**，按样式 + 乐器归属）。
@@ -146,11 +157,14 @@ pub const InstrumentKind = enum(u8) { synth = 0, drumkit = 1, vst3 = 2 };
 pub const LayerKind = enum(u8) {
     subtractive = 0,
     vst3 = 2,
+    /// 采样器层（一次性、原速；变速靠 `speed` 旋钮）
+    sampler = 3,
 
     pub fn displayName(self: LayerKind) []const u8 {
         return switch (self) {
             .subtractive => "减法合成器",
             .vst3 => "VST3 乐器",
+            .sampler => "采样器",
         };
     }
 };
@@ -184,6 +198,30 @@ pub const DrumLayer = struct {
     /// 最后已知类 CID（32 hex 文本；0 长 = 未知）——重绑定自愈/存档身份
     plugin_cid: [32]u8 = [_]u8{0} ** 32,
     plugin_cid_len: u8 = 0,
+
+    // ── 采样器层（kind == .sampler）──
+    /// 采样源文件路径（固定缓冲；存档按相对路径）
+    asset_path: [512]u8 = [_]u8{0} ** 512,
+    asset_path_len: u16 = 0,
+    /// 运行时资产下标（`App.audio_assets`；-1 = 未加载/失败）
+    asset_idx: i32 = -1,
+    /// 采样内起点（帧）
+    trim_start: i32 = 0,
+    /// 采样内长度（帧；<= 0 = 到素材末尾）
+    trim_len: i32 = 0,
+    /// 播放速度（1 = 原速；v1 = 变速变调；0.5..2.0 旋钮范围）
+    speed: f32 = 1.0,
+
+    pub fn assetPath(self: *const DrumLayer) []const u8 {
+        return self.asset_path[0..self.asset_path_len];
+    }
+    pub fn setAssetPath(self: *DrumLayer, path: []const u8) void {
+        const n = @min(path.len, self.asset_path.len);
+        const same = self.asset_path_len == n and std.mem.eql(u8, self.asset_path[0..n], path[0..n]);
+        @memcpy(self.asset_path[0..n], path[0..n]);
+        self.asset_path_len = @intCast(n);
+        if (!same) self.load_failed = false;
+    }
 
     pub fn pluginCid(self: *const DrumLayer) []const u8 {
         return self.plugin_cid[0..self.plugin_cid_len];

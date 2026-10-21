@@ -131,6 +131,7 @@ fn gatherRange(
 ) bool {
     if (song_mode) {
         for (clips) |clip| {
+            if (clip.isAudio()) continue; // 音频片段不是样式实例：不参与音符调度
             if (sched.muted) |mu| {
                 if (mu.contains(clip.track)) continue; // 静音轨道：其片段不调度
             }
@@ -174,6 +175,7 @@ fn gatherMidOns(
 ) void {
     if (song_mode) {
         for (clips) |clip| {
+            if (clip.isAudio()) continue; // 音频片段不是样式实例：不参与音符调度
             if (sched.muted) |mu| {
                 if (mu.contains(clip.track)) continue; // 静音轨道：不补挂音符
             }
@@ -331,6 +333,48 @@ pub fn rescanForEdit(
     }
 }
 
+/// **播放中切轨道静音**：立即生效（不是“下一遍才静”）。
+///
+/// 1) 该轨在游标处**正在响**的音符 → 补 `off@游标`（只动这条轨的声部）；
+/// 2) 递增 `edit_gen`（音频丢弃**未触发**的旧副本）+ 重扫 `[游标+1, 水位线)`：
+///    新静音集合已在 `sched.muted` 上生效 → 后续事件天然被过滤。
+///
+/// 注：PAT 模式不按轨道（播放当前样式），直接返回。
+/// 调用方负责在发布前置好 `sched.muted` 指向的静音集合。
+pub fn muteTrackLive(
+    sched: *Scheduler,
+    queue: *synth.SchedQueue,
+    clips: []const model.Clip,
+    notes: []const model.Note,
+    song_mode: bool,
+    pattern: i32,
+    track: i32,
+    cur: i32,
+    muted: bool,
+) void {
+    if (!song_mode) return;
+    if (muted) {
+        for (clips) |clip| {
+            if (clip.isAudio()) continue; // 音频片段不是样式实例：不参与音符调度
+            if (clip.track != track) continue;
+            for (notes) |nt| {
+                if (nt.pattern != clip.pattern) continue;
+                const m = mapSong(clip, nt) orelse continue;
+                if (m.start < cur and cur < m.end) {
+                    queue.push(makeEv(nt, .off, cur, sched));
+                }
+            }
+        }
+    }
+    sched.edit_gen +%= 1;
+    const from = cur + 1;
+    sched.rescan_from = from;
+    const watermark = sched.scheduled_upto;
+    if (watermark > from) {
+        scheduleRange(sched, queue, clips, notes, song_mode, pattern, from, watermark);
+    }
+}
+
 /// `rescanForEdit`/`switchMode` 的差分单侧：遍历 `side_notes` 中**本侧首次
 /// 出现**的（音高, 乐器）键，计算两侧跨游标实例数差（两侧的模式/游标可不同：
 /// 编辑重扫时同侧同游标；模式切换时旧模式@旧游标 vs 新模式@新游标）；
@@ -391,6 +435,7 @@ fn crossingCount(clips: []const model.Clip, notes: []const model.Note, song_mode
         if (nt.pitch != pitch or nt.instrument != instrument) continue;
         if (song_mode) {
             for (clips) |clip| {
+                if (clip.isAudio()) continue; // 音频片段不是样式实例：不参与音符调度
                 if (nt.pattern != clip.pattern) continue;
                 const m = mapSong(clip, nt) orelse continue;
                 if (m.start <= cur and cur < m.end) c += 1;
@@ -986,4 +1031,61 @@ test "sequencer: switchMode——匹配实例不发事件（保声部）、off �
     }
     try std.testing.expect(on115_64); // 其他轨起音
     try std.testing.expect(!on115_60); // 匹配实例不重击
+}
+
+test "sequencer: 播放中切静音——该轨在响音符立即 off，窗口内不再补 on" {
+    const alloc = std.testing.allocator;
+    var q = synth.SchedQueue{};
+    var s = Scheduler{};
+    var mutes = TrackMutes{};
+    defer mutes.deinit(alloc);
+    s.muted = &mutes;
+    const clips = [_]model.Clip{.{ .track = 0, .start = 0, .len = 64, .pattern = 0 }};
+    const notes = [_]model.Note{
+        .{ .step = 4, .len = 8, .pitch = 60, .pattern = 0 }, // 跨游标 8（正在响）
+        .{ .step = 16, .len = 4, .pitch = 62, .pattern = 0 }, // 窗口内（静音后不应再调度）
+    };
+    reset(&s, &q, &clips, &notes, true, 0, 0);
+    scheduleRange(&s, &q, &clips, &notes, true, 0, 0, 64);
+    var out: [64]synth.SchedEvent = undefined;
+    _ = drainAll(&q, &out); // 排空初始事件
+
+    try mutes.put(alloc, 0, {}); // 静音集合先就位（调用方职责）
+    muteTrackLive(&s, &q, &clips, &notes, true, 0, 0, 8, true);
+
+    const n = drainAll(&q, &out);
+    try std.testing.expectEqual(@as(usize, 1), n); // 只有 off@8；on@16 被过滤
+    try std.testing.expectEqual(synth.EventKind.off, out[0].kind);
+    try std.testing.expectEqual(@as(u8, 60), out[0].pitch);
+    try std.testing.expectEqual(@as(i32, 8), out[0].step);
+
+    // 取消静音 → 后续窗口恢复调度（on@16 回来）
+    _ = mutes.remove(0);
+    muteTrackLive(&s, &q, &clips, &notes, true, 0, 0, 8, false);
+    const n2 = drainAll(&q, &out);
+    var seen_on16 = false;
+    for (out[0..n2]) |ev| {
+        if (ev.kind == .on and ev.step == 16 and ev.pitch == 62) seen_on16 = true;
+    }
+    try std.testing.expect(seen_on16);
+}
+
+test "sequencer: 音频片段不参与音符调度（不得借道其 pattern/轨道发声）" {
+    var q = synth.SchedQueue{};
+    var s = Scheduler{};
+    const clips = [_]model.Clip{
+        .{ .track = 0, .start = 0, .len = 32, .pattern = 0 }, // 音符片段（将被静音）
+        .{ .track = 1, .start = 0, .len = 32, .pattern = 0, .audio_style = 0 }, // 音频片段
+    };
+    const notes = [_]model.Note{.{ .step = 0, .len = 4, .pitch = 60, .pattern = 0 }};
+    var mutes = TrackMutes{};
+    defer mutes.deinit(std.testing.allocator);
+    s.muted = &mutes;
+    try mutes.put(std.testing.allocator, 0, {}); // 静音音符轨（音频轨未静音）
+
+    reset(&s, &q, &clips, &notes, true, 0, 0);
+    scheduleRange(&s, &q, &clips, &notes, true, 0, 0, 64);
+
+    var out: [16]synth.SchedEvent = undefined;
+    try std.testing.expectEqual(@as(usize, 0), drainAll(&q, &out));
 }

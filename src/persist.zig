@@ -43,6 +43,12 @@ pub const SavedClip = struct {
     pattern: i32,
     /// 左缘对应的局部步
     offset: i32 = 0,
+    /// **音频片段**：音频样式序号（-1 = 样式片段）
+    audio_style: i32 = -1,
+    /// 音频片段：采样内起点（帧）
+    trim_start: i32 = 0,
+    /// 音频片段：采样内长度（帧；<= 0 = 到素材末尾）
+    trim_len: i32 = 0,
     // ── v1 兼容字段（**仅用于迁移**；v2 存档不写）──
     /// v1：起始小节（1 起）。加载 v1 时据此重建 `start`。
     bar: ?i32 = null,
@@ -63,6 +69,19 @@ pub const SavedClip = struct {
         if (self.offset != 0) {
             try jw.objectField("offset");
             try jw.write(self.offset);
+        }
+        // 音频片段（默认省略：-1/0 = 样式片段）
+        if (self.audio_style >= 0) {
+            try jw.objectField("audio_style");
+            try jw.write(self.audio_style);
+        }
+        if (self.trim_start != 0) {
+            try jw.objectField("trim_start");
+            try jw.write(self.trim_start);
+        }
+        if (self.trim_len != 0) {
+            try jw.objectField("trim_len");
+            try jw.write(self.trim_len);
         }
         try jw.endObject();
     }
@@ -157,6 +176,28 @@ pub const SavedDrumLayer = struct {
     /// 音色状态（base64 文本；组件/控制器各一份；空 = 无）
     plugin_state: []const u8 = "",
     plugin_state_ctrl: []const u8 = "",
+    // ── 采样器层（kind == 3；路径按相对工程目录存）──
+    /// 采样源文件（相对路径）
+    asset_path: []const u8 = "",
+    /// 采样内起点/长度（帧）
+    trim_start: i32 = 0,
+    trim_len: i32 = 0,
+    /// 播放速度（1 = 原速）
+    speed: f32 = 1.0,
+};
+
+/// 存档中的**音频样式**（与音符样式对称：共享内容 = 通道/增益；片段引用样式序号）
+pub const SavedAudioStyle = struct {
+    /// 名称（默认 = 文件名；用户信息）
+    name: []const u8 = "",
+    /// 源文件（**相对工程目录**的路径；空 = 无源）
+    path: []const u8 = "",
+    /// 混音通道（0 起）
+    channel: i32 = 0,
+    /// 样式增益（0..2；1 = 原电平）
+    gain: f32 = 1.0,
+    /// 播放速度（1 = 原速；变速变调）
+    speed: f32 = 1.0,
 };
 
 /// 存档中的鼓垫（一个音高 + 名字 + 层列表）
@@ -267,6 +308,8 @@ pub const Project = struct {
     legacy_units_per_bar: i32 = model.units_per_whole,
     clips: []SavedClip = &.{},
     notes: []SavedNote = &.{},
+    /// 音频样式（引用文件按相对工程目录的路径；片段经 `SavedClip.audio_style` 引用）
+    audio_styles: []SavedAudioStyle = &.{},
     instruments: []SavedInstrument = &.{},
     /// 调音台通道（旧存档缺失 → 全默认 8 通道；加载时长度不匹配则重置）
     mixer: []SavedMixerChannel = &.{},
@@ -418,11 +461,57 @@ pub fn fromJson(allocator: std.mem.Allocator, data: []const u8) !std.json.Parsed
 //   存储（省 25%）：tag 0 = 空、1 = raw、2 = 文本回退（非法 base64 原样存）。
 // 读取严格：magic/版本校验 + 全量消费（尾部垃圾 = 错误——防截断/错位静默）。
 pub const binary_magic = "SAWD";
-pub const binary_version: u8 = 5;
+/// 当前布局版本。
+/// **不变量**：任何 `Saved*`/`Project` 字段增删/调序**必须**递增它（v5 首版曾被
+/// 多次改布局未递增，导致旧工程加载错位 → `integer does not fit…` 崩溃，实测）。
+/// v5 旧档保留专门的兼容读（见 `introducedVersion`/`legacySkip`）。
+pub const binary_version: u8 = 6;
+/// v5（首版二进制，f4a7960）——兼容读取用
+const binary_version_legacy: u8 = 5;
+
+/// 某字段**首次出现的存档版本**（未登记 = 从首版就有 → null）。
+///
+/// **纪律**：新增字段时在这里登记它的版本号（见 `docs/save-format.md`）。
+/// 读取比该字段更早的存档时，`legacySkip` 会跳过它（保留声明默认值），
+/// 否则会吞掉下一字段/下一元素的字节（v5 事故：`integer does not fit…` 崩溃）。
+/// 按**结构体名 + 字段名**双重匹配（`plugin_path` 在 `SavedInstrument`
+/// 里是 v5 之前就有的，不能误跳）。
+fn introducedVersion(comptime T: type, comptime name: []const u8) ?u8 {
+    const tn = @typeName(T);
+    if (comptime std.mem.endsWith(u8, tn, "SavedDrumLayer")) {
+        // 85f9bad（层 VST3）+ 音频 P1（采样器层字段）——均为 v6
+        inline for (.{ "plugin_path", "plugin_cid", "plugin_state", "plugin_state_ctrl", "asset_path", "trim_start", "trim_len", "speed" }) |fn_name| {
+            if (comptime std.mem.eql(u8, name, fn_name)) return binary_version;
+        }
+        return null;
+    }
+    if (comptime std.mem.endsWith(u8, tn, "SavedClip")) {
+        // 音频片段字段——v6
+        inline for (.{ "audio_style", "trim_start", "trim_len" }) |fn_name| {
+            if (comptime std.mem.eql(u8, name, fn_name)) return binary_version;
+        }
+        return null;
+    }
+    if (comptime std.mem.endsWith(u8, tn, "Project")) {
+        inline for (.{"audio_styles"}) |fn_name| {
+            if (comptime std.mem.eql(u8, name, fn_name)) return binary_version;
+        }
+        return null;
+    }
+    return null;
+}
+
+/// 读 `ver` 版本存档时，字段 `name` 是否应**跳过不读**（比它首次出现的版本更旧）。
+fn legacySkip(ver: u8, comptime T: type, comptime name: []const u8) bool {
+    const intro = comptime introducedVersion(T, name) orelse return false;
+    return ver < intro;
+}
 
 const BinWriter = struct {
     a: std.mem.Allocator,
     buf: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 },
+    /// 目标格式版本（默认当前；`toBinaryLegacyV5` 写旧布局时改为旧版本）
+    version: u8 = binary_version,
 
     fn put(self: *BinWriter, bytes: []const u8) !void {
         try self.buf.appendSlice(self.a, bytes);
@@ -440,6 +529,8 @@ const BinWriter = struct {
 const BinReader = struct {
     data: []const u8,
     pos: usize = 0,
+    /// 源存档版本（决定哪些字段需要跳过：见 `legacySkip`）
+    version: u8 = binary_version,
 
     fn take(self: *BinReader, n: usize) ![]const u8 {
         if (n > self.data.len -| self.pos) return error.UnexpectedEndOfBinary;
@@ -524,7 +615,15 @@ fn binWriteValue(comptime T: type, w: *BinWriter, v: T) !void {
         .@"enum" => try w.putVarint(@intFromEnum(v)),
         .@"struct" => |s| {
             inline for (s.fields) |f| {
-                if (comptime isB64TextField(f.name, f.type)) {
+                if (comptime introducedVersion(T, f.name) != null) {
+                    if (!legacySkip(w.version, T, f.name)) { // 目标版本更旧 → 不写该字段
+                        if (comptime isB64TextField(f.name, f.type)) {
+                            try binWriteB64Field(w, @field(v, f.name));
+                        } else {
+                            try binWriteValue(f.type, w, @field(v, f.name));
+                        }
+                    }
+                } else if (comptime isB64TextField(f.name, f.type)) {
                     try binWriteB64Field(w, @field(v, f.name));
                 } else {
                     try binWriteValue(f.type, w, @field(v, f.name));
@@ -590,7 +689,15 @@ fn binReadValue(comptime T: type, r: *BinReader, a: std.mem.Allocator) !T {
         .@"struct" => |s| {
             var out: T = undefined;
             inline for (s.fields) |f| {
-                if (comptime isB64TextField(f.name, f.type)) {
+                if (comptime introducedVersion(T, f.name) != null) {
+                    if (legacySkip(r.version, T, f.name)) {
+                        // 旧版本没有该字段 → 用声明默认值
+                        const dv = f.default_value_ptr orelse @compileError("legacy v5 跳过字段必须有默认值：" ++ f.name);
+                        @field(out, f.name) = @as(*const f.type, @ptrCast(@alignCast(dv))).*;
+                    } else {
+                        @field(out, f.name) = try binReadValue(f.type, r, a);
+                    }
+                } else if (comptime isB64TextField(f.name, f.type)) {
                     @field(out, f.name) = try binReadB64Field(r, a);
                 } else {
                     @field(out, f.name) = try binReadValue(f.type, r, a);
@@ -612,6 +719,16 @@ pub fn toBinary(allocator: std.mem.Allocator, project: Project) ![]u8 {
     return w.buf.toOwnedSlice(allocator);
 }
 
+/// 以 **v5 旧布局**写出（测试/兼容验证用；生产永远写当前版本）
+pub fn toBinaryLegacyV5(allocator: std.mem.Allocator, project: Project) ![]u8 {
+    var w = BinWriter{ .a = allocator, .version = binary_version_legacy };
+    errdefer w.buf.deinit(allocator);
+    try w.put(binary_magic);
+    try w.putByte(binary_version_legacy);
+    try binWriteValue(Project, &w, project);
+    return w.buf.toOwnedSlice(allocator);
+}
+
 /// v5 二进制 → 工程。返回值与 `fromJson` 同型（`.value` / `.deinit()`）——
 /// 内部用 ArenaAllocator 持有切片，调用方零差异。
 pub fn fromBinary(allocator: std.mem.Allocator, data: []const u8) !std.json.Parsed(Project) {
@@ -624,7 +741,9 @@ pub fn fromBinary(allocator: std.mem.Allocator, data: []const u8) !std.json.Pars
     const magic = try r.take(binary_magic.len);
     if (!std.mem.eql(u8, magic, binary_magic)) return error.NotBinaryProject;
     const ver = try r.byte();
-    if (ver != binary_version) return error.UnsupportedBinaryVersion;
+    if (ver == binary_version_legacy) {
+        r.version = ver; // 旧档：`legacySkip` 据此跳过旧版本没有的字段（保留默认值）
+    } else if (ver != binary_version) return error.UnsupportedBinaryVersion;
     const value = try binReadValue(Project, &r, arena.allocator());
     if (r.pos != data.len) return error.TrailingBinaryData;
     return .{ .arena = arena, .value = value };
@@ -1041,6 +1160,18 @@ test "persist: 全字段非默认往返（防手写序列化漏字段）" {
     try expectRoundtrip(SavedMixerChannel, .{ .name = "鼓组", .volume = 0.111, .pan = 0.222, .muted = true, .effects = &chain });
     var lyrs = [_]SavedDrumLayer{.{ .kind = 1, .synth = .{ .attack = 0.1 }, .gain = 0.5, .source_preset = "kit/k" }};
     try expectRoundtrip(SavedDrumLayer, lyrs[0]);
+    // 采样器层：采样路径/trim 全量往返
+    try expectRoundtrip(SavedDrumLayer, .{
+        .kind = 3,
+        .gain = 0.8,
+        .source_preset = "kick.wav",
+        .asset_path = "samples/kick.wav",
+        .trim_start = 100,
+        .trim_len = 2000,
+    });
+    // 音频样式 + 音频片段字段往返
+    try expectRoundtrip(SavedAudioStyle, .{ .name = "Kick", .path = "samples/kick.wav", .channel = 2, .gain = 0.75 });
+    try expectRoundtrip(SavedClip, .{ .track = 1, .start = 96, .len = 24, .pattern = 0, .audio_style = 0, .trim_start = 100, .trim_len = 2000 });
     // VST3 层：插件字段全量往返（路径/CID/状态 base64）
     try expectRoundtrip(SavedDrumLayer, .{
         .kind = 2,
@@ -1325,4 +1456,30 @@ test "persist: 样式名往返（旧存档无字段 → 空列表）" {
     defer old.deinit();
     try std.testing.expectEqual(@as(usize, 0), old.value.pattern_names.len);
     try std.testing.expectEqual(@as(i32, 6), old.value.pattern_count);
+}
+
+test "persist: v5 旧布局兼容读（v5 之后追加的字段取默认值）" {
+    const a = std.testing.allocator;
+    const clips = [_]SavedClip{
+        .{ .track = 2, .start = 8, .len = 4, .pattern = 1, .audio_style = 3, .trim_start = 100, .trim_len = 200 },
+        .{ .track = 0, .start = 0, .len = 16, .pattern = 0, .audio_style = 5, .trim_start = 7, .trim_len = 9 },
+    };
+    const proj = Project{ .clips = @constCast(&clips) };
+    const bytes = try toBinaryLegacyV5(a, proj);
+    defer a.free(bytes);
+    try std.testing.expectEqual(@as(u8, binary_version_legacy), bytes[4]);
+    var parsed = try fromBinary(a, bytes);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.clips.len);
+    // 旧字段完整
+    try std.testing.expectEqual(@as(i32, 2), parsed.value.clips[0].track);
+    try std.testing.expectEqual(@as(i32, 8), parsed.value.clips[0].start);
+    try std.testing.expectEqual(@as(i32, 4), parsed.value.clips[0].len);
+    try std.testing.expectEqual(@as(i32, 1), parsed.value.clips[0].pattern);
+    try std.testing.expectEqual(@as(i32, 0), parsed.value.clips[1].track);
+    // v5 之后追加的字段 → 默认值（不吞后面的元素字节）
+    try std.testing.expectEqual(@as(i32, -1), parsed.value.clips[0].audio_style);
+    try std.testing.expectEqual(@as(i32, 0), parsed.value.clips[0].trim_start);
+    try std.testing.expectEqual(@as(i32, -1), parsed.value.clips[1].audio_style);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.audio_styles.len);
 }

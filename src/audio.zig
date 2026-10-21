@@ -137,6 +137,34 @@ pub const Params = struct {
     kit_layer_plugin: [][]std.atomic.Value(?*vst_host.Plugin) = &.{},
     /// 鼓组层 VST3 防挂音 panic（状态恢复后置位：下一段对该层全 128 补 off）
     kit_layer_panic: [][]std.atomic.Value(bool) = &.{},
+    /// 鼓组采样器层的采样数据（kind == 3；UI 发布不可变 SampleData 指针）
+    kit_layer_asset: [][]std.atomic.Value(?*const SampleData) = &.{},
+    /// 鼓组采样器层：采样内起点（帧，>= 0）
+    kit_layer_trim_start: [][]std.atomic.Value(i32) = &.{},
+    /// 鼓组采样器层：采样内长度（帧；<= 0 = 到素材末尾）
+    kit_layer_trim_len: [][]std.atomic.Value(i32) = &.{},
+    /// 鼓组采样器层：播放速度（每帧前进的采样帧数；v1 = 音高同步变速）
+    kit_layer_speed: [][]std.atomic.Value(f32) = &.{},
+
+    // ── 音频片段/试听（见 `AudioTable` / `renderSegment`）──
+    /// 音频片段播放表（不可变快照；UI 重建/发布，帧末轮换退役）
+    audio_table: std.atomic.Value(?*const AudioTable) = std.atomic.Value(?*const AudioTable).init(null),
+    /// 波形窗口试听（全局单实例）：采样 + 区间 + 增益 + 通道
+    preview_asset: std.atomic.Value(?*const SampleData) = std.atomic.Value(?*const SampleData).init(null),
+    preview_start: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
+    preview_len: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
+    preview_gain: std.atomic.Value(f32) = std.atomic.Value(f32).init(1.0),
+    /// 试听速度（变速变调；波形窗按样式速度试听）
+    preview_speed: std.atomic.Value(f32) = std.atomic.Value(f32).init(1.0),
+    /// 试听速度（变速变调；波形窗按样式速度试听）
+    preview_channel: std.atomic.Value(u16) = std.atomic.Value(u16).init(0),
+    preview_playing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// 试听游标回写（帧；-1 = 未播放）——UI 读它画游标
+    preview_pos: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
+    /// 主输出峰值（|x| 最大值；UI 读来做电平表——以后波形超载标红也用它）
+    out_peak: std.atomic.Value(f32) = std.atomic.Value(f32).init(0),
+    /// 自上次 UI 读取以来 |x| > 1.0 的采样数（swap 清零：削波计数）
+    out_over: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     // ── 调音台：每通道参数（UI 写、音频线程读）──
     /// 通道增益（0-1）
@@ -215,6 +243,10 @@ pub const Params = struct {
         self.kit_layer_kind = try allocAtomicRows(u32, a, ic, kit_max_layers, 0);
         self.kit_layer_plugin = try allocAtomicRows(?*vst_host.Plugin, a, ic, kit_max_layers, null);
         self.kit_layer_panic = try allocAtomicRows(bool, a, ic, kit_max_layers, false);
+        self.kit_layer_asset = try allocAtomicRows(?*const SampleData, a, ic, kit_max_layers, null);
+        self.kit_layer_trim_start = try allocAtomicRows(i32, a, ic, kit_max_layers, 0);
+        self.kit_layer_trim_len = try allocAtomicRows(i32, a, ic, kit_max_layers, 0);
+        self.kit_layer_speed = try allocAtomicRows(f32, a, ic, kit_max_layers, 1.0);
         self.sounding_lo = try allocAtomicArr(u64, a, ic, 0);
         self.sounding_hi = try allocAtomicArr(u64, a, ic, 0);
         self.channel_gain = try allocAtomicArr(f32, a, cc, 0.8);
@@ -254,6 +286,10 @@ pub const Params = struct {
         freeAtomicRows(u32, a, &self.kit_layer_kind);
         freeAtomicRows(?*vst_host.Plugin, a, &self.kit_layer_plugin);
         freeAtomicRows(bool, a, &self.kit_layer_panic);
+        freeAtomicRows(?*const SampleData, a, &self.kit_layer_asset);
+        freeAtomicRows(i32, a, &self.kit_layer_trim_start);
+        freeAtomicRows(i32, a, &self.kit_layer_trim_len);
+        freeAtomicRows(f32, a, &self.kit_layer_speed);
         freeAtomicArr(u64, a, &self.sounding_lo);
         freeAtomicArr(u64, a, &self.sounding_hi);
         freeAtomicArr(f32, a, &self.channel_gain);
@@ -294,6 +330,10 @@ pub const Params = struct {
             try growAtomicRows(u32, a, &self.kit_layer_kind, ic, kit_max_layers, 0);
             try growAtomicRows(?*vst_host.Plugin, a, &self.kit_layer_plugin, ic, kit_max_layers, null);
             try growAtomicRows(bool, a, &self.kit_layer_panic, ic, kit_max_layers, false);
+            try growAtomicRows(?*const SampleData, a, &self.kit_layer_asset, ic, kit_max_layers, null);
+            try growAtomicRows(i32, a, &self.kit_layer_trim_start, ic, kit_max_layers, 0);
+            try growAtomicRows(i32, a, &self.kit_layer_trim_len, ic, kit_max_layers, 0);
+            try growAtomicRows(f32, a, &self.kit_layer_speed, ic, kit_max_layers, 1.0);
             try growAtomicArr(u64, a, &self.sounding_lo, ic, 0);
             try growAtomicArr(u64, a, &self.sounding_hi, ic, 0);
             self.instruments_cap = ic;
@@ -448,6 +488,8 @@ pub const Engine = struct {
     /// 鼓组 VST3 层状态（每层事件批 + 发声位图；**惰性**——仅含 VST3 层的
     /// 鼓组分配；生命周期同鼓组池：设备暂停窗口内创建/释放，见 `App.ensureKitVsti`）
     kit_vsti: []std.atomic.Value(?*KitVstiState) = &.{},
+    /// 鼓组采样器层状态（每层声部池；**惰性**，同 kit_vsti）
+    kit_sampler: []std.atomic.Value(?*KitSamplerState) = &.{},
     /// VSTi 渲染中转缓冲（插件的原位写出不能直接覆盖通道缓冲——需叠加）
     vsti_scratch: []f32 = &.{},
     /// VSTi 待发送事件批（事件在**段边界以 offset 0 生效**：dispatchNote 填充，
@@ -469,6 +511,9 @@ pub const Engine = struct {
     stash_n: usize = 0,
     /// 当前渲染**段**起点的绝对播放帧（dataCallback 每段设置；ProcessContext 用）
     seg_abs0: u64 = 0,
+    /// 累计派发的调度事件数（单调递增；导出诊断用）
+    dbg_dispatched: u64 = 0,
+    /// 最近一次 resumeDevice 的 miniaudio 返回码（0 = 成功；排障用）
     /// stash 所属的 generation（gen 变化时整批作废）
     stash_gen: u32 = 1,
     /// 上一块的播放状态（用于检测“播放 → 暂停”下降沿）
@@ -537,7 +582,9 @@ pub const Engine = struct {
     }
 
     pub fn resumeDevice(self: *Engine) void {
-        if (self.initialized) _ = ma.ma_device_start(&self.device);
+        if (!self.initialized) return;
+        if (ma.ma_device_get_state(&self.device) == ma.ma_device_state_started) return;
+        _ = ma.ma_device_start(&self.device);
     }
 
     pub fn deinit(self: *Engine) void {
@@ -560,6 +607,11 @@ pub const Engine = struct {
         }
         if (self.kit_vsti.len > 0) self.allocator.free(self.kit_vsti);
         self.kit_vsti = &.{};
+        for (self.kit_sampler) |*c| {
+            if (c.load(.monotonic)) |ks| self.allocator.destroy(ks);
+        }
+        if (self.kit_sampler.len > 0) self.allocator.free(self.kit_sampler);
+        self.kit_sampler = &.{};
         if (self.vsti_scratch.len > 0) {
             self.allocator.free(self.vsti_scratch);
             self.vsti_scratch = &.{};
@@ -588,6 +640,12 @@ pub const Engine = struct {
         self.instruments_cap = 0;
         self.channels_cap = 0;
         self.slots_cap = 0;
+    }
+
+    /// 设备状态（排障用）：-1 = 未初始化；0 = uninit / 1 = stopped / 2 = started / 3 = starting / 4 = stopping
+    pub fn deviceState(self: *const Engine) i32 {
+        if (!self.initialized) return -1;
+        return @intCast(ma.ma_device_get_state(&self.device));
     }
 
     /// 建立/扩容引擎侧容量数组（**契约：设备未运行或已暂停**——见 `App.ensureAudioCapacity`）。
@@ -624,6 +682,17 @@ pub const Engine = struct {
             }
             if (self.kit_vsti.len > 0) a.free(self.kit_vsti);
             self.kit_vsti = nv;
+            // 鼓组采样器层状态：惰性——只维护指针数组（Chunk 由 `App.ensureKitSampler` 分配）
+            const nsm = try a.alloc(std.atomic.Value(?*KitSamplerState), ic);
+            for (nsm) |*c| c.* = std.atomic.Value(?*KitSamplerState).init(null);
+            for (nsm[0..@min(ic, self.kit_sampler.len)], 0..) |*c, i| c.* = std.atomic.Value(?*KitSamplerState).init(self.kit_sampler[i].load(.monotonic));
+            if (self.kit_sampler.len > ic) {
+                for (self.kit_sampler[ic..]) |*c| {
+                    if (c.load(.monotonic)) |ks| a.destroy(ks);
+                }
+            }
+            if (self.kit_sampler.len > 0) a.free(self.kit_sampler);
+            self.kit_sampler = nsm;
             const ne = try a.alloc([]ivstevents.Event, ic);
             @memset(ne, &.{});
             errdefer {
@@ -710,6 +779,128 @@ pub const Engine = struct {
 /// 鼓组层声部池：每乐器一池（`kit_max_layers` 层 × 每层 32 声部）
 pub const KitPool = [kit_max_layers]synth.KitLayerSynth;
 
+/// 鼓组采样器层的每层声部数（快滚奏时重叠一次性采样）
+pub const kit_sampler_voices = 8;
+
+/// 采样器声部（v1：一次性、原速；`step` 预留变速）
+pub const SamplerVoice = struct {
+    /// 采样内位置（帧，浮点——线性插值）
+    pos: f64 = 0,
+    /// 结束位置（帧；trim 末）
+    end: f64 = 0,
+    /// 每帧前进的采样帧数（v1 恒 1.0）
+    step: f64 = 1.0,
+    /// 输出增益（力度 × 层增益 × 声像 L/R）
+    gain_l: f32 = 0,
+    gain_r: f32 = 0,
+    /// 触发音高（发声高亮回传用）
+    pitch: u8 = 0,
+    active: bool = false,
+};
+
+/// 鼓组采样器集体：每层一个声部池
+pub const KitSamplerState = struct {
+    layers: [kit_max_layers]Layer = [_]Layer{.{}} ** kit_max_layers,
+
+    pub const Layer = struct {
+        voices: [kit_sampler_voices]SamplerVoice = [_]SamplerVoice{.{}} ** kit_sampler_voices,
+    };
+};
+
+/// 不可变采样数据（UI 解码后发布；音频线程只读。帧 = f32 交错立体声@引擎率）
+pub const SampleData = struct {
+    frames: []const f32,
+    /// 采样点数（**原生采样率**下的帧数——`frames` 的索引上限）
+    frame_count: usize,
+    /// 原生率 / 引擎率（播放位置换算：引擎帧 × ratio = 采样帧；1.0 = 同率）
+    /// 解码时**不重采样**（P1 提速）：所有 UI/trim 仍以引擎帧为单位，
+    /// 只在真正取样本时乘这个系数。
+    ratio: f32 = 1.0,
+
+    /// 引擎帧域长度（UI/trim 域：= frame_count / ratio）
+    pub inline fn engFrames(self: *const SampleData) usize {
+        if (self.ratio <= 0.0) return self.frame_count;
+        return @intFromFloat(@as(f64, @floatFromInt(self.frame_count)) / @as(f64, self.ratio));
+    }
+};
+
+/// 音频片段播放表的一行（不可变快照；UI 重建后原子发布）
+pub const AudioTableRow = struct {
+    /// 时间轴（步）
+    start: i32,
+    len: i32,
+    /// 采样数据与采样内 trim（帧）
+    asset: ?*const SampleData,
+    trim_start: i32,
+    trim_len: i32,
+    /// 混音通道 + 样式增益
+    channel: u16,
+    gain: f32,
+    /// 播放速度（1 = 原速；v1 = 变速变调，0.5..2.0）
+    speed: f32 = 1.0,
+};
+
+/// 音频片段播放表（**不可变**快照；UI 在帧末重建并发布）
+pub const AudioTable = struct {
+    rows: []const AudioTableRow,
+};
+
+/// 音频片段在**本渲染段**内的写入窗口（纯函数，见 `clipSpan`）。
+/// 坐标全部是**段内相对**（`[w0, w1)` ∈ `[0, seg_len)`）——直接下标写本段缓冲。
+pub const ClipSpan = struct {
+    w0: usize,
+    w1: usize,
+    /// 对 `w0` 的采样内起点（原生帧域，可为小数）
+    pos0: f64,
+    /// 每个输出帧的采样内前进量（速度 × 采样率比）
+    step: f64,
+};
+
+/// 计算一个音频片段在渲染段 `[seg_abs0, seg_abs0+seg_len)` 内的写入窗口。
+///
+/// **坑（实测“篝火噼啪声”的真因）**：音频线程会把一个块按音符事件切段
+/// （`renderSegment` 多次调用），每段的缓冲长度 = 段长、且缓冲每次只清段长。
+/// 旧实现用**整块起点**（`params.frames_played`）算段内偏移 → 第二段起越界
+/// 与错位（每次音符事件炸一下）。这里强制用**段坐标**。
+pub fn clipSpan(
+    seg_abs0: i64,
+    seg_len: i64,
+    start_frame: i64,
+    start_step: i32,
+    step_frames: i64,
+    row_start: i32,
+    row_len: i32,
+    trim_start: i32,
+    trim_len: i32,
+    speed: f32,
+    ratio: f32,
+    eng_frames: usize,
+) ?ClipSpan {
+    const r: f64 = @max(0.0001, @as(f64, ratio));
+    const tstart: i64 = trim_start;
+    var tlen: i64 = trim_len;
+    if (tlen <= 0) tlen = @as(i64, @intCast(eng_frames)) - tstart;
+    if (tlen <= 0 or tstart < 0 or @as(u64, @intCast(tstart)) >= eng_frames) return null;
+    const tstart_n: i64 = @intFromFloat(@as(f64, @floatFromInt(tstart)) * r);
+    const tlen_n: i64 = @intFromFloat(@as(f64, @floatFromInt(tlen)) * r);
+    const spd: f64 = @max(0.25, @min(4.0, @as(f64, speed)));
+    const tlen_play: i64 = @intFromFloat(@as(f64, @floatFromInt(tlen_n)) / spd);
+    // 时间轴 → 绝对帧
+    const clip_s: i64 = start_frame + @as(i64, @intCast(row_start - start_step)) * step_frames;
+    const span_all: i64 = @as(i64, row_len) * step_frames;
+    const audible: i64 = @min(span_all, tlen_play);
+    const clip_e = clip_s + audible;
+    const ov_s: i64 = @max(seg_abs0, clip_s);
+    const ov_e: i64 = @min(seg_abs0 + seg_len, clip_e);
+    if (ov_e <= ov_s) return null;
+    return .{
+        .w0 = @intCast(ov_s - seg_abs0),
+        .w1 = @intCast(ov_e - seg_abs0),
+        .pos0 = @as(f64, @floatFromInt(tstart_n)) + @as(f64, @floatFromInt(ov_s - clip_s)) * spd * r,
+        .step = spd * r,
+    };
+}
+
 /// 鼓组 VST3 层的每层运行态：事件批（音频线程段内写/消费）+ 发声位图
 /// （暂停/all-off 按位补发 note-off——同乐器级 VSTi 惯例）。
 pub const KitVstiState = struct {
@@ -727,6 +918,59 @@ pub const KitVstiState = struct {
 fn kitVstiState(engine: *const Engine, i: usize) ?*KitVstiState {
     if (i >= engine.kit_vsti.len) return null;
     return engine.kit_vsti[i].load(.acquire);
+}
+
+/// 取某乐器的鼓组采样器层状态（未分配 → null；惰性分配见 `App.ensureKitSampler`）
+fn kitSamplerState(engine: *const Engine, i: usize) ?*KitSamplerState {
+    if (i >= engine.kit_sampler.len) return null;
+    return engine.kit_sampler[i].load(.acquire);
+}
+
+/// 采样器层：触发一次（一次性；找空闲声部，无 → 覆盖 0 号）
+fn kitSamplerNoteOn(engine: *Engine, i: usize, l: usize, pitch: u8, velocity: u8, pan: f32) void {
+    const st = kitSamplerState(engine, i) orelse return;
+    const params = engine.params;
+    const asset = params.kit_layer_asset[i][l].load(.acquire) orelse return;
+    if (l >= kit_max_layers) return;
+    const ld = &st.layers[l];
+    var v: *SamplerVoice = &ld.voices[0];
+    for (&ld.voices) |*cand| {
+        if (!cand.active) {
+            v = cand;
+            break;
+        }
+    }
+    const ts = params.kit_layer_trim_start[i][l].load(.monotonic);
+    var tl = params.kit_layer_trim_len[i][l].load(.monotonic);
+    if (ts < 0) return;
+    // 引擎帧 → 采样帧（原生率；解码不重采样）
+    const kr: f64 = @max(0.0001, @as(f64, asset.ratio));
+    const total = asset.frame_count;
+    if (ts >= @as(i32, @intCast(asset.engFrames()))) return;
+    if (tl <= 0) tl = @as(i32, @intCast(asset.engFrames() - @as(usize, @intCast(ts))));
+    const ts_n: usize = @intFromFloat(@as(f64, @floatFromInt(ts)) * kr);
+    const end: usize = @min(total, @as(usize, @intFromFloat(@as(f64, @floatFromInt(@as(i64, @intCast(ts)) + tl)) * kr)));
+    if (end <= ts_n) return;
+    const bg = balanceGains(pan);
+    const g: f32 = @as(f32, @floatFromInt(@max(1, velocity))) / 127.0;
+    const spd = std.math.clamp(params.kit_layer_speed[i][l].load(.monotonic), 0.25, 4.0);
+    v.* = .{
+        .pos = @floatFromInt(ts_n),
+        .end = @floatFromInt(end),
+        .step = spd * @as(f32, @floatCast(kr)),
+        .gain_l = g * bg[0],
+        .gain_r = g * bg[1],
+        .pitch = pitch,
+        .active = true,
+    };
+}
+
+/// 采样器层：全部声部清零（暂停/跳转/全体释音）
+fn kitSamplerAllOff(engine: *Engine, i: usize) void {
+    const st = kitSamplerState(engine, i) orelse return;
+    for (&st.layers) |*ld| {
+        for (&ld.voices) |*v| v.* = .{};
+    }
 }
 
 /// 取某乐器的鼓组层池（未分配 → null；惰性分配见 `App.ensureKitPool`）
@@ -759,6 +1003,8 @@ fn releaseAllVoices(engine: *Engine) void {
             kitLayerVstiPanic(engine, i, l);
         }
     }
+    // 鼓组采样器层：声部全清零（一次性无 off 可依——暂停/全体释音必须硬清）
+    for (0..engine.kit_sampler.len) |i| kitSamplerAllOff(engine, i);
 }
 
 /// VSTi：把事件追加到该乐器的待发送批（满则丢弃——宁可丢事件不分配）
@@ -1020,6 +1266,20 @@ fn publishSounding(engine: *Engine, params: *Params) void {
                 hi |= st.active_hi[l];
             }
         }
+        // 鼓组采样器层：发声声部的触发音高（一次性）
+        if (kitSamplerState(engine, i)) |kss| {
+            for (&kss.layers) |*ld| {
+                for (&ld.voices) |*v| {
+                    if (!v.active) continue;
+                    const p = v.pitch;
+                    if (p < 64) {
+                        lo |= @as(u64, 1) << @intCast(p);
+                    } else {
+                        hi |= @as(u64, 1) << @intCast(p - 64);
+                    }
+                }
+            }
+        }
         params.sounding_lo[i].store(lo, .monotonic);
         params.sounding_hi[i].store(hi, .monotonic);
     }
@@ -1087,11 +1347,17 @@ fn dispatchNote(engine: *Engine, ev: anytype) void {
                 const n_layers = @min(params.kit_layer_count[ev.instrument].load(.monotonic), kit_max_layers);
                 for (0..n_layers) |l| {
                     if (params.kit_layer_pitch[ev.instrument][l].load(.monotonic) != ev.pitch) continue;
+                    const lkind = params.kit_layer_kind[ev.instrument][l].load(.monotonic);
                     // VST3 层：事件转发到该层插件（实例未就绪 → 跳过）
-                    if (params.kit_layer_kind[ev.instrument][l].load(.monotonic) == 2) {
+                    if (lkind == 2) {
                         if (params.kit_layer_plugin[ev.instrument][l].load(.acquire) != null) {
                             kitLayerVstiNoteOn(engine, ev.instrument, l, ev.pitch, ev.velocity);
                         }
+                        continue;
+                    }
+                    // 采样器层：一次性触发（不需要声部池的 kit pool）
+                    if (lkind == 3) {
+                        kitSamplerNoteOn(engine, ev.instrument, l, ev.pitch, ev.velocity, pan);
                         continue;
                     }
                     const ks = engine.kitSynth(ev.instrument, l) orelse continue;
@@ -1105,15 +1371,17 @@ fn dispatchNote(engine: *Engine, ev: anytype) void {
             if (is_vsti) {
                 vstiNoteOff(engine, ev.instrument, ev.pitch);
             } else if (is_kit) {
-                // 全部层都收 off（无关层空转——防漏 off）
+                // 全部层都收 off（无关层空转——防漏 off；采样器为一次性，off 自然无效）
                 const n_layers = @min(params.kit_layer_count[ev.instrument].load(.monotonic), kit_max_layers);
                 for (0..n_layers) |l| {
-                    if (params.kit_layer_kind[ev.instrument][l].load(.monotonic) == 2) {
+                    const lkind = params.kit_layer_kind[ev.instrument][l].load(.monotonic);
+                    if (lkind == 2) {
                         if (params.kit_layer_plugin[ev.instrument][l].load(.acquire) != null) {
                             kitLayerVstiNoteOff(engine, ev.instrument, l, ev.pitch);
                         }
                         continue;
                     }
+                    if (lkind == 3) continue; // 一次性：off 不处理
                     if (engine.kitSynth(ev.instrument, l)) |ks| synth.noteOff(ks, ev.pitch);
                 }
                 // 类型刚切走的边角：synth 池也发一份（空转无害）
@@ -1218,6 +1486,109 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
             }
         } else {
             synth.render(sp, &engine.synths[i], cbuf, frames, sr, g, true);
+        }
+    }
+
+    // 2.5) 音频片段 + 波形试听：**无状态按帧映射**（跳转/循环天然正确）：
+        // 位置 = start_step + (abs − start_frame)/step_frames；**本段** = [seg_abs0, +frames)
+        {
+            // **段坐标**（不是整块起点！——见 `clipSpan` 注释里的“篝火噼啪”事故）
+            const abs0 = engine.seg_abs0;
+        const start_frame = params.start_frame.load(.monotonic);
+        const start_step = params.start_step.load(.monotonic);
+        const start_frame_i: i64 = @intCast(start_frame);
+        const bpm2: u64 = @max(20, params.bpm.load(.monotonic));
+        const spb2: u64 = @max(1, params.steps_per_beat.load(.monotonic));
+        const step_frames: u64 = @max(1, @as(u64, @intFromFloat(@as(f64, sr))) * 60 / (bpm2 * spb2));
+        if (params.audio_table.load(.acquire)) |tbl| {
+            // **仅在播放时扫描**（暂停时位置映射仍在推进——实测 bug：暂停中拖入的
+            // 音频“一直放、停止不停”）
+            if (params.playing.load(.monotonic)) {
+            for (tbl.rows) |row| {
+                const asset = row.asset orelse continue;
+                if (asset.frame_count == 0 or asset.frames.len < 2) continue;
+                const sp = clipSpan(
+                    @intCast(abs0),
+                    @as(i64, @intCast(frames)),
+                    start_frame_i,
+                    start_step,
+                    @as(i64, @intCast(step_frames)),
+                    row.start,
+                    row.len,
+                    row.trim_start,
+                    row.trim_len,
+                    row.speed,
+                    asset.ratio,
+                    asset.engFrames(),
+                ) orelse continue;
+                if (n_ch == 0) continue; // 无混音通道：不渲染（防御：chan_bufs 未分配时索引会崩）
+                const ch: usize = if (n_ch > 0) @min(row.channel, n_ch - 1) else 0;
+                const cb: [*]f32 = @ptrCast(&engine.chan_bufs[ch * buf_stride]);
+                var w: usize = sp.w0;
+                while (w < sp.w1) : (w += 1) {
+                    const posf: f64 = sp.pos0 + @as(f64, @floatFromInt(w - sp.w0)) * sp.step;
+                    if (posf < 0) continue;
+                    const ip: usize = @intFromFloat(posf);
+                    if (ip >= asset.frame_count) break;
+                    // **线性插值**（采样率与引擎不同/变速时不再取最近邻——减少混叠噪声）
+                    const g = row.gain;
+                    if (ip + 1 < asset.frame_count) {
+                        const t: f32 = @floatCast(posf - @floor(posf));
+                        const l0 = asset.frames[ip * 2];
+                        const r0 = asset.frames[ip * 2 + 1];
+                        const l1 = asset.frames[(ip + 1) * 2];
+                        const r1 = asset.frames[(ip + 1) * 2 + 1];
+                        cb[w * 2] += (l0 + (l1 - l0) * t) * g;
+                        cb[w * 2 + 1] += (r0 + (r1 - r0) * t) * g;
+                    } else {
+                        cb[w * 2] += asset.frames[ip * 2] * g;
+                        cb[w * 2 + 1] += asset.frames[ip * 2 + 1] * g;
+                    }
+                }
+            }
+            }
+        }
+        // 波形窗口试听（全局单实例；无状态：读游标→混音→写回）
+        if (params.preview_playing.load(.monotonic)) {
+            if (params.preview_asset.load(.acquire)) |pa| {
+                const ps = params.preview_start.load(.monotonic);
+                var pl = params.preview_len.load(.monotonic);
+                const cur = params.preview_pos.load(.monotonic);
+                if (ps < 0 or cur < ps or @as(usize, @intCast(cur)) >= pa.engFrames()) {
+                    params.preview_playing.store(false, .monotonic);
+                    params.preview_pos.store(-1, .monotonic);
+                } else {
+                    const pr: f64 = @max(0.0001, @as(f64, pa.ratio));
+                    if (pl <= 0) pl = @intCast(pa.engFrames() - @as(usize, @intCast(ps)));
+                    const p_end_eng: usize = @min(pa.engFrames(), @as(usize, @intCast(ps)) + @as(usize, @intCast(pl)));
+                    const p_end: usize = @min(pa.frame_count, @as(usize, @intFromFloat(@as(f64, @floatFromInt(p_end_eng)) * pr)));
+                    const pg = params.preview_gain.load(.monotonic);
+            const ch2: usize = if (n_ch > 0) @min(params.preview_channel.load(.monotonic), n_ch - 1) else 0;
+            const cb2: [*]f32 = @ptrCast(&engine.chan_bufs[ch2 * buf_stride]);
+                    const pspd: f64 = @max(0.25, @min(4.0, @as(f64, params.preview_speed.load(.monotonic)))) * pr;
+                    var ppos: f64 = @floatFromInt(cur);
+                    ppos *= pr; // 引擎帧 → 采样帧
+                    var f2: usize = 0;
+                    const p_end_f: f64 = @floatFromInt(p_end);
+                    while (f2 < frames and ppos < p_end_f) : ({
+                        f2 += 1;
+                        ppos += pspd;
+                    }) {
+                        const pi: usize = @intFromFloat(ppos);
+                        if (pi >= p_end) break;
+                        cb2[f2 * 2] += pa.frames[pi * 2] * pg;
+                        cb2[f2 * 2 + 1] += pa.frames[pi * 2 + 1] * pg;
+                    }
+                    if (ppos >= p_end_f) {
+                        params.preview_playing.store(false, .monotonic);
+                        params.preview_pos.store(-1, .monotonic);
+                    } else {
+                        params.preview_pos.store(@intFromFloat(ppos / pr), .monotonic);
+                            }
+                }
+            } else {
+                params.preview_playing.store(false, .monotonic);
+            }
         }
     }
 
@@ -1439,8 +1810,10 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
         renderSegment(engine, params, out, frames, sr, master);
         publishSounding(engine, params);
         _ = params.frames_played.fetchAdd(frames, .monotonic);
+    publishOutMeter(params, out, frames);
         return;
     }
+
 
     // 4) 播放：stash 管理 + 样本级事件触发
     if (gen != engine.stash_gen) handleGenChange(engine, params, gen, was_playing);
@@ -1484,6 +1857,7 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
         const cur: i64 = @as(i64, @intCast(abs0)) + @as(i64, done);
         if (ev_frame <= cur) {
             dispatchNote(engine, ev); // 已到时（含“起播前就应触发”的补发事件）
+                engine.dbg_dispatched += 1;
             si += 1;
             continue;
         }
@@ -1513,6 +1887,21 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
     publishSounding(engine, params);
 
     _ = params.frames_played.fetchAdd(frames, .monotonic);
+    publishOutMeter(params, out, frames);
+}
+
+/// 主输出电平/削波统计（音频线程→UI 原子量）：峰值 + |x|>1 采样计数
+fn publishOutMeter(params: *Params, out: [*]f32, frames: u32) void {
+    const n: usize = @as(usize, frames) * 2;
+    var peak: f32 = 0;
+    var over: u32 = 0;
+    for (0..n) |i| {
+        const v = @abs(out[i]);
+        if (v > peak) peak = v;
+        if (v > 1.0) over += 1;
+    }
+    params.out_peak.store(peak, .monotonic);
+    if (over > 0) _ = params.out_over.fetchAdd(over, .monotonic);
 }
 
 test "audio: 播放中 gen 变化（跳转）释放全部声部（修“跳走后音符悬挂”）" {
@@ -2304,3 +2693,37 @@ test "audio: VSTi panic——全 128 音高 note-off + 位图清零（state 恢�
     }
 }
 
+
+test "audio: clipSpan——按段坐标计算（多段渲染不越界、不重复）" {
+    const step_frames: i64 = 100;
+    const eng_frames: usize = 4800;
+
+    // 段 1：[0,128)
+    const s1 = clipSpan(0, 128, 0, 0, step_frames, 0, 48, 0, 0, 1.0, 1.0, eng_frames).?;
+    try std.testing.expectEqual(@as(usize, 0), s1.w0);
+    try std.testing.expectEqual(@as(usize, 128), s1.w1);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.0), s1.pos0, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), s1.step, 1e-9);
+
+    // 段 2：[128,256)——**段内相对**（旧实现这里越界 + 重复播放 → 噼啪声）
+    const s2 = clipSpan(128, 128, 0, 0, step_frames, 0, 48, 0, 0, 1.0, 1.0, eng_frames).?;
+    try std.testing.expectEqual(@as(usize, 0), s2.w0);
+    try std.testing.expectEqual(@as(usize, 128), s2.w1);
+    try std.testing.expectApproxEqAbs(@as(f64, 128.0), s2.pos0, 1e-9); // 续上、不重复
+
+    // 片段只到 1900 帧 → 段 [1792,1920) 只写 [0,108)
+    const s3 = clipSpan(1792, 128, 0, 0, step_frames, 0, 19, 0, 0, 1.0, 1.0, eng_frames).?;
+    try std.testing.expectEqual(@as(usize, 108), s3.w1);
+
+    // 段与片段完全无交集
+    try std.testing.expect(clipSpan(5000, 128, 0, 0, step_frames, 0, 48, 0, 0, 1.0, 1.0, eng_frames) == null);
+
+    // 采样率不同（24k 素材 @48k 引擎）：段 2 采样内起点 = 64、步长 = 0.5
+    const s4 = clipSpan(128, 128, 0, 0, step_frames, 0, 48, 0, 0, 1.0, 0.5, 4800).?;
+    try std.testing.expectApproxEqAbs(@as(f64, 64.0), s4.pos0, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), s4.step, 1e-9);
+
+    // 速度 2×：每输出帧前进 2 个采样帧
+    const s5 = clipSpan(0, 64, 0, 0, step_frames, 0, 48, 0, 0, 2.0, 1.0, eng_frames).?;
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), s5.step, 1e-9);
+}

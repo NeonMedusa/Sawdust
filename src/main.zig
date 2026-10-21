@@ -35,6 +35,7 @@ const view_panels = @import("view_panels.zig");
 const view_presets = @import("view_presets.zig");
 const view_drumkit = @import("view_drumkit.zig");
 const view_help = @import("view_help.zig");
+const view_wave = @import("view_wave.zig");
 const view_settings = @import("view_settings.zig");
 const view_plugins = @import("view_plugins.zig");
 const plugin_db = @import("plugin_db.zig");
@@ -538,6 +539,7 @@ pub fn main(init: std.process.Init) !u8 {
             if (inst) |it| {
                 if (it.kit != null) {
                     app.ensureKitPool(i);
+                    app.ensureKitSampler(i);
                 } else if (app.engine.kit_chunks.len > i and app.engine.kit_chunks[i].load(.monotonic) != null) {
                     app.kit_gc_pending = true; // 不再是鼓组 → 帧末释放其池
                 }
@@ -556,6 +558,11 @@ pub fn main(init: std.process.Init) !u8 {
                             // VST3 层：实例指针**先于** kind 发布（音频侧 kind==2 时指针
                             // 必然已是新值——避免“新 kind + 旧退役实例”窗口）
                             app.params.kit_layer_plugin[i][slot].store(if (ly.kind == .vst3) ly.plugin else null, .monotonic);
+                            // 采样器层：采样数据指针/trim（同样指针先于 kind）
+                            app.params.kit_layer_asset[i][slot].store(if (ly.kind == .sampler) app.kitLayerAssetData(&ly) else null, .monotonic);
+                            app.params.kit_layer_trim_start[i][slot].store(ly.trim_start, .monotonic);
+                            app.params.kit_layer_trim_len[i][slot].store(ly.trim_len, .monotonic);
+                            app.params.kit_layer_speed[i][slot].store(ly.speed, .monotonic);
                             app.params.kit_layer_kind[i][slot].store(@intFromEnum(ly.kind), .monotonic);
                             slot += 1;
                         }
@@ -565,6 +572,10 @@ pub fn main(init: std.process.Init) !u8 {
             // 清掉多余旧槽位（层数减少时防旧指针/旧音高残留；同样指针先清、kind 后清）
             while (slot < audio.kit_max_layers) : (slot += 1) {
                 app.params.kit_layer_plugin[i][slot].store(null, .monotonic);
+                app.params.kit_layer_asset[i][slot].store(null, .monotonic);
+                app.params.kit_layer_trim_start[i][slot].store(0, .monotonic);
+                app.params.kit_layer_trim_len[i][slot].store(0, .monotonic);
+                app.params.kit_layer_speed[i][slot].store(1.0, .monotonic);
                 app.params.kit_layer_kind[i][slot].store(0, .monotonic);
                 app.params.kit_layer_pitch[i][slot].store(0, .monotonic);
                 app.params.kit_layer_params[i][slot].store(null, .monotonic);
@@ -643,13 +654,17 @@ pub fn main(init: std.process.Init) !u8 {
 
         // 播放推进 + 序列器调度：**由音频采样时钟驱动**（frames_played），不由渲染驱动。
         // 每步 = 1 / (每拍步数) 拍；每拍步数 = U / 分母（拍号可变）。
-        // 旧公式硬编码 4（= 16 分音符分辨率）；U=96 后必须用动态值，否则速度差 6 倍。
-        if (app.playing) {
+        // **导出期间冻结 UI 传输**（离线渲染独占引擎：tick/循环回跳/lookahead 会 gen++
+        // 清 stash 并释放声部 → 导出中途静音，实测 bug）
+        if (app.playing and app.export_wav == null) {
             const frames = app.params.frames_played.load(.monotonic);
             const bpm: u64 = @intCast(std.math.clamp(app.bpm, 20, 999));
             const spb_per_beat: u64 = @intCast(model.stepsPerBeat(app.time_den));
             const step_frames: u64 = @max(1, app.params.sample_rate * 60 / (bpm * spb_per_beat));
-            const elapsed_steps: i32 = @intCast((frames - app.playback.start_frame) / step_frames);
+            // **饱和减法 + 安全 cast**：`frames < start_frame` 时旧写法会 u64 下溢 →
+            // 步号变垃圾（导出后游标抽搐/不出声的典型来源）
+            const elapsed_frames: u64 = frames -| app.playback.start_frame;
+            const elapsed_steps: i32 = std.math.cast(i32, elapsed_frames / step_frames) orelse std.math.maxInt(i32);
             const cur = app.playback.start_step + elapsed_steps;
             if (app.sel.song_mode) {
                 app.playback.song_step = cur;
@@ -717,6 +732,7 @@ pub fn main(init: std.process.Init) !u8 {
         if (app.file_menu_open) drawFileMenu(&ui, &app);
         // 样式右键菜单：同上（浮动窗口之后，否则会被盖住）
         if (app.panels.ctx_pattern != null) view_panels.drawPatternCtxMenu(&ui, &app);
+    if (app.panels.ctx_audio_style != null) view_panels.drawAudioStyleCtxMenu(&ui, &app);
         // 轨道右键菜单（最外层同上——在浮动窗口之后）
         if (app.panels.ctx_track != null) view_playlist.drawTrackCtxMenu(&ui, &app);
         // 预设浏览器（模态；同上——浮动窗口之后）
@@ -842,6 +858,13 @@ pub fn main(init: std.process.Init) !u8 {
         app.pending_relocate_instrument = null;
         relocateInstrumentDialog(&app, &win, ri);
     }
+    // 系统拖入的音频文件 → 建样式 + 放到播放列表（游标处；同起点自动错开）
+    // 系统拖入的文件 → 按落点分区处理（播放列表=放片段 / 样式栏=只建样式 / 其他=忽略）
+    handleDroppedFiles(&app, &win, ui.mouse_x, ui.mouse_y);
+    if (app.pending_load_sample) |pls| {
+        app.pending_load_sample = null;
+        loadSampleDialog(&app, &win, pls.instrument, pls.pitch, pls.layer);
+    }
     if (app.pending_relocate_effect) |re| {
         app.pending_relocate_effect = null;
         relocateEffectDialog(&app, &win, re.ch, re.slot);
@@ -869,6 +892,13 @@ pub fn main(init: std.process.Init) !u8 {
     // 4.4d) VST3 乐器实例同步（惰性加载 + 编辑器编辑轮询）
     syncInstrumentPlugins(&app);
     app.syncKitLayerPlugins();
+    app.rebuildAudioTable();
+    app.pollPreview();
+    app.pollOutMeter();
+    // 设备看门狗：意外停下（导出恢复失败等）→ 每帧尝试重启；正常时仅一次状态判断
+    if (app.engine.initialized and app.export_wav == null and app.engine.deviceState() != 2) {
+        app.engine.resumeDevice();
+    }
     // 4.4e) VST3 插件界面嵌入同步（面板 → 子窗口；遮挡→隐藏；见函数注释）
     syncPluginEditors(&app, &ui, @intCast(win.fb.width), @intCast(win.fb.height));
 
@@ -2080,6 +2110,10 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
         // 任何菜单展开 = 最上模态层（全屏屏蔽）
         _ = ui.declare(.{ .prio = 900, .rect = .{ .x = 0, .y = 0, .w = w, .h = h }, .modal = true });
     }
+    // 波形窗口（v1 固定置顶：优先级高于所有 wins）
+    if (app.wave_win.open) {
+        _ = ui.declare(.{ .prio = 1 + @as(i32, @intCast(nwin)), .rect = .{ .x = app.wave_win.x, .y = app.wave_win.y, .w = app.wave_win.w, .h = app.wave_win.h } });
+    }
 
     // 主界面（prio 0）
     _ = ui.beginLayer(0);
@@ -2118,6 +2152,15 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     } else {
         view_playlist.draw(ui, app, right_x2, body_y, right_w2, body_h);
     }
+    // 面板矩形写回（拖入文件的区域命中用；与上面绘制同一套坐标）
+    app.layout.body_y = body_y;
+    app.layout.body_h = body_h;
+    app.layout.patterns_x = mid_x;
+    app.layout.patterns_w = app.layout.mid_w;
+    app.layout.playlist_x = right_x2;
+    app.layout.playlist_w = right_w2;
+    {
+    }
 
     // 状态栏
     view_panels.drawStatusBar(ui, app, w, h);
@@ -2136,6 +2179,13 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
             .settings => _ = view_settings.draw(ui, app, w, h),
             .plugin_mgr => _ = view_plugins.draw(ui, app, w, h),
         }
+        ui.endLayer();
+    }
+
+    // 波形窗口（音频片段/采样器层）：v1 固定置顶（不进 wins 的 z 序）
+    if (app.wave_win.open) {
+        _ = ui.beginLayerNoClip(1 + @as(i32, @intCast(nwin)));
+        _ = view_wave.draw(ui, app, w, h);
         ui.endLayer();
     }
 
@@ -2365,7 +2415,9 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
     if (ui.slider(300, &app.volume, vol_x, by + 3, vol_w, 20)) {
         app.params.volume.store(app.volume, .monotonic);
     }
-    app.params.playing.store(app.playing, .monotonic);
+    // **导出期间不得用 UI 的 app.playing 覆盖**（导出用 params.playing 单独驱动离线渲染；
+    // 旧实现每帧把 false 写回去 → 导出只剩开头几声，实测 bug）
+    if (app.export_wav == null) app.params.playing.store(app.playing, .monotonic);
 }
 
 // ── 保存 / 加载 ──
@@ -2471,6 +2523,8 @@ fn saveProject(app: *App, win: *window.Window, io: std.Io, force_dialog: bool) v
     };
 
     // 导出 → 序列化（**v5 二进制默认**；JSON 保留为导入/导出通道）→ 写文件 → 释放
+    // 基准目录 = 目标工程目录（音频相对路径按它导出）
+    app.setBaseDirFromPath(path);
     const project = app.exportProject() catch |e| {
         app.setToastWith("保存失败：导出失败（{s}）", .{@errorName(e)});
         return;
@@ -2992,6 +3046,112 @@ fn pickPluginFile(app: *App, win: *window.Window) void {
 }
 
 /// 手动重新定位（右键「重新定位插件…」→ 帧末弹框；pending 状态保留）
+/// 拖入/选择音频文件：建音频样式 + 放到播放列表（游标处；同起点自动错开；
+/// v1 不区分拖入位置——落点 = 播放游标/PAT 虚拟位置，片段可再拖）
+/// 拖入文件的落点区域（播放列表 / 样式面板 / 其他 = 不响应）
+const DropZone = enum { playlist, styles, none };
+
+/// 落点分区（与绘制同一套面板矩形：见 `App.layout`）
+fn dropZoneAt(app: *const App, px: i32, py: i32) DropZone {
+    const b = app.layout;
+    if (b.body_h <= 0) return .none;
+    if (util.inRect(px, py, b.playlist_x, b.body_y, b.playlist_w, b.body_h)) return .playlist;
+    if (util.inRect(px, py, b.patterns_x, b.body_y, b.patterns_w, b.body_h)) return .styles;
+    return .none;
+}
+
+/// 建音频样式（**不建片段**）。失败 → toast + null
+fn createAudioStyle(app: *App, path: []const u8) ?i32 {
+    return app.audioStyleAdd(path, "") orelse {
+        app.setToast("无法加载音频（格式不支持/文件过大/读取失败）");
+        return null;
+    };
+}
+
+/// 系统拖入文件的分发：
+/// - **播放列表** → 在落点（吸附网格）放音频片段；多文件依次放到**下面的轨道**
+/// - **样式面板** → 只建样式（自动切到「音频」页并选中最后一个）
+/// - 其他区域 / 导出中 → 不响应（不建样式、不 toast、不弄脏工程）
+fn handleDroppedFiles(app: *App, win: *window.Window, px: i32, py: i32) void {
+    var paths: std.ArrayListUnmanaged([]u8) = .{ .items = &.{}, .capacity = 0 };
+    defer {
+        for (paths.items) |p| app.allocator.free(p);
+        paths.deinit(app.allocator);
+    }
+    while (win.takeDropped()) |p| paths.append(app.allocator, p) catch app.allocator.free(p);
+    if (paths.items.len == 0) return;
+    if (app.export_wav != null) return; // 导出期间不接编辑
+    const zone = dropZoneAt(app, px, py);
+    if (zone == .none) return;
+
+    if (zone == .styles) {
+        var created: usize = 0;
+        var last: ?i32 = null;
+        for (paths.items) |p| {
+            if (createAudioStyle(app, p)) |s| {
+                created += 1;
+                last = s;
+            }
+        }
+        if (created == 0) return;
+        if (last) |s| {
+            app.panels.patterns_tab_audio = true; // 自动切到音频页
+            app.audio_style_sel = s;
+        }
+        app.commitHistory("拖入音频样式");
+        app.setToastWith("已新建 {d} 个音频样式", .{created});
+        return;
+    }
+
+    // 播放列表：先算落点（不在轨道内容区 → 忽略）
+    const hit = view_playlist.hitAt(app, px, py) orelse return;
+    var track = hit.track;
+    var created: usize = 0;
+    var last_style: ?i32 = null;
+    app.clearClipSelection(); // 新放入的片段成为选区（用户拍板：选择跟随）
+    for (paths.items) |p| {
+        const st = createAudioStyle(app, p) orelse continue;
+        last_style = st;
+        if (app.audioClipAdd(st, track, hit.step)) |ci| {
+            if (ci < app.clips.items.len) app.clips.items[ci].selected = true;
+        }
+        created += 1;
+        track += 1; // 多文件：依次放到下面的轨道（用户拍板）
+    }
+    if (created == 0) return;
+    app.sel.track = hit.track; // 选择跟随：当前轨道 = 落点轨道
+    // 样式面板自动切到「音频」页，并选中本次最后导入的样式
+    app.panels.patterns_tab_audio = true;
+    if (last_style) |s| app.audio_style_sel = s;
+    app.commitHistory("拖入音频片段");
+    app.setToastWith("已在 Track {d} · 第 {d} 步放入 {d} 个音频片段", .{ hit.track + 1, hit.step, created });
+}
+
+/// 鼓垫采样：加载/更换（layer = null → 新增采样器层）
+fn loadSampleDialog(app: *App, win: *window.Window, instrument: i32, pitch: u8, layer: ?usize) void {
+    const picked = filedialog.open(app.allocator, win.hwnd, "加载采样音频", filedialog.audio_filter) catch |e| {
+        app.setToastWith("文件选择出错（{s}）", .{@errorName(e)});
+        return;
+    };
+    const path = picked orelse return;
+    defer app.allocator.free(path);
+    if (layer) |li| {
+        if (app.kitSamplerSetSample(instrument, pitch, li, path)) {
+            app.commitHistory("更换采样");
+            app.setToast("已更换采样");
+        } else {
+            app.setToast("采样加载失败（格式不支持/文件过大）");
+        }
+    } else {
+        if (app.kitLayerAddSampler(instrument, pitch, path)) {
+            app.commitHistory("添加采样层");
+            app.setToast("已添加采样层 — 层行 [编辑] 打开采样器窗口");
+        } else {
+            app.setToast("添加失败（层数已满/采样加载失败）");
+        }
+    }
+}
+
 fn relocateInstrumentDialog(app: *App, win: *window.Window, ii: usize) void {
     const picked = filedialog.open(app.allocator, win.hwnd, "重新定位 VST3 乐器插件", filedialog.vst3_filter) catch |e| {
         app.setToastWith("文件选择出错（{s}）", .{@errorName(e)});
@@ -3398,7 +3558,7 @@ fn performUpgrade(app: *App, io: std.Io) void {
     app.setProjectPath(path);
     app.resetHistory("打开工程（已升级）");
     app.markSaved();
-    app.setToastWith("已升级为 v5 并备份到 {s}", .{bak});
+    app.setToastWith("已升级为 v{d} 并备份到 {s}", .{ persist.binary_version, bak });
     app.clearPendingUpgrade();
 }
 
@@ -3410,21 +3570,33 @@ fn loadProjectFromPath(app: *App, io: std.Io, path: []const u8) void {
     };
     defer app.allocator.free(data);
 
-    // v5 二进制 = 当前格式，直接加载。JSON（v1–v4）探针版本：
-    // v1–v3 旧档走“备份并升级”弹窗（③ 迁移流程）；过新拒绝；v4 直接加载。
-    if (!(data.len >= persist.binary_magic.len and std.mem.eql(u8, data[0..persist.binary_magic.len], persist.binary_magic))) {
-        if (persist.probeJsonVersion(app.allocator, data)) |ver| {
-            if (ver > persist.file_version) {
-                app.setToastWith("打开失败：存档版本过新（v{d}），请使用更新的 Sawdust", .{ver});
+    // **旧格式一律“备份并升级”弹窗**（与 JSON v1–v3 同一条路径——用户拍板）：
+    // - 二进制 v5 = 旧布局（能兼容读），但保存后旧版就再也打不开 → 必须让用户知情；
+    // - 二进制 v6 = 当前 → 直接打开；更高 → 拒绝。
+    if (data.len >= persist.binary_magic.len and std.mem.eql(u8, data[0..persist.binary_magic.len], persist.binary_magic)) {
+        if (data.len > persist.binary_magic.len) {
+            const bver = data[persist.binary_magic.len];
+            if (bver > persist.binary_version) {
+                app.setToastWith("打开失败：存档版本过新（v{d}），请使用更新的 Sawdust", .{bver});
                 return;
             }
-            if (ver < persist.file_version) {
-                app.setPendingUpgrade(path, ver);
+            if (bver < persist.binary_version) {
+                app.setPendingUpgrade(path, bver);
                 app.modal = .save_upgrade;
                 app.modal_choice = null;
-                return; // 等弹窗确认（performUpgrade）；取消 = 不打开（原文件不动）
+                return; // 等弹窗确认（performUpgrade）；取消 = 不打开
             }
         }
+    } else if (persist.probeJsonVersion(app.allocator, data)) |ver| {
+        if (ver > persist.file_version) {
+            app.setToastWith("打开失败：存档版本过新（v{d}），请使用更新的 Sawdust", .{ver});
+            return;
+        }
+        // JSON（v1–v4）保存后同样会变成不可回退的 v6 二进制 → 全部走升级弹窗
+        app.setPendingUpgrade(path, ver);
+        app.modal = .save_upgrade;
+        app.modal_choice = null;
+        return;
     }
 
     const parsed = persist.parseAuto(app.allocator, data) catch |e| {
@@ -3433,6 +3605,8 @@ fn loadProjectFromPath(app: *App, io: std.Io, path: []const u8) void {
     };
     defer parsed.deinit();
 
+    // 基准目录 = 工程目录（相对音频路径解析用）
+    app.setBaseDirFromPath(path);
     app.importProject(parsed.value);
 
     app.setProjectPath(path);
@@ -3969,4 +4143,85 @@ test {
     const r2 = intersectRect(0, 0, 10, 10, 2, 2, 100, 100) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(i32, 8), r2.w);
     try std.testing.expectEqual(@as(i32, 8), r2.h);
+}
+
+test "main: 旧版二进制 v5 → performUpgrade 备份并改写为当前版本" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.dir.close(io);
+    const dirp = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(dirp);
+    const path = try std.fmt.allocPrint(alloc, "{s}/old.saw", .{dirp});
+    defer alloc.free(path);
+
+    // 写一个 v5 旧布局档（片段里带 v5 之后新增的音频字段——升级后应取默认）
+    {
+        const clips = [_]persist.SavedClip{.{ .track = 1, .start = 4, .len = 8, .pattern = 0, .audio_style = 9, .trim_start = 5 }};
+        const proj = persist.Project{ .clips = @constCast(&clips), .pattern_count = 2 };
+        const bytes = try persist.toBinaryLegacyV5(alloc, proj);
+        defer alloc.free(bytes);
+        try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes });
+    }
+
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(@import("app.zig").default_mixer_channels);
+    app.setPendingUpgrade(path, 5);
+    performUpgrade(&app, io);
+
+    // 1) 原路径现在必须是当前版本
+    const after = try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .unlimited);
+    defer alloc.free(after);
+    try std.testing.expect(after.len > 5);
+    try std.testing.expectEqual(@as(u8, persist.binary_version), after[4]);
+    // 2) 备份存在且仍是旧版本字节
+    var bak_buf: [1100]u8 = undefined;
+    const bak = uniqueBackupPath(io, path, &bak_buf).?;
+    // uniqueBackupPath 现在会给出下一个可用名（原备份已存在）→ 直接读 .bak.saw
+    _ = bak;
+    const bak_path = try std.fmt.allocPrint(alloc, "{s}/old.bak.saw", .{dirp});
+    defer alloc.free(bak_path);
+    const bak_bytes = try std.Io.Dir.cwd().readFileAlloc(io, bak_path, alloc, .unlimited);
+    defer alloc.free(bak_bytes);
+    try std.testing.expectEqual(@as(u8, 5), bak_bytes[4]);
+    // 3) 内容完整：片段数量/轨道/起点保留
+    try std.testing.expectEqual(@as(usize, 1), app.clips.items.len);
+    try std.testing.expectEqual(@as(i32, 1), app.clips.items[0].track);
+    try std.testing.expectEqual(@as(i32, 4), app.clips.items[0].start);
+    try std.testing.expectEqual(@as(i32, 8), app.clips.items[0].len);
+    // 4) 升级后是“已保存”状态，且待升级标记已清
+    try std.testing.expect(app.pending_upgrade_path == null);
+    try std.testing.expect(!app.dirty);
+}
+
+
+test "main: dropZoneAt——播放列表 / 样式面板 / 其他区域" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.layout = .{
+        .initialized = true,
+        .left_w = 140,
+        .mid_w = 140,
+        .body_y = 100,
+        .body_h = 400,
+        .patterns_x = 140 + 6,
+        .patterns_w = 140,
+        .playlist_x = 140 + 6 + 140 + 6,
+        .playlist_w = 600,
+    };
+    try std.testing.expectEqual(DropZone.styles, dropZoneAt(&app, 200, 200));
+    try std.testing.expectEqual(DropZone.playlist, dropZoneAt(&app, 400, 200));
+    try std.testing.expectEqual(DropZone.none, dropZoneAt(&app, 50, 200)); // 历史栏
+    try std.testing.expectEqual(DropZone.none, dropZoneAt(&app, 400, 50)); // 工具栏
+    try std.testing.expectEqual(DropZone.none, dropZoneAt(&app, 400, 600)); // 状态栏
+    // 未初始化布局（body_h = 0）→ 一律不响应
+    app.layout.body_h = 0;
+    try std.testing.expectEqual(DropZone.none, dropZoneAt(&app, 400, 200));
 }
