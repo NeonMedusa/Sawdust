@@ -228,6 +228,12 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
                 dw.sel_pitch = pp;
                 dw.layer_scroll = 0;
             }
+            // 点击整行 = **试听该鼓垫**（换行/松手释音）——“点击鼓组琴键没声”的修正
+            if (hovered and ui.mouse_pressed) {
+                if (dw.list_audition) |ap| app.auditionOffInst(inst_idx, ap);
+                dw.list_audition = pp;
+                app.auditionOnInst(inst_idx, pp);
+            }
         }
         ui.drawScrollbar(lx + left_w - 5, ly, 5, lh, dw.scroll, content_h, lh);
     }
@@ -424,6 +430,15 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
             if (hovered and ui.mouse_pressed) {
                 app.pending_load_sample = .{ .instrument = inst_idx, .pitch = sel, .layer = null };
             }
+        }
+    }
+
+    // 列表试听释音（松手 → 停）：**不依赖 active_id**，否则鼠标一进入其它控件就漏 off →
+    // 声部挂住/琴键常亮（与钢琴卷帘“卡按下”同一类 bug）
+    if (dw.list_audition) |ap| {
+        if (!ui.mouse_down) {
+            app.auditionOffInst(inst_idx, ap);
+            dw.list_audition = null;
         }
     }
 

@@ -303,6 +303,17 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // - 正在拖动（active_id != 0 且不是琴键试听）时忽略鼠标 → 修“拖动窗口时划过琴键误触发”
     // - **菜单展开中 / 帧首菜单开着** 时忽略鼠标 → 修“点菜单击穿到琴键发声”（实测 bug）
     {
+        // **兜底释音**：鼠标已抬起而 held_pitch 还在 → 立即补 off。
+        // 为什么不能只靠下面的 `active_id == 6000` 分支：一旦鼠标接着点进音符区/其它控件，
+        // `active_id` 会被那个控件接管 → 释音分支永不执行 → 音符 off 永不发 →
+        // 声部永远挂住 + 琴键常亮，只能靠暂停/停止清（实测反馈：“按键卡在按下状态”）。
+        if (!ui.mouse_down) {
+            if (app.piano.held_pitch) |hp| {
+                app.auditionOff(hp);
+                app.piano.held_pitch = null;
+            }
+            if (ui.active_id == 6000) ui.active_id = 0;
+        }
         const kh = app.piano.key_h;
         // 菜单展开中 → 琴键不响应（机架的下拉/右键菜单，以及卷帘自己的两个选单）
         const menu_blocks = app.rack.ctx_instrument != null or

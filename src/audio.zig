@@ -160,6 +160,8 @@ pub const Params = struct {
     preview_playing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// 试听游标回写（帧；-1 = 未播放）——UI 读它画游标
     preview_pos: std.atomic.Value(i32) = std.atomic.Value(i32).init(-1),
+    /// 试听循环（采样器层：在 trim 区间内循环，像钢琴窗的循环选区）
+    preview_loop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// 主输出峰值（|x| 最大值；UI 读来做电平表——以后波形超载标红也用它）
     out_peak: std.atomic.Value(f32) = std.atomic.Value(f32).init(0),
     /// 自上次 UI 读取以来 |x| > 1.0 的采样数（swap 清零：削波计数）
@@ -541,19 +543,22 @@ pub const Engine = struct {
 
     /// 初始化并启动音频设备（默认设备，双声道 f32）
     pub fn init(self: *Engine, params: *Params, allocator: std.mem.Allocator) !void {
+        // ⚠️ `App.initAudioCapacity()` 可能**已经**建过容量数组（`setCapacity`）。
+        // 这里必须先释放旧缓冲：下面若直接赋值会**覆盖指针**——实测泄漏
+        // chan_bufs 1 MB + slot_eq 280 KB（Debug 下 SafeAllocator 报的正是它们）。
+        self.freeStorage();
         self.params = params;
         self.allocator = allocator;
         // 容量数组：按 Params 当前容量建立（乐器/通道/效果槽）
+        // **chan_bufs / slot_eq 都由 setCapacity 分配**（不要在这里再分配一遍）
         try self.setCapacity(params.instruments_cap, params.channels_cap, params.slots_cap);
         // VSTi 中转缓冲（一个渲染块大小）
-        self.vsti_scratch = try allocator.alloc(f32, 2 * 4096);
-        @memset(self.vsti_scratch, 0);
-        // 调音台缓冲（堆分配——体积大不能放栈）
-        self.chan_bufs = try allocator.alloc(f32, mixer_channels * 2 * 4096);
-        @memset(self.chan_bufs, 0);
-        const n_eq = mixer_channels * effect_slots * eq_bands * 2;
-        self.slot_eq = try allocator.alloc(eq.Biquad, n_eq);
-        @memset(self.slot_eq, .{});
+        if (self.vsti_scratch.len == 0) {
+            self.vsti_scratch = try allocator.alloc(f32, 2 * 4096);
+            @memset(self.vsti_scratch, 0);
+        }
+        // 调音台缓冲 / EQ 阵列：**已在 setCapacity 里按 cc/sc 分配（含旧帧状态拷贝）**，
+        // 这里不再重复分配（那是历史上泄漏 1 MB + 280 KB 的根源）。
 
         var config = ma.ma_device_config_init(ma.ma_device_type_playback);
         config.playback.format = ma.ma_format_f32;
@@ -592,6 +597,12 @@ pub const Engine = struct {
             ma.ma_device_uninit(&self.device);
             self.initialized = false;
         }
+        self.freeStorage();
+    }
+
+    /// 释放全部堆缓冲/容量数组（**不含设备**）。`deinit` 与 `init` 复用同一 Engine 前
+    /// 都调它；全部按 `len > 0` 守卫，所以对全新的 `Engine{}`（allocator=undefined）安全。
+    fn freeStorage(self: *Engine) void {
         if (self.synths.len > 0) {
             self.allocator.free(self.synths);
             self.synths = &.{};
@@ -950,7 +961,9 @@ fn kitSamplerNoteOn(engine: *Engine, i: usize, l: usize, pitch: u8, velocity: u8
     const ts_n: usize = @intFromFloat(@as(f64, @floatFromInt(ts)) * kr);
     const end: usize = @min(total, @as(usize, @intFromFloat(@as(f64, @floatFromInt(@as(i64, @intCast(ts)) + tl)) * kr)));
     if (end <= ts_n) return;
-    const bg = balanceGains(pan);
+    // ⚠️ `balanceGains` 要的是 **0..1**，而这里拿到的 `pan` 是**音符级 0..127**
+    // （`effectivePan` 的返回）——直接传 → clamp 到 1.0 → **只有右耳**（实测 bug）。
+    const bg = balanceGains(pan / 127.0);
     const g: f32 = @as(f32, @floatFromInt(@max(1, velocity))) / 127.0;
     const spd = std.math.clamp(params.kit_layer_speed[i][l].load(.monotonic), 0.25, 4.0);
     v.* = .{
@@ -962,6 +975,51 @@ fn kitSamplerNoteOn(engine: *Engine, i: usize, l: usize, pitch: u8, velocity: u8
         .pitch = pitch,
         .active = true,
     };
+}
+
+/// 混音鼓组采样器层（**一次性声部**；线性插值、按 trim 区间结束）。
+/// 写进乐器自己的通道缓冲（`cbuf` = 立体声交错，`n_samples` = 采样点总数 = 帧×2）。
+/// `g` = 乐器增益、`lg` = 层增益；声部自己的 `gain_l/gain_r` 已含力度×声像。
+/// 【pub 供单测直接调用；渲染路径在同一处】
+pub fn mixKitSamplerLayer(
+    engine: *Engine,
+    params: *const Params,
+    cbuf: [*]f32,
+    n_samples: usize,
+    i: usize,
+    l: usize,
+    g: f32,
+    lg: f32,
+) void {
+    const st = kitSamplerState(engine, i) orelse return;
+    if (l >= kit_max_layers) return;
+    const asset = params.kit_layer_asset[i][l].load(.acquire) orelse return;
+    if (asset.frame_count < 2 or asset.frames.len < 4) return;
+    const total: usize = asset.frame_count;
+    const ld = &st.layers[l];
+    for (&ld.voices) |*v| {
+        if (!v.active) continue;
+        var k: usize = 0;
+        while (k < n_samples) : (k += 2) {
+            if (v.pos >= v.end) {
+                v.active = false;
+                break;
+            }
+            const idx: usize = @intFromFloat(v.pos);
+            if (idx + 1 >= total) {
+                v.active = false;
+                break;
+            }
+            const fr: f32 = @floatCast(v.pos - @as(f64, @floatFromInt(idx)));
+            const a0 = asset.frames[idx * 2];
+            const b0 = asset.frames[(idx + 1) * 2];
+            const a1 = asset.frames[idx * 2 + 1];
+            const b1 = asset.frames[(idx + 1) * 2 + 1];
+            cbuf[k] += (a0 + (b0 - a0) * fr) * v.gain_l * g * lg;
+            cbuf[k + 1] += (a1 + (b1 - a1) * fr) * v.gain_r * g * lg;
+            v.pos += v.step;
+        }
+    }
 }
 
 /// 采样器层：全部声部清零（暂停/跳转/全体释音）
@@ -1479,6 +1537,11 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
                     }
                     continue;
                 }
+                if (params.kit_layer_kind[i][l].load(.monotonic) == 3) {
+                    // 采样器层：一次性声部（trim 区间内插值播放）
+                    mixKitSamplerLayer(engine, params, cbuf, n, i, l, g, lg);
+                    continue;
+                }
                 const lp = params.kit_layer_params[i][l].load(.monotonic) orelse continue;
                 const ks = engine.kitSynth(i, l) orelse continue;
                 synth.render(lp, ks, cbuf, frames, sr, g * lg, true);
@@ -1565,24 +1628,35 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
                     const ch2: usize = if (n_ch > 0) @min(params.preview_channel.load(.monotonic), n_ch - 1) else 0;
                     const cb2: [*]f32 = @ptrCast(&engine.chan_bufs[ch2 * buf_stride]);
                     const pspd: f64 = @max(0.25, @min(4.0, @as(f64, params.preview_speed.load(.monotonic)))) * pr;
-                    var ppos: f64 = @floatFromInt(cur);
-                    ppos *= pr; // 引擎帧 → 采样帧
-                    var f2: usize = 0;
+                    const loop_on = params.preview_loop.load(.monotonic);
                     const p_end_f: f64 = @floatFromInt(p_end);
-                    while (f2 < frames and ppos < p_end_f) : ({
-                        f2 += 1;
-                        ppos += pspd;
-                    }) {
+                    const start_f: f64 = @as(f64, @floatFromInt(@max(0, ps))) * pr;
+                    var ppos: f64 = @as(f64, @floatFromInt(cur)) * pr; // 引擎帧 → 采样帧
+                    if (ppos >= p_end_f) ppos = start_f; // 防御：陈旧游标（裁剪缩短了）
+                    // **循环必须在一个块内回绕**：否则每块都是“播到末尾→回绕”，而下块又从旧游标开始，
+                    // 听感就是卡在右端点反复播同一个点（实测：“电流声”），游标也不动。
+                    const can_loop = loop_on and start_f < p_end_f;
+                    var f2: usize = 0;
+                    while (f2 < frames) {
+                        if (ppos >= p_end_f) {
+                            if (!can_loop) break;
+                            ppos = start_f;
+                        }
                         const pi: usize = @intFromFloat(ppos);
                         if (pi >= p_end) break;
                         cb2[f2 * 2] += pa.frames[pi * 2] * pg;
                         cb2[f2 * 2 + 1] += pa.frames[pi * 2 + 1] * pg;
+                        f2 += 1;
+                        ppos += pspd;
                     }
-                    if (ppos >= p_end_f) {
+                    if (ppos >= p_end_f and !can_loop) {
+                        // 不循环且播完（到右端点）：**游标回左端点**（= 下次 ▶ 的起点）
                         params.preview_playing.store(false, .monotonic);
-                        params.preview_pos.store(-1, .monotonic);
+                        params.preview_pos.store(@max(0, ps), .monotonic);
                     } else {
-                        params.preview_pos.store(@intFromFloat(ppos / pr), .monotonic);
+                        const pos_eng: i32 = @intFromFloat(ppos / pr);
+                        const max_eng: i32 = @intCast(pa.engFrames() - 1);
+                        params.preview_pos.store(std.math.clamp(pos_eng, @max(0, ps), @max(0, max_eng)), .monotonic);
                     }
                 }
             } else {
@@ -1590,7 +1664,6 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
             }
         }
     }
-
     // 3) **子通道（1..）**：效果链 → 增益（含静音）→ 等功率声像 → **汇入主通道缓冲**
     // 注：此处**不含 master**——master 只在主通道出口乘一次（否则会重复相乘）
     var ch_i: usize = 1;
@@ -2723,4 +2796,123 @@ test "audio: clipSpan——按段坐标计算（多段渲染不越界、不重�
     // 速度 2×：每输出帧前进 2 个采样帧
     const s5 = clipSpan(0, 64, 0, 0, step_frames, 0, 48, 0, 0, 2.0, 1.0, eng_frames).?;
     try std.testing.expectApproxEqAbs(@as(f64, 2.0), s5.step, 1e-9);
+}
+
+test "audio: 鼓组采样器层——触发后能发声，trim 到点自动收声" {
+    const alloc = std.testing.allocator;
+    var env: KitTestEnv = undefined;
+    try env.init(alloc, false);
+    defer env.deinit(alloc);
+
+    // 采样夹具：立体声交错、前 200 帧恒为 0.5，其余 0（便于断言“有声/静音”）
+    const nframes: usize = 1000;
+    const frames = try alloc.alloc(f32, nframes * 2);
+    defer alloc.free(frames);
+    for (frames, 0..) |*s, k| s.* = if (k / 2 < 200) 0.5 else 0.0;
+    var data = SampleData{ .frames = frames, .frame_count = nframes, .ratio = 1.0 };
+
+    // 采样器声部池（对应 App.ensureKitSampler）
+    const kss = try alloc.create(KitSamplerState);
+    kss.* = .{};
+    env.engine.kit_sampler[0].store(kss, .monotonic);
+    defer {
+        env.engine.kit_sampler[0].store(null, .monotonic);
+        alloc.destroy(kss);
+    }
+
+    // 层 0 = 采样器层，音高 36，trim = 全段
+    env.params.instrument_kind[0].store(1, .monotonic);
+    env.params.kit_layer_count[0].store(1, .monotonic);
+    env.params.kit_layer_pitch[0][0].store(36, .monotonic);
+    env.params.kit_layer_gain[0][0].store(1.0, .monotonic);
+    env.params.kit_layer_asset[0][0].store(&data, .release);
+    env.params.kit_layer_trim_start[0][0].store(0, .monotonic);
+    env.params.kit_layer_trim_len[0][0].store(0, .monotonic); // 0 = 到末尾
+    env.params.kit_layer_speed[0][0].store(1.0, .monotonic);
+    env.params.kit_layer_kind[0][0].store(3, .monotonic);
+
+    // 触发 → 声部激活
+    dispatchNote(&env.engine, synth.NoteEvent{ .kind = .on, .pitch = 36, .instrument = 0 });
+    try std.testing.expect(kss.layers[0].voices[0].active);
+
+    // 混一块 100 帧：应听到非零（0.5 × 力度 × 声像）
+    var buf: [200]f32 = @splat(0);
+    mixKitSamplerLayer(&env.engine, &env.params, &buf, buf.len, 0, 0, 1.0, 1.0);
+    var peak: f32 = 0;
+    for (buf) |s| peak = @max(peak, @abs(s));
+    try std.testing.expect(peak > 0.3);
+
+    // 继续推进到 200 帧之后（恒定段结束）→ 输出归零；推到 1000 帧 → 声部收声
+    var buf2: [200]f32 = @splat(0);
+    mixKitSamplerLayer(&env.engine, &env.params, &buf2, buf2.len, 0, 0, 1.0, 1.0);
+    var peak2: f32 = 0;
+    for (buf2) |s| peak2 = @max(peak2, @abs(s));
+    try std.testing.expect(peak2 > 0.3); // 这块覆盖 100..200 帧，仍在恒定段
+    var tail: [200]f32 = @splat(0);
+    mixKitSamplerLayer(&env.engine, &env.params, &tail, tail.len, 0, 0, 1.0, 1.0);
+    var peak3: f32 = 0;
+    for (tail) |s| peak3 = @max(peak3, @abs(s));
+    try std.testing.expect(peak3 == 0.0); // 300..400 帧都是静音样本
+    var buf3: [1600 * 2]f32 = @splat(0);
+    mixKitSamplerLayer(&env.engine, &env.params, &buf3, buf3.len, 0, 0, 1.0, 1.0);
+    try std.testing.expect(!kss.layers[0].voices[0].active); // 播放到底 → 自动收声
+
+    // trim 起点：从 500 帧开始且长 100 → 只在该区间出声
+    env.params.kit_layer_trim_start[0][0].store(500, .monotonic);
+    env.params.kit_layer_trim_len[0][0].store(500, .monotonic); // 500..1000（上半段静音）
+    dispatchNote(&env.engine, synth.NoteEvent{ .kind = .on, .pitch = 36, .instrument = 0 });
+    var tbuf: [200 * 2]f32 = @splat(0);
+    mixKitSamplerLayer(&env.engine, &env.params, &tbuf, tbuf.len, 0, 0, 1.0, 1.0);
+    // 500..600 帧是静音样本 → 这块应全零；但声部仍应活着（还没到 end）
+    var tpeak: f32 = 0;
+    for (tbuf) |s| tpeak = @max(tpeak, @abs(s));
+    try std.testing.expectEqual(@as(f32, 0.0), tpeak);
+    try std.testing.expect(kss.layers[0].voices[0].active);
+}
+
+test "audio: 鼓组采样器层——声像居中时左右声道都响（回归：只有右耳）" {
+    const alloc = std.testing.allocator;
+    var env: KitTestEnv = undefined;
+    try env.init(alloc, false);
+    defer env.deinit(alloc);
+
+    const nframes: usize = 64;
+    const frames = try alloc.alloc(f32, nframes * 2);
+    defer alloc.free(frames);
+    for (frames) |*s| s.* = 0.5;
+    var data = SampleData{ .frames = frames, .frame_count = nframes, .ratio = 1.0 };
+
+    const kss = try alloc.create(KitSamplerState);
+    kss.* = .{};
+    env.engine.kit_sampler[0].store(kss, .monotonic);
+    defer {
+        env.engine.kit_sampler[0].store(null, .monotonic);
+        alloc.destroy(kss);
+    }
+
+    env.params.instrument_kind[0].store(1, .monotonic);
+    env.params.instrument_pan[0].store(0.5, .monotonic); // 乐器声像居中
+    env.params.kit_layer_count[0].store(1, .monotonic);
+    env.params.kit_layer_pitch[0][0].store(36, .monotonic);
+    env.params.kit_layer_gain[0][0].store(1.0, .monotonic);
+    env.params.kit_layer_asset[0][0].store(&data, .release);
+    env.params.kit_layer_trim_start[0][0].store(0, .monotonic);
+    env.params.kit_layer_trim_len[0][0].store(0, .monotonic);
+    env.params.kit_layer_speed[0][0].store(1.0, .monotonic);
+    env.params.kit_layer_kind[0][0].store(3, .monotonic);
+
+    // 音符级声像 64 = 居中 → 左右都应出声
+    dispatchNote(&env.engine, synth.NoteEvent{ .kind = .on, .pitch = 36, .instrument = 0, .pan = 64 });
+    var buf: [32 * 2]f32 = @splat(0);
+    mixKitSamplerLayer(&env.engine, &env.params, &buf, buf.len, 0, 0, 1.0, 1.0);
+    var pl: f32 = 0;
+    var pr: f32 = 0;
+    var k: usize = 0;
+    while (k < buf.len) : (k += 2) {
+        pl = @max(pl, @abs(buf[k]));
+        pr = @max(pr, @abs(buf[k + 1]));
+    }
+    try std.testing.expect(pl > 0.3); // 回归：曾经左声道恒 0（pan 单位错）
+    try std.testing.expect(pr > 0.3);
+    try std.testing.expectApproxEqAbs(pl, pr, 0.02); // 居中 → 两侧等功率
 }

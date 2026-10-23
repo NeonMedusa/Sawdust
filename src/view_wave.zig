@@ -151,42 +151,70 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         }
     }
 
-    // ── 控制行：试听 / 增益旋钮 / 通道推子（或“跟随鼓组乐器”）──
+    // ── 控制行：[循环][▶/⏸][■] / 增益 / 速度 / 通道（采样器层无通道框——跟随鼓组乐器）──
     const ctl_y = y + title_h + 4;
     {
         const asset = if (tgt.asset >= 0 and tgt.asset < @as(i32, @intCast(app.audio_assets.items.len)))
-            &app.audio_assets.items[@intCast(tgt.asset)]
+            app.audio_assets.items[@intCast(tgt.asset)]
         else
             null;
-        // [▶/⏸ 播放/暂停] + [■ 停止]（与主传输同构——用户拍板）
+        // [循环] + [▶/⏸ 播放/暂停] + [■ 停止]（循环按钮在播放**左边**——用户拍板）
         const playing_this = app.preview.playing and app.preview.asset == tgt.asset and asset != null;
+        const loop_w: i32 = 56;
+        const loop_x = x + 8;
+        const play_x = loop_x + loop_w + 6;
         const play_w: i32 = 64;
         const stop_w: i32 = 44;
         {
-            if (ui.iconButton(9710, if (playing_this) .pause else .play, x + 8, ctl_y, play_w, ctl_h - 8, playing_this, ui.theme.accent)) {
+            // 循环开关（仅采样器层有意义；其它目标变灰不可点）
+            const loop_ok = tgt.layer_ref != null;
+            const lh = util.hitUI(ui, loop_x, ctl_y, loop_w, ctl_h - 8);
+            const on = app.preview.loop and loop_ok;
+            ui.renderer.fillRect(loop_x, ctl_y, loop_w, ctl_h - 8, if (!loop_ok) ui.theme.slider_track else if (on) ui.theme.accent else if (lh) ui.theme.item_hover else ui.theme.slider_track);
+            ui.renderer.strokeRect(loop_x, ctl_y, loop_w, ctl_h - 8, ui.theme.panel_border);
+            const lt: i32 = @intFromFloat(ui.font.measure("循环"));
+            ui.labelCentered("循环", loop_x + @divTrunc(loop_w - lt, 2), ctl_y, ctl_h - 8, if (loop_ok) ui.theme.text else ui.theme.text_dim);
+            if (lh and ui.mouse_pressed and loop_ok) app.preview.loop = !app.preview.loop;
+        }
+        {
+            if (ui.iconButton(9710, if (playing_this) .pause else .play, play_x, ctl_y, play_w, ctl_h - 8, playing_this, ui.theme.accent)) {
                 if (asset) |a| {
                     if (playing_this) {
                         app.previewPause(); // 暂停：保留暂停点（再按从该处继续）
                     } else {
-                        const total: i32 = @intCast(a.data.frame_count);
-                        // 完整音频试听（与片段 trim 无关）
+                        // 游标/trim 都是**引擎帧域**（原生帧只影响取样的 ratio）
+                        const total_e: i32 = @intCast(a.data.engFrames());
                         var start: i32 = 0;
-                        if (app.preview.asset == tgt.asset and app.preview.pos > 0 and app.preview.pos < total) {
+                        var plen: i32 = 0;
+                        if (tgt.layer_ref != null) {
+                            // 采样器层：**只试听 trim 区间**（默认全选）
+                            const ts2: i32 = std.math.clamp(tgt.trim_start.*, 0, @max(0, total_e - 1));
+                            const te2: i32 = if (tgt.trim_len.* > 0) @min(total_e, ts2 + tgt.trim_len.*) else total_e;
+                            start = ts2;
+                            if (app.preview.asset == tgt.asset and app.preview.pos >= ts2 and app.preview.pos < te2) start = app.preview.pos;
+                            plen = te2 - ts2;
+                        } else if (app.preview.asset == tgt.asset and app.preview.pos > 0 and app.preview.pos < total_e) {
                             start = app.preview.pos;
                         }
-                        app.previewStart(tgt.asset, start, 0, tgt.channel, tgt.gain.*, tgt.speed.*);
+                        // 循环只看按钮状态（且仅采样器层）
+                        app.previewStartEx(tgt.asset, start, plen, tgt.channel, tgt.gain.*, tgt.speed.*, tgt.layer_ref != null and app.preview.loop);
                     }
                 } else {
                     app.setToast("音频未加载（文件缺失/格式不支持）");
                 }
             }
-            if (ui.iconButton(9711, .stop, x + 8 + play_w + 6, ctl_y, stop_w, ctl_h - 8, false, ui.theme.accent)) {
-                app.previewStop(); // 停止：游标归位（下次从 trim 起点）
+            if (ui.iconButton(9711, .stop, play_x + play_w + 6, ctl_y, stop_w, ctl_h - 8, false, ui.theme.accent)) {
+                // 停止 → 游标回**左端点**（采样器层）/ 素材开头（样式·片段）
+                var cp: i32 = 0;
+                if (tgt.layer_ref != null) {
+                    if (asset) |a| cp = std.math.clamp(tgt.trim_start.*, 0, @max(0, @as(i32, @intCast(a.data.engFrames())) - 1));
+                }
+                app.previewStopAt(cp);
             }
         }
 
         // 增益旋钮（用户拍板：增益用旋钮）
-        var gx = x + 8 + play_w + 6 + stop_w + 12;
+        var gx = play_x + play_w + 6 + stop_w + 12;
         ui.label("增益", gx, ctl_y + 2, ui.theme.text_dim);
         gx += 36;
         var gv: f32 = std.math.clamp(tgt.gain.*, 0.0, 2.0) * 0.5; // 0..2（1.0 = 无增益＝旋钮正中）
@@ -214,7 +242,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         gx += ctl_h + 30;
 
         // 通道（音频片段 = 样式级推子，照机架乐器通道推子：方框数字 + 上下拖；
-        // 采样器层 = 跟随鼓组乐器 → 只读显示）
+        // 采样器层 = 跟随鼓组乐器 → **不画通道框、也不占行宽**）
         var cval: i32 = std.math.clamp(tgt.channel, 0, 65535);
         const n_ch: i32 = @max(1, @as(i32, @intCast(app.mixer_channels_state.items.len)));
         if (tgt.channel_editable) {
@@ -233,13 +261,14 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
             }
             gx += 62;
         } else {
-            ui.label("通道 = 跟随鼓组乐器", gx, ctl_y + 2, ui.theme.text_dim);
-            gx += 140;
+            // 采样器层：通道跟随鼓组乐器 → **不占行宽**（腾给循环按钮；用户拍板）
         }
 
         // 采样器层：[换采样…]
         if (tgt.layer_ref) |ref| {
             const bw: i32 = 78;
+            // 与速度旋钮的“100%”标签拉开距离（实测：紧贴着，看着像一左一右）
+            gx += 44;
             if (gx + bw < x + ww_w - 10) {
                 const h2 = util.hitUI(ui, gx, ctl_y, bw, ctl_h - 8);
                 ui.renderer.fillRect(gx, ctl_y, bw, ctl_h - 8, if (h2) ui.theme.item_hover else ui.theme.slider_track);
@@ -252,7 +281,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         }
     }
 
-    // ── 波形区：峰值 + trim 手柄 + 试听游标 ──
+    // ── 波形区：峰值 + trim 端点拖柄（仅采样器层）+ 试听游标 ──
     {
         const wave_x = x + 8;
         const wave_y = y + title_h + ctl_h + 12;
@@ -260,8 +289,9 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         const wave_h = ww_h - (title_h + ctl_h + 12) - 10;
         ui.renderer.fillRect(wave_x, wave_y, wave_w, wave_h, ui.theme.bg);
         ui.renderer.strokeRect(wave_x, wave_y, wave_w, wave_h, ui.theme.panel_border);
+        const is_layer = tgt.layer_ref != null;
         const asset: ?*app_mod.AudioAsset = if (tgt.asset >= 0 and tgt.asset < @as(i32, @intCast(app.audio_assets.items.len)))
-            &app.audio_assets.items[@intCast(tgt.asset)]
+            app.audio_assets.items[@intCast(tgt.asset)]
         else
             null;
         if (asset == null) {
@@ -285,10 +315,89 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
                     ui.renderer.vline(wave_x + px2, y0, @max(1, y1 - y0), ui.theme.waveform);
                 }
             }
-            // （trim 手柄已移除——用户拍板：采样裁剪在播放列表里拖片段左右端点，与音符片段一致）
-            // 点击/拖动波形 = 设置游标（拖拽中只动**视觉游标**，松手才一次性跳转——
-            // 播放中不再自动暂停，也不会因连续跳位出“打碟”声）
-            if (util.hitUI(ui, wave_x, wave_y, wave_w, wave_h) and ui.mouse_down) {
+            // （音频**样式/片段**的裁剪在播放列表里拖片段左右端点，与音符片段一致；
+            //   只有**采样器层**没有片段可拖 → 在波形上直接给左右端点抓手。用户拍板：
+            //   默认全选，拖左右端点调起点/终点；手感类似横向滑块的左右端点）
+            const ts_now: i32 = std.math.clamp(tgt.trim_start.*, 0, total_eng - 1);
+            const tl_now: i32 = tgt.trim_len.*;
+            const te_now: i32 = if (tl_now > 0)
+                @min(total_eng, ts_now + tl_now)
+            else
+                total_eng;
+            const px_of = struct {
+                fn f(t: i32, total_frames: i32, wx: i32, ww2: i32) i32 {
+                    return wx + @as(i32, @intFromFloat(@as(f32, @floatFromInt(t)) / @as(f32, @floatFromInt(@max(1, total_frames))) * @as(f32, @floatFromInt(ww2))));
+                }
+            }.f;
+            if (is_layer) {
+                const lx: i32 = px_of(ts_now, total_eng, wave_x, wave_w);
+                const rx: i32 = px_of(te_now, total_eng, wave_x, wave_w);
+                // 左右外侧变暗（选中区间保持原亮度）+ 区间边线
+                if (lx > wave_x) ui.renderer.fillRect(wave_x, wave_y, lx - wave_x, wave_h, 0x66000000);
+                if (rx < wave_x + wave_w) ui.renderer.fillRect(rx, wave_y, wave_x + wave_w - rx, wave_h, 0x66000000);
+                ui.renderer.fillRect(lx, wave_y, 2, wave_h, ui.theme.accent);
+                ui.renderer.fillRect(rx - 2, wave_y, 2, wave_h, ui.theme.accent);
+                // 抓手：命中带比线宽宽（±8px，好抓）；悬停/拖动时 ↔ 光标 + 加亮
+                const grip_l_hover = util.inRect(ui.mouse_x, ui.mouse_y, lx - 8, wave_y, 20, wave_h);
+                const grip_r_hover = util.inRect(ui.mouse_x, ui.mouse_y, rx - 8, wave_y, 20, wave_h);
+                const dragging = ww.trim_drag_side != 0;
+                if (grip_l_hover or grip_r_hover or dragging) ui.cursor = .resize_h;
+                const l_hot = grip_l_hover or ww.trim_drag_side == 1;
+                const r_hot = grip_r_hover or ww.trim_drag_side == 2;
+                // 抓手块（上下各一个小方块，像滑块端点的齿）
+                ui.renderer.fillRect(lx - 3, wave_y + 1, 8, 6, if (l_hot) ui.theme.text else ui.theme.accent);
+                ui.renderer.fillRect(lx - 3, wave_y + wave_h - 7, 8, 6, if (l_hot) ui.theme.text else ui.theme.accent);
+                ui.renderer.fillRect(rx - 5, wave_y + 1, 8, 6, if (r_hot) ui.theme.text else ui.theme.accent);
+                ui.renderer.fillRect(rx - 5, wave_y + wave_h - 7, 8, 6, if (r_hot) ui.theme.text else ui.theme.accent);
+                if (ui.mouse_pressed) {
+                    if (grip_l_hover) {
+                        ui.active_id = 9720; // ⚠️ 不能与旋钮 id 撞：9702 = 采样速度旋钮
+                        ww.trim_drag_side = 1;
+                    } else if (grip_r_hover) {
+                        ui.active_id = 9720;
+                        ww.trim_drag_side = 2;
+                    }
+                }
+                // 拖动：**边侧必须存在窗口状态里**（每帧局部变量只有按下那帧生效 → 拖不动）
+                if (ww.trim_drag_side != 0) {
+                    if (!ui.mouse_down) {
+                        ww.trim_drag_side = 0;
+                        if (ui.active_id == 9720) ui.active_id = 0;
+                    } else if (ui.active_id == 9720) {
+                        const rel: f32 = @as(f32, @floatFromInt(ui.mouse_x - wave_x)) / @as(f32, @floatFromInt(@max(1, wave_w)));
+                        const f: i32 = std.math.clamp(@as(i32, @intFromFloat(rel * @as(f32, @floatFromInt(total_eng)))), 0, total_eng);
+                        if (ww.trim_drag_side == 1) {
+                            const new_start = @min(f, te_now - 1);
+                            tgt.trim_start.* = new_start;
+                            tgt.trim_len.* = te_now - new_start;
+                        } else {
+                            const new_end = @max(f, ts_now + 1);
+                            tgt.trim_len.* = new_end - ts_now;
+                        }
+                        app.history_pending = "调整采样范围";
+                    }
+                }
+                // 起点/终点/长度数值（ms；trim 变了就地刷新）
+                const sr_f: f32 = @floatFromInt(@max(1, app.params.sample_rate));
+                var nb2: [112]u8 = undefined;
+                const ts_draw = std.math.clamp(tgt.trim_start.*, 0, total_eng - 1);
+                const te_draw = if (tgt.trim_len.* > 0) @min(total_eng, ts_draw + tgt.trim_len.*) else total_eng;
+                const info = std.fmt.bufPrint(&nb2, "起点 {d:.3}s · 终点 {d:.3}s · 长 {d:.3}s", .{
+                    @as(f32, @floatFromInt(ts_draw)) / sr_f,
+                    @as(f32, @floatFromInt(te_draw)) / sr_f,
+                    @as(f32, @floatFromInt(te_draw - ts_draw)) / sr_f,
+                }) catch "";
+                // 循环区**跟随拖动**：正在循环试听时，把 trim 改动同步回音频线程
+                // （否则拖完右端点还要再按 ▶ 才生效）
+                if (app.preview.playing and app.preview.asset == tgt.asset) {
+                    app.params.preview_start.store(ts_draw, .monotonic);
+                    app.params.preview_len.store(te_draw - ts_draw, .monotonic);
+                }
+                ui.label(info, wave_x + 4, wave_y + wave_h - 14, ui.theme.text_dim);
+            }
+            // 点击/拖动波形 = 设置试听游标（**仅非层目标**：采样器层没有片段可裁、采样往往很短，
+            // 鼠标设游标反而会和端点抓手抢操作；层的游标只由 ▶ 试听推动并在 trim 区间内循环）
+            if (!is_layer and util.hitUI(ui, wave_x, wave_y, wave_w, wave_h) and ui.mouse_down) {
                 const relc: f32 = @as(f32, @floatFromInt(ui.mouse_x - wave_x)) / @as(f32, @floatFromInt(@max(1, wave_w)));
                 const npos: i32 = std.math.clamp(@as(i32, @intFromFloat(relc * @as(f32, @floatFromInt(total_eng)))), 0, total_eng - 1);
                 app.preview.seeking = true;

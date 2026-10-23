@@ -47,7 +47,8 @@ extern "kernel32" fn CreateFileW(
 /// - 无父控制台（双击；或被 GUI 进程 spawn 的扫描 worker）→ 静默失败，**不弹窗**；
 /// - 已有合法标准句柄（终端继承 / 重定向管道）→ **不覆盖**（重定向才能正常捕获）；
 /// - 句柄为 NULL 时 → 重开 `CONOUT$` 并 SetStdHandle。
-fn attachParentConsole() void {
+/// 从终端启动时把自己接到父控制台（GUI 子系统下 panic/日志才看得见）
+pub fn attachParentConsole() void {
     if (AttachConsole(0xFFFF_FFFF) == 0) return; // ATTACH_PARENT_PROCESS
     const h = CreateFileW(std.unicode.utf8ToUtf16LeStringLiteral("CONOUT$"), 0x8000_0000 | 0x4000_0000, 1 | 2, null, 3, 0, null);
     const raw = @intFromPtr(h orelse return);

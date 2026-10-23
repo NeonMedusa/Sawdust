@@ -46,8 +46,7 @@ https://drive.google.com/drive/folders/1vHJcw6CiEt24WLKBgtTzmiMKY8IMpbfF?usp=sha
   多输出 VSTi（SFLT）/ 扫描管理器 + 预设浏览器）
 - [x] 音频文件（WAV/MP3）加载与波形缓存（音频样式 / 音频片段 / 波形窗 / 采样器层，
   见 `docs/audio-files.md`）
-- [ ] 音频导入性能：**P2** 工作线程两阶段异步导入（先按时长建片段、解码完再填波形）、
-  **P3** 长文件流式解码与峰值懒算（详见 `docs/audio-files.md` §8）
+- [ ] 音频导入性能：**P3** 长文件流式解码与峰值懒算（详见 `docs/audio-files.md` §8）
 - [ ] 性能打磨（长工程滚动、打开/保存耗时、内存峰值）
 - [ ] 自动化曲线（声像、音量、颤音、bpm变速等等等，还有 MIDI 通道声像的完整还原）
 - [ ] 音频、音符录制
@@ -65,6 +64,9 @@ git clone --recursive https://github.com/NeonMedusa/Sawdust.git
 cd Sawdust
 zig build run             # 构建并运行
 ```
+
+编译结果在 zig-out\bin\ 目录中，文件名 Sawdust.exe，
+正式编译发布请用:```zig build -Dcpu=baseline -Doptimize=ReleaseFast```
 
 **C 绑定（Zig 0.17 起）**：`@cImport` 已被 Zig 移除，本项目改为**预生成绑定**：
 `src/c/miniaudio.zig`、`src/c/stb_truetype.zig` 由 `zig translate-c` 生成并入库（构建期

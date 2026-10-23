@@ -210,6 +210,13 @@ pub fn drawStatusBar(ui: *Ui, app: *App, w: i32, h: i32) void {
         db,
     }) catch "";
     ui.label(left, 8, y + 4, if (app.out_over_hold > 0) ui.theme.danger else ui.theme.text_dim);
+    // 后台音频解码进度（打开工程后陆续就位；**不阻塞任何操作**）
+    const loading_n = app.audioLoadPending();
+    if (loading_n > 0) {
+        var lbuf: [64]u8 = undefined;
+        const ltxt = std.fmt.bufPrint(&lbuf, "后台载入音频 ({d})…", .{loading_n}) catch "";
+        ui.label(ltxt, 360, y + 4, ui.theme.accent);
+    }
     if (app.toast) |t| {
         ui.label(t, w - 620, y + 4, ui.theme.accent);
     } else if (app.piano.pattern != null) {

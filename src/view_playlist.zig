@@ -471,7 +471,24 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                                         }
                                     }
                                 } else {
-                                    ui.labelClipped("（音频缺失）", clip_x + 4, ty + 3, clip_w - 8, ui.theme.danger);
+                                    // 异步导入中（P2）：斜纹占位 + 百分比；真·缺失才写“音频缺失”
+                                    if (app.styleImportProgress(@intCast(clip.audio_style))) |p| {
+                                        var sx: i32 = 0;
+                                        // 斜纹（45°；间距 6px，直接画竖段近似）
+                                        while (sx < clip_w) : (sx += 6) {
+                                            ui.renderer.vline(clip_x + sx, ty + 2, @max(1, track_h - 4), ui.theme.panel_border);
+                                        }
+                                        const pct: i32 = @intFromFloat(@round(p * 100.0));
+                                        var pbuf: [16]u8 = undefined;
+                                        const ptxt = std.fmt.bufPrint(&pbuf, "载入 {d}%", .{pct}) catch "载入";
+                                        if (label_h > 0) {
+                                            ui.labelClipped(ptxt, clip_x + 6, ty + 4, clip_w - 12, ui.theme.text_dim);
+                                        } else if (clip_w >= 40) {
+                                            ui.labelClipped(ptxt, clip_x + 3, ty + 3, clip_w - 6, ui.theme.text_dim);
+                                        }
+                                    } else {
+                                        ui.labelClipped("（音频缺失）", clip_x + 4, ty + 3, clip_w - 8, ui.theme.danger);
+                                    }
                                 }
                             }
                             continue;
@@ -881,11 +898,14 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             // 选中了音频样式（♪ 行，且当前在音频页）→ 放置**音频片段**
             if (app.panels.patterns_tab_audio and app.audio_style_sel >= 0 and @as(usize, @intCast(app.audio_style_sel)) < app.audio_styles.items.len) {
                 const ast = app.audio_styles.items[@intCast(app.audio_style_sel)];
-                const frames: i32 = if (app.audioStyleAsset(@intCast(app.audio_style_sel))) |d| @intCast(d.data.frame_count) else 0;
+                // 异步导入中资产还没挂上 → 用文件头的引擎帧数（长度一样是对的）
+                const frames: i32 = if (app.audioStyleAsset(@intCast(app.audio_style_sel))) |d|
+                    @intCast(d.data.engFrames())
+                else
+                    @intCast(@min(ast.frames_hint, std.math.maxInt(i32)));
                 const fps: i32 = @intCast(@max(1, app.framesPerStep()));
                 const alen: i32 = @max(1, @divTrunc(frames, fps));
                 app.addClip(.{ .track = track_i, .start = snap_step, .len = alen, .pattern = 0, .audio_style = @intCast(app.audio_style_sel), .trim_start = 0 });
-                _ = ast;
                 app.commitHistory("放置音频片段"); // 原子操作：立即提交
             } else {
                 const new_len: i32 = app.patternEffectiveLen(app.sel.pattern);

@@ -20,6 +20,7 @@ const plugin_db = @import("plugin_db.zig");
 const vst_host = @import("vst_host.zig");
 const preset_mod = @import("preset.zig");
 const wav = @import("wav.zig"); // 导出音频（24-bit PCM WAV 写出器）
+const audio_import = @import("audio_import.zig"); // P2：异步导入（单 worker）
 
 pub const Clip = model.Clip;
 pub const Note = model.Note;
@@ -98,7 +99,8 @@ pub const AudioAsset = struct {
     /// 每桶帧数
     peak_frames: u32,
 
-    pub const Peak = struct { min: f32, max: f32 };
+    /// 峰值类型**单一真源**在 `audio_import.Peak`（异步导入的 worker 也要写同一布局）
+    pub const Peak = audio_import.Peak;
 };
 
 /// 音频样式（编号 = 下标；与音符样式对称：**通道/增益共享给全部片段实例**）
@@ -112,6 +114,9 @@ pub const AudioStyle = struct {
     gain: f32 = 1.0,
     /// 播放速度（1 = 原速；v1 变速变调）
     speed: f32 = 1.0,
+    /// **运行时**（不入存档）：读文件头得到的引擎帧数。
+    /// 异步导入未完成（`asset == -1`）时，片段长度/波形宽度用它算
+    frames_hint: u64 = 0,
 };
 
 /// 退役中的音频播放表（音频线程可能仍在读旧指针；帧末倒计时后释放）
@@ -129,6 +134,8 @@ pub const PreviewState = struct {
     active: bool = false,
     /// 拖拽定位中（松手才真正跳转；拖拽期间音频照旧播、不回读游标）
     seeking: bool = false,
+    /// 循环试听（波形窗按钮切换；**默认关**——用户拍板）
+    loop: bool = false,
 };
 
 /// 音频资产解码目标采样率（引擎采样率未知时兜底——实际以 `params.sample_rate` 为准）
@@ -153,6 +160,9 @@ pub const WaveWindow = struct {
     layer: ?WaveLayerRef = null,
     /// 目标：音频样式（双击样式列表的“♪”行；只是展示/试听——trim 以片段为准）
     style: ?usize = null,
+    /// trim 端点拖动中的边（0 = 无，1 = 左端，2 = 右端）——**必须持久**：
+    /// 用每帧局部变量的话只有按下那一帧会更新，拖不动（实测 bug：“一次只能拖一点点”）
+    trim_drag_side: u8 = 0,
 };
 
 pub const HistoryState = struct {
@@ -852,6 +862,8 @@ pub const DrumKitWindow = struct {
     layer_scroll: i32 = 0,
     /// 试听按住中的音高（松开 → 释音）
     audition_pitch: ?i32 = null,
+    /// 左音高列表点击试听（与上者分开：列表是“点一下整行”，按钮是“按住”）
+    list_audition: ?i32 = null,
 };
 
 /// 调音台通道数：**默认 2**（主通道 + 通道#1），可添加；上限见 `max_mixer_channels`
@@ -1282,9 +1294,16 @@ pub const App = struct {
     /// 鼓组池删除位移日志（removeInstrument 记录 idx；帧末按序重放左移）
     kit_shift_log: std.ArrayListUnmanaged(usize) = .empty,
     /// 音频资产池（会话存活；工程切换时统一释放）
-    audio_assets: std.ArrayListUnmanaged(AudioAsset) = .empty,
+    /// ⚠️ **指针稳定**：元素是 `*AudioAsset`，资产本体单独分配——
+    /// 播放表（音频线程）里存的是 `&asset.data`，池子扩容绝不能让它悬空。
+    audio_assets: std.ArrayListUnmanaged(*AudioAsset) = .empty,
     /// 音频样式（片段共享的通道/增益）
     audio_styles: std.ArrayListUnmanaged(AudioStyle) = .empty,
+    /// 音频导入（P2：单 worker 线程 + 队列；见 `audio_import.zig`）
+    /// **工程加载**也走它（`beginProjectLoadAsync`）——UI 线程全程不阻塞。
+    import_mgr: audio_import.Manager = .{},
+    /// 进程 Io（0.17 的阻塞 I/O 句柄）：`main` 启动时注入，测试用 `std.testing.io`
+    io: ?std.Io = null,
     /// 播放表重建用的复用缓冲（逐帧重新计算；容量保留）
     audio_scratch: std.ArrayListUnmanaged(audio.AudioTableRow) = .empty,
     /// 退役中的旧播放表（倒计时回收；见 `reapRetiredAudioTables`）
@@ -2899,7 +2918,7 @@ pub const App = struct {
     }
 
     pub fn findAssetByPath(self: *const App, path: []const u8) ?usize {
-        for (self.audio_assets.items, 0..) |*asset, i| {
+        for (self.audio_assets.items, 0..) |asset, i| {
             if (std.mem.eql(u8, asset.path, path)) return i;
         }
         return null;
@@ -2953,32 +2972,10 @@ pub const App = struct {
             const want: ma.ma_uint64 = @intCast(nframes - got_total);
             if (ma.ma_decoder_read_pcm_frames(&dec, frames.ptr + got_total * 2, want, &got) != ma.MA_SUCCESS) break;
             if (got == 0) break;
-            // 本块新帧的峰值（单遍；跨块桶用“先到先算”近似——桶与块边界很小的误差可接受）
             const s0 = got_total;
             const s1 = got_total + @as(usize, @intCast(got));
-            var pi = s0 / bucket;
-            while (pi < npeaks and pi * bucket < s1) : (pi += 1) {
-                const b0 = @max(s0, pi * bucket);
-                const b1 = @min(s1, (pi + 1) * bucket);
-                if (b1 <= b0) continue;
-                var mn: f32 = 1;
-                var mx: f32 = -1;
-                var fi = b0;
-                while (fi < b1) : (fi += stride) {
-                    const m = (frames[fi * 2] + frames[fi * 2 + 1]) * 0.5;
-                    mn = @min(mn, m);
-                    mx = @max(mx, m);
-                }
-                if (mn > mx) {
-                    mn = 0;
-                    mx = 0;
-                }
-                if (b0 == pi * bucket) {
-                    peaks[pi] = .{ .min = mn, .max = mx };
-                } else { // 跨块桶：取更宽的包络
-                    peaks[pi] = .{ .min = @min(peaks[pi].min, mn), .max = @max(peaks[pi].max, mx) };
-                }
-            }
+            // 峰值算法**单一真源**在 `audio_import.updatePeaks`（异步导入的 worker 用同一份）
+            audio_import.Manager.updatePeaks(frames, s0, s1, peaks, bucket, stride);
             got_total = s1;
         }
         if (got_total == 0) return null;
@@ -2991,12 +2988,21 @@ pub const App = struct {
             return null;
         };
         errdefer a.free(path_dup);
-        self.audio_assets.append(a, .{
+        // **单独分配**：池子扩容时资产本体不移动（播放表里存的是 &asset.data）
+        const asset = a.create(AudioAsset) catch {
+            a.free(path_dup);
+            a.free(frames);
+            a.free(peaks);
+            return null;
+        };
+        asset.* = .{
             .path = path_dup,
             .data = .{ .frames = frames, .frame_count = got_total, .ratio = @floatCast(@as(f64, @floatFromInt(native_sr)) / @as(f64, @floatFromInt(eng_sr))) },
             .peaks = peaks,
             .peak_frames = @intCast(bucket),
-        }) catch {
+        };
+        self.audio_assets.append(a, asset) catch {
+            a.destroy(asset);
             a.free(path_dup);
             a.free(frames);
             a.free(peaks);
@@ -3007,10 +3013,14 @@ pub const App = struct {
 
     /// 释放全部资产（**契约：先暂停设备**——音频线程可能正在读；工程切换/退出时用）
     pub fn resetAudioAssets(self: *App) void {
-        for (self.audio_assets.items) |*asset| {
+        // 先停掉导入（worker 可能正在往将要释放的样式/资产里写）——阻塞最多一个解码块
+        self.import_mgr.cancelAll();
+        self.import_mgr.drain();
+        for (self.audio_assets.items) |asset| {
             self.allocator.free(asset.path);
             if (asset.data.frames.len > 0) self.allocator.free(asset.data.frames);
             if (asset.peaks.len > 0) self.allocator.free(asset.peaks);
+            self.allocator.destroy(asset);
         }
         self.audio_assets.deinit(self.allocator);
         self.audio_assets = .empty;
@@ -3044,12 +3054,121 @@ pub const App = struct {
         return @intCast(self.audio_styles.items.len - 1);
     }
 
+    /// 注入进程 Io（`main` 启动时调用；测试用 `std.testing.io`）
+    pub fn attachIo(self: *App, io: std.Io) void {
+        self.io = io;
+    }
+
+    /// 引擎采样率（未初始化时用回退值；异步导入的 ratio 用它算）
+    fn engSampleRate(self: *const App) u32 {
+        return if (self.params.sample_rate > 0) @intCast(self.params.sample_rate) else audio_fallback_rate;
+    }
+
+    /// **异步**新建音频样式（P2）：只读文件头（毫秒级）→ 建样式 + 入队；解码在 worker。
+    /// - 导入完成前 `style.asset == -1`，UI 用 `styleImportProgress` 画进度；
+    /// - 片段长度用 `style.frames_hint`（文件头时长）——**解码前就能算对**；
+    /// - 同路径去重（包括正在导入中的）；失败（非音频/超长/读不到头）→ null。
+    pub fn audioStyleAddAsync(self: *App, path: []const u8, name: []const u8) ?i32 {
+        if (path.len == 0) return null;
+        if (self.audioStyleFindByPath(path)) |i| return @intCast(i);
+        const io = self.io orelse return null;
+        const eng_sr = self.engSampleRate();
+        const hdr = audio_import.Manager.probeFile(path, eng_sr) orelse return null;
+        const a = self.allocator;
+        const nm = if (name.len > 0) name else std.fs.path.basename(path);
+        const nd = a.dupe(u8, nm) catch return null;
+        const pd = a.dupe(u8, path) catch {
+            a.free(nd);
+            return null;
+        };
+        self.audio_styles.append(a, .{
+            .name = nd,
+            .path = pd,
+            .asset = -1,
+            .channel = 0,
+            .gain = 1.0,
+            .frames_hint = hdr.eng_frames,
+        }) catch {
+            a.free(nd);
+            a.free(pd);
+            return null;
+        };
+        const idx = self.audio_styles.items.len - 1;
+        // 入队失败：样式保留（asset = -1 → 片段画“音频缺失”），不崩不泄
+        _ = self.import_mgr.enqueue(a, io, path, idx, hdr, eng_sr);
+        return @intCast(idx);
+    }
+
+    /// 该样式是否正在导入 → 返回 0..1 进度（未在导入 → null）
+    pub fn styleImportProgress(self: *const App, style: usize) ?f32 {
+        if (!self.import_mgr.started) return null;
+        return self.import_mgr.progressFor(style);
+    }
+
+    /// 每帧：收尾已结束的导入（done → 过继缓冲；failed → toast）。
+    /// 调用点在 `main` 主循环里、`rebuildAudioTable` **之前**——保证同帧出声。
+    pub fn pollImports(self: *App) void {
+        if (!self.import_mgr.started) return;
+        while (self.import_mgr.takeFinished()) |job| self.finalizeImport(job);
+        self.import_mgr.promote();
+    }
+
+    fn finalizeImport(self: *App, job: *audio_import.Job) void {
+        const st = job.state.load(.acquire);
+        const a = self.allocator;
+        defer self.import_mgr.destroyJob(job);
+        switch (st) {
+            .done => {
+                const bufs = self.import_mgr.takeBuffers(job);
+                const pd = a.dupe(u8, job.path) catch {
+                    if (bufs.frames.len > 0) a.free(bufs.frames);
+                    if (bufs.peaks.len > 0) a.free(bufs.peaks);
+                    return;
+                };
+                const nat_sr: u32 = @max(1, job.native_sr);
+                const eng_sr: u32 = @max(1, job.eng_sr);
+                // **单独分配**：池子扩容时不移动已有资产（播放表存的是 `&asset.data`）
+                const asset = a.create(AudioAsset) catch {
+                    a.free(pd);
+                    if (bufs.frames.len > 0) a.free(bufs.frames);
+                    if (bufs.peaks.len > 0) a.free(bufs.peaks);
+                    return;
+                };
+                asset.* = .{
+                    .path = pd,
+                    .data = .{
+                        .frames = bufs.frames,
+                        .frame_count = @intCast(bufs.got_frames),
+                        .ratio = @floatCast(@as(f64, @floatFromInt(nat_sr)) / @as(f64, @floatFromInt(eng_sr))),
+                    },
+                    .peaks = bufs.peaks,
+                    .peak_frames = bufs.peak_frames,
+                };
+                self.audio_assets.append(a, asset) catch {
+                    a.destroy(asset);
+                    a.free(pd);
+                    if (bufs.frames.len > 0) a.free(bufs.frames);
+                    if (bufs.peaks.len > 0) a.free(bufs.peaks);
+                    return;
+                };
+                const ai: i32 = @intCast(self.audio_assets.items.len - 1);
+                if (job.style < self.audio_styles.items.len) self.audio_styles.items[job.style].asset = ai;
+            },
+            .failed => {
+                // 用 job 记录的原因（打不开 / 解码失败）——比“导入失败”更能定位问题
+                const why = @as(audio_import.FailReason, @fromBackingInt(@intCast(job.fail_reason.load(.acquire)))).text();
+                self.setToastWith("音频导入失败：{s}（{s}）", .{ std.fs.path.basename(job.path), why });
+            },
+            else => {},
+        }
+    }
+
     /// 样式 → 资产（无效 → null）
     pub fn audioStyleAsset(self: *const App, style: usize) ?*AudioAsset {
         if (style >= self.audio_styles.items.len) return null;
         const si = self.audio_styles.items[style].asset;
         if (si < 0 or si >= @as(i32, @intCast(self.audio_assets.items.len))) return null;
-        return &self.audio_assets.items[@intCast(si)];
+        return self.audio_assets.items[@intCast(si)];
     }
 
     /// 删除音频样式后**修正所有索引引用**：引用它的片段一并删除（与音符样式删除同语义），
@@ -3096,6 +3215,8 @@ pub const App = struct {
     /// 返回连带删除的片段数（>=0）；越界返回 null。调用方负责 commitHistory。
     pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
         if (idx >= self.audio_styles.items.len) return null;
+        // 进行中/排队中的导入：引用该样式的取消，更大索引的 job 前移
+        self.import_mgr.remapAfterRemove(idx);
         const st = self.audio_styles.items[idx];
         _ = self.audio_styles.orderedRemove(idx);
         self.allocator.free(st.name);
@@ -3116,13 +3237,17 @@ pub const App = struct {
     pub fn audioClipAdd(self: *App, style_idx: i32, track: i32, start: i32) ?usize {
         if (style_idx < 0 or style_idx >= @as(i32, @intCast(self.audio_styles.items.len))) return null;
         var steps: i32 = 4;
-        if (self.audioStyleAsset(@intCast(style_idx))) |asset| {
+        // 异步导入未完成时资产还没挂上 → 用文件头的 `frames_hint`（长度一样是对的）
+        const eng_frames: u64 = if (self.audioStyleAsset(@intCast(style_idx))) |asset|
+            asset.data.engFrames()
+        else
+            self.audio_styles.items[@intCast(style_idx)].frames_hint;
+        if (eng_frames > 0) {
             const sr: u64 = if (self.params.sample_rate > 0) self.params.sample_rate else audio_fallback_rate;
             const bpm2: u64 = @max(20, @as(u64, @intCast(std.math.clamp(self.bpm, 20, 999))));
             const spb2: u64 = @intCast(@max(1, model.stepsPerBeat(self.time_den)));
             const step_frames: u64 = @max(1, sr * 60 / (bpm2 * spb2));
-            const fr: u64 = asset.data.engFrames();
-            steps = @intCast(@max(1, fr / step_frames));
+            steps = @intCast(@max(1, eng_frames / step_frames));
         }
         self.addClip(.{
             .track = track,
@@ -3323,11 +3448,14 @@ pub const App = struct {
         self.bringToFront(&self.wave_win.z);
     }
 
-    pub fn previewStart(self: *App, asset: i32, start: i32, len: i32, channel: i32, gain: f32, speed: f32) void {
+    /// 试听（可指定**循环**：采样器层在 trim 区间内循环，像钢琴窗的循环选区）
+    pub fn previewStartEx(self: *App, asset: i32, start: i32, len: i32, channel: i32, gain: f32, speed: f32, loop: bool) void {
         if (asset < 0 or asset >= @as(i32, @intCast(self.audio_assets.items.len))) return;
         const data = self.audio_assets.items[@intCast(asset)].data;
         if (data.frame_count == 0) return;
         const s = std.math.clamp(start, 0, @as(i32, @intCast(data.engFrames() - 1)));
+        // 注意：**整结构重建会把 loop 冲回默认值**（实测 bug：点播放后循环按钮自己亮/灭）
+        const keep_loop = self.preview.loop;
         self.preview = .{
             .asset = asset,
             .channel = @intCast(std.math.clamp(channel, 0, 65535)),
@@ -3335,6 +3463,7 @@ pub const App = struct {
             .active = true,
             .pos = s,
             .playing = true,
+            .loop = keep_loop,
         };
         self.params.preview_asset.store(&self.audio_assets.items[@intCast(asset)].data, .release);
         self.params.preview_start.store(s, .monotonic);
@@ -3343,15 +3472,24 @@ pub const App = struct {
         self.params.preview_speed.store(std.math.clamp(speed, 0.25, 4.0), .monotonic);
         self.params.preview_channel.store(self.preview.channel, .monotonic);
         self.params.preview_pos.store(s, .monotonic);
+        self.params.preview_loop.store(loop, .monotonic);
         self.params.preview_playing.store(true, .monotonic);
     }
 
-    pub fn previewStop(self: *App) void {
+    /// 停止试听：**游标停在 `cursor`**（= 下次 ▶ 的起点）。
+    /// 采样器层传 trim 左端点，样式/片段传 0。
+    pub fn previewStopAt(self: *App, cursor: i32) void {
         self.preview.playing = false;
         self.preview.active = false;
-        self.preview.pos = 0; // 停止 = 游标归位开头（白线可见）
+        self.preview.seeking = false;
+        const cp = @max(0, cursor);
+        self.preview.pos = cp; // 白线可见地留在起点
         self.params.preview_playing.store(false, .monotonic);
-        self.params.preview_pos.store(-1, .monotonic);
+        self.params.preview_pos.store(cp, .monotonic);
+    }
+
+    pub fn previewStop(self: *App) void {
+        self.previewStopAt(0);
     }
 
     /// 暂停试听：停播但**保留暂停点**（再按播放从该处继续）
@@ -3371,10 +3509,12 @@ pub const App = struct {
     pub fn pollPreview(self: *App) void {
         if (!self.preview.active or self.preview.seeking) return; // 暂停/停止/拖拽中：保留本地游标
         const p = self.params.preview_pos.load(.monotonic);
-        if (p < 0) { // 音频线程自然播完 → **游标回到开头**（用户拍板）
+        const still_playing = self.params.preview_playing.load(.monotonic);
+        if (p < 0 or !still_playing) {
+            // 音频线程停了（不循环播完 / 越界）：**游标留在起点**（= 下次 ▶ 的起点），不留 -1
             self.preview.active = false;
             self.preview.playing = false;
-            self.preview.pos = 0;
+            if (p >= 0) self.preview.pos = p;
             return;
         }
 
@@ -3430,32 +3570,15 @@ pub const App = struct {
 
     /// 导入音频样式表（**整表替换**，下标与存档一致；相对路径按基准目录解析）
     pub fn importAudioStyles(self: *App, styles: []const persist.SavedAudioStyle) void {
+        // 样式数组即将整块替换 → 进行中的导入全部作废（否则 job 里的 style 下标会指错）
+        self.import_mgr.cancelAll();
+        self.import_mgr.drain();
         for (self.audio_styles.items) |*st| {
             self.allocator.free(st.name);
             self.allocator.free(st.path);
         }
         self.audio_styles.clearRetainingCapacity();
-        for (styles) |s| {
-            var path_buf: [1024]u8 = undefined;
-            const resolved = self.resolveAudioPath(s.path, &path_buf) orelse s.path;
-            const nd = self.allocator.dupe(u8, s.name) catch continue;
-            const pd = self.allocator.dupe(u8, resolved) catch {
-                self.allocator.free(nd);
-                continue;
-            };
-            const ai = self.loadAudioAsset(resolved) orelse -1;
-            self.audio_styles.append(self.allocator, .{
-                .name = nd,
-                .path = pd,
-                .asset = ai,
-                .channel = s.channel,
-                .gain = s.gain,
-                .speed = s.speed,
-            }) catch {
-                self.allocator.free(nd);
-                self.allocator.free(pd);
-            };
-        }
+        for (styles) |s| self.importAudioStyleOne(s);
     }
 
     /// 清空后的**无名空垫**清理：无层且无名 = 无信息可保留 → 移除
@@ -3562,6 +3685,8 @@ pub const App = struct {
 
     /// 释放全部乐器（名字 + 合成器参数，含退役的）+ 保存相关字段——进程退出时调用
     pub fn deinitAll(self: *App) void {
+        // 异步导入：先停 worker（join）——之后才能安全释放缓冲/资产
+        self.import_mgr.deinit();
         self.clearGesture(); // 手势增量列表（无引擎依赖）先释放
         // 插件实例：引擎已停（main 的 defer 顺序保证）→ 直接同步销毁；
         // 退役列表中未到期的也必须在此强制释放（之后没人再跑回收）
@@ -3650,6 +3775,86 @@ pub const App = struct {
         self.params.deinit(self.allocator);
         self.kit_shift_log.deinit(self.allocator);
         self.kit_shift_log = .empty;
+    }
+
+    /// 工程加载（**异步解码**，P3）：打开工程时**只读文件头**建样式 + 入队，
+    /// 解码交给 P2 的 worker —— UI 线程（窗口拖动/最大化/重绘）全程不被阻塞。
+    ///
+    /// - 片段/音符/乐器等内容**立刻**建好 → 时间轴马上可见；
+    /// - 音频片段在解码完成前画"载入 N%"（`styleImportProgress`），完成后自动出声；
+    /// - `parsed` 的所有权**转移**进来（拷贝完就释放）；`path` 复制一份。
+    /// - 无 io（单测/异常）→ 退回同步解码（保持确定性）。
+    pub fn beginProjectLoadAsync(self: *App, parsed: std.json.Parsed(persist.Project), path: ?[]const u8) void {
+        const p = parsed.value;
+        self.importProjectPrepare(p);
+        const eng_sr = self.engSampleRate();
+        const io_opt = self.io;
+        if (io_opt == null) {
+            for (p.audio_styles) |s| self.importAudioStyleOne(s);
+            self.importProjectBody(p);
+            if (path) |pth| self.setProjectPath(pth);
+            self.resetHistory("打开工程");
+            self.markSaved();
+            parsed.deinit();
+            return;
+        }
+        const io = io_opt.?;
+        const a = self.allocator;
+        // 音频样式：建样式（asset=-1）+ 入队（probe 只读头，毫秒级；失败 → 保持缺失态）
+        for (p.audio_styles) |s| {
+            var path_buf: [1024]u8 = undefined;
+            const resolved = self.resolveAudioPath(s.path, &path_buf) orelse s.path;
+            const nd = a.dupe(u8, s.name) catch continue;
+            const pd = a.dupe(u8, resolved) catch {
+                a.free(nd);
+                continue;
+            };
+            // 已经解过的文件（同一次加载里重复引用/池里已有）→ 直接挂上，不再重复解码
+            var ai: i32 = -1;
+            var hint: u64 = 0;
+            var hdr_opt: ?audio_import.Header = null; // **探测一次就够**（每多探一次就多开一次文件）
+            if (self.findAssetByPath(resolved)) |existing| {
+                ai = @intCast(existing);
+            } else if (audio_import.Manager.probeFile(resolved, eng_sr)) |hdr| {
+                hint = hdr.eng_frames;
+                hdr_opt = hdr;
+            }
+            self.audio_styles.append(a, .{
+                .name = nd,
+                .path = pd,
+                .asset = ai,
+                .channel = s.channel,
+                .gain = s.gain,
+                .speed = s.speed,
+                .frames_hint = hint,
+            }) catch {
+                a.free(nd);
+                a.free(pd);
+                continue;
+            };
+            if (ai < 0) {
+                if (hdr_opt) |hdr| {
+                    const style_idx = self.audio_styles.items.len - 1;
+                    _ = self.import_mgr.enqueue(a, io, pd, style_idx, hdr, eng_sr);
+                }
+            }
+        }
+        self.importProjectBody(p);
+        if (path) |pth| self.setProjectPath(pth);
+        self.resetHistory("打开工程"); // 打开 = 新基线（旧历史作废）
+        self.markSaved();
+        self.setToastWith("已打开：{s}", .{if (path) |pth| pth else "工程"});
+        parsed.deinit(); // 内容已拷进 App → 解析数据可立刻释放
+    }
+
+    /// 还有多少个音频样式在后台解码（状态栏提示用）
+    pub fn audioLoadPending(self: *const App) usize {
+        if (!self.import_mgr.started) return 0;
+        var n: usize = 0;
+        for (0..self.audio_styles.items.len) |i| {
+            if (self.import_mgr.progressFor(i) != null) n += 1;
+        }
+        return n;
     }
 
     // ── 预设库（数据根目录 / 扫描结果 / 弹窗状态）──
@@ -5567,8 +5772,35 @@ pub const App = struct {
     /// 新建（空）工程：重置为默认基线——
     /// 1 个样式 + 样式 1 在 Track 1 最左的片段 + 1 个减法合成器 + 默认调音台/BPM；
     /// 历史以“新建”为基线，视为已保存（dirty = false）。**先停播**（数据全换）。
+    /// 清空音频样式 + 资产池（**新建/打开工程共用**）。
+    /// 顺序很重要：先作废进行中的导入 → **暂停设备**（音频线程可能正读资产）→
+    /// 清样式/释放资产 → 发布空播放表 → 恢复设备（`defer`）。
+    /// 否则会留下悬念指针：旧资产已 free，而已发布的播放表/预览还指着它。
+    fn clearAudioEverything(self: *App) void {
+        self.import_mgr.cancelAll();
+        self.import_mgr.drain();
+        self.engine.pauseDevice();
+        defer self.engine.resumeDevice();
+        // 样式（名字/路径）
+        for (self.audio_styles.items) |*st| {
+            self.allocator.free(st.name);
+            self.allocator.free(st.path);
+        }
+        self.audio_styles.clearRetainingCapacity();
+        self.resetAudioAssets(); // 清资产 + 预览（含 preview_asset 发布 null）
+        // 已发布的播放表可能还指着旧资产 → 在**暂停窗口内**重发（空表；旧表退役）
+        self.rebuildAudioTable();
+        // UI 侧引用一并复位
+        self.audio_style_sel = -1;
+        self.panels.ctx_audio_style = null;
+        self.wave_win.open = false; // 波形窗可能正看着被清掉的样式/片段
+    }
+
     pub fn resetToDefaultProject(self: *App) void {
         self.stopPlayback();
+        // 音频：新建的空工程没有任何音频样式/资产 → 一并清空并释放内存
+        self.clearAudioEverything();
+        self.panels.patterns_tab_audio = false; // 回到音符页（音页已无样式）
         // 样式 / 调音台 / BPM 拍号
         self.resetPatterns(1);
         self.clearTrackNames(); // 轨道：自定义名清空——行跨度自动推导（最短行程 128 行）
@@ -7167,10 +7399,20 @@ pub const App = struct {
         self.freeSavedAudioStyles(styles);
     }
 
-    /// 用存档替换当前工程内容（先清空旧数据）
+    /// 用存档替换当前工程内容（先清空旧数据）——**同步一条到底**（测试/内部用）。
+    /// 界面里走 `beginProjectLoad()` + 每帧 `stepProjectLoad()`（同一套代码分段执行）。
     pub fn importProject(self: *App, p: persist.Project) void {
+        self.importProjectPrepare(p);
+        for (p.audio_styles) |s| self.importAudioStyleOne(s);
+        self.importProjectBody(p);
+    }
+
+    /// 阶段 1：清场 + 容量（便宜，毫秒级）
+    fn importProjectPrepare(self: *App, p: persist.Project) void {
         // 停止播放（避免调度器引用已被清空的数据）
         self.stopPlayback();
+        // 旧工程的音频样式/资产全部作废（否则旧资产池只增不减，白吃内存）
+        self.clearAudioEverything();
         // 容量先行（存档规模可能超过当前容量；设备自动暂停/恢复）
         self.ensureAudioCapacity(p.instruments.len, p.mixer.len, savedMaxChainSlots(p.mixer));
         self.kit_reset = true;
@@ -7184,10 +7426,33 @@ pub const App = struct {
         while (self.instruments.items.len > 0) {
             self.removeInstrument(self.instruments.items.len - 1);
         }
+    }
 
-        // 恢复
-        // 音频样式先于片段导入（片段经下标引用；相对路径按基准目录解析）
-        self.importAudioStyles(p.audio_styles);
+    /// 阶段 2：**单个**音频样式（含同步解码——这是加载最慢的部分；分帧时一次只做一个）
+    fn importAudioStyleOne(self: *App, s: persist.SavedAudioStyle) void {
+        var path_buf: [1024]u8 = undefined;
+        const resolved = self.resolveAudioPath(s.path, &path_buf) orelse s.path;
+        const nd = self.allocator.dupe(u8, s.name) catch return;
+        const pd = self.allocator.dupe(u8, resolved) catch {
+            self.allocator.free(nd);
+            return;
+        };
+        const ai = self.loadAudioAsset(resolved) orelse -1;
+        self.audio_styles.append(self.allocator, .{
+            .name = nd,
+            .path = pd,
+            .asset = ai,
+            .channel = s.channel,
+            .gain = s.gain,
+            .speed = s.speed,
+        }) catch {
+            self.allocator.free(nd);
+            self.allocator.free(pd);
+        };
+    }
+
+    /// 阶段 3：其余内宇（片段/音符/乐器/全局设置；毫秒级）
+    fn importProjectBody(self: *App, p: persist.Project) void {
         for (p.clips) |c| {
             self.addClip(.{ .track = c.track, .start = c.start, .len = c.len, .pattern = c.pattern, .offset = c.offset, .audio_style = c.audio_style, .trim_start = c.trim_start, .trim_len = c.trim_len });
         }
@@ -13723,4 +13988,318 @@ test "app: 存档容错——片段引用不存在的音频样式 → 加载时�
     const proj = persist.Project{ .clips = @constCast(&clips), .pattern_count = 1 };
     app.importProject(proj);
     try std.testing.expectEqual(@as(usize, 0), app.clips.items.len);
+}
+
+// ── P2：异步导入（单 worker）────────────────────────────────────────────
+
+/// 测试用：写一个 16-bit PCM 立体声正弦 WAV（48 kHz）
+fn writeSineWavForTest(io: std.Io, alloc: std.mem.Allocator, path: []const u8, frames: usize, sample_rate: u32) !void {
+    var w = std.ArrayListUnmanaged(u8).empty;
+    defer w.deinit(alloc);
+    const data_bytes: u32 = @intCast(frames * 4);
+    try w.appendSlice(alloc, "RIFF");
+    try w.appendSlice(alloc, std.mem.asBytes(&(@as(u32, 36) + data_bytes)));
+    try w.appendSlice(alloc, "WAVEfmt ");
+    try w.appendSlice(alloc, std.mem.asBytes(&@as(u32, 16)));
+    try w.appendSlice(alloc, std.mem.asBytes(&@as(u16, 1)));
+    try w.appendSlice(alloc, std.mem.asBytes(&@as(u16, 2)));
+    try w.appendSlice(alloc, std.mem.asBytes(&sample_rate));
+    try w.appendSlice(alloc, std.mem.asBytes(&(sample_rate * 4)));
+    try w.appendSlice(alloc, std.mem.asBytes(&@as(u16, 4)));
+    try w.appendSlice(alloc, std.mem.asBytes(&@as(u16, 16)));
+    try w.appendSlice(alloc, "data");
+    try w.appendSlice(alloc, std.mem.asBytes(&data_bytes));
+    var i: usize = 0;
+    while (i < frames) : (i += 1) {
+        const s: i16 = @intFromFloat(@sin(@as(f64, @floatFromInt(i)) * 0.03) * 12000.0);
+        try w.appendSlice(alloc, std.mem.asBytes(&s));
+        try w.appendSlice(alloc, std.mem.asBytes(&s));
+    }
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = w.items });
+}
+
+/// 测试用：等异步导入收尾（UI 侧 poll；最多 5 s）
+fn waitImportsIdleForTest(app: *App, io: std.Io) void {
+    var spins: usize = 0;
+    while (app.import_mgr.busy() and spins < 5000) : (spins += 1) {
+        app.pollImports();
+        if (!app.import_mgr.busy()) break;
+        std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
+    }
+    app.pollImports();
+}
+
+test "P2 异步导入：立刻返回占位 → 完成后资产入池 + 播放表出现该行" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.dir.close(io);
+    const dirp = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(dirp);
+    const wav_path = try std.fmt.allocPrint(alloc, "{s}/p2.wav", .{dirp});
+    defer alloc.free(wav_path);
+    try writeSineWavForTest(io, alloc, wav_path, 9600, 48000); // 0.2 s
+
+    var app = App{ .allocator = alloc };
+    app.attachIo(io);
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    app.sel.song_mode = true;
+    app.resetHistory("初始");
+
+    const s = app.audioStyleAddAsync(wav_path, "P2") orelse return error.StyleFailed;
+    const si: usize = @intCast(s);
+    // 阶段 A 立刻返回：资产没挂，但时长已知（9600 帧）
+    try std.testing.expectEqual(@as(i32, -1), app.audio_styles.items[si].asset);
+    try std.testing.expectEqual(@as(u64, 9600), app.audio_styles.items[si].frames_hint);
+    // 占位片段的长度来自文件头（不是默认的 4 步）
+    const ci = app.audioClipAdd(s, 0, 0) orelse return error.ClipFailed;
+    const fps: u64 = app.framesPerStep();
+    try std.testing.expectEqual(@as(i32, @intCast(@max(1, 9600 / fps))), app.clips.items[ci].len);
+
+    waitImportsIdleForTest(&app, io);
+
+    // 完成后：资产入池、样式挂上、峰值有内容
+    try std.testing.expect(app.audio_styles.items[si].asset >= 0);
+    const asset = app.audioStyleAsset(si) orelse return error.AssetMissing;
+    try std.testing.expectEqual(@as(usize, 9600), asset.data.frame_count);
+    try std.testing.expect(asset.peaks.len > 0);
+    try std.testing.expectEqual(@as(usize, 1), app.audio_assets.items.len);
+    // 播放表出现该行（每帧重算；下一帧就出声）
+    app.rebuildAudioTable();
+    const tbl = app.params.audio_table.load(.monotonic).?;
+    try std.testing.expectEqual(@as(usize, 1), tbl.rows.len);
+    try std.testing.expect(tbl.rows[0].asset != null);
+}
+
+test "P2 异步导入：取消 → 缓冲释放、样式保持缺失态（无泄漏）" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.dir.close(io);
+    const dirp = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(dirp);
+    const wav_path = try std.fmt.allocPrint(alloc, "{s}/p2c.wav", .{dirp});
+    defer alloc.free(wav_path);
+    try writeSineWavForTest(io, alloc, wav_path, 48000 * 3, 48000); // 3 s：够长，能被打断
+
+    var app = App{ .allocator = alloc };
+    app.attachIo(io);
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+
+    const s = app.audioStyleAddAsync(wav_path, "取消") orelse return error.StyleFailed;
+    const si: usize = @intCast(s);
+    app.import_mgr.cancelAll();
+    app.import_mgr.drain(); // 等 worker 收手（正常 1 ms 级）
+    waitImportsIdleForTest(&app, io);
+
+    try std.testing.expectEqual(@as(i32, -1), app.audio_styles.items[si].asset);
+    try std.testing.expectEqual(@as(usize, 0), app.audio_assets.items.len);
+    try std.testing.expect(!app.import_mgr.busy());
+}
+
+test "P2 异步导入：非音频文件 → 建样式失败（不产生占位样式）" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.dir.close(io);
+    const dirp = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(dirp);
+    const txt = try std.fmt.allocPrint(alloc, "{s}/notaudio.wav", .{dirp});
+    defer alloc.free(txt);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = txt, .data = "hello, not audio" });
+
+    var app = App{ .allocator = alloc };
+    app.attachIo(io);
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+
+    try std.testing.expectEqual(@as(?i32, null), app.audioStyleAddAsync(txt, ""));
+    try std.testing.expectEqual(@as(usize, 0), app.audio_styles.items.len);
+}
+
+test "app: 新建空工程 → 音频样式与资产池一并清空（含异步导入中）" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.dir.close(io);
+    const dirp = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(dirp);
+    const wav_path = try std.fmt.allocPrint(alloc, "{s}/reset.wav", .{dirp});
+    defer alloc.free(wav_path);
+    try writeSineWavForTest(io, alloc, wav_path, 9600, 48000);
+
+    var app = App{ .allocator = alloc };
+    app.attachIo(io);
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    app.sel.song_mode = true;
+
+    // 导入 + 放片段（模拟用户刚拖进来的音频）
+    const s = app.audioStyleAddAsync(wav_path, "将随工程消失") orelse return error.StyleFailed;
+    _ = app.audioClipAdd(s, 0, 0) orelse return error.ClipFailed;
+    waitImportsIdleForTest(&app, io);
+    try std.testing.expectEqual(@as(usize, 1), app.audio_styles.items.len);
+    try std.testing.expectEqual(@as(usize, 1), app.audio_assets.items.len);
+    app.rebuildAudioTable();
+    try std.testing.expect(app.params.audio_table.load(.monotonic).?.rows.len == 1);
+
+    // 新建（空）工程：样式/资产/音频片段全部消失，内存释放（testing.allocator 查泄漏）
+    app.resetToDefaultProject();
+
+    try std.testing.expectEqual(@as(usize, 0), app.audio_styles.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.audio_assets.items.len);
+    try std.testing.expectEqual(@as(i32, -1), app.audio_style_sel);
+    try std.testing.expect(!app.panels.patterns_tab_audio);
+    // 片段回到默认的 1 个**音符**片段（不是音频）
+    try std.testing.expectEqual(@as(usize, 1), app.clips.items.len);
+    try std.testing.expect(!app.clips.items[0].isAudio());
+    // 播放表已发布空表（不让音频线程摸已释放的资产）
+    try std.testing.expectEqual(@as(usize, 0), app.params.audio_table.load(.monotonic).?.rows.len);
+}
+
+test "app: 导入中新建空工程 → 取消在跑的导入，不崩不泄" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.dir.close(io);
+    const dirp = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(dirp);
+    const wav_path = try std.fmt.allocPrint(alloc, "{s}/inflight.wav", .{dirp});
+    defer alloc.free(wav_path);
+    try writeSineWavForTest(io, alloc, wav_path, 48000 * 3, 48000);
+
+    var app = App{ .allocator = alloc };
+    app.attachIo(io);
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+
+    _ = app.audioStyleAddAsync(wav_path, "导入中") orelse return error.StyleFailed;
+    app.resetToDefaultProject(); // 导入可能还在跑：必须取消 + join 前等待
+    try std.testing.expectEqual(@as(usize, 0), app.audio_styles.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.audio_assets.items.len);
+    try std.testing.expect(!app.import_mgr.busy());
+}
+test "音频资产池：追加资产不移动已有 Asset —— 播放表指针稳定（回归：播放中导入崩溃）" {
+    // 曾经的实现是 `ArrayListUnmanaged(AudioAsset)`：导入完成时 append 触发扩容，
+    // 已有 AudioAsset 被搬到新内存，而**音频线程的播放表**里存的是 `&asset.data`
+    // → 播放中导入 = 读已释放内存（实测：边播边导入一会儿就崩）。
+    // 现在池子里放的是 `*AudioAsset`（本体单独分配），地址恒定。
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.dir.close(io);
+    const dirp = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(dirp);
+
+    var app = App{ .allocator = alloc };
+    app.attachIo(io);
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    app.sel.song_mode = true;
+
+    const p0 = try std.fmt.allocPrint(alloc, "{s}/a0.wav", .{dirp});
+    defer alloc.free(p0);
+    try writeSineWavForTest(io, alloc, p0, 4800, 48000);
+    const s0 = app.audioStyleAdd(p0, "") orelse return error.StyleFailed;
+    _ = app.audioClipAdd(s0, 0, 0) orelse return error.ClipFailed;
+    app.rebuildAudioTable();
+    const tbl = app.params.audio_table.load(.monotonic).?;
+    try std.testing.expectEqual(@as(usize, 1), tbl.rows.len);
+    const sample0 = tbl.rows[0].asset.?; // 音频线程看到的就是这个指针
+    const frames0 = sample0.frame_count;
+    const first0 = sample0.frames[0];
+
+    // 追加 12 个资产（必然触发多次扩容）
+    var i: usize = 0;
+    while (i < 12) : (i += 1) {
+        const pn = try std.fmt.allocPrint(alloc, "{s}/a{d}.wav", .{ dirp, i + 1 });
+        defer alloc.free(pn);
+        try writeSineWavForTest(io, alloc, pn, 960 + i * 120, 48000);
+        _ = app.audioStyleAdd(pn, "") orelse return error.StyleFailed;
+    }
+    try std.testing.expectEqual(@as(usize, 13), app.audio_assets.items.len);
+
+    // 旧指针仍指向有效数据（内容不变）
+    try std.testing.expectEqual(frames0, sample0.frame_count);
+    try std.testing.expectEqual(first0, sample0.frames[0]);
+    try std.testing.expectEqual(frames0, app.audioStyleAsset(@intCast(s0)).?.data.frame_count);
+}
+
+test "工程加载（异步解码）：工程立刻可见，音频随后就位" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.dir.close(io);
+    const dirp = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(dirp);
+
+    // 源 App：两个音频样式 + 两个音频片段 → 导出存档 JSON
+    var a1 = App{ .allocator = alloc };
+    a1.attachIo(io);
+    defer a1.clips.deinit(alloc);
+    defer a1.notes.deinit(alloc);
+    defer a1.deinitAll();
+    a1.resetPatterns(1);
+    a1.resetMixerChannels(default_mixer_channels);
+    a1.sel.song_mode = true;
+    var i: usize = 0;
+    while (i < 2) : (i += 1) {
+        const pth = try std.fmt.allocPrint(alloc, "{s}/aload{d}.wav", .{ dirp, i });
+        defer alloc.free(pth);
+        try writeSineWavForTest(io, alloc, pth, 4800, 48000);
+        const s = a1.audioStyleAdd(pth, "") orelse return error.StyleFailed;
+        _ = a1.audioClipAdd(s, @intCast(i), 0) orelse return error.ClipFailed;
+    }
+    const proj = try a1.exportProject();
+    defer a1.freeProject(proj);
+    const json = try std.json.Stringify.valueAlloc(alloc, proj, .{});
+    defer alloc.free(json);
+
+    // 目标 App：异步加载（UI 线程不阻塞）
+    var a2 = App{ .allocator = alloc };
+    a2.attachIo(io);
+    defer a2.clips.deinit(alloc);
+    defer a2.notes.deinit(alloc);
+    defer a2.deinitAll();
+    a2.resetPatterns(1);
+    a2.resetMixerChannels(default_mixer_channels);
+
+    const parsed = try persist.parseAuto(alloc, json);
+    a2.beginProjectLoadAsync(parsed, null);
+    // 立刻可见：样式与片段都已就位（音频可能还在解码 → asset = -1 但长度正确）
+    try std.testing.expectEqual(@as(usize, 2), a2.audio_styles.items.len);
+    var audio_clips: usize = 0;
+    for (a2.clips.items) |c| {
+        if (c.isAudio()) audio_clips += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), audio_clips);
+    try std.testing.expect(!a2.dirty); // 打开 = 已保存基线
+    try std.testing.expectEqual(@as(usize, 1), a2.history.items.len);
+
+    // 等后台解码收尾 → 两个资产都挂上
+    waitImportsIdleForTest(&a2, io);
+    try std.testing.expectEqual(@as(usize, 2), a2.audio_assets.items.len);
+    try std.testing.expect(a2.audioStyleAsset(0) != null);
+    try std.testing.expect(a2.audioStyleAsset(1) != null);
+    try std.testing.expectEqual(@as(usize, 0), a2.audioLoadPending());
 }

@@ -3,7 +3,11 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const strip = b.option(bool, "strip", "Strip debug info from the binary (default: true)") orelse true;
+    // 调试构建（默认 `zig build run` = Debug）**不 strip**：否则 SafeAllocator 的泄漏报告
+    // 与 panic 栈都只剩“Cannot print stack trace: stack tracing is disabled”，
+    // 没任何可诊断信息（实测：退出时两条 1MB/280KB 泄漏无从下手）。
+    // 发布构建（ReleaseFast/Small/Safe）仍默认 strip。
+    const strip = b.option(bool, "strip", "Strip debug info (default: off for Debug, on otherwise)") orelse (optimize != .debug);
 
     const exe = b.addExecutable(.{
         .name = "Sawdust",

@@ -45,6 +45,10 @@ const vst_host = @import("vst_host.zig");
 const eq = @import("eq.zig");
 const audio = @import("audio.zig");
 const vstscan = @import("vstscan.zig"); // 插件扫描工具（同二进制自举入口 `--vst-scan`）
+const crash = @import("crash.zig"); // 崩溃日志（GUI 子系统下 panic 看不见）
+
+/// 自定义 panic：消息追加进 `sawdust-crash.log`，再走默认处理器
+pub const panic = std.debug.FullPanic(crash.panicFn);
 
 pub fn main(init: std.process.Init) !u8 {
     const allocator = init.gpa;
@@ -55,6 +59,7 @@ pub fn main(init: std.process.Init) !u8 {
     // 必须在任何 GUI/音频初始化**之前**——否则 worker 进程会拉起窗口。
     if (hasScanArg(init)) return vstscan.cliMain(init);
 
+    vstscan.attachParentConsole(); // 从终端启动时接回父控制台（panic/日志可见）
     var win: window.Window = undefined;
     try win.init(allocator, "Sawdust — Simple Audio Workstation", 1280, 760);
     defer win.deinit();
@@ -66,6 +71,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer font.deinit();
 
     var app = App{ .allocator = allocator };
+    app.attachIo(io); // 0.17：异步导入的 worker 用 futex 等活，需要进程 Io
     app.initAudioCapacity() catch {}; // 音频容量数组（池化：乐器/通道/效果槽动态容量）
     app.main_hwnd = win.hwnd;
     app.scheduler.muted = &app.track_muted; // 静音轨道集合挂载（SONG 调度时过滤）
@@ -892,6 +898,7 @@ pub fn main(init: std.process.Init) !u8 {
         // 4.4d) VST3 乐器实例同步（惰性加载 + 编辑器编辑轮询）
         syncInstrumentPlugins(&app);
         app.syncKitLayerPlugins();
+        app.pollImports(); // P2：收尾已完成的异步导入（必须在 rebuildAudioTable 之前）
         app.rebuildAudioTable();
         app.pollPreview();
         app.pollOutMeter();
@@ -3059,8 +3066,9 @@ fn dropZoneAt(app: *const App, px: i32, py: i32) DropZone {
 }
 
 /// 建音频样式（**不建片段**）。失败 → toast + null
+/// P2：异步（只读文件头，立刻返回；解码在 worker 线程）
 fn createAudioStyle(app: *App, path: []const u8) ?i32 {
-    return app.audioStyleAdd(path, "") orelse {
+    return app.audioStyleAddAsync(path, "") orelse {
         app.setToast("无法加载音频（格式不支持/文件过大/读取失败）");
         return null;
     };
@@ -3601,16 +3609,13 @@ fn loadProjectFromPath(app: *App, io: std.Io, path: []const u8) void {
         app.setToastWith("打开失败：解析失败（{s}）", .{@errorName(e)});
         return;
     };
-    defer parsed.deinit();
+    // 注意：**不再 defer parsed.deinit()** —— `beginProjectLoad` 接管所有权
+    // （分帧加载，任务结束时释放）
 
     // 基准目录 = 工程目录（相对音频路径解析用）
     app.setBaseDirFromPath(path);
-    app.importProject(parsed.value);
-
-    app.setProjectPath(path);
-    app.resetHistory("打开工程"); // 打开 = 新基线（旧历史作废）
-    app.markSaved();
-    app.setToastWith("已打开：{s}", .{path});
+    // **异步加载**：只读文件头 + 入队，解码交给后台 worker（UI 线程全程不阻塞）
+    app.beginProjectLoadAsync(parsed, path);
 }
 
 /// MIDI 过滤器（描述\0通配\0…；与 project_filter 同格式）
