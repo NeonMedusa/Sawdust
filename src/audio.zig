@@ -30,9 +30,8 @@ const eq = @import("eq.zig");
 const fx = @import("effects.zig");
 const vst_host = @import("vst_host.zig");
 const ivstevents = @import("zig_vst3").pluginterfaces.vst.ivstevents;
-const ma = @cImport({
-    @cInclude("miniaudio.h");
-});
+// 0.17：`@cImport` 已移除——改用 `zig translate-c` 预生成的绑定（免网络、免构建期翻译）
+const ma = @import("c/miniaudio.zig");
 
 /// 每乐器每个分段发送给 VSTi 的事件上限（超出的丢弃；宁可丢事件也不分配）
 pub const vsti_batch_max = 256;
@@ -196,7 +195,7 @@ pub const Params = struct {
 
     // ── 音频线程回传：调音台频谱（用于 EQ 窗口背景）──
     /// 频谱柱（0-1）——**目标效果器的输入信号**（非主输出全混）
-    spec_bars: [eq.spec_bars]std.atomic.Value(f32) = [_]std.atomic.Value(f32){std.atomic.Value(f32).init(0)} ** eq.spec_bars,
+    spec_bars: [eq.spec_bars]std.atomic.Value(f32) = @splat(std.atomic.Value(f32).init(0)),
     /// 频谱版本（音频线程每分析一次递增；UI 据此拷贝）
     spec_version: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// 频谱分析目标：效果器所在通道（UI 每帧发布；-1 = 不分析）
@@ -800,10 +799,10 @@ pub const SamplerVoice = struct {
 
 /// 鼓组采样器集体：每层一个声部池
 pub const KitSamplerState = struct {
-    layers: [kit_max_layers]Layer = [_]Layer{.{}} ** kit_max_layers,
+    layers: [kit_max_layers]Layer = @splat(.{}),
 
     pub const Layer = struct {
-        voices: [kit_sampler_voices]SamplerVoice = [_]SamplerVoice{.{}} ** kit_sampler_voices,
+        voices: [kit_sampler_voices]SamplerVoice = @splat(.{}),
     };
 };
 
@@ -905,8 +904,8 @@ pub fn clipSpan(
 /// （暂停/all-off 按位补发 note-off——同乐器级 VSTi 惯例）。
 pub const KitVstiState = struct {
     evts: [kit_max_layers]EvtBuf,
-    active_lo: [kit_max_layers]u64 = [_]u64{0} ** kit_max_layers,
-    active_hi: [kit_max_layers]u64 = [_]u64{0} ** kit_max_layers,
+    active_lo: [kit_max_layers]u64 = @splat(0),
+    active_hi: [kit_max_layers]u64 = @splat(0),
 
     pub const EvtBuf = struct {
         events: [vsti_batch_max]ivstevents.Event = undefined,
@@ -1030,7 +1029,7 @@ fn vstiNoteOn(engine: *Engine, i: usize, pitch: u8, velocity: u8) void {
     vstiActiveSet(engine, i, pitch, true);
     vstiPush(engine, i, .{
         .sampleOffset = 0,
-        .type = @intFromEnum(ivstevents.Event.EventTypes.kNoteOnEvent),
+        .type = @backingInt(ivstevents.Event.EventTypes.kNoteOnEvent),
         .data = .{ .noteOn = .{
             .channel = 0,
             .pitch = @intCast(pitch),
@@ -1045,7 +1044,7 @@ fn vstiNoteOff(engine: *Engine, i: usize, pitch: u8) void {
     vstiActiveSet(engine, i, pitch, false);
     vstiPush(engine, i, .{
         .sampleOffset = 0,
-        .type = @intFromEnum(ivstevents.Event.EventTypes.kNoteOffEvent),
+        .type = @backingInt(ivstevents.Event.EventTypes.kNoteOffEvent),
         .data = .{ .noteOff = .{
             .channel = 0,
             .pitch = @intCast(pitch),
@@ -1091,7 +1090,7 @@ fn kitLayerVstiNoteOn(engine: *Engine, i: usize, l: usize, pitch: u8, velocity: 
     kitLayerVstiActiveSet(engine, i, l, pitch, true);
     kitLayerVstiPush(engine, i, l, .{
         .sampleOffset = 0,
-        .type = @intFromEnum(ivstevents.Event.EventTypes.kNoteOnEvent),
+        .type = @backingInt(ivstevents.Event.EventTypes.kNoteOnEvent),
         .data = .{ .noteOn = .{
             .channel = 0,
             .pitch = @intCast(pitch),
@@ -1106,7 +1105,7 @@ fn kitLayerVstiNoteOff(engine: *Engine, i: usize, l: usize, pitch: u8) void {
     kitLayerVstiActiveSet(engine, i, l, pitch, false);
     kitLayerVstiPush(engine, i, l, .{
         .sampleOffset = 0,
-        .type = @intFromEnum(ivstevents.Event.EventTypes.kNoteOffEvent),
+        .type = @backingInt(ivstevents.Event.EventTypes.kNoteOffEvent),
         .data = .{ .noteOff = .{
             .channel = 0,
             .pitch = @intCast(pitch),
@@ -1490,10 +1489,10 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
     }
 
     // 2.5) 音频片段 + 波形试听：**无状态按帧映射**（跳转/循环天然正确）：
-        // 位置 = start_step + (abs − start_frame)/step_frames；**本段** = [seg_abs0, +frames)
-        {
-            // **段坐标**（不是整块起点！——见 `clipSpan` 注释里的“篝火噼啪”事故）
-            const abs0 = engine.seg_abs0;
+    // 位置 = start_step + (abs − start_frame)/step_frames；**本段** = [seg_abs0, +frames)
+    {
+        // **段坐标**（不是整块起点！——见 `clipSpan` 注释里的“篝火噼啪”事故）
+        const abs0 = engine.seg_abs0;
         const start_frame = params.start_frame.load(.monotonic);
         const start_step = params.start_step.load(.monotonic);
         const start_frame_i: i64 = @intCast(start_frame);
@@ -1504,48 +1503,48 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
             // **仅在播放时扫描**（暂停时位置映射仍在推进——实测 bug：暂停中拖入的
             // 音频“一直放、停止不停”）
             if (params.playing.load(.monotonic)) {
-            for (tbl.rows) |row| {
-                const asset = row.asset orelse continue;
-                if (asset.frame_count == 0 or asset.frames.len < 2) continue;
-                const sp = clipSpan(
-                    @intCast(abs0),
-                    @as(i64, @intCast(frames)),
-                    start_frame_i,
-                    start_step,
-                    @as(i64, @intCast(step_frames)),
-                    row.start,
-                    row.len,
-                    row.trim_start,
-                    row.trim_len,
-                    row.speed,
-                    asset.ratio,
-                    asset.engFrames(),
-                ) orelse continue;
-                if (n_ch == 0) continue; // 无混音通道：不渲染（防御：chan_bufs 未分配时索引会崩）
-                const ch: usize = if (n_ch > 0) @min(row.channel, n_ch - 1) else 0;
-                const cb: [*]f32 = @ptrCast(&engine.chan_bufs[ch * buf_stride]);
-                var w: usize = sp.w0;
-                while (w < sp.w1) : (w += 1) {
-                    const posf: f64 = sp.pos0 + @as(f64, @floatFromInt(w - sp.w0)) * sp.step;
-                    if (posf < 0) continue;
-                    const ip: usize = @intFromFloat(posf);
-                    if (ip >= asset.frame_count) break;
-                    // **线性插值**（采样率与引擎不同/变速时不再取最近邻——减少混叠噪声）
-                    const g = row.gain;
-                    if (ip + 1 < asset.frame_count) {
-                        const t: f32 = @floatCast(posf - @floor(posf));
-                        const l0 = asset.frames[ip * 2];
-                        const r0 = asset.frames[ip * 2 + 1];
-                        const l1 = asset.frames[(ip + 1) * 2];
-                        const r1 = asset.frames[(ip + 1) * 2 + 1];
-                        cb[w * 2] += (l0 + (l1 - l0) * t) * g;
-                        cb[w * 2 + 1] += (r0 + (r1 - r0) * t) * g;
-                    } else {
-                        cb[w * 2] += asset.frames[ip * 2] * g;
-                        cb[w * 2 + 1] += asset.frames[ip * 2 + 1] * g;
+                for (tbl.rows) |row| {
+                    const asset = row.asset orelse continue;
+                    if (asset.frame_count == 0 or asset.frames.len < 2) continue;
+                    const sp = clipSpan(
+                        @intCast(abs0),
+                        @as(i64, @intCast(frames)),
+                        start_frame_i,
+                        start_step,
+                        @as(i64, @intCast(step_frames)),
+                        row.start,
+                        row.len,
+                        row.trim_start,
+                        row.trim_len,
+                        row.speed,
+                        asset.ratio,
+                        asset.engFrames(),
+                    ) orelse continue;
+                    if (n_ch == 0) continue; // 无混音通道：不渲染（防御：chan_bufs 未分配时索引会崩）
+                    const ch: usize = if (n_ch > 0) @min(row.channel, n_ch - 1) else 0;
+                    const cb: [*]f32 = @ptrCast(&engine.chan_bufs[ch * buf_stride]);
+                    var w: usize = sp.w0;
+                    while (w < sp.w1) : (w += 1) {
+                        const posf: f64 = sp.pos0 + @as(f64, @floatFromInt(w - sp.w0)) * sp.step;
+                        if (posf < 0) continue;
+                        const ip: usize = @intFromFloat(posf);
+                        if (ip >= asset.frame_count) break;
+                        // **线性插值**（采样率与引擎不同/变速时不再取最近邻——减少混叠噪声）
+                        const g = row.gain;
+                        if (ip + 1 < asset.frame_count) {
+                            const t: f32 = @floatCast(posf - @floor(posf));
+                            const l0 = asset.frames[ip * 2];
+                            const r0 = asset.frames[ip * 2 + 1];
+                            const l1 = asset.frames[(ip + 1) * 2];
+                            const r1 = asset.frames[(ip + 1) * 2 + 1];
+                            cb[w * 2] += (l0 + (l1 - l0) * t) * g;
+                            cb[w * 2 + 1] += (r0 + (r1 - r0) * t) * g;
+                        } else {
+                            cb[w * 2] += asset.frames[ip * 2] * g;
+                            cb[w * 2 + 1] += asset.frames[ip * 2 + 1] * g;
+                        }
                     }
                 }
-            }
             }
         }
         // 波形窗口试听（全局单实例；无状态：读游标→混音→写回）
@@ -1563,8 +1562,8 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
                     const p_end_eng: usize = @min(pa.engFrames(), @as(usize, @intCast(ps)) + @as(usize, @intCast(pl)));
                     const p_end: usize = @min(pa.frame_count, @as(usize, @intFromFloat(@as(f64, @floatFromInt(p_end_eng)) * pr)));
                     const pg = params.preview_gain.load(.monotonic);
-            const ch2: usize = if (n_ch > 0) @min(params.preview_channel.load(.monotonic), n_ch - 1) else 0;
-            const cb2: [*]f32 = @ptrCast(&engine.chan_bufs[ch2 * buf_stride]);
+                    const ch2: usize = if (n_ch > 0) @min(params.preview_channel.load(.monotonic), n_ch - 1) else 0;
+                    const cb2: [*]f32 = @ptrCast(&engine.chan_bufs[ch2 * buf_stride]);
                     const pspd: f64 = @max(0.25, @min(4.0, @as(f64, params.preview_speed.load(.monotonic)))) * pr;
                     var ppos: f64 = @floatFromInt(cur);
                     ppos *= pr; // 引擎帧 → 采样帧
@@ -1584,7 +1583,7 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
                         params.preview_pos.store(-1, .monotonic);
                     } else {
                         params.preview_pos.store(@intFromFloat(ppos / pr), .monotonic);
-                            }
+                    }
                 }
             } else {
                 params.preview_playing.store(false, .monotonic);
@@ -1681,9 +1680,9 @@ fn processChannelChain(engine: *Engine, params: *Params, ch_i: usize, buf: []f32
                     }
                 }
             },
-        5 => { // VST3 插件（实例未加载 → 直通；由 UI 侧惰性加载/退役）
-            if (params.plugin_ptrs[ch_i][slot].load(.monotonic)) |pl| pl.processWithHost(buf, frames, currentHostTime(engine, params, sr));
-        },
+            5 => { // VST3 插件（实例未加载 → 直通；由 UI 侧惰性加载/退役）
+                if (params.plugin_ptrs[ch_i][slot].load(.monotonic)) |pl| pl.processWithHost(buf, frames, currentHostTime(engine, params, sr));
+            },
             2, 3, 4 => { // 混响 / 延迟 / 压缩器：**每槽独立状态盒**（UI 发布指针）
                 const raw = params.fx_ptrs[ch_i][slot].load(.monotonic) orelse continue;
                 const box: *FxBox = @ptrCast(@alignCast(raw));
@@ -1810,10 +1809,9 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
         renderSegment(engine, params, out, frames, sr, master);
         publishSounding(engine, params);
         _ = params.frames_played.fetchAdd(frames, .monotonic);
-    publishOutMeter(params, out, frames);
+        publishOutMeter(params, out, frames);
         return;
     }
-
 
     // 4) 播放：stash 管理 + 样本级事件触发
     if (gen != engine.stash_gen) handleGenChange(engine, params, gen, was_playing);
@@ -1857,7 +1855,7 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
         const cur: i64 = @as(i64, @intCast(abs0)) + @as(i64, done);
         if (ev_frame <= cur) {
             dispatchNote(engine, ev); // 已到时（含“起播前就应触发”的补发事件）
-                engine.dbg_dispatched += 1;
+            engine.dbg_dispatched += 1;
             si += 1;
             continue;
         }
@@ -2597,7 +2595,7 @@ test "audio: VSTi 声像平衡——等功率（0.5 原样、两端满偏单侧�
 
 test "audio: VSTi 声像——插件输出按平衡叠加（全左/全右/居中能量分配）" {
     const alloc = std.testing.allocator;
-    const dll_z = alloc.dupeZ(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll") catch return;
+    const dll_z = alloc.dupeSentinel(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll", 0) catch return;
     defer alloc.free(dll_z);
 
     const measure = struct {
@@ -2688,11 +2686,10 @@ test "audio: VSTi panic——全 128 音高 note-off + 位图清零（state 恢�
     try std.testing.expectEqual(@as(u64, 0), engine.vsti_active_hi[0]);
     try std.testing.expectEqual(before + 128, engine.vsti_event_n[0]); // 全 128 无条件 off
     for (engine.vsti_events[0][before..engine.vsti_event_n[0]], 0..) |ev, k| {
-        try std.testing.expectEqual(@intFromEnum(ivstevents.Event.EventTypes.kNoteOffEvent), ev.type);
+        try std.testing.expectEqual(@backingInt(ivstevents.Event.EventTypes.kNoteOffEvent), ev.type);
         try std.testing.expectEqual(@as(i16, @intCast(k)), ev.data.noteOff.pitch);
     }
 }
-
 
 test "audio: clipSpan——按段坐标计算（多段渲染不越界、不重复）" {
     const step_frames: i64 = 100;

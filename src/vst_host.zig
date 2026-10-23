@@ -218,7 +218,7 @@ const MemStream = struct {
     iface: ibstream.IBStream = .{ .vtable = &vtable },
     ref_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
     alloc: std.mem.Allocator,
-    buf: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 },
+    buf: std.ArrayListUnmanaged(u8) = .empty,
     pos: usize = 0,
 
     fn asIface(self: *Self) *ibstream.IBStream {
@@ -302,9 +302,9 @@ const MemStream = struct {
         const self = owner(ptr);
         // IStreamSeekMode：0=kIBSeekSet 1=kIBSeekCur 2=kIBSeekEnd
         const base: i64 = switch (mode) {
-            @intFromEnum(ibstream.IStreamSeekMode.kIBSeekSet) => 0,
-            @intFromEnum(ibstream.IStreamSeekMode.kIBSeekCur) => @intCast(self.pos),
-            @intFromEnum(ibstream.IStreamSeekMode.kIBSeekEnd) => @intCast(self.buf.items.len),
+            @backingInt(ibstream.IStreamSeekMode.kIBSeekSet) => 0,
+            @backingInt(ibstream.IStreamSeekMode.kIBSeekCur) => @intCast(self.pos),
+            @backingInt(ibstream.IStreamSeekMode.kIBSeekEnd) => @intCast(self.buf.items.len),
             else => return btypes.kResultFalse,
         };
         const new_pos = base + pos;
@@ -400,9 +400,9 @@ pub const StateBlobs = struct {
 /// 单个参数的元数据（加载时抓取；名称/单位已转 UTF-8 限长存储）
 pub const ParamMeta = struct {
     id: u32 = 0,
-    name_buf: [48]u8 = [_]u8{0} ** 48,
+    name_buf: [48]u8 = @splat(0),
     name_len: u8 = 0,
-    units_buf: [16]u8 = [_]u8{0} ** 16,
+    units_buf: [16]u8 = @splat(0),
     units_len: u8 = 0,
     /// 0 = 连续；>0 = 离散步数
     step_count: i32 = 0,
@@ -530,7 +530,7 @@ const EventList = struct {
     iface: ivstevents.IEventList = .{ .vtable = &vtable },
     ref_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
     count: u32 = 0,
-    events: [128]ivstevents.Event = [_]ivstevents.Event{.{}} ** 128,
+    events: [128]ivstevents.Event = @splat(.{}),
 
     fn owner(ptr: *anyopaque) *EventList {
         return @fieldParentPtr("iface", @as(*ivstevents.IEventList, @ptrCast(@alignCast(ptr))));
@@ -716,16 +716,16 @@ pub const Role = enum { effect, instrument };
 /// 一个 VST3 类的元数据（固定缓冲；零分配、可值传递）
 pub const ModuleClass = struct {
     cid: tuid.TUID = tuid.zero,
-    category_buf: [32]u8 = [_]u8{0} ** 32,
+    category_buf: [32]u8 = @splat(0),
     category_len: u16 = 0,
-    name_buf: [64]u8 = [_]u8{0} ** 64,
+    name_buf: [64]u8 = @splat(0),
     name_len: u16 = 0,
-    vendor_buf: [64]u8 = [_]u8{0} ** 64,
+    vendor_buf: [64]u8 = @splat(0),
     vendor_len: u16 = 0,
-    version_buf: [64]u8 = [_]u8{0} ** 64,
+    version_buf: [64]u8 = @splat(0),
     version_len: u16 = 0,
     /// 子类别（v2 类信息；“Instrument|Synth” 等——乐器识别用）
-    sub_buf: [64]u8 = [_]u8{0} ** 64,
+    sub_buf: [64]u8 = @splat(0),
     sub_len: u16 = 0,
 
     pub fn category(self: *const ModuleClass) []const u8 {
@@ -755,7 +755,7 @@ pub const ModuleClass = struct {
 
 /// 一次模块扫描的结果（最多 `MaxClasses` 个类）
 pub const Scan = struct {
-    classes: [MaxClasses]ModuleClass = [_]ModuleClass{.{}} ** MaxClasses,
+    classes: [MaxClasses]ModuleClass = @splat(.{}),
     len: usize = 0,
 
     pub fn slice(self: *const Scan) []const ModuleClass {
@@ -892,13 +892,13 @@ pub fn dumpBuses(path: [:0]const u8) !void {
         .{ .d = .kInput, .t = .kAudio, .label = "in" },
         .{ .d = .kOutput, .t = .kAudio, .label = "out" },
     }) |side| {
-        const n = component.vtable.getBusCount(raw_component, @intFromEnum(side.t), @intFromEnum(side.d));
+        const n = component.vtable.getBusCount(raw_component, @backingInt(side.t), @backingInt(side.d));
         std.debug.print("[{s}] 总线数 {d}\n", .{ side.label, n });
         var i: i32 = 0;
         while (i < n) : (i += 1) {
             var bi: icomp.BusInfo = .{};
-            _ = component.vtable.getBusInfo(raw_component, @intFromEnum(side.t), @intFromEnum(side.d), i, &bi);
-            const is_main = bi.busType == @intFromEnum(icomp.BusTypes.kMain);
+            _ = component.vtable.getBusInfo(raw_component, @backingInt(side.t), @backingInt(side.d), i, &bi);
+            const is_main = bi.busType == @backingInt(icomp.BusTypes.kMain);
             std.debug.print("  [{s}{d}] {s} 通道={d} 默认激活={} flags={d}\n", .{
                 side.label,
                 i,
@@ -973,17 +973,17 @@ pub const Plugin = struct {
     ctrl_same: bool = false,
 
     /// 实例化时选中的类 CID（VST3 稳定身份——预设分类/重绑定用；零 = 未记录）
-    class_cid: [16]u8 = [_]u8{0} ** 16,
+    class_cid: [16]u8 = @splat(0),
 
     // ── 参数与状态（阶段 4）──
     /// 参数元数据（加载时抓取；空 = 抓取失败——面板退化，其余功能不受影响）
     params: []ParamMeta = &.{},
     /// 宿主 → 插件待送参数变更（SPSC 环：UI 线程写、音频线程读）
-    pend: [8]ParamMsg = [_]ParamMsg{.{ .id = 0, .value = 0 }} ** 8,
+    pend: [8]ParamMsg = @splat(.{ .id = 0, .value = 0 }),
     pend_head: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     pend_tail: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// 音频线程组装 inputParameterChanges 的预分配容器
-    in_queues: [8]ParamValueQueue = [_]ParamValueQueue{.{}} ** 8,
+    in_queues: [8]ParamValueQueue = @splat(.{}),
     in_changes: ParamChanges = .{},
     /// VSTi：本段输入事件（processInstrument 填充；段边界 = 事件时刻）
     in_events: EventList = .{},
@@ -993,7 +993,7 @@ pub const Plugin = struct {
     handler_obj: ?*PluginHandler = null,
     /// 编辑器交互事件**环形队列**（插件 GUI 线程写、宿主 UI 线程读）：begin/perform/end
     /// 三类事件全量保留——撤销“参数增量回放”的数据源；begin 事件还用于“按旋钮切历史”。
-    edit_ring: [edit_ring_len]EditEvent = [_]EditEvent{.{ .kind = .perform, .id = 0, .value = 0 }} ** edit_ring_len,
+    edit_ring: [edit_ring_len]EditEvent = @splat(.{ .kind = .perform, .id = 0, .value = 0 }),
     /// 累计写入数（单调）；`edit_ring[w % len]` 为最新一条
     edit_w: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// 已读累计数（仅 UI 线程写）
@@ -1022,10 +1022,10 @@ pub const Plugin = struct {
 
     /// 是否有主音频输入（乐器/VSTi 常为 false；process 时不读输入缓冲）
     has_input: bool = true,
-    name_buf: [64]u8 = [_]u8{0} ** 64,
+    name_buf: [64]u8 = @splat(0),
     name_len: u16 = 0,
     /// 厂商（类信息的 vendor；预设展示/回退用）
-    vendor_buf: [64]u8 = [_]u8{0} ** 64,
+    vendor_buf: [64]u8 = @splat(0),
     vendor_len: u16 = 0,
     sample_rate: f64 = 0,
     max_block: u32 = 0,
@@ -1047,13 +1047,13 @@ pub const Plugin = struct {
     /// 主输出总线在**激活序列**中的位次（“仅主输出”混音策略用）
     out_main_index: usize = 0,
     /// 每激活总线的通道数（按总线索引升序；仅多输出有效）
-    out_chan_counts: [MaxBuses]u8 = [_]u8{0} ** MaxBuses,
+    out_chan_counts: [MaxBuses]u8 = @splat(0),
     /// 多输出：全部激活总线的 planar 样本池（一段连续内存）
     out_pool: []f32 = &.{},
     /// 各总线各声道的 planar 指针（装载期填好；渲染期只 memset/读）
-    out_ptrs: [MaxBuses][2][*]f32 = [_][2][*]f32{.{ undefined, undefined }} ** MaxBuses,
+    out_ptrs: [MaxBuses][2][*]f32 = @splat(.{ undefined, undefined }),
     /// ProcessData.outputs 数组（音频线程只读）
-    out_buffers: [MaxBuses]iaudio.AudioBusBuffers = [_]iaudio.AudioBusBuffers{.{}} ** MaxBuses,
+    out_buffers: [MaxBuses]iaudio.AudioBusBuffers = @splat(.{}),
 
     pub fn name(self: *const Plugin) []const u8 {
         return self.name_buf[0..self.name_len];
@@ -1110,7 +1110,7 @@ pub const Plugin = struct {
         const rc = self.raw_controller orelse return "";
         const id = self.params[idx].id;
         const v = c.vtable.getParamNormalized(rc, id);
-        var wbuf: [128]u16 = [_]u16{0} ** 128;
+        var wbuf: [128]u16 = @splat(0);
         if (c.vtable.getParamStringByValue(rc, id, v, &wbuf) == btypes.kResultOk) {
             var len: u8 = 0;
             copyUtf16ToUtf8(buf, &len, std.mem.sliceTo(&wbuf, 0));
@@ -1500,7 +1500,6 @@ pub const Plugin = struct {
         }
     }
 
-
     /// 关闭插件编辑器（UI 线程；幂等）
     pub fn closeEditor(self: *Plugin) void {
         if (self.view) |v| {
@@ -1589,8 +1588,8 @@ pub const Plugin = struct {
         self.in_changes.count = @intCast(n_q);
 
         var pd = iaudio.ProcessData{
-            .processMode = @intFromEnum(iaudio.ProcessModes.kRealtime),
-            .symbolicSampleSize = @intFromEnum(iaudio.SymbolicSampleSizes.kSample32),
+            .processMode = @backingInt(iaudio.ProcessModes.kRealtime),
+            .symbolicSampleSize = @backingInt(iaudio.SymbolicSampleSizes.kSample32),
             .numSamples = @intCast(frames),
             .numInputs = if (self.has_input) 1 else 0,
             .numOutputs = @intCast(self.out_bus_count),
@@ -1815,8 +1814,8 @@ pub fn loadPlugin(allocator: std.mem.Allocator, path: [:0]const u8, sample_rate:
     };
 
     // 主总线：1×立体声主输入 + 1×立体声主输出（辅助/侧链总线关闭但不拒绝）
-    const n_in = component.vtable.getBusCount(raw_component, @intFromEnum(icomp.MediaTypes.kAudio), @intFromEnum(icomp.BusDirections.kInput));
-    const n_out = component.vtable.getBusCount(raw_component, @intFromEnum(icomp.MediaTypes.kAudio), @intFromEnum(icomp.BusDirections.kOutput));
+    const n_in = component.vtable.getBusCount(raw_component, @backingInt(icomp.MediaTypes.kAudio), @backingInt(icomp.BusDirections.kInput));
+    const n_out = component.vtable.getBusCount(raw_component, @backingInt(icomp.MediaTypes.kAudio), @backingInt(icomp.BusDirections.kOutput));
     if (n_in < 0 or n_out < 0 or n_in > MaxBuses or n_out > MaxBuses) return error.BusCountInvalid;
     var main_in: i32 = -1;
     var main_out: i32 = -1;
@@ -1824,8 +1823,8 @@ pub fn loadPlugin(allocator: std.mem.Allocator, path: [:0]const u8, sample_rate:
         var i: i32 = 0;
         while (i < n_in) : (i += 1) {
             var bi: icomp.BusInfo = .{};
-            if (component.vtable.getBusInfo(raw_component, @intFromEnum(icomp.MediaTypes.kAudio), @intFromEnum(icomp.BusDirections.kInput), i, &bi) != btypes.kResultOk) return error.BusInfoFailed;
-            if (bi.busType == @intFromEnum(icomp.BusTypes.kMain) and main_in < 0) {
+            if (component.vtable.getBusInfo(raw_component, @backingInt(icomp.MediaTypes.kAudio), @backingInt(icomp.BusDirections.kInput), i, &bi) != btypes.kResultOk) return error.BusInfoFailed;
+            if (bi.busType == @backingInt(icomp.BusTypes.kMain) and main_in < 0) {
                 if (bi.channelCount != 2) return error.MainInputNotStereo;
                 main_in = i;
             }
@@ -1833,8 +1832,8 @@ pub fn loadPlugin(allocator: std.mem.Allocator, path: [:0]const u8, sample_rate:
         i = 0;
         while (i < n_out) : (i += 1) {
             var bi: icomp.BusInfo = .{};
-            if (component.vtable.getBusInfo(raw_component, @intFromEnum(icomp.MediaTypes.kAudio), @intFromEnum(icomp.BusDirections.kOutput), i, &bi) != btypes.kResultOk) return error.BusInfoFailed;
-            if (bi.busType == @intFromEnum(icomp.BusTypes.kMain) and main_out < 0) {
+            if (component.vtable.getBusInfo(raw_component, @backingInt(icomp.MediaTypes.kAudio), @backingInt(icomp.BusDirections.kOutput), i, &bi) != btypes.kResultOk) return error.BusInfoFailed;
+            if (bi.busType == @backingInt(icomp.BusTypes.kMain) and main_out < 0) {
                 if (bi.channelCount != 2) return error.MainOutputNotStereo;
                 main_out = i;
             }
@@ -1848,8 +1847,8 @@ pub fn loadPlugin(allocator: std.mem.Allocator, path: [:0]const u8, sample_rate:
     // ① 先试“仅主输出”（单总线路径：内存小、行为最简——旧行为）；
     // ② 被插件拒绝（如 SFLT：17 出全默认激活、要求全供 buffer）→ 全激活 +
     //    每总线 planar 缓冲 + 渲染时求和混音（见 `render` / `finishBuffers`）。
-    var in_arr: [MaxBuses]vsttypes.SpeakerArrangement = [_]vsttypes.SpeakerArrangement{vstspeaker.SpeakerArr.kEmpty} ** MaxBuses;
-    var out_arr: [MaxBuses]vsttypes.SpeakerArrangement = [_]vsttypes.SpeakerArrangement{vstspeaker.SpeakerArr.kEmpty} ** MaxBuses;
+    var in_arr: [MaxBuses]vsttypes.SpeakerArrangement = @splat(vstspeaker.SpeakerArr.kEmpty);
+    var out_arr: [MaxBuses]vsttypes.SpeakerArrangement = @splat(vstspeaker.SpeakerArr.kEmpty);
     if (main_in >= 0) in_arr[@intCast(main_in)] = vstspeaker.SpeakerArr.kStereo; // 乐器（VSTi）无主输入：跳过
     out_arr[@intCast(main_out)] = vstspeaker.SpeakerArr.kStereo;
     var multi = false;
@@ -1860,7 +1859,7 @@ pub fn loadPlugin(allocator: std.mem.Allocator, path: [:0]const u8, sample_rate:
         var n_active: usize = 1;
         while (oi < n_out) : (oi += 1) {
             var bi2: icomp.BusInfo = .{};
-            if (component.vtable.getBusInfo(raw_component, @intFromEnum(icomp.MediaTypes.kAudio), @intFromEnum(icomp.BusDirections.kOutput), oi, &bi2) != btypes.kResultOk) return error.BusInfoFailed;
+            if (component.vtable.getBusInfo(raw_component, @backingInt(icomp.MediaTypes.kAudio), @backingInt(icomp.BusDirections.kOutput), oi, &bi2) != btypes.kResultOk) return error.BusInfoFailed;
             if (oi == main_out or bi2.channelCount == 0) continue;
             if (bi2.channelCount > 2) return error.MultiOutputUnsupported; // >立体声的辅助总线暂不支持
             out_arr[@intCast(oi)] = if (bi2.channelCount == 1) vstspeaker.SpeakerArr.kMono else vstspeaker.SpeakerArr.kStereo;
@@ -1876,7 +1875,7 @@ pub fn loadPlugin(allocator: std.mem.Allocator, path: [:0]const u8, sample_rate:
     {
         var i: i32 = 0;
         while (i < n_in) : (i += 1) {
-            _ = component.vtable.activateBus(raw_component, @intFromEnum(icomp.MediaTypes.kAudio), @intFromEnum(icomp.BusDirections.kInput), i, if (i == main_in) 1 else 0);
+            _ = component.vtable.activateBus(raw_component, @backingInt(icomp.MediaTypes.kAudio), @backingInt(icomp.BusDirections.kInput), i, if (i == main_in) 1 else 0);
         }
         i = 0;
         while (i < n_out) : (i += 1) {
@@ -1884,7 +1883,7 @@ pub fn loadPlugin(allocator: std.mem.Allocator, path: [:0]const u8, sample_rate:
                 (if (out_arr[@intCast(i)] == vstspeaker.SpeakerArr.kEmpty) 0 else 1)
             else
                 (if (i == main_out) 1 else 0);
-            _ = component.vtable.activateBus(raw_component, @intFromEnum(icomp.MediaTypes.kAudio), @intFromEnum(icomp.BusDirections.kOutput), i, want);
+            _ = component.vtable.activateBus(raw_component, @backingInt(icomp.MediaTypes.kAudio), @backingInt(icomp.BusDirections.kOutput), i, want);
         }
     }
     // 多输出：激活后重查各激活总线的通道数（激活可能改变 arrangement），
@@ -1898,7 +1897,7 @@ pub fn loadPlugin(allocator: std.mem.Allocator, path: [:0]const u8, sample_rate:
         while (i < n_out) : (i += 1) {
             if (out_arr[@intCast(i)] == vstspeaker.SpeakerArr.kEmpty) continue;
             var got: vsttypes.SpeakerArrangement = vstspeaker.SpeakerArr.kEmpty;
-            _ = processor.vtable.getBusArrangement(raw_processor, @intFromEnum(icomp.BusDirections.kOutput), i, &got);
+            _ = processor.vtable.getBusArrangement(raw_processor, @backingInt(icomp.BusDirections.kOutput), i, &got);
             const ch: usize = speakerChannelCount(got);
             if (ch == 0 or ch > 2) return error.MultiOutputUnsupported;
             pl.out_chan_counts[cnt] = @intCast(ch);
@@ -1910,12 +1909,12 @@ pub fn loadPlugin(allocator: std.mem.Allocator, path: [:0]const u8, sample_rate:
     }
 
     // 采样精度与 setup
-    if (processor.vtable.canProcessSampleSize(raw_processor, @intFromEnum(iaudio.SymbolicSampleSizes.kSample32)) != btypes.kResultOk) {
+    if (processor.vtable.canProcessSampleSize(raw_processor, @backingInt(iaudio.SymbolicSampleSizes.kSample32)) != btypes.kResultOk) {
         return error.Sample32Unsupported;
     }
     var setup = iaudio.ProcessSetup{
-        .processMode = @intFromEnum(iaudio.ProcessModes.kRealtime),
-        .symbolicSampleSize = @intFromEnum(iaudio.SymbolicSampleSizes.kSample32),
+        .processMode = @backingInt(iaudio.ProcessModes.kRealtime),
+        .symbolicSampleSize = @backingInt(iaudio.SymbolicSampleSizes.kSample32),
         .maxSamplesPerBlock = @intCast(max_block),
         .sampleRate = sample_rate,
     };

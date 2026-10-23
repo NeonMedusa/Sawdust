@@ -91,7 +91,7 @@ pub const Instrument = struct {
 
     // ── VST3 乐器（kind == .vst3）──
     /// 插件路径（固定缓冲零分配；同 EffectSlot 惯例）
-    plugin_path: [512]u8 = [_]u8{0} ** 512,
+    plugin_path: [512]u8 = @splat(0),
     plugin_path_len: u16 = 0,
     /// 运行时插件实例（**不存档**；main 侧惰性加载/退役回收）
     plugin: ?*vst_host.Plugin = null,
@@ -107,7 +107,7 @@ pub const Instrument = struct {
 
     /// 最后已知类 CID（32 hex 文本；0 长 = 未知）——重绑定自愈/存档身份。
     /// 加载成功时回填；路径变化时清空（身份失效，等新加载回填）。
-    plugin_cid: [32]u8 = [_]u8{0} ** 32,
+    plugin_cid: [32]u8 = @splat(0),
     plugin_cid_len: u8 = 0,
 
     pub fn pluginCid(self: *const Instrument) []const u8 {
@@ -184,7 +184,7 @@ pub const DrumLayer = struct {
 
     // ── VST3 层（kind == .vst3；字段/惯例同 `Instrument` 的插件段）──
     /// 插件路径（固定缓冲零分配；同 Instrument/EffectSlot 惯例）
-    plugin_path: [512]u8 = [_]u8{0} ** 512,
+    plugin_path: [512]u8 = @splat(0),
     plugin_path_len: u16 = 0,
     /// 运行时插件实例（**不存档**；main 侧 `syncKitLayerPlugins` 惰性加载/退役回收）
     plugin: ?*vst_host.Plugin = null,
@@ -196,12 +196,12 @@ pub const DrumLayer = struct {
     pending_state: ?[]u8 = null,
     pending_state_ctrl: ?[]u8 = null,
     /// 最后已知类 CID（32 hex 文本；0 长 = 未知）——重绑定自愈/存档身份
-    plugin_cid: [32]u8 = [_]u8{0} ** 32,
+    plugin_cid: [32]u8 = @splat(0),
     plugin_cid_len: u8 = 0,
 
     // ── 采样器层（kind == .sampler）──
     /// 采样源文件路径（固定缓冲；存档按相对路径）
-    asset_path: [512]u8 = [_]u8{0} ** 512,
+    asset_path: [512]u8 = @splat(0),
     asset_path_len: u16 = 0,
     /// 运行时资产下标（`App.audio_assets`；-1 = 未加载/失败）
     asset_idx: i32 = -1,
@@ -264,12 +264,12 @@ pub const DrumPad = struct {
     /// 自定义名（空 = 用 GM 标准名/音名）
     name: []u8,
     /// 层列表（空 = 已建垫但无音源）
-    layers: std.ArrayListUnmanaged(DrumLayer) = .{ .items = &.{}, .capacity = 0 },
+    layers: std.ArrayListUnmanaged(DrumLayer) = .empty,
 };
 
 /// 一套鼓（按音高升序存放 pads）
 pub const DrumKit = struct {
-    pads: std.ArrayListUnmanaged(DrumPad) = .{ .items = &.{}, .capacity = 0 },
+    pads: std.ArrayListUnmanaged(DrumPad) = .empty,
 
     /// 按音高找垫（未建垫返回 null）
     pub fn find(self: *const DrumKit, pitch: u8) ?*DrumPad {
@@ -338,7 +338,6 @@ pub const max_patterns = 1_000_000_000;
 
 /// 轨道（= 播放列表的行，纯编排行）的规模由内容推导（最短 128 行；上限受
 /// 滚动防溢出帽与 i32 字段值域约束）——处理见 docs/pitfalls.md“坐标界与防护措施”。
-
 /// 行轴**最短行程**（= 初始跨度与回收下限；横向“保底 4 小节 + 3 留白”的纵向版）。
 /// 实际跨度 = max(本值, 内容下缘 + 1 + `track_headroom`)，随内容自动生长/收回。
 pub const min_track_span = 128;
@@ -749,52 +748,52 @@ pub fn gmDrumName(pitch: i32) []const u8 {
     if (pitch < 35 or pitch > 81) return "";
     const names = [_][]const u8{
         "Acoustic Bass Drum", // 35
-        "Bass Drum 1",        // 36
-        "Side Stick",         // 37
-        "Acoustic Snare",     // 38
-        "Hand Clap",          // 39
-        "Electric Snare",     // 40
-        "Low Floor Tom",      // 41
-        "Closed Hi-Hat",      // 42
-        "High Floor Tom",     // 43
-        "Pedal Hi-Hat",       // 44
-        "Low Tom",            // 45
-        "Open Hi-Hat",        // 46
-        "Low-Mid Tom",        // 47
-        "Hi-Mid Tom",         // 48
-        "Crash Cymbal 1",     // 49
-        "High Tom",           // 50
-        "Ride Cymbal 1",      // 51
-        "Chinese Cymbal",     // 52
-        "Ride Bell",          // 53
-        "Tambourine",         // 54
-        "Splash Cymbal",      // 55
-        "Cowbell",            // 56
-        "Crash Cymbal 2",     // 57
-        "Vibraslap",          // 58
-        "Ride Cymbal 2",      // 59
-        "Hi Bongo",           // 60
-        "Low Bongo",          // 61
-        "Mute Hi Conga",      // 62
-        "Open Hi Conga",      // 63
-        "Low Conga",          // 64
-        "High Timbale",       // 65
-        "Low Timbale",        // 66
-        "High Agogo",         // 67
-        "Low Agogo",          // 68
-        "Cabasa",             // 69
-        "Maracas",            // 70
-        "Short Whistle",      // 71
-        "Long Whistle",       // 72
-        "Short Guiro",        // 73
-        "Long Guiro",         // 74
-        "Claves",             // 75
-        "Hi Wood Block",      // 76
-        "Low Wood Block",     // 77
-        "Mute Cuica",         // 78
-        "Open Cuica",         // 79
-        "Mute Triangle",      // 80
-        "Open Triangle",      // 81
+        "Bass Drum 1", // 36
+        "Side Stick", // 37
+        "Acoustic Snare", // 38
+        "Hand Clap", // 39
+        "Electric Snare", // 40
+        "Low Floor Tom", // 41
+        "Closed Hi-Hat", // 42
+        "High Floor Tom", // 43
+        "Pedal Hi-Hat", // 44
+        "Low Tom", // 45
+        "Open Hi-Hat", // 46
+        "Low-Mid Tom", // 47
+        "Hi-Mid Tom", // 48
+        "Crash Cymbal 1", // 49
+        "High Tom", // 50
+        "Ride Cymbal 1", // 51
+        "Chinese Cymbal", // 52
+        "Ride Bell", // 53
+        "Tambourine", // 54
+        "Splash Cymbal", // 55
+        "Cowbell", // 56
+        "Crash Cymbal 2", // 57
+        "Vibraslap", // 58
+        "Ride Cymbal 2", // 59
+        "Hi Bongo", // 60
+        "Low Bongo", // 61
+        "Mute Hi Conga", // 62
+        "Open Hi Conga", // 63
+        "Low Conga", // 64
+        "High Timbale", // 65
+        "Low Timbale", // 66
+        "High Agogo", // 67
+        "Low Agogo", // 68
+        "Cabasa", // 69
+        "Maracas", // 70
+        "Short Whistle", // 71
+        "Long Whistle", // 72
+        "Short Guiro", // 73
+        "Long Guiro", // 74
+        "Claves", // 75
+        "Hi Wood Block", // 76
+        "Low Wood Block", // 77
+        "Mute Cuica", // 78
+        "Open Cuica", // 79
+        "Mute Triangle", // 80
+        "Open Triangle", // 81
     };
     return names[@intCast(pitch - 35)];
 }
@@ -803,11 +802,11 @@ pub fn gmDrumName(pitch: i32) []const u8 {
 pub fn gmDrumShortName(pitch: i32) []const u8 {
     if (pitch < 35 or pitch > 81) return "";
     const names = [_][]const u8{
-        "Kick",  "Kick2", "Stick", "Snare", "Clap",  "Snare2", "Tom1", "CHH",  "Tom2",  "PHH",
-        "Tom3",  "OHH",   "Tom4",  "Tom5",  "Crash1", "Tom6",   "Ride1", "China", "Bell",  "Tamb",
-        "Splash", "Cowbell", "Crash2", "Vibra", "Ride2", "BongoH", "BongoL", "CongaH", "CongaM", "CongaL",
-        "TimbH", "TimbL",  "AgogoH", "AgogoL", "Cabasa", "Maracas", "WhistS", "WhistL", "GuiroS", "GuiroL",
-        "Claves", "WoodH",  "WoodL",  "CuicaM", "CuicaO", "TriM",   "TriO",
+        "Kick",   "Kick2",   "Stick",  "Snare",  "Clap",   "Snare2",  "Tom1",   "CHH",    "Tom2",   "PHH",
+        "Tom3",   "OHH",     "Tom4",   "Tom5",   "Crash1", "Tom6",    "Ride1",  "China",  "Bell",   "Tamb",
+        "Splash", "Cowbell", "Crash2", "Vibra",  "Ride2",  "BongoH",  "BongoL", "CongaH", "CongaM", "CongaL",
+        "TimbH",  "TimbL",   "AgogoH", "AgogoL", "Cabasa", "Maracas", "WhistS", "WhistL", "GuiroS", "GuiroL",
+        "Claves", "WoodH",   "WoodL",  "CuicaM", "CuicaO", "TriM",    "TriO",
     };
     return names[@intCast(pitch - 35)];
 }
@@ -1092,7 +1091,7 @@ test "model: GM 鼓表——范围/抽查/边界" {
 
 test "model: 鼓组键列标签——垫名 > GM 名 > 音名（仅 C 行）" {
     const alloc = std.testing.allocator;
-    var kit = DrumKit{ .pads = .{ .items = &.{}, .capacity = 0 } };
+    var kit = DrumKit{ .pads = .empty };
     defer kit.pads.deinit(alloc);
     var buf: [16]u8 = undefined;
 
@@ -1113,7 +1112,7 @@ test "model: 鼓组键列标签——垫名 > GM 名 > 音名（仅 C 行）" {
 
 test "model: isMapped——有垫且至少一层才算已映射（空垫不亮）" {
     const alloc = std.testing.allocator;
-    var kit = DrumKit{ .pads = .{ .items = &.{}, .capacity = 0 } };
+    var kit = DrumKit{ .pads = .empty };
     defer kit.pads.deinit(alloc);
 
     try std.testing.expect(!kit.isMapped(35)); // 无垫

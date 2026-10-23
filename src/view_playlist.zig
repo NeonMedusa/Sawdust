@@ -112,7 +112,6 @@ pub fn drawTrackCtxMenu(ui: *Ui, app: *App) void {
     }
 }
 
-
 /// 播放列表落点（拖入文件用）：屏幕坐标 → (轨道行, **吸附后**的步)。
 /// 不在轨道内容区 → null（标题/标尺/滚动条/轨道名列都算"不响应"）。
 pub fn hitAt(app: *const App, px: i32, py: i32) ?struct { track: i32, step: i32 } {
@@ -324,7 +323,6 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     const rows_draw: i32 = @max(map_rows, @divTrunc(app.playlist.scroll + tracks_h + track_h - 1, @max(1, track_h)));
     app.playlist.view_rows = rows_draw;
 
-
     // 样式音域统计（每帧一次）：片段预览的纵向映射用（避免片段循环里重复扫全量音符）。
     // **按实际样式数**复用 App 缓冲（原为 `[max_patterns]` 栈数组——上限放到十亿级后
     // 不能预分配；成本完全按真实用量）。
@@ -352,19 +350,19 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 const selected = app.sel.track == @as(i32, @intCast(i));
                 // 轨道名（左列；底色加深与内容区区分）
                 // 注：Ctrl 按下时不响应（让位给“按行框选”——起点在轨道名列的手势）
-                    const muted = app.trackMuted(i);
-                    // 静音方形开关（名字右侧；开=绿/关=灰）——点它切换，不点名字
-                    const btn_sz: i32 = @min(track_h - 2, @max(12, @as(i32, @intFromFloat(ui.font.lineHeight()))));
-                    const btn_x: i32 = main_x + header_w - btn_sz - 4;
-                    const btn_y: i32 = ty + @divTrunc(track_h - btn_sz, 2);
-                    const over_mute = util.inRect(ui.mouse_x, ui.mouse_y, btn_x, btn_y, btn_sz, btn_sz);
-                    if (ui.listItem(3000 + i, app.trackName(i), main_x, ty, header_w, track_h, selected, i % 2 == 1, ui.theme.bg, if (muted) muted_gray else null) and !ui.mods_ctrl and !over_mute) {
-                        app.sel.track = @intCast(i);
-                    }
-                    if (ui.toggleSquare(!muted, btn_x, btn_y, btn_sz)) { // 蓝=发声 / 灰=静音
-                        app.setTrackMuted(i, !muted);
-                        app.commitHistory(if (!muted) "静音轨道" else "取消静音轨道");
-                    }
+                const muted = app.trackMuted(i);
+                // 静音方形开关（名字右侧；开=绿/关=灰）——点它切换，不点名字
+                const btn_sz: i32 = @min(track_h - 2, @max(12, @as(i32, @intFromFloat(ui.font.lineHeight()))));
+                const btn_x: i32 = main_x + header_w - btn_sz - 4;
+                const btn_y: i32 = ty + @divTrunc(track_h - btn_sz, 2);
+                const over_mute = util.inRect(ui.mouse_x, ui.mouse_y, btn_x, btn_y, btn_sz, btn_sz);
+                if (ui.listItem(3000 + i, app.trackName(i), main_x, ty, header_w, track_h, selected, i % 2 == 1, ui.theme.bg, if (muted) muted_gray else null) and !ui.mods_ctrl and !over_mute) {
+                    app.sel.track = @intCast(i);
+                }
+                if (ui.toggleSquare(!muted, btn_x, btn_y, btn_sz)) { // 蓝=发声 / 灰=静音
+                    app.setTrackMuted(i, !muted);
+                    app.commitHistory(if (!muted) "静音轨道" else "取消静音轨道");
+                }
                 // 右键轨道头 → 重命名/清空菜单（位置快照；与样式右键同一模式）
                 if (ui.mouse_right_pressed and ui.hitRect(main_x, ty, header_w, track_h)) {
                     app.panels.ctx_track = i;
@@ -434,9 +432,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                             }
                         }
 
-        // 片段左上角名称区高度（放不下就不占位；阈值放宽到 30px——
-        // 实测反馈：“片段缩短后名字过早消失”）
-        const label_h: i32 = if (clip_w >= 30 and track_h >= 26) 13 else 0;
+                        // 片段左上角名称区高度（放不下就不占位；阈值放宽到 30px——
+                        // 实测反馈：“片段缩短后名字过早消失”）
+                        const label_h: i32 = if (clip_w >= 30 and track_h >= 26) 13 else 0;
                         // 音频片段：画波形（替代音符预览；预览走 trim 区间）
                         if (clip.isAudio()) {
                             if (!thin) {
@@ -453,25 +451,25 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                                         var px: i32 = 0;
                                         while (px < clip_w) : (px += 1) {
                                             const pxps: f64 = @as(f64, step_px) * @as(f64, zoom);
-                                        const spd_f: f64 = std.math.clamp(@as(f64, app.audioStyleSpeed(clip)), 0.25, 4.0);
-                                        // 引擎帧域 → 原生帧域（ratio = 原生/引擎；峰值桶按原生帧）
-                                        const fr_i: i64 = @as(i64, @intFromFloat((@as(f64, @floatFromInt(ts)) + @as(f64, @floatFromInt(px)) / @max(1e-6, pxps) * fps_f * spd_f) * @as(f64, asset.data.ratio)));
+                                            const spd_f: f64 = std.math.clamp(@as(f64, app.audioStyleSpeed(clip)), 0.25, 4.0);
+                                            // 引擎帧域 → 原生帧域（ratio = 原生/引擎；峰值桶按原生帧）
+                                            const fr_i: i64 = @as(i64, @intFromFloat((@as(f64, @floatFromInt(ts)) + @as(f64, @floatFromInt(px)) / @max(1e-6, pxps) * fps_f * spd_f) * @as(f64, asset.data.ratio)));
                                             if (fr_i >= total) break;
                                             const fr: i32 = @intCast(fr_i);
                                             const bi: usize = @min(asset.peaks.len - 1, @as(usize, @intCast(@divTrunc(fr, peak_frames))));
                                             const pk = asset.peaks[bi];
                                             const y0: i32 = mid - @as(i32, @intFromFloat(pk.max * half));
                                             const y1: i32 = mid - @as(i32, @intFromFloat(pk.min * half));
-                                    ui.renderer.vline(clip_x + px, y0, @max(1, y1 - y0), if (row_muted) muted_gray else ui.theme.waveform);
-                                }
-                            // 名称：与音符片段**同一位置/风格**（无底色标签——用户拍板）
-                            if (label_h > 0) {
-                                const sidx: usize = @intCast(clip.audio_style);
-                                if (sidx < app.audio_styles.items.len) {
-                                    ui.labelClipped(app.audio_styles.items[sidx].name, clip_x + 6, ty + 4, clip_w - 12, if (row_muted) muted_gray else ui.theme.text);
-                                }
-                            }
-                            }
+                                            ui.renderer.vline(clip_x + px, y0, @max(1, y1 - y0), if (row_muted) muted_gray else ui.theme.waveform);
+                                        }
+                                        // 名称：与音符片段**同一位置/风格**（无底色标签——用户拍板）
+                                        if (label_h > 0) {
+                                            const sidx: usize = @intCast(clip.audio_style);
+                                            if (sidx < app.audio_styles.items.len) {
+                                                ui.labelClipped(app.audio_styles.items[sidx].name, clip_x + 6, ty + 4, clip_w - 12, if (row_muted) muted_gray else ui.theme.text);
+                                            }
+                                        }
+                                    }
                                 } else {
                                     ui.labelClipped("（音频缺失）", clip_x + 4, ty + 3, clip_w - 8, ui.theme.danger);
                                 }
@@ -489,10 +487,10 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                         const inner_y = ty + 2 + label_h;
                         const inner_h = @max(2, track_h - 4 - label_h);
                         {
-                                        const pi: usize = @intCast(@max(0, clip.pattern));
-                                        // 细线（≤2px）跳过预览：亮点不可见，且省一遍全量音符扫描
-                                        if (!thin and clip.pattern >= 0 and pi < pat_stat.len and pat_stat[pi].has_notes) {
-                                            const range = model.rangeMap(pat_stat[pi].min_pitch, pat_stat[pi].max_pitch, 12);
+                            const pi: usize = @intCast(@max(0, clip.pattern));
+                            // 细线（≤2px）跳过预览：亮点不可见，且省一遍全量音符扫描
+                            if (!thin and clip.pattern >= 0 and pi < pat_stat.len and pat_stat[pi].has_notes) {
+                                const range = model.rangeMap(pat_stat[pi].min_pitch, pat_stat[pi].max_pitch, 12);
                                 const win_lo = clip.offset;
                                 const win_steps = clip.len;
                                 // 画**全部**乐器、全部音符（**不做“画满 N 个就停”的截断**）。
@@ -530,16 +528,16 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                                 }
                             }
                         }
-            if (label_h > 0) {
-                var buf: [24]u8 = undefined;
-                // 显示**样式名**（可重命名）；名字缺失/索引无效时回退“样式 N”
-                const pname: []const u8 = if (clip.pattern >= 0 and @as(usize, @intCast(clip.pattern)) < app.pattern_items.items.len)
-                    app.pattern_items.items[@intCast(clip.pattern)]
-                else
-                    "";
-                const label_text = if (pname.len > 0) pname else std.fmt.bufPrint(&buf, "样式 {d}", .{clip.pattern + 1}) catch "";
-                ui.labelClipped(label_text, clip_x + 6, ty + 4, clip_w - 12, if (row_muted) muted_gray else ui.theme.text);
-            }
+                        if (label_h > 0) {
+                            var buf: [24]u8 = undefined;
+                            // 显示**样式名**（可重命名）；名字缺失/索引无效时回退“样式 N”
+                            const pname: []const u8 = if (clip.pattern >= 0 and @as(usize, @intCast(clip.pattern)) < app.pattern_items.items.len)
+                                app.pattern_items.items[@intCast(clip.pattern)]
+                            else
+                                "";
+                            const label_text = if (pname.len > 0) pname else std.fmt.bufPrint(&buf, "样式 {d}", .{clip.pattern + 1}) catch "";
+                            ui.labelClipped(label_text, clip_x + 6, ty + 4, clip_w - 12, if (row_muted) muted_gray else ui.theme.text);
+                        }
                     }
                 }
             }
@@ -831,9 +829,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             const c = app.clips.items[hit.index];
             app.sel.pattern = c.pattern;
             // 拉伸基准（**按下时快照**）：原起点/原长/按下步——增量式拉伸的锚
-                    app.playlist.resize_orig_start = c.start;
-                    app.playlist.resize_orig_len = c.len;
-                    app.playlist.resize_orig_trim = c.trim_start;
+            app.playlist.resize_orig_start = c.start;
+            app.playlist.resize_orig_len = c.len;
+            app.playlist.resize_orig_trim = c.trim_start;
             app.playlist.resize_down_step = step_i;
             // 拖动死区：先记录按下位置；超过阈值才真正编辑（防单击吸附）
             app.playlist.drag_armed = false;
@@ -878,22 +876,22 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 }
             }
         } else {
-                app.clearClipSelection();
-                app.playlist.prev_click_clip = null;
-                // 选中了音频样式（♪ 行，且当前在音频页）→ 放置**音频片段**
-                if (app.panels.patterns_tab_audio and app.audio_style_sel >= 0 and @as(usize, @intCast(app.audio_style_sel)) < app.audio_styles.items.len) {
-                    const ast = app.audio_styles.items[@intCast(app.audio_style_sel)];
-                    const frames: i32 = if (app.audioStyleAsset(@intCast(app.audio_style_sel))) |d| @intCast(d.data.frame_count) else 0;
-                    const fps: i32 = @intCast(@max(1, app.framesPerStep()));
-                    const alen: i32 = @max(1, @divTrunc(frames, fps));
-                    app.addClip(.{ .track = track_i, .start = snap_step, .len = alen, .pattern = 0, .audio_style = @intCast(app.audio_style_sel), .trim_start = 0 });
-                    _ = ast;
-                    app.commitHistory("放置音频片段"); // 原子操作：立即提交
-                } else {
+            app.clearClipSelection();
+            app.playlist.prev_click_clip = null;
+            // 选中了音频样式（♪ 行，且当前在音频页）→ 放置**音频片段**
+            if (app.panels.patterns_tab_audio and app.audio_style_sel >= 0 and @as(usize, @intCast(app.audio_style_sel)) < app.audio_styles.items.len) {
+                const ast = app.audio_styles.items[@intCast(app.audio_style_sel)];
+                const frames: i32 = if (app.audioStyleAsset(@intCast(app.audio_style_sel))) |d| @intCast(d.data.frame_count) else 0;
+                const fps: i32 = @intCast(@max(1, app.framesPerStep()));
+                const alen: i32 = @max(1, @divTrunc(frames, fps));
+                app.addClip(.{ .track = track_i, .start = snap_step, .len = alen, .pattern = 0, .audio_style = @intCast(app.audio_style_sel), .trim_start = 0 });
+                _ = ast;
+                app.commitHistory("放置音频片段"); // 原子操作：立即提交
+            } else {
                 const new_len: i32 = app.patternEffectiveLen(app.sel.pattern);
                 app.addClip(.{ .track = track_i, .start = snap_step, .len = new_len, .pattern = app.sel.pattern });
                 app.commitHistory("放置片段"); // 原子操作：立即提交
-                }
+            }
             app.commitHistory("放置片段"); // 原子操作：立即提交
         }
     }
@@ -1081,16 +1079,16 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             else
                 util.glideI32(pl.track_h, pl.track_h_target, app.frame_dt_ns, 0.03);
             if (h_new > 0 and h_new != pl.track_h) {
-            const content_new: i32 = map_rows * h_new;
-            const old_map_max: i32 = @max(0, map_rows * pl.track_h - tracks_h);
-            const over: i32 = @max(0, pl.scroll - old_map_max); // 悬空量保留（不拽回地图）
-            pl.scroll = Ui.zoomAnchoredScrollY(pl.scroll, tracks_h, pl.track_h_anchor_off, pl.track_h, h_new, content_new) + over;
+                const content_new: i32 = map_rows * h_new;
+                const old_map_max: i32 = @max(0, map_rows * pl.track_h - tracks_h);
+                const over: i32 = @max(0, pl.scroll - old_map_max); // 悬空量保留（不拽回地图）
+                pl.scroll = Ui.zoomAnchoredScrollY(pl.scroll, tracks_h, pl.track_h_anchor_off, pl.track_h, h_new, content_new) + over;
                 pl.track_h = h_new;
             }
         }
         pl.track_h_anim_last = pl.track_h;
         // 纵向滚动
-                if (pl.scroll_anim_last < 0 or pl.scroll != pl.scroll_anim_last) pl.scroll_target = pl.scroll;
+        if (pl.scroll_anim_last < 0 or pl.scroll != pl.scroll_anim_last) pl.scroll_target = pl.scroll;
         // 滚轮上限 = 防溢出帽（垂直滚轮可出图——同拖动）
         pl.scroll_target = std.math.clamp(pl.scroll_target, 0, 1 << 30);
         if (pl.scroll != pl.scroll_target) {

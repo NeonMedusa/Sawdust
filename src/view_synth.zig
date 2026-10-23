@@ -420,7 +420,7 @@ fn drawOscRow(ui: *Ui, app: *App, p: *synth.SynthParams, oi: usize, x: i32, y: i
     ui.label(nt, x + sw_sz + 8, cy - 5, if (on) ui.theme.text else ui.theme.text_dim);
 
     // 波形按钮（点击切换下一个）
-    const wf = @as(synth.Waveform, @enumFromInt(op.waveform.load(.monotonic) % synth.waveform_count));
+    const wf = @as(synth.Waveform, @fromBackingInt(@intCast(op.waveform.load(.monotonic) % synth.waveform_count)));
     const btn_x = x + sw_sz + 58;
     const btn_w: i32 = 64;
     const btn_h: i32 = 22;
@@ -430,7 +430,7 @@ fn drawOscRow(ui: *Ui, app: *App, p: *synth.SynthParams, oi: usize, x: i32, y: i
     ui.renderer.strokeRect(btn_x, btn_y, btn_w, btn_h, ui.theme.panel_border);
     ui.labelClipped(wf.name(), btn_x + 8, btn_y + 3, btn_w - 12, ui.theme.text);
     if (btn_hovered and ui.mouse_pressed) {
-        op.waveform.store(@intFromEnum(wf.next()), .monotonic);
+        op.waveform.store(@backingInt(wf.next()), .monotonic);
         app.commitHistory("切换波形"); // 按钮：原子提交
     }
 

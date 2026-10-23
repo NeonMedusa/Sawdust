@@ -276,7 +276,7 @@ fn drawParamPanel(ui: *Ui, app: *App, es: *app_mod.EffectSlot, px: i32, py: i32,
         util.drawPluginParamList(ui, app, pl, es.load_failed, scroll_p, ref, 7900, px, py, pw, ph, yy);
         return;
     }
-    const infos = fx.paramInfos(@intFromEnum(es.kind));
+    const infos = fx.paramInfos(@backingInt(es.kind));
     if (infos.len == 0 or pw < 200 or ph < 60) return;
     const knob: i32 = 40;
     const row_h: i32 = knob + 18;

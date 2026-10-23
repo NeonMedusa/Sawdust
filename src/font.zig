@@ -10,9 +10,8 @@
 //! 可换 `stbtt_GetCodepointSDF` + CPU 采样（接口不变，只换内部实现）。
 
 const std = @import("std");
-const stb = @cImport({
-    @cInclude("stb_truetype.h");
-});
+// 0.17：`@cImport` 已移除——改用 `zig translate-c` 预生成的绑定（免网络、免构建期翻译）
+const stb = @import("c/stb_truetype.zig");
 const Renderer = @import("render.zig").Renderer;
 const Color = @import("render.zig").Color;
 
@@ -39,7 +38,7 @@ pub const Font = struct {
     ascent: f32,
     descent: f32,
     line_gap: f32,
-    glyphs: std.ArrayListUnmanaged(Glyph) = .{ .items = &.{}, .capacity = 0 },
+    glyphs: std.ArrayListUnmanaged(Glyph) = .empty,
 
     /// 从文件加载字体（`size_px` = 期望的字号像素高）
     pub fn initFromFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, size_px: f32) !Font {

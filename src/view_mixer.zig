@@ -419,7 +419,6 @@ fn drawStrip(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32) void
 }
 
 /// （已移除：通道名改由 `MixerChannel.displayName` 提供——自定义名/占位名）
-
 /// 右区：选中通道的效果器链（抬头 + 效果行 + 空槽 + 添加按钮）
 fn drawEffectPanel(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32) void {
     const mc = &app.mixer_channels_state.items[ci];

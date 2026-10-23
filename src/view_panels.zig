@@ -224,7 +224,6 @@ pub fn drawStatusBar(ui: *Ui, app: *App, w: i32, h: i32) void {
 /// 在**所有浮动窗口之后**绘制（main 末尾、与文件菜单同一位置约定——
 /// 否则会被浮动窗口盖住）；`App.menuIsOpen()` 已计入 `panels.ctx_pattern`
 /// → 展开时有全屏模态层屏蔽下层交互。
-
 /// 音频样式右键菜单（重命名/删除）。与 `drawPatternCtxMenu` 同一绘制/命中约定：
 /// 在**所有浮动窗口之后**绘制（main 末尾）。
 pub fn drawAudioStyleCtxMenu(ui: *Ui, app: *App) void {

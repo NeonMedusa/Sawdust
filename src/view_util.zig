@@ -790,7 +790,7 @@ test "网格：拍线因太密隐藏时，拍位置上的网格线仍画（不�
 }
 
 test "中略：放得下不省略、超宽省略中间保留两边、太窄返回 null" {
-    const w = [_]f32{10} ** 10; // 10 个码点、每个宽 10
+    const w: [10]f32 = @splat(10); // 10 个码点、每个宽 10
     const ell: f32 = 12;
 
     // 放得下 → 不省略（记号：head = n、tail = 0）
@@ -799,7 +799,7 @@ test "中略：放得下不省略、超宽省略中间保留两边、太窄返�
     // 宽 60：k=4 → 20+12+20=52≤60；k=5 → 30+12+20=62>60 → 取 k=4（头 2 尾 2）
     try std.testing.expectEqual(EllipsisSplit{ .head = 2, .tail = 2 }, ellipsisSplit(&w, ell, 60).?);
     // 头略多（与 `Acous…Drum` 风格一致）：20 码点、宽 102 时取 k=9 → head 5 / tail 4
-    const w20 = [_]f32{10} ** 20; // 全文 200 > 102
+    const w20: [20]f32 = @splat(10); // 全文 200 > 102
     try std.testing.expectEqual(EllipsisSplit{ .head = 5, .tail = 4 }, ellipsisSplit(&w20, ell, 102).?);
 
     // 四舍五入边界：恰好等于可用宽 → 算放得下（≤）

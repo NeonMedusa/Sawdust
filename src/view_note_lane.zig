@@ -349,7 +349,7 @@ pub fn draw(
         if (app.sel.song_mode) {
             show = false;
             // SONG 模式片段参照 = **锚**（双击的片段；无快照回退最左）——与钢琴窗统一
-        if (app.patOriginClip()) |c| {
+            if (app.patOriginClip()) |c| {
                 if (model.clipSongToLocal(c, app.playback.song_step) != null) {
                     cur_f = app.cursorDisplay(true) - @as(f32, @floatFromInt(c.start)) + @as(f32, @floatFromInt(c.offset));
                     show = true;

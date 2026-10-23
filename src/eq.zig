@@ -310,7 +310,7 @@ test "eq: 频谱柱映射——低频正弦主能量落在低柱、高频落高�
 }
 
 test "eq: Hann 窗（边界衰减、中心保持）" {
-    var buf = [_]f32{1.0} ** 64;
+    var buf: [64]f32 = @splat(1.0);
     hannWindow(&buf);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), buf[0], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), buf[63], 0.001);

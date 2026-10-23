@@ -44,7 +44,11 @@ https://drive.google.com/drive/folders/1vHJcw6CiEt24WLKBgtTzmiMKY8IMpbfF?usp=sha
 ## 路线图（下一步）
 - [x] VST3 插件（效果器 + 乐器：参数编辑 / 插件界面 / 状态存档与撤销 / BPM 同步 /
   多输出 VSTi（SFLT）/ 扫描管理器 + 预设浏览器）
-- [ ] 音频文件（WAV/MP3）加载与波形缓存
+- [x] 音频文件（WAV/MP3）加载与波形缓存（音频样式 / 音频片段 / 波形窗 / 采样器层，
+  见 `docs/audio-files.md`）
+- [ ] 音频导入性能：**P2** 工作线程两阶段异步导入（先按时长建片段、解码完再填波形）、
+  **P3** 长文件流式解码与峰值懒算（详见 `docs/audio-files.md` §8）
+- [ ] 性能打磨（长工程滚动、打开/保存耗时、内存峰值）
 - [ ] 自动化曲线（声像、音量、颤音、bpm变速等等等，还有 MIDI 通道声像的完整还原）
 - [ ] 音频、音符录制
 - [ ] 将自带的减法合成器升级成更强大的波表合成器
@@ -52,16 +56,29 @@ https://drive.google.com/drive/folders/1vHJcw6CiEt24WLKBgtTzmiMKY8IMpbfF?usp=sha
 - [ ] 跨平台（Linux: X11/Wayland；macOS: Cocoa）
 - [ ] asio支持
 
-
 ## 构建与运行
 
-**环境：Windows + Zig 0.16**（仓库含 submodule，克隆必须带 `--recursive`）：
+**环境：Windows + Zig 0.17**（仓库含 submodule，克隆必须带 `--recursive`）：
 
 ```bash
 git clone --recursive https://github.com/NeonMedusa/Sawdust.git
 cd Sawdust
 zig build run             # 构建并运行
 ```
+
+**C 绑定（Zig 0.17 起）**：`@cImport` 已被 Zig 移除，本项目改为**预生成绑定**：
+`src/c/miniaudio.zig`、`src/c/stb_truetype.zig` 由 `zig translate-c` 生成并入库（构建期
+零网络、零翻译步骤）。C 实现仍走 `addCSourceFile`（`libs/*/*_impl.c`）。
+需要升级/更换第三方头文件时，重新生成：
+
+```bash
+zig translate-c -I libs/miniaudio libs/miniaudio/miniaudio.h > src/c/miniaudio.zig
+zig translate-c -I libs/stb       libs/stb/stb_truetype.h    > src/c/stb_truetype.zig
+```
+
+**关于 `libs/zig-vst3`**：只当作**普通源码目录**用（`build.zig` 里 `createModule` 直引
+`zig-vst3/src/root.zig`），**不跑它的 `build.zig`**——这样既不碰网络，也不受它自身
+构建 API 与 Zig 版本同步的影响。
 
 ## 架构
 
@@ -82,10 +99,11 @@ zig build run             # 构建并运行
 | `src/vst_host.zig` | VST3 宿主：加载 / 处理 / 参数 / 状态 / 编辑器窗口（见 `docs/plugin-hosting.md`） |
 | `src/vstscan.zig` | VST3 探测工具（枚举 / 试跑 / 参数 / 编辑器冒烟） |
 | `src/main.zig` + `src/view_*.zig` | 应用主循环与各视图（播放列表/卷帘/调音台/机架/效果器/鼓组/预设） |
+| `src/c/*.zig` | **预生成的 C 绑定**（`zig translate-c` 产物：miniaudio / stb_truetype） |
 
 **文档**：踩坑记录见 `docs/pitfalls.md`；鼓组插件设计见 `docs/drumkit.md`；
 力度/声像编辑轨见 `docs/note-lane.md`；时间轴滚动条见 `docs/timeline-scrollbar.md`；
-VST3 宿主见 `docs/plugin-hosting.md`。
+VST3 宿主见 `docs/plugin-hosting.md`；**Zig 0.17 迁移实录**见 `docs/zig-017-migration.md`。
 
 **线程模型**：UI 在主线程，音频回调在 miniaudio 的实时线程；
 参数用 `std.atomic.Value` 传递（无锁，实时安全）；编辑提交走"重扫"机制

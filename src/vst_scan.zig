@@ -180,12 +180,12 @@ fn writeCidHex(w: *std.Io.Writer, cid: [16]u8) void {
 /// 主流程：发现 → 逐个枚举 → JSONL（每步立即落盘）。
 /// 容错：任何单插件失败都只产生 `err` 行，不中断整场扫描。
 pub fn runScan(io: std.Io, alloc: std.mem.Allocator, roots: []const []const u8, out_path: []const u8) !void {
-    var cands: std.ArrayListUnmanaged(Candidate) = .{ .items = &.{}, .capacity = 0 };
+    var cands: std.ArrayListUnmanaged(Candidate) = .empty;
     defer freeCandidates(alloc, &cands);
     for (roots) |r| discover(io, alloc, r, &cands) catch {};
     sortCandidates(cands.items);
 
-    var log: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 };
+    var log: std.ArrayListUnmanaged(u8) = .empty;
     defer log.deinit(alloc);
 
     {
@@ -210,7 +210,7 @@ pub fn runScan(io: std.Io, alloc: std.mem.Allocator, roots: []const []const u8, 
             emitLine(io, alloc, &log, out_path, w.buffered());
         }
 
-        const dllz = alloc.dupeZ(u8, c.dll) catch {
+        const dllz = alloc.dupeSentinel(u8, c.dll, 0) catch {
             nerr += 1;
             emitErr(io, alloc, &log, out_path, c, "OutOfMemory");
             continue;
@@ -326,7 +326,7 @@ test "vst_scan: 候选发现（包结构 / 裸文件 / 递归 / 单文件根）"
     defer alloc.free(root);
     try makeTestTree(io, root);
 
-    var cands: std.ArrayListUnmanaged(Candidate) = .{ .items = &.{}, .capacity = 0 };
+    var cands: std.ArrayListUnmanaged(Candidate) = .empty;
     defer freeCandidates(alloc, &cands);
     try discover(io, alloc, root, &cands);
     try std.testing.expectEqual(@as(usize, 4), cands.items.len);
@@ -347,7 +347,7 @@ test "vst_scan: 候选发现（包结构 / 裸文件 / 递归 / 单文件根）"
     try std.testing.expect(found_a and found_f);
 
     // 单文件根：直接当候选
-    var one: std.ArrayListUnmanaged(Candidate) = .{ .items = &.{}, .capacity = 0 };
+    var one: std.ArrayListUnmanaged(Candidate) = .empty;
     defer freeCandidates(alloc, &one);
     const b_path = try std.fmt.allocPrint(alloc, "{s}/B.vst3", .{root});
     defer alloc.free(b_path);

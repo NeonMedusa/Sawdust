@@ -66,7 +66,7 @@ const WindowsWindow = struct {
     /// 排除“全矩形”会把弹窗/菜单盖在插件上的部分也挖掉（实测“对话框盖不住 VST UI”）；
     /// 排除“可见区域”则：没被裁时=整矩形（防闪烁），被裁时被裁部分照常回写（正常覆盖）。
     exclude_n: usize = 0,
-    exclude_hwnd: [4]?*anyopaque = .{null} ** 4,
+    exclude_hwnd: [4]?*anyopaque = @splat(null),
     /// 每项的 x/y/w/h（主窗 client 坐标；GetWindowRgn 取不到时回退整矩形）
     exclude_pos: [4][4]i32 = undefined,
     hdc_mem: ?*anyopaque = null, // 内存 DC
@@ -76,7 +76,7 @@ const WindowsWindow = struct {
     allocator: std.mem.Allocator,
     should_quit: bool = false,
     /// 待消费的拖入文件路径（UTF-8；WM_DROPFILES 收集，App 帧初取走）
-    dropped: std.ArrayListUnmanaged([]u8) = .{ .items = &.{}, .capacity = 0 },
+    dropped: std.ArrayListUnmanaged([]u8) = .empty,
     /// 当前系统光标（避免重复设置）
     cursor_kind: @import("ui.zig").CursorKind = .arrow,
     /// 当前光标句柄（WM_SETCURSOR 时重设，防止系统改回默认）
@@ -94,7 +94,7 @@ const WindowsWindow = struct {
     /// 最近一次鼠标位置（客户区；冻结锚点用）
     last_mouse: POINT = .{ .x = 0, .y = 0 },
     /// 事件队列（主循环每帧排空）
-    events: std.ArrayListUnmanaged(Event) = .{ .items = &.{}, .capacity = 0 },
+    events: std.ArrayListUnmanaged(Event) = .empty,
 
     /// 初始化（**必须**在稳定的内存地址上调用：`var win: WindowsWindow = undefined; try win.init(...)`）。
     /// 注意：不能用"返回值 + 局部变量取址"的写法——WndProc 里保存的 `&self` 在

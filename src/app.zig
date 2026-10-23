@@ -12,9 +12,8 @@ const sequencer = @import("sequencer.zig");
 const persist = @import("persist.zig");
 const ivstevents = @import("zig_vst3").pluginterfaces.vst.ivstevents;
 const midi = @import("midi.zig");
-const miniaudio = @cImport({
-    @cInclude("miniaudio.h");
-});
+// 0.17：`@cImport` 已移除——改用 `zig translate-c` 预生成的绑定（免网络、免构建期翻译）
+const ma = @import("c/miniaudio.zig");
 const eq = @import("eq.zig");
 const fx = @import("effects.zig");
 const plugin_db = @import("plugin_db.zig");
@@ -278,11 +277,11 @@ pub const PresetBrowser = struct {
     ctx_y: i32 = 0,
     /// 搜索过滤串（右栏；子串匹配、大小写不敏感；空 = 不过滤）。
     /// 与编辑中的 `text_input`（target = `.preset_search`）每帧同步。
-    filter_buf: [40]u8 = [_]u8{0} ** 40,
+    filter_buf: [40]u8 = @splat(0),
     filter_len: usize = 0,
 };
 
-    /// 预设面板的**意图**（同一面板服务四条路：选预设 / 新建 / 更换 / 加层）——
+/// 预设面板的**意图**（同一面板服务四条路：选预设 / 新建 / 更换 / 加层）——
 /// 决定左栏分类的可选性（`presetCategorySelectable`）与选中后的动作。
 pub const PresetIntent = union(enum) {
     /// **替换音色**（乐器窗口「预设 ▾」）：同一面板——点其它插件 = 顺带换插件；
@@ -453,7 +452,7 @@ pub const PlaylistState = struct {
     /// 第二次按下时命中的可能已被轮换换人）
     prev_click_clip: ?usize = null,
     /// 绘制排序暂存（层序下标表；跨帧复用）
-    draw_order: std.ArrayListUnmanaged(usize) = .{ .items = &.{}, .capacity = 0 },
+    draw_order: std.ArrayListUnmanaged(usize) = .empty,
 
     // ── 中键拖动平移视口（抓画布：内容跟手）──
     nav_active: bool = false,
@@ -525,7 +524,7 @@ pub const PianoState = struct {
     /// 音高行高（像素；□ 缺口缩放）——默认 16：视口内行数较少、内容更大
     key_h: i32 = 16,
     /// 绘制排序暂存（音符层序下标表；跨帧复用）
-    draw_order: std.ArrayListUnmanaged(usize) = .{ .items = &.{}, .capacity = 0 },
+    draw_order: std.ArrayListUnmanaged(usize) = .empty,
     /// 纵向滚动（像素）
     scroll: i32 = 0,
     /// 横向滚动（内容像素）
@@ -729,10 +728,10 @@ pub const TextInput = struct {
     /// 目标乐器槽位（`kit_pad_name` 用；音高在 `index`）
     instrument: i32 = -1,
     /// 附加固定载荷（`preset_rename` 的**旧名字**；固定缓冲避免生命周期问题）
-    aux_buf: [64]u8 = [_]u8{0} ** 64,
+    aux_buf: [64]u8 = @splat(0),
     aux_len: usize = 0,
     /// UTF-8 缓冲（64 字节 ≈ 21 个汉字）
-    buf: [64]u8 = [_]u8{0} ** 64,
+    buf: [64]u8 = @splat(0),
     len: usize = 0,
     /// 光标位置（**字节偏移**；总是落在 code point 边界上）
     cursor: usize = 0,
@@ -764,7 +763,7 @@ pub const TextInput = struct {
 /// 发声音高缓存（每帧从音频线程回传的位掩码展开；供视图高亮用）
 /// —— 只关心**当前乐器**：索引 = 音高（0-127）
 pub const SoundingPitches = struct {
-    flags: [128]bool = [_]bool{false} ** 128,
+    flags: [128]bool = @splat(false),
 
     pub fn set(self: *SoundingPitches, lo: u64, hi: u64) void {
         for (0..64) |i| self.flags[i] = (lo & (@as(u64, 1) << @intCast(i))) != 0;
@@ -857,10 +856,10 @@ pub const DrumKitWindow = struct {
 
 /// 调音台通道数：**默认 2**（主通道 + 通道#1），可添加；上限见 `max_mixer_channels`
 pub const default_mixer_channels = 2;
-    /// 调音台通道**初始容量**（池化：按需增长/回收；起点 32）
-    pub const max_mixer_channels = 32;
-    /// 每通道效果器链**初始槽数**（同上；起点 32）
-    pub const max_effects_per_channel = 32;
+/// 调音台通道**初始容量**（池化：按需增长/回收；起点 32）
+pub const max_mixer_channels = 32;
+/// 每通道效果器链**初始槽数**（同上；起点 32）
+pub const max_effects_per_channel = 32;
 
 /// 效果器类型（插件式：通道上可挂多个效果器；目前只有 EQ）
 pub const EffectKind = enum(u32) {
@@ -913,7 +912,7 @@ pub const EffectSlot = struct {
     /// 添加时由 `addEffect` 按类型填默认值（EQ 不用）
     p: [fx.max_params]f32 = .{ 0, 0, 0, 0, 0 },
     /// 插件路径（kind == .plugin；VST3 文件）；固定缓冲，零分配
-    plugin_path: [512]u8 = [_]u8{0} ** 512,
+    plugin_path: [512]u8 = @splat(0),
     plugin_path_len: u16 = 0,
     /// 运行时插件实例（**不存档**；main 侧惰性加载/退役回收）
     plugin: ?*vst_host.Plugin = null,
@@ -932,7 +931,7 @@ pub const EffectSlot = struct {
 
     /// 最后已知类 CID（32 hex 文本；0 长 = 未知）——重绑定自愈/存档身份。
     /// 加载成功时回填；路径变化时清空。
-    plugin_cid: [32]u8 = [_]u8{0} ** 32,
+    plugin_cid: [32]u8 = @splat(0),
     plugin_cid_len: u8 = 0,
 
     pub fn pluginCid(self: *const EffectSlot) []const u8 {
@@ -989,10 +988,10 @@ pub const MixerChannel = struct {
     muted: bool = false,
     /// 自定义名字（UTF-8；`name_len == 0` = 用默认占位名“主通道/通道#N”）。
     /// 定长存储（≤ 32 字节 ≈ 10 个汉字）——避免动态分配的生命周期管理
-    name: [32]u8 = [_]u8{0} ** 32,
+    name: [32]u8 = @splat(0),
     name_len: usize = 0,
     /// 效果器链（**动态**：顺序处理；空列表 = 无效果）
-    effects: std.ArrayListUnmanaged(EffectSlot) = .{ .items = &.{}, .capacity = 0 },
+    effects: std.ArrayListUnmanaged(EffectSlot) = .empty,
 
     /// 显示名（自定义 → 原名；否则占位）
     pub fn displayName(self: *const MixerChannel, index: usize, buf: []u8) []const u8 {
@@ -1069,7 +1068,7 @@ pub const ExportWav = struct {
     blocks: u64 = 0,
     dbg0: u64 = 0,
     /// 导出日志（纯文本；完成时写成 `<wav>.log`——现场排障用）
-    log_buf: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 },
+    log_buf: std.ArrayListUnmanaged(u8) = .empty,
     /// 开始时间（纳秒；预留剩余时间估算）
     t0_ns: i64,
     /// 取消请求（对话框按钮 / Esc 置位；下一帧步进时清理）
@@ -1145,14 +1144,14 @@ pub const PluginMgrWindow = struct {
     scan_ok: usize = 0,
     scan_err: usize = 0,
     scan_total: usize = 0,
-    scan_current_buf: [260]u8 = [_]u8{0} ** 260,
+    scan_current_buf: [260]u8 = @splat(0),
     scan_current_len: usize = 0,
     /// 轮询计数（每 8 帧读一次进度文件）
     scan_frame: u32 = 0,
     /// 无进展帧数（看门狗：长时间无进展 → 殺 worker——防被外部弹框卡死）
     scan_idle: u32 = 0,
     /// 进度文件路径（数据目录下；扫描期间）
-    scan_out_buf: [640]u8 = [_]u8{0} ** 640,
+    scan_out_buf: [640]u8 = @splat(0),
     scan_out_len: usize = 0,
 };
 
@@ -1226,14 +1225,14 @@ pub const App = struct {
 
     // ── 文档数据（所有视图共享）──
     /// 已放置的样式片段
-    clips: std.ArrayListUnmanaged(Clip) = .{ .items = &.{}, .capacity = 0 },
+    clips: std.ArrayListUnmanaged(Clip) = .empty,
     /// 钢琴窗音符（**局部坐标**：按样式 + 乐器归属）
-    notes: std.ArrayListUnmanaged(Note) = .{ .items = &.{}, .capacity = 0 },
+    notes: std.ArrayListUnmanaged(Note) = .empty,
     /// 乐器列表（槽位；可多个同名）
-    instruments: std.ArrayListUnmanaged(Instrument) = .{ .items = &.{}, .capacity = 0 },
+    instruments: std.ArrayListUnmanaged(Instrument) = .empty,
     /// 已删除乐器的合成器参数（**延迟释放**）：音频线程可能仍持有指针，
     /// 立即 destroy 会造成 use-after-free。进程退出时才真正释放。
-    retired_synths: std.ArrayListUnmanaged(*synth.SynthParams) = .{ .items = &.{}, .capacity = 0 },
+    retired_synths: std.ArrayListUnmanaged(*synth.SynthParams) = .empty,
     /// 音符事件队列（UI 推、音频线程消费）——试听/all_off
     events: synth.EventQueue = .{},
     /// 调度事件队列（序列器；UI 按 lookahead 提前推）
@@ -1247,15 +1246,15 @@ pub const App = struct {
     /// 键盘移动选中音符（Shift/Ctrl+方向键；本帧累加、音符视图消费）
     pending_move: ?MoveReq = null,
     /// 音符剪贴板（step 为相对最左音符的偏移）
-    clipboard_notes: std.ArrayListUnmanaged(ClipboardNote) = .{ .items = &.{}, .capacity = 0 },
+    clipboard_notes: std.ArrayListUnmanaged(ClipboardNote) = .empty,
     /// 片段剪贴板（绝对坐标；粘贴时整体平移）
-    clipboard_clips: std.ArrayListUnmanaged(Clip) = .{ .items = &.{}, .capacity = 0 },
+    clipboard_clips: std.ArrayListUnmanaged(Clip) = .empty,
     /// 批量拉伸快照（拖选中音符边缘期间；顺序 = 音符数组顺序）
-    batch_snap: std.ArrayListUnmanaged(BatchSnap) = .{ .items = &.{}, .capacity = 0 },
+    batch_snap: std.ArrayListUnmanaged(BatchSnap) = .empty,
 
     // ── 撤销/重做（快照式；见 `commitHistory`）──
     /// 历史快照栈（[0] = 初始/打开工程时的状态；current = 当前所在快照）
-    history: std.ArrayListUnmanaged(HistoryState) = .{ .items = &.{}, .capacity = 0 },
+    history: std.ArrayListUnmanaged(HistoryState) = .empty,
     /// 当前状态在 `history` 中的下标
     history_current: usize = 0,
     /// 最后一次保存时对应的历史下标（脏标记 = 当前 != 此处）
@@ -1281,15 +1280,15 @@ pub const App = struct {
     /// 鼓组池全量重置挂起（装载/历史重建：乐器被重建 → 池全部失效）
     kit_reset: bool = false,
     /// 鼓组池删除位移日志（removeInstrument 记录 idx；帧末按序重放左移）
-    kit_shift_log: std.ArrayListUnmanaged(usize) = .{ .items = &.{}, .capacity = 0 },
+    kit_shift_log: std.ArrayListUnmanaged(usize) = .empty,
     /// 音频资产池（会话存活；工程切换时统一释放）
-    audio_assets: std.ArrayListUnmanaged(AudioAsset) = .{ .items = &.{}, .capacity = 0 },
+    audio_assets: std.ArrayListUnmanaged(AudioAsset) = .empty,
     /// 音频样式（片段共享的通道/增益）
-    audio_styles: std.ArrayListUnmanaged(AudioStyle) = .{ .items = &.{}, .capacity = 0 },
+    audio_styles: std.ArrayListUnmanaged(AudioStyle) = .empty,
     /// 播放表重建用的复用缓冲（逐帧重新计算；容量保留）
-    audio_scratch: std.ArrayListUnmanaged(audio.AudioTableRow) = .{ .items = &.{}, .capacity = 0 },
+    audio_scratch: std.ArrayListUnmanaged(audio.AudioTableRow) = .empty,
     /// 退役中的旧播放表（倒计时回收；见 `reapRetiredAudioTables`）
-    audio_tables_retired: std.ArrayListUnmanaged(RetiredAudioTable) = .{ .items = &.{}, .capacity = 0 },
+    audio_tables_retired: std.ArrayListUnmanaged(RetiredAudioTable) = .empty,
     /// 波形窗口试听（全局单实例）
     preview: PreviewState = .{},
     /// 主输出电平表（帧末 pollOutMeter 更新）：当前峰值 / 回落保持值
@@ -1302,7 +1301,7 @@ pub const App = struct {
     /// 波形窗口“样式模式”的占位 trim（无片段上下文；不可编辑）
     wave_trim_dummy: [2]i32 = .{ 0, 0 },
     /// 基准目录（打开工程时设置；相对音频路径按它解析）
-    base_dir: [1024]u8 = [_]u8{0} ** 1024,
+    base_dir: [1024]u8 = @splat(0),
     base_dir_len: usize = 0,
     /// 待处理的“加载采样”（鼓垫层）——文件对话框在 main 帧初执行
     pending_load_sample: ?struct { instrument: i32, pitch: u8, layer: ?usize } = null,
@@ -1347,13 +1346,13 @@ pub const App = struct {
 
     // ── 预设库（合成器音色；`data/presets/<插件类型>/`）──
     /// 数据根目录（启动时由 `preset.resolveDataRoot` 解析；相对或绝对路径）
-    data_root_buf: [512]u8 = [_]u8{0} ** 512,
+    data_root_buf: [512]u8 = @splat(0),
     data_root_len: usize = 0,
     /// 预设库（扫描结果；启动/保存后刷新）
     preset_lib: preset_mod.Library = .{},
     /// 浏览器锚插件 id 缓冲（`presetTargetPlugin` 动态生成 VST3 分类 id 用；
     /// 每次开面板前覆写——slice 生命周期与面板同步）
-    preset_anchor_buf: [40]u8 = [_]u8{0} ** 40,
+    preset_anchor_buf: [40]u8 = @splat(0),
     /// 预设浏览器弹窗（合成器窗口的“预设 ▾”）
     preset_browser: PresetBrowser = .{},
     /// 预设“保存为…”的源（`beginRenamePreset` 记录；提交时排队）。
@@ -1428,7 +1427,7 @@ pub const App = struct {
     plugin_mgr: PluginMgrWindow = .{},
     /// 本帧浮动窗口的**绘制顺序与最终矩形**（`main.drawApp` 逐帧填写；与绘制严格同序：
     /// 后排 = 在上）——插件子窗口区域裁切（`setEditorClip`）据此收集覆盖矩形
-    win_draw_info: [8]WinDraw = [_]WinDraw{.{ .kind = .rack, .x = 0, .y = 0, .w = 0, .h = 0 }} ** 8,
+    win_draw_info: [8]WinDraw = @splat(.{ .kind = .rack, .x = 0, .y = 0, .w = 0, .h = 0 }),
     win_draw_n: usize = 0,
     /// 插件管理数据（main 启动时加载；`null` = 未初始化——单元测试不加载）
     plugin_cfg: ?plugin_db.Config = null,
@@ -1452,12 +1451,12 @@ pub const App = struct {
     /// 浮动窗口 Z 序的**全局计数器**（点窗口置顶时 +1，见 `bringToFront`）
     z_top: i32 = 50,
     /// 调音台通道（**动态**；默认 2 个，可添加；乐器通过 `Instrument.mixer` 路由到其中之一）
-    mixer_channels_state: std.ArrayListUnmanaged(MixerChannel) = .{ .items = &.{}, .capacity = 0 },
+    mixer_channels_state: std.ArrayListUnmanaged(MixerChannel) = .empty,
     /// 已删除但可能仍被音频线程引用的插件实例（**延迟销毁**）——
     /// `countdown` 帧后由 `reapRetiredPlugins` 真正释放（远大于音频缓冲周期）
-    retired_plugins: std.ArrayListUnmanaged(RetiredPlugin) = .{ .items = &.{}, .capacity = 0 },
+    retired_plugins: std.ArrayListUnmanaged(RetiredPlugin) = .empty,
     /// 同模式：退役的效果器状态盒（混响/延迟/压缩器）
-    retired_fx: std.ArrayListUnmanaged(RetiredFx) = .{ .items = &.{}, .capacity = 0 },
+    retired_fx: std.ArrayListUnmanaged(RetiredFx) = .empty,
     /// 「+ 添加乐器」→ 预设面板（帧末无待办项）
     /// 手动重定位（管理器/右键「重新定位插件…」帧末弹文件框）
     pending_relocate_instrument: ?usize = null,
@@ -1466,7 +1465,7 @@ pub const App = struct {
     // ── 占位数据 ──
     /// 样式列表（**动态**；名字由 App 管理生命周期，如 "样式 7"）。
     /// 数量 = `pattern_items.items.len`；上限 `max_patterns`（播放列表预览数组等按此设限）。
-    pattern_items: std.ArrayListUnmanaged([]u8) = .{ .items = &.{}, .capacity = 0 },
+    pattern_items: std.ArrayListUnmanaged([]u8) = .empty,
     /// 轨道自定义名（**稀疏**：仅存改过名的行；键 = 行号）。行本身是坐标空间（纯编排行，
     /// 无每轨状态）——行数 = `trackCount()`（内容下缘 + 保底 + 3 行留白）随时推导，
     /// 与横向小节对称、无限向下延伸；“添加轨道”动作已废弃（往留白行放片段即自动生长）。
@@ -1692,7 +1691,7 @@ pub const App = struct {
         const span = @max(1, max_end - min_start);
 
         // 先收集到临时表（append 可能 realloc——不能边迭代原数组边 append）
-        var to_clone: std.ArrayListUnmanaged(Clip) = .{ .items = &.{}, .capacity = 0 };
+        var to_clone: std.ArrayListUnmanaged(Clip) = .empty;
         defer to_clone.deinit(self.allocator);
         for (self.clips.items) |c| {
             if (!c.selected) continue;
@@ -1785,7 +1784,7 @@ pub const App = struct {
 
         // 先把待克隆的音符收集到临时表（数组 append 可能 realloc——
         // 直接迭代原数组再 append 会悬空），再清空选区、追加克隆体。
-        var to_clone: std.ArrayListUnmanaged(model.Note) = .{ .items = &.{}, .capacity = 0 };
+        var to_clone: std.ArrayListUnmanaged(model.Note) = .empty;
         defer to_clone.deinit(self.allocator);
         for (self.notes.items) |nt| {
             if (!nt.selected) continue;
@@ -2056,8 +2055,8 @@ pub const App = struct {
             .muted = inst.muted,
             .mixer = inst.mixer,
             .midi_channel = inst.midi_channel,
-            .kind = @intFromEnum(inst.kind),
-            .key_mode = @intFromEnum(inst.key_mode),
+            .kind = @backingInt(inst.kind),
+            .key_mode = @backingInt(inst.key_mode),
             .synth = persist.exportSynth(inst.synth),
         };
         errdefer self.allocator.free(si.name);
@@ -2138,7 +2137,7 @@ pub const App = struct {
             }
             for (pad.layers.items, 0..) |layer, li| {
                 layers[li] = .{
-                    .kind = @intFromEnum(layer.kind),
+                    .kind = @backingInt(layer.kind),
                     .synth = persist.exportSynth(layer.params),
                     .gain = layer.gain,
                     .source_preset = try self.allocator.dupe(u8, layer.source_preset),
@@ -2276,9 +2275,9 @@ pub const App = struct {
             used: bool = false,
             plan_skip: bool = false,
             plan_job: ?ReplayJob = null,
-            path: [512]u8 = [_]u8{0} ** 512,
+            path: [512]u8 = @splat(0),
             path_len: u16 = 0,
-            cid: [32]u8 = [_]u8{0} ** 32,
+            cid: [32]u8 = @splat(0),
             cid_len: u8 = 0,
         };
         var rescues: [audio.kit_max_layers]Rescue = undefined;
@@ -2807,7 +2806,7 @@ pub const App = struct {
                             continue;
                         }
                         ly.fail_wait = kit_plugin_retry_frames;
-                        const pz = self.allocator.dupeZ(u8, ly.pluginPath()) catch continue;
+                        const pz = self.allocator.dupeSentinel(u8, ly.pluginPath(), 0) catch continue;
                         defer self.allocator.free(pz);
                         ly.plugin = vst_host.loadPlugin(self.allocator, pz, sr, 4096, .instrument) catch |e| {
                             if (!ly.load_failed) {
@@ -2923,17 +2922,17 @@ pub const App = struct {
         wbuf[wbuf_out] = 0;
         const eng_sr: u32 = if (self.params.sample_rate > 0) @intCast(self.params.sample_rate) else audio_fallback_rate;
         // 采样率传 0 = 不重采样（原生率直出）
-        const cfg = miniaudio.ma_decoder_config_init(miniaudio.ma_format_f32, 2, 0);
-        var dec: miniaudio.ma_decoder = undefined;
-        if (miniaudio.ma_decoder_init_file_w(@ptrCast(&wbuf[0]), &cfg, &dec) != miniaudio.MA_SUCCESS) return null;
-        defer _ = miniaudio.ma_decoder_uninit(&dec);
-        var native_sr: miniaudio.ma_uint32 = eng_sr;
-        var ch_out: miniaudio.ma_uint32 = 2;
-        var fmt_out: miniaudio.ma_format = miniaudio.ma_format_f32;
-        if (miniaudio.ma_decoder_get_data_format(&dec, &fmt_out, &ch_out, &native_sr, null, 0) != miniaudio.MA_SUCCESS) return null;
+        const cfg = ma.ma_decoder_config_init(ma.ma_format_f32, 2, 0);
+        var dec: ma.ma_decoder = undefined;
+        if (ma.ma_decoder_init_file_w(@ptrCast(&wbuf[0]), &cfg, &dec) != ma.MA_SUCCESS) return null;
+        defer _ = ma.ma_decoder_uninit(&dec);
+        var native_sr: ma.ma_uint32 = eng_sr;
+        var ch_out: ma.ma_uint32 = 2;
+        var fmt_out: ma.ma_format = ma.ma_format_f32;
+        if (ma.ma_decoder_get_data_format(&dec, &fmt_out, &ch_out, &native_sr, null, 0) != ma.MA_SUCCESS) return null;
         if (native_sr == 0) native_sr = eng_sr;
-        var total: miniaudio.ma_uint64 = 0;
-        if (miniaudio.ma_decoder_get_length_in_pcm_frames(&dec, &total) != miniaudio.MA_SUCCESS) return null;
+        var total: ma.ma_uint64 = 0;
+        if (ma.ma_decoder_get_length_in_pcm_frames(&dec, &total) != ma.MA_SUCCESS) return null;
         const max_frames: u64 = @as(u64, native_sr) * 60 * 30;
         if (total == 0 or total > max_frames) return null;
         const nframes: usize = @intCast(total);
@@ -2950,9 +2949,9 @@ pub const App = struct {
         const stride: usize = if (bucket > 32) @max(1, bucket / 16) else 1;
         var got_total: usize = 0;
         while (got_total < nframes) {
-            var got: miniaudio.ma_uint64 = 0;
-            const want: miniaudio.ma_uint64 = @intCast(nframes - got_total);
-            if (miniaudio.ma_decoder_read_pcm_frames(&dec, frames.ptr + got_total * 2, want, &got) != miniaudio.MA_SUCCESS) break;
+            var got: ma.ma_uint64 = 0;
+            const want: ma.ma_uint64 = @intCast(nframes - got_total);
+            if (ma.ma_decoder_read_pcm_frames(&dec, frames.ptr + got_total * 2, want, &got) != ma.MA_SUCCESS) break;
             if (got == 0) break;
             // 本块新帧的峰值（单遍；跨块桶用“先到先算”近似——桶与块边界很小的误差可接受）
             const s0 = got_total;
@@ -3014,7 +3013,7 @@ pub const App = struct {
             if (asset.peaks.len > 0) self.allocator.free(asset.peaks);
         }
         self.audio_assets.deinit(self.allocator);
-        self.audio_assets = .{ .items = &.{}, .capacity = 0 };
+        self.audio_assets = .empty;
         self.params.preview_asset.store(null, .release);
         self.preview = .{};
     }
@@ -3053,58 +3052,58 @@ pub const App = struct {
         return &self.audio_assets.items[@intCast(si)];
     }
 
-/// 删除音频样式后**修正所有索引引用**：引用它的片段一并删除（与音符样式删除同语义），
-/// 更大的索引前移；选择/波形窗口/右键菜单同步跟随。返回被连带删除的片段数。
-fn remapAudioStyleRefs(self: *App, removed: i32) usize {
-    var dropped: usize = 0;
-    var i: usize = 0;
-    while (i < self.clips.items.len) {
-        const c = &self.clips.items[i];
-        if (c.audio_style == removed) {
-            _ = self.clips.swapRemove(i);
-            dropped += 1;
-            continue;
+    /// 删除音频样式后**修正所有索引引用**：引用它的片段一并删除（与音符样式删除同语义），
+    /// 更大的索引前移；选择/波形窗口/右键菜单同步跟随。返回被连带删除的片段数。
+    fn remapAudioStyleRefs(self: *App, removed: i32) usize {
+        var dropped: usize = 0;
+        var i: usize = 0;
+        while (i < self.clips.items.len) {
+            const c = &self.clips.items[i];
+            if (c.audio_style == removed) {
+                _ = self.clips.swapRemove(i);
+                dropped += 1;
+                continue;
+            }
+            if (c.audio_style > removed) c.audio_style -= 1;
+            i += 1;
         }
-        if (c.audio_style > removed) c.audio_style -= 1;
-        i += 1;
-    }
-    if (self.audio_style_sel == removed) {
-        self.audio_style_sel = -1;
-    } else if (self.audio_style_sel > removed) {
-        self.audio_style_sel -= 1;
-    }
-    if (self.panels.ctx_audio_style) |s| {
-        if (s == removed) {
-            self.panels.ctx_audio_style = null;
-        } else if (s > removed) {
-            self.panels.ctx_audio_style = s - 1;
+        if (self.audio_style_sel == removed) {
+            self.audio_style_sel = -1;
+        } else if (self.audio_style_sel > removed) {
+            self.audio_style_sel -= 1;
         }
-    }
-    if (self.wave_win.open) {
-        if (self.wave_win.style) |s| {
+        if (self.panels.ctx_audio_style) |s| {
             if (s == removed) {
-                self.wave_win.open = false; // 正看着被删的样式 → 关闭
+                self.panels.ctx_audio_style = null;
             } else if (s > removed) {
-                self.wave_win.style = s - 1;
+                self.panels.ctx_audio_style = s - 1;
             }
         }
-        if (self.wave_win.clip != null) self.wave_win.open = false; // 片段下标会移位：直接关
+        if (self.wave_win.open) {
+            if (self.wave_win.style) |s| {
+                if (s == removed) {
+                    self.wave_win.open = false; // 正看着被删的样式 → 关闭
+                } else if (s > removed) {
+                    self.wave_win.style = s - 1;
+                }
+            }
+            if (self.wave_win.clip != null) self.wave_win.open = false; // 片段下标会移位：直接关
+        }
+        return dropped;
     }
-    return dropped;
-}
 
-/// 删除音频样式（**顺序删除**以保持索引语义；连带删除引用它的片段）。
-/// 返回连带删除的片段数（>=0）；越界返回 null。调用方负责 commitHistory。
-pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
-    if (idx >= self.audio_styles.items.len) return null;
-    const st = self.audio_styles.items[idx];
-    _ = self.audio_styles.orderedRemove(idx);
-    self.allocator.free(st.name);
-    self.allocator.free(st.path);
-    const dropped = self.remapAudioStyleRefs(@intCast(idx));
-    self.dirty = true;
-    return dropped;
-}
+    /// 删除音频样式（**顺序删除**以保持索引语义；连带删除引用它的片段）。
+    /// 返回连带删除的片段数（>=0）；越界返回 null。调用方负责 commitHistory。
+    pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
+        if (idx >= self.audio_styles.items.len) return null;
+        const st = self.audio_styles.items[idx];
+        _ = self.audio_styles.orderedRemove(idx);
+        self.allocator.free(st.name);
+        self.allocator.free(st.path);
+        const dropped = self.remapAudioStyleRefs(@intCast(idx));
+        self.dirty = true;
+        return dropped;
+    }
 
     /// 片段 → 资产（音频片段有效 → 资产的采样数据）
     pub fn clipAudioData(self: *const App, c: model.Clip) ?*const audio.SampleData {
@@ -3227,9 +3226,9 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
             self.allocator.destroy(r.tbl);
         }
         self.audio_tables_retired.deinit(self.allocator);
-        self.audio_tables_retired = .{ .items = &.{}, .capacity = 0 };
+        self.audio_tables_retired = .empty;
         self.audio_scratch.deinit(self.allocator);
-        self.audio_scratch = .{ .items = &.{}, .capacity = 0 };
+        self.audio_scratch = .empty;
     }
 
     /// 采样器层：资产指针（声部渲染用）
@@ -3596,11 +3595,11 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
         }
         for (self.retired_plugins.items) |r| vst_host.unloadPlugin(self.allocator, r.pl);
         self.retired_plugins.deinit(self.allocator);
-        self.retired_plugins = .{ .items = &.{}, .capacity = 0 };
+        self.retired_plugins = .empty;
         // 效果器状态盒：退役列表 + 链上活槽（引擎已停 → 同步销毁）
         for (self.retired_fx.items) |r| self.allocator.destroy(r.box);
         self.retired_fx.deinit(self.allocator);
-        self.retired_fx = .{ .items = &.{}, .capacity = 0 };
+        self.retired_fx = .empty;
         for (self.mixer_channels_state.items) |*mc| {
             for (mc.effects.items) |*es| {
                 if (es.fx_state) |box| {
@@ -3647,10 +3646,10 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
             self.allocator.free(st.path);
         }
         self.audio_styles.deinit(self.allocator);
-        self.audio_styles = .{ .items = &.{}, .capacity = 0 };
+        self.audio_styles = .empty;
         self.params.deinit(self.allocator);
         self.kit_shift_log.deinit(self.allocator);
-        self.kit_shift_log = .{ .items = &.{}, .capacity = 0 };
+        self.kit_shift_log = .empty;
     }
 
     // ── 预设库（数据根目录 / 扫描结果 / 弹窗状态）──
@@ -3792,10 +3791,10 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
             else => false,
         };
         if (fxKindFromCategory(id) != null) return is_effect_intent;
-    if (preset_mod.vst3CidFromCategory(id) != null) {
-        // 层上下文 = 乐器角色（VST3 乐器可入层；效果器分类由 role 拦下）
-        return self.presetCategoryInstalledRole(id, !is_effect_intent);
-    }
+        if (preset_mod.vst3CidFromCategory(id) != null) {
+            // 层上下文 = 乐器角色（VST3 乐器可入层；效果器分类由 role 拦下）
+            return self.presetCategoryInstalledRole(id, !is_effect_intent);
+        }
         if (is_effect_intent) return false;
         if (is_layer_ctx) return std.mem.eql(u8, id, preset_mod.plugin_subtractive);
         return true; // 乐器意图：全部内置（含未实装占位，保持既有置灰提示）
@@ -4603,7 +4602,7 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
 
     /// 参数增量排序：按槽（kind,a,b）+ 参数 ID——同槽记录连续，应用侧取子切片
     fn paramEditLess(_: void, a: ParamEditRec, b: ParamEditRec) bool {
-        if (a.ref.kind != b.ref.kind) return @intFromEnum(a.ref.kind) < @intFromEnum(b.ref.kind);
+        if (a.ref.kind != b.ref.kind) return @backingInt(a.ref.kind) < @backingInt(b.ref.kind);
         if (a.ref.a != b.ref.a) return a.ref.a < b.ref.a;
         if (a.ref.b != b.ref.b) return a.ref.b < b.ref.b;
         return a.param_id < b.param_id;
@@ -4803,7 +4802,7 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
         // 注：必须 `deinit`（释放底层数组）——`clearRetainingCapacity` 只清长度，
         // 会把数组泄漏掉（实测：undo → importMixerChannels → 重建通道后泄漏）
         self.mixer_channels_state.deinit(self.allocator);
-        self.mixer_channels_state = .{ .items = &.{}, .capacity = 0 };
+        self.mixer_channels_state = .empty;
     }
 
     /// 初始化音频容量（启动第一个编辑动作/测试建立；幂等）
@@ -5059,8 +5058,8 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
     /// 新效果器槽（默认干湿/参数；新建与导入共用）
     fn newEffectSlot(kind: EffectKind) EffectSlot {
         var slot = EffectSlot{ .kind = kind };
-        slot.mix = fx.defaultMix(@intFromEnum(kind));
-        if (kind != .eq) slot.p = fx.defaultParams(@intFromEnum(kind));
+        slot.mix = fx.defaultMix(@backingInt(kind));
+        if (kind != .eq) slot.p = fx.defaultParams(@backingInt(kind));
         return slot;
     }
 
@@ -5109,7 +5108,6 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
         }
     }
 
-
     /// 效果器状态盒进退役列表（音频线程可能仍持有指针；倒计时后销毁）
     pub fn retireFxState(self: *App, box: *audio.FxBox) void {
         self.retired_fx.append(self.allocator, .{ .box = box, .countdown = 30 }) catch {
@@ -5136,7 +5134,7 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
     /// （音频线程以 effect_count 限界 + 盒内 kind 自洽，指针先到就不会误解）。
     /// 链外旧槽的状态由字段销毁路径退役（removeEffect/deinitMixerChannels 等）。
     pub fn syncFxStateForSlot(self: *App, ci: usize, slot: usize, es: *EffectSlot) void {
-        const kind: u8 = @intCast(@intFromEnum(es.kind));
+        const kind: u8 = @intCast(@backingInt(es.kind));
         const needs = kind >= 2 and kind <= 4;
         if (needs) {
             if (es.fx_state) |box| {
@@ -5282,9 +5280,9 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
         /// 起手提交的历史下标（pin 时替换该条快照）
         index: usize,
         /// 本手势内插件参数编辑（折叠：同槽同参一条；pin 时按 ref 排序）
-        param_edits: std.ArrayListUnmanaged(ParamEditRec) = .{ .items = &.{}, .capacity = 0 },
+        param_edits: std.ArrayListUnmanaged(ParamEditRec) = .empty,
         /// 本手势内出现过结构性信号的槽
-        structural_refs: std.ArrayListUnmanaged(PluginSlotRef) = .{ .items = &.{}, .capacity = 0 },
+        structural_refs: std.ArrayListUnmanaged(PluginSlotRef) = .empty,
     };
 
     /// 丢弃进行中的手势（释放增量/结构信号列表）
@@ -5736,7 +5734,7 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
                     }
                 }
                 effs[si] = .{
-                    .kind = @intFromEnum(es.kind),
+                    .kind = @backingInt(es.kind),
                     .enabled = es.enabled,
                     .mix = es.mix,
                     .bands = bands,
@@ -5768,11 +5766,11 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
         const n_total = if (mixer.len == 0) default_mixer_channels else n_saved;
         // 参数回放任务（构建期登记；救援后执行——那时新槽才持有实例）
         const ReplayJobSlot = struct { ch: usize, slot: usize, job: ReplayJob, saved: *const persist.SavedEffectSlot };
-        var replay_jobs: std.ArrayListUnmanaged(ReplayJobSlot) = .{ .items = &.{}, .capacity = 0 };
+        var replay_jobs: std.ArrayListUnmanaged(ReplayJobSlot) = .empty;
         defer replay_jobs.deinit(alloc);
 
         // ── 1) 构建新通道列表（先不动旧链：救援需要旧槽仍存活）──
-        var new_list: std.ArrayListUnmanaged(MixerChannel) = .{ .items = &.{}, .capacity = 0 };
+        var new_list: std.ArrayListUnmanaged(MixerChannel) = .empty;
         var build_ok = true;
         new_list.ensureTotalCapacity(alloc, n_total) catch {
             build_ok = false;
@@ -6047,19 +6045,19 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
             // （与 ADSR 同一个坑：调了值但不产生历史）
             if (a.velocity != b.velocity or a.pan != b.pan) return false;
         }
-    for (st.clips, self.clips.items) |a, b| {
-        if (a.track != b.track or a.start != b.start or a.len != b.len or
-            a.pattern != b.pattern or a.offset != b.offset) return false;
-        // 音频片段字段（样式引用/trim）也要比较——否则粗剪/换源被判“无变化”
-        if (a.audio_style != b.audio_style or a.trim_start != b.trim_start or a.trim_len != b.trim_len) return false;
-    }
-    // 音频样式（名称/路径/通道/增益）——否则调样式推子会被判“无变化”丢历史
-    if (st.audio_styles.len != self.audio_styles.items.len) return false;
-    for (st.audio_styles, self.audio_styles.items) |a, b| {
-        if (!std.mem.eql(u8, a.name, b.name)) return false;
-        if (!std.mem.eql(u8, a.path, b.path)) return false;
-        if (a.channel != b.channel or a.gain != b.gain or a.speed != b.speed) return false;
-    }
+        for (st.clips, self.clips.items) |a, b| {
+            if (a.track != b.track or a.start != b.start or a.len != b.len or
+                a.pattern != b.pattern or a.offset != b.offset) return false;
+            // 音频片段字段（样式引用/trim）也要比较——否则粗剪/换源被判“无变化”
+            if (a.audio_style != b.audio_style or a.trim_start != b.trim_start or a.trim_len != b.trim_len) return false;
+        }
+        // 音频样式（名称/路径/通道/增益）——否则调样式推子会被判“无变化”丢历史
+        if (st.audio_styles.len != self.audio_styles.items.len) return false;
+        for (st.audio_styles, self.audio_styles.items) |a, b| {
+            if (!std.mem.eql(u8, a.name, b.name)) return false;
+            if (!std.mem.eql(u8, a.path, b.path)) return false;
+            if (a.channel != b.channel or a.gain != b.gain or a.speed != b.speed) return false;
+        }
         if (st.instruments.len != self.instruments.items.len) return false;
         for (st.instruments, self.instruments.items, 0..) |a, b, ii| {
             if (a.volume != b.volume or a.pan != b.pan or a.muted != b.muted or
@@ -6067,35 +6065,35 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
             if (!std.mem.eql(u8, a.name, b.name)) return false;
             if (!std.mem.eql(u8, a.preset_name, b.preset_name)) return false; // 关联预设名（否则加载同名同参预设会被判“无变化”）
             // 乐器类型/鼓组内容也要比较（否则鼓组编辑被判“无变化”）
-            if (a.kind != @intFromEnum(b.kind)) return false;
+            if (a.kind != @backingInt(b.kind)) return false;
             if (a.kit.pads.len != (if (b.kit) |k| k.pads.items.len else 0)) return false;
-        if (b.kit) |k| {
-            var flat: usize = 0; // 展平槽位（脏标寻址；与 syncParams 同序）
-            for (a.kit.pads, k.pads.items) |sa, ba| {
-                if (sa.pitch != ba.pitch) return false;
-                if (!std.mem.eql(u8, sa.name, ba.name)) return false;
-                if (sa.layers.len != ba.layers.items.len) return false;
-                for (sa.layers, ba.layers.items) |sl, bl| {
-                    if (sl.kind != @intFromEnum(bl.kind)) return false;
-                    if (sl.gain != bl.gain) return false;
-                    if (!std.mem.eql(u8, sl.source_preset, bl.source_preset)) return false;
-                    // VST3 层：路径/CID + **脏时与活实例比较音色**——否则插件内参数
-                    // 编辑被判“无变化”，静默丢弃历史条目（同乐器级机制）
-                    if (bl.kind == .vst3) {
-                        if (!std.mem.eql(u8, sl.plugin_path, bl.pluginPath())) return false;
-                        if (!std.mem.eql(u8, sl.plugin_cid, bl.pluginCid())) return false;
-                        if (ii < self.kit_layer_state_dirty.len and flat < self.kit_layer_state_dirty[ii].len and
-                            self.kit_layer_state_dirty[ii][flat])
-                        {
-                            if (!self.layerStateMatchesLive(&bl, sl.plugin_state, sl.plugin_state_ctrl)) return false;
+            if (b.kit) |k| {
+                var flat: usize = 0; // 展平槽位（脏标寻址；与 syncParams 同序）
+                for (a.kit.pads, k.pads.items) |sa, ba| {
+                    if (sa.pitch != ba.pitch) return false;
+                    if (!std.mem.eql(u8, sa.name, ba.name)) return false;
+                    if (sa.layers.len != ba.layers.items.len) return false;
+                    for (sa.layers, ba.layers.items) |sl, bl| {
+                        if (sl.kind != @backingInt(bl.kind)) return false;
+                        if (sl.gain != bl.gain) return false;
+                        if (!std.mem.eql(u8, sl.source_preset, bl.source_preset)) return false;
+                        // VST3 层：路径/CID + **脏时与活实例比较音色**——否则插件内参数
+                        // 编辑被判“无变化”，静默丢弃历史条目（同乐器级机制）
+                        if (bl.kind == .vst3) {
+                            if (!std.mem.eql(u8, sl.plugin_path, bl.pluginPath())) return false;
+                            if (!std.mem.eql(u8, sl.plugin_cid, bl.pluginCid())) return false;
+                            if (ii < self.kit_layer_state_dirty.len and flat < self.kit_layer_state_dirty[ii].len and
+                                self.kit_layer_state_dirty[ii][flat])
+                            {
+                                if (!self.layerStateMatchesLive(&bl, sl.plugin_state, sl.plugin_state_ctrl)) return false;
+                            }
                         }
+                        const cur = persist.exportSynth(bl.params);
+                        if (!std.meta.eql(sl.synth, cur)) return false;
+                        flat += 1;
                     }
-                    const cur = persist.exportSynth(bl.params);
-                    if (!std.meta.eql(sl.synth, cur)) return false;
-                    flat += 1;
                 }
             }
-        }
             // **合成器参数也要比较**——否则 ADSR/滤波等改动会被判为“无变化”，
             // 静默丢弃历史条目（实测 bug：调 ADSR 不产生历史）
             const cur = persist.exportSynth(b.synth);
@@ -6134,7 +6132,7 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
             for (0..bn) |si| {
                 const ae = a.effects[si];
                 const be = b.effects.items[si];
-                if (ae.kind != @intFromEnum(be.kind) or ae.enabled != be.enabled or ae.mix != be.mix) return false;
+                if (ae.kind != @backingInt(be.kind) or ae.enabled != be.enabled or ae.mix != be.mix) return false;
                 for (ae.bands, be.bands) |ab, bb| {
                     if (ab.freq != bb.freq or ab.gain_db != bb.gain_db or ab.q != bb.q) return false;
                 }
@@ -6770,14 +6768,14 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
         if (na) |kv| self.track_names.put(self.allocator, bi, kv.value) catch self.allocator.free(kv.value);
         if (nb) |kv| self.track_names.put(self.allocator, ai, kv.value) catch self.allocator.free(kv.value);
         // 静音交换
-        const ma = self.track_muted.contains(ai);
+        const ma_muted = self.track_muted.contains(ai);
         const mb = self.track_muted.contains(bi);
         if (mb) {
             self.track_muted.put(self.allocator, ai, {}) catch {};
         } else {
             _ = self.track_muted.remove(ai);
         }
-        if (ma) {
+        if (ma_muted) {
             self.track_muted.put(self.allocator, bi, {}) catch {};
         } else {
             _ = self.track_muted.remove(bi);
@@ -6806,7 +6804,7 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
         }
         // 自定义名：收集 → 清空 → 按新键回填（被删行的名字释放）
         const KV = struct { k: i32, v: []u8 };
-        var keep: std.ArrayListUnmanaged(KV) = .{ .items = &.{}, .capacity = 0 };
+        var keep: std.ArrayListUnmanaged(KV) = .empty;
         defer keep.deinit(self.allocator);
         var itn = self.track_names.iterator();
         while (itn.next()) |e| {
@@ -6823,7 +6821,7 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
         self.track_names.clearRetainingCapacity();
         for (keep.items) |kv| self.track_names.put(self.allocator, kv.k, kv.v) catch self.allocator.free(kv.v);
         // 静音：同理
-        var keepm: std.ArrayListUnmanaged(i32) = .{ .items = &.{}, .capacity = 0 };
+        var keepm: std.ArrayListUnmanaged(i32) = .empty;
         defer keepm.deinit(self.allocator);
         var itm = self.track_muted.keyIterator();
         while (itm.next()) |kp| {
@@ -6945,9 +6943,9 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
         const alloc = self.allocator;
         const clips = try alloc.alloc(persist.SavedClip, self.clips.items.len);
         errdefer alloc.free(clips);
-    for (self.clips.items, 0..) |c, i| {
-        clips[i] = .{ .track = c.track, .start = c.start, .len = c.len, .pattern = c.pattern, .offset = c.offset, .audio_style = c.audio_style, .trim_start = c.trim_start, .trim_len = c.trim_len };
-    }
+        for (self.clips.items, 0..) |c, i| {
+            clips[i] = .{ .track = c.track, .start = c.start, .len = c.len, .pattern = c.pattern, .offset = c.offset, .audio_style = c.audio_style, .trim_start = c.trim_start, .trim_len = c.trim_len };
+        }
         const notes = try alloc.alloc(persist.SavedNote, self.notes.items.len);
         errdefer alloc.free(notes);
         for (self.notes.items, 0..) |n, i| {
@@ -6963,11 +6961,11 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
             insts[i] = try self.exportInstrument(inst, false);
             ni += 1;
         }
-    // 调音台通道（增益/声像/静音/效果链）——共用 `exportMixerChannels`
-    const mix = try self.exportMixerChannels(alloc, true, false);
-    // 音频样式（相对路径——工程文件夹便携；未在基准目录下 → 保留绝对）
-    const astyles = try self.exportAudioStyles(alloc, true);
-    errdefer self.freeSavedAudioStyles(astyles);
+        // 调音台通道（增益/声像/静音/效果链）——共用 `exportMixerChannels`
+        const mix = try self.exportMixerChannels(alloc, true, false);
+        // 音频样式（相对路径——工程文件夹便携；未在基准目录下 → 保留绝对）
+        const astyles = try self.exportAudioStyles(alloc, true);
+        errdefer self.freeSavedAudioStyles(astyles);
         // 样式名字（自定义名随工程保存；旧版加载方忽略）
         const pat_names = try alloc.alloc([]const u8, self.pattern_items.items.len);
         var pn: usize = 0;
@@ -7032,12 +7030,12 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
             .track_names = trk_names,
             .track_name_rows = trk_rows,
             .track_muted = muted_list,
-        .clips = clips,
-        .notes = notes,
-        .instruments = insts,
-        .mixer = mix,
-        .audio_styles = astyles,
-    };
+            .clips = clips,
+            .notes = notes,
+            .instruments = insts,
+            .mixer = mix,
+            .audio_styles = astyles,
+        };
     }
 
     /// 释放 `exportProject` 返回的存档（含内部字符串）
@@ -7131,22 +7129,22 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
 
     /// 释放存档切片里的调音台通道（含每效果的 bands 子切片）——多处共用
     fn freeSavedMixerChannels(self: *App, mixer: []const persist.SavedMixerChannel, pooled: bool) void {
-    for (mixer) |sm| {
-        for (sm.effects[0..@min(sm.effects.len, sm.effect_count)]) |se| {
-            if (se.bands.len > 0) self.allocator.free(se.bands);
-            if (se.plugin_path.len > 0) self.allocator.free(se.plugin_path);
-            if (se.plugin_cid.len > 0) self.allocator.free(se.plugin_cid);
-            // 插件状态：历史快照走池引用计数；工程导出为独占块（直接 free）
-            if (se.plugin_state.len > 0) {
-                if (pooled) self.state_pool.release(self.allocator, se.plugin_state) else self.allocator.free(se.plugin_state);
+        for (mixer) |sm| {
+            for (sm.effects[0..@min(sm.effects.len, sm.effect_count)]) |se| {
+                if (se.bands.len > 0) self.allocator.free(se.bands);
+                if (se.plugin_path.len > 0) self.allocator.free(se.plugin_path);
+                if (se.plugin_cid.len > 0) self.allocator.free(se.plugin_cid);
+                // 插件状态：历史快照走池引用计数；工程导出为独占块（直接 free）
+                if (se.plugin_state.len > 0) {
+                    if (pooled) self.state_pool.release(self.allocator, se.plugin_state) else self.allocator.free(se.plugin_state);
+                }
+                if (se.plugin_state_ctrl.len > 0) {
+                    if (pooled) self.state_pool.release(self.allocator, se.plugin_state_ctrl) else self.allocator.free(se.plugin_state_ctrl);
+                }
             }
-            if (se.plugin_state_ctrl.len > 0) {
-                if (pooled) self.state_pool.release(self.allocator, se.plugin_state_ctrl) else self.allocator.free(se.plugin_state_ctrl);
-            }
+            if (sm.name.len > 0) self.allocator.free(sm.name);
+            if (sm.effects.len > 0) self.allocator.free(sm.effects);
         }
-        if (sm.name.len > 0) self.allocator.free(sm.name);
-        if (sm.effects.len > 0) self.allocator.free(sm.effects);
-    }
     }
 
     pub fn freeProject(self: *App, p: persist.Project) void {
@@ -7192,22 +7190,22 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
         self.importAudioStyles(p.audio_styles);
         for (p.clips) |c| {
             self.addClip(.{ .track = c.track, .start = c.start, .len = c.len, .pattern = c.pattern, .offset = c.offset, .audio_style = c.audio_style, .trim_start = c.trim_start, .trim_len = c.trim_len });
-    }
-    // 容错：片段引用了不存在的音频样式（手工改档/旧 bug）→ 丢弃，避免“隐形空片段”
-    {
-        var bad: usize = 0;
-        const n_styles: i32 = @intCast(self.audio_styles.items.len);
-        var ci: usize = 0;
-        while (ci < self.clips.items.len) {
-            const c = &self.clips.items[ci];
-            if (c.isAudio() and (c.audio_style < 0 or c.audio_style >= n_styles)) {
-                _ = self.clips.swapRemove(ci);
-                bad += 1;
-                continue;
-            }
-            ci += 1;
         }
-        if (bad > 0) self.setToastWith("有 {d} 个音频片段引用了不存在的样式，已丢弃", .{bad});
+        // 容错：片段引用了不存在的音频样式（手工改档/旧 bug）→ 丢弃，避免“隐形空片段”
+        {
+            var bad: usize = 0;
+            const n_styles: i32 = @intCast(self.audio_styles.items.len);
+            var ci: usize = 0;
+            while (ci < self.clips.items.len) {
+                const c = &self.clips.items[ci];
+                if (c.isAudio() and (c.audio_style < 0 or c.audio_style >= n_styles)) {
+                    _ = self.clips.swapRemove(ci);
+                    bad += 1;
+                    continue;
+                }
+                ci += 1;
+            }
+            if (bad > 0) self.setToastWith("有 {d} 个音频片段引用了不存在的样式，已丢弃", .{bad});
         }
         for (p.notes) |n| {
             self.addNote(.{ .step = n.step, .len = n.len, .pitch = n.pitch, .pattern = n.pattern, .instrument = n.instrument, .velocity = n.velocity, .pan = n.pan });
@@ -7328,7 +7326,7 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
     /// 失败返回错误；成功返回统计信息。
     pub fn importMidi(self: *App, parsed: *const midi.Parsed) !MidiImportResult {
         // 1) 收集用到的通道（升序稳定）
-        var ch_used = [_]bool{false} ** 16;
+        var ch_used: [16]bool = @splat(false);
         for (parsed.notes) |n| ch_used[n.channel & 0x0F] = true;
 
         // 2) 新建样式（达到上限 → 报错，不做半途导入）
@@ -7336,7 +7334,7 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
         if (new_pat < 0) return error.TooManyPatterns;
 
         // 3) 通道 → 乐器（顺序建立，保持通道升序）
-        var ch_to_inst = [_]i32{-1} ** 16;
+        var ch_to_inst: [16]i32 = @splat(-1);
         var inst_count: usize = 0;
         for (ch_used, 0..) |u, ch| {
             if (!u) continue;
@@ -7389,8 +7387,8 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
     /// 通道规则与 `exportMidiNotes` 一致（优先来源通道 `midi_channel`，否则号 mod 16）；
     /// 音符级声像不导出（MIDI 只有通道级声像）——见 `midi.ExportSong.channel_pan`。
     pub fn exportChannelPans(self: *const App) [16]u8 {
-        var out = [_]u8{64} ** 16;
-        var set = [_]bool{false} ** 16;
+        var out: [16]u8 = @splat(64);
+        var set: [16]bool = @splat(false);
         for (self.instruments.items, 0..) |inst, i| {
             // 无来源通道且乐器号 ≥ 16 → 不导出（与 `exportMidiNotes` 同规则）
             if (inst.midi_channel < 0 and i >= 16) continue;
@@ -7409,7 +7407,7 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
     /// 会导出多次——与播放听到的一致）；乐器号 mod 16 → 通道。
     /// 返回的切片归调用方释放（`allocator.free`）。
     pub fn exportMidiNotes(self: *App, allocator: std.mem.Allocator) ![]midi.ExportNote {
-        var out: std.ArrayListUnmanaged(midi.ExportNote) = .{ .items = &.{}, .capacity = 0 };
+        var out: std.ArrayListUnmanaged(midi.ExportNote) = .empty;
         errdefer out.deinit(allocator);
 
         for (self.clips.items) |clip| {
@@ -7570,7 +7568,7 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
 
         // 插件状态快照（乐器 + 混音台效果链）——导出会推进其 DSP 内部状态；
         // 结束后回写（分配失败的那一个不入快照：该插件保持导出后的状态，可接受）
-        var states: std.ArrayListUnmanaged(PlStateSnap) = .{ .items = &.{}, .capacity = 0 };
+        var states: std.ArrayListUnmanaged(PlStateSnap) = .empty;
         errdefer {
             for (states.items) |s| s.blobs.deinit(self.allocator);
             states.deinit(self.allocator);
@@ -7639,7 +7637,7 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
             .total_frames = total_frames,
             .done = 0,
             .dbg0 = self.engine.dbg_dispatched,
-            .log_buf = .{ .items = &.{}, .capacity = 0 },
+            .log_buf = .empty,
             .t0_ns = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds),
         };
         self.export_win = .{}; // 进度窗复位（首帧居中）
@@ -7647,10 +7645,11 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
         if (self.export_wav) |*ew| {
             var hb: [256]u8 = undefined;
             const h = std.fmt.bufPrint(&hb, "begin gen={d} edit_gen={d} start_step={d} start_frame={d} bpm={d} spb={d} step_frames={d} total={d} sr={d}", .{
-                self.scheduler.gen, self.scheduler.edit_gen,
+                self.scheduler.gen,                      self.scheduler.edit_gen,
                 self.params.start_step.load(.monotonic), self.params.start_frame.load(.monotonic),
-                self.params.bpm.load(.monotonic), self.params.steps_per_beat.load(.monotonic),
-                step_frames, total_frames, sr,
+                self.params.bpm.load(.monotonic),        self.params.steps_per_beat.load(.monotonic),
+                step_frames,                             total_frames,
+                sr,
             }) catch "";
             ew.log_buf.appendSlice(self.allocator, h) catch {};
             ew.log_buf.appendSlice(self.allocator, "\n") catch {};
@@ -7692,8 +7691,8 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
             if (ew.blocks % 32 == 0) {
                 var lb: [192]u8 = undefined;
                 const ls = std.fmt.bufPrint(&lb, "blk={d} fp={d} stash={d} disp={d} peak={d:.3} pl={}", .{
-                    ew.blocks, self.params.frames_played.load(.monotonic),
-                    self.engine.stash_n, self.engine.dbg_dispatched -| ew.dbg0,
+                    ew.blocks,                             self.params.frames_played.load(.monotonic),
+                    self.engine.stash_n,                   self.engine.dbg_dispatched -| ew.dbg0,
                     self.params.out_peak.load(.monotonic), self.params.playing.load(.monotonic),
                 }) catch "";
                 ew.log_buf.appendSlice(self.allocator, ls) catch {};
@@ -7768,7 +7767,7 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
             for (ew.states.items) |s| s.blobs.deinit(self.allocator);
             ew.states.deinit(self.allocator);
             self.allocator.free(ew.path);
-        self.export_wav.?.log_buf.deinit(self.allocator);
+            self.export_wav.?.log_buf.deinit(self.allocator);
         }
         self.export_wav = null;
     }
@@ -8231,24 +8230,24 @@ pub fn removeAudioStyle(self: *App, idx: usize) ?usize {
         ti.view_off = 0;
     }
 
-/// 打开音频样式重命名输入框（位置由调用方给；复用文本输入基建——支持中文 IME）
-pub fn beginRenameAudioStyle(self: *App, idx: usize, x: i32, y: i32) void {
-    if (idx >= self.audio_styles.items.len) return;
-    const ti = &self.text_input;
-    ti.active = true;
-    ti.target = .audio_style;
-    ti.index = idx;
-    ti.x = x;
-    ti.y = y;
-    const name = self.audio_styles.items[idx].name;
-    const n = @min(name.len, ti.buf.len);
-    @memcpy(ti.buf[0..n], name[0..n]);
-    ti.len = n;
-    ti.cursor = n;
-    ti.sel_anchor = null;
-    ti.drag_active = false;
-    ti.view_off = 0;
-}
+    /// 打开音频样式重命名输入框（位置由调用方给；复用文本输入基建——支持中文 IME）
+    pub fn beginRenameAudioStyle(self: *App, idx: usize, x: i32, y: i32) void {
+        if (idx >= self.audio_styles.items.len) return;
+        const ti = &self.text_input;
+        ti.active = true;
+        ti.target = .audio_style;
+        ti.index = idx;
+        ti.x = x;
+        ti.y = y;
+        const name = self.audio_styles.items[idx].name;
+        const n = @min(name.len, ti.buf.len);
+        @memcpy(ti.buf[0..n], name[0..n]);
+        ti.len = n;
+        ti.cursor = n;
+        ti.sel_anchor = null;
+        ti.drag_active = false;
+        ti.view_off = 0;
+    }
 
     /// 追加一个字符（UTF-8；在**光标处插入**——有选区则先删除选区）
     pub fn textInputAppend(self: *App, cp: u21) void {
@@ -8401,21 +8400,21 @@ pub fn beginRenameAudioStyle(self: *App, idx: usize, x: i32, y: i32) void {
                     }
                 }
             },
-        .audio_style => {
-            if (ti.index < self.audio_styles.items.len) {
-                const st = &self.audio_styles.items[ti.index];
-                // 空串 → 恢复默认名（文件名）
-                const want: []const u8 = if (val.len > 0) val else std.fs.path.basename(st.path);
-                if (want.len > 0 and !std.mem.eql(u8, st.name, want)) {
-                    if (self.allocator.dupe(u8, want)) |c| {
-                        self.allocator.free(st.name);
-                        st.name = c;
-                        self.dirty = true;
-                        self.commitHistory("重命名音频样式");
-                    } else |_| {}
+            .audio_style => {
+                if (ti.index < self.audio_styles.items.len) {
+                    const st = &self.audio_styles.items[ti.index];
+                    // 空串 → 恢复默认名（文件名）
+                    const want: []const u8 = if (val.len > 0) val else std.fs.path.basename(st.path);
+                    if (want.len > 0 and !std.mem.eql(u8, st.name, want)) {
+                        if (self.allocator.dupe(u8, want)) |c| {
+                            self.allocator.free(st.name);
+                            st.name = c;
+                            self.dirty = true;
+                            self.commitHistory("重命名音频样式");
+                        } else |_| {}
+                    }
                 }
-            }
-        },
+            },
             .pattern => {
                 if (ti.index < self.pattern_items.items.len and val.len > 0) {
                     const old = self.pattern_items.items[ti.index];
@@ -9438,7 +9437,7 @@ test "app: 音频资产/样式/片段——解码/去重/播放表/撤销/采样
     defer alloc.free(wav_path);
     // 写 16bit PCM 立体声 4800 帧（0.1s@48k 正弦）
     {
-        var w = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+        var w = std.ArrayListUnmanaged(u8).empty;
         defer w.deinit(alloc);
         const data_bytes: u32 = 4800 * 4;
         try w.appendSlice(alloc, "RIFF");
@@ -9481,7 +9480,7 @@ test "app: 音频资产/样式/片段——解码/去重/播放表/撤销/采样
     {
         const wav2 = try std.fmt.allocPrint(alloc, "{s}/b24.wav", .{dirp});
         defer alloc.free(wav2);
-        var w = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+        var w = std.ArrayListUnmanaged(u8).empty;
         defer w.deinit(alloc);
         const data_bytes: u32 = 2400 * 4;
         try w.appendSlice(alloc, "RIFF");
@@ -9603,11 +9602,11 @@ test "app: 鼓组两层 VST3 各自编辑 → 历史各自成条 + 撤销 + 无�
     const vital_path = "C:\\Program Files\\Common Files\\VST3\\Vital.vst3";
     const sine_path = "libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll";
     var dll: []const u8 = vital_path;
-    var pz = alloc.dupeZ(u8, dll) catch return;
+    var pz = alloc.dupeSentinel(u8, dll, 0) catch return;
     var pl1 = vst_host.loadPlugin(alloc, pz, 48000, 4096, .instrument) catch blk: {
         alloc.free(pz);
         dll = sine_path;
-        pz = alloc.dupeZ(u8, dll) catch return;
+        pz = alloc.dupeSentinel(u8, dll, 0) catch return;
         break :blk vst_host.loadPlugin(alloc, pz, 48000, 4096, .instrument) catch return;
     };
     defer alloc.free(pz);
@@ -12101,7 +12100,7 @@ test "app: 效果器可叠加同种（用户拍板）；默认参数随类型填
 
     // 默认参数：与 `fx.defaultParams` 一致（混响首位 = 空间默认，非全零）
     const es_r = &app.mixer_channels_state.items[0].effects.items[s0];
-    const defs = fx.defaultParams(@intFromEnum(EffectKind.reverb));
+    const defs = fx.defaultParams(@backingInt(EffectKind.reverb));
     try std.testing.expectEqual(defs[0], es_r.p[0]);
     try std.testing.expectEqual(defs[1], es_r.p[1]);
     try std.testing.expect(es_r.p[0] > 0);
@@ -12266,7 +12265,7 @@ test "app: 插件槽——添加 / 存档往返（plugin_path）/ 无实例删�
 
 test "插件实例：deinitAll 同步卸载链上实例与退役项（无泄漏）" {
     // 用 zig-vst3 自带示例 DLL 真加载（缺失则跳过——示例未构建的环境）
-    const dll_z = std.testing.allocator.dupeZ(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll") catch return;
+    const dll_z = std.testing.allocator.dupeSentinel(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll", 0) catch return;
     defer std.testing.allocator.free(dll_z);
     const pl = vst_host.loadEffect(std.testing.allocator, dll_z, 48000, 4096) catch return;
 
@@ -12287,7 +12286,7 @@ test "插件实例：deinitAll 同步卸载链上实例与退役项（无泄漏�
 }
 
 test "VST3 参数：元数据/设置/音频生效/编辑器编辑轮询" {
-    const dll_z = std.testing.allocator.dupeZ(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll") catch return;
+    const dll_z = std.testing.allocator.dupeSentinel(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll", 0) catch return;
     defer std.testing.allocator.free(dll_z);
     const pl = vst_host.loadEffect(std.testing.allocator, dll_z, 48000, 4096) catch return;
     defer vst_host.unloadPlugin(std.testing.allocator, pl);
@@ -12315,7 +12314,7 @@ test "VST3 参数：元数据/设置/音频生效/编辑器编辑轮询" {
 }
 
 test "VST3 状态：捕获/恢复往返（参数值保留、音频生效）" {
-    const dll_z = std.testing.allocator.dupeZ(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll") catch return;
+    const dll_z = std.testing.allocator.dupeSentinel(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll", 0) catch return;
     defer std.testing.allocator.free(dll_z);
     const p1 = vst_host.loadEffect(std.testing.allocator, dll_z, 48000, 4096) catch return;
     defer vst_host.unloadPlugin(std.testing.allocator, p1);
@@ -12334,7 +12333,7 @@ test "VST3 状态：捕获/恢复往返（参数值保留、音频生效）" {
 }
 
 test "VST3 状态：工程存档往返（base64 → pending 解码 → 恢复）" {
-    const dll_z = std.testing.allocator.dupeZ(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll") catch return;
+    const dll_z = std.testing.allocator.dupeSentinel(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll", 0) catch return;
     defer std.testing.allocator.free(dll_z);
     const pl = vst_host.loadEffect(std.testing.allocator, dll_z, 48000, 4096) catch return;
 
@@ -12385,7 +12384,7 @@ test "VST3 状态：工程存档往返（base64 → pending 解码 → 恢复）
 }
 
 test "VST3 乐器：无输入插件按乐器角色加载与 process（sine-synth 示例）" {
-    const dll_z = std.testing.allocator.dupeZ(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll") catch return;
+    const dll_z = std.testing.allocator.dupeSentinel(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll", 0) catch return;
     defer std.testing.allocator.free(dll_z);
     // 效果器角色：应报 NoMainInput（它没有主音频输入）
     if (vst_host.loadPlugin(std.testing.allocator, dll_z, 48000, 4096, .effect)) |pl| {
@@ -12405,19 +12404,19 @@ test "VST3 乐器：无输入插件按乐器角色加载与 process（sine-synth
 }
 
 test "VST3 乐器：音符事件送达插件（sine-synth：noteOn 发声、noteOff 停）" {
-    const dll_z = std.testing.allocator.dupeZ(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll") catch return;
+    const dll_z = std.testing.allocator.dupeSentinel(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll", 0) catch return;
     defer std.testing.allocator.free(dll_z);
     const pl = vst_host.loadPlugin(std.testing.allocator, dll_z, 48000, 4096, .instrument) catch return;
     defer vst_host.unloadPlugin(std.testing.allocator, pl);
 
     const note_on = ivstevents.Event{
         .sampleOffset = 0,
-        .type = @intFromEnum(ivstevents.Event.EventTypes.kNoteOnEvent),
+        .type = @backingInt(ivstevents.Event.EventTypes.kNoteOnEvent),
         .data = .{ .noteOn = .{ .channel = 0, .pitch = 69, .velocity = 1.0, .noteId = -1 } },
     };
     const note_off = ivstevents.Event{
         .sampleOffset = 0,
-        .type = @intFromEnum(ivstevents.Event.EventTypes.kNoteOffEvent),
+        .type = @backingInt(ivstevents.Event.EventTypes.kNoteOffEvent),
         .data = .{ .noteOff = .{ .channel = 0, .pitch = 69, .velocity = 0, .noteId = -1 } },
     };
 
@@ -12447,7 +12446,7 @@ test "VST3 乐器：音符事件送达插件（sine-synth：noteOn 发声、note
 }
 
 test "VST3 乐器：音色随工程存档与撤销往返（pending → restoreState）" {
-    const dll_z = std.testing.allocator.dupeZ(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll") catch return;
+    const dll_z = std.testing.allocator.dupeSentinel(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll", 0) catch return;
     defer std.testing.allocator.free(dll_z);
     const pl = vst_host.loadPlugin(std.testing.allocator, dll_z, 48000, 4096, .instrument) catch return;
 
@@ -12496,7 +12495,7 @@ test "工程加载恢复后：插件回声字节不算编辑（单击不产生�
     // 若非“已采纳”处理：①单击片段提交→幽灵历史条目（实测 v4 工程）；
     // ②幽灵条目 blob 与基线不同 → 条目间跳转每次对全部实例整块 setState（卡顿）。
     const vital_path = "C:\\Program Files\\Common Files\\VST3/Vital.vst3";
-    const dll_z = std.testing.allocator.dupeZ(u8, vital_path) catch return;
+    const dll_z = std.testing.allocator.dupeSentinel(u8, vital_path, 0) catch return;
     defer std.testing.allocator.free(dll_z);
     const pl = vst_host.loadPlugin(std.testing.allocator, dll_z, 48000, 4096, .instrument) catch return; // 未安装 → 跳过
 
@@ -12544,7 +12543,7 @@ test "工程加载恢复后：插件回声字节不算编辑（单击不产生�
 
 test "就地替换插件状态记账：提交建条目且快照现取（预设加载路径回归锁）" {
     const dll_path = "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll";
-    const dll_z = std.testing.allocator.dupeZ(u8, dll_path) catch return;
+    const dll_z = std.testing.allocator.dupeSentinel(u8, dll_path, 0) catch return;
     defer std.testing.allocator.free(dll_z);
 
     var app = App{ .allocator = std.testing.allocator };
@@ -12635,7 +12634,7 @@ fn guiSetParam(pl: *vst_host.Plugin, idx: usize, v: f64) void {
 
 test "编辑器参数手势：同旋钮连拧合并为一条（静置语义；撤销一次全回退）" {
     const dll_path = "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll";
-    const dll_z = std.testing.allocator.dupeZ(u8, dll_path) catch return;
+    const dll_z = std.testing.allocator.dupeSentinel(u8, dll_path, 0) catch return;
     defer std.testing.allocator.free(dll_z);
 
     var app = App{ .allocator = std.testing.allocator };
@@ -12694,7 +12693,7 @@ test "编辑器参数手势：同旋钮连拧合并为一条（静置语义；�
 
 test "编辑器参数手势：同一插件换旋钮切历史（Vital 实测场景：Level→Pan）" {
     const vital_path = "C:\\Program Files\\Common Files\\VST3/Vital.vst3";
-    const dll_z = std.testing.allocator.dupeZ(u8, vital_path) catch return;
+    const dll_z = std.testing.allocator.dupeSentinel(u8, vital_path, 0) catch return;
     defer std.testing.allocator.free(dll_z);
     const pl = vst_host.loadPlugin(std.testing.allocator, dll_z, 48000, 4096, .instrument) catch return; // 未安装 → 跳过
     // 探针实测的 Vital 参数（版本差异 → 不存在则跳过）
@@ -12860,7 +12859,7 @@ test "撤销：VST3 乐器状态未变时跳过重放（pending 不设）" {
 }
 
 test "VST3 编辑队列：多条排空/最后一条兼容/溢出降级" {
-    const dll_z = std.testing.allocator.dupeZ(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll") catch return;
+    const dll_z = std.testing.allocator.dupeSentinel(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll", 0) catch return;
     defer std.testing.allocator.free(dll_z);
     const pl = vst_host.loadEffect(std.testing.allocator, dll_z, 48000, 4096) catch return;
     defer vst_host.unloadPlugin(std.testing.allocator, pl);
@@ -12916,7 +12915,7 @@ test "VST3 编辑队列：多条排空/最后一条兼容/溢出降级" {
 
 test "撤销：参数增量回放（不 setState）+ 未变槽捕获复用（零 getState）" {
     const dll_path = "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll";
-    const dll_z = std.testing.allocator.dupeZ(u8, dll_path) catch return;
+    const dll_z = std.testing.allocator.dupeSentinel(u8, dll_path, 0) catch return;
     defer std.testing.allocator.free(dll_z);
 
     var app = App{ .allocator = std.testing.allocator };
@@ -12957,7 +12956,7 @@ test "撤销：参数增量回放（不 setState）+ 未变槽捕获复用（零
 
 test "撤销：结构性信号存在时参数回放降级为整块恢复（pending 就绪）" {
     const dll_path = "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll";
-    const dll_z = std.testing.allocator.dupeZ(u8, dll_path) catch return;
+    const dll_z = std.testing.allocator.dupeSentinel(u8, dll_path, 0) catch return;
     defer std.testing.allocator.free(dll_z);
 
     var app = App{ .allocator = std.testing.allocator };
@@ -13057,7 +13056,7 @@ test "VST3 乐器：applyVst3Instrument 清 pending/退役旧实例，保留名�
 }
 
 test "VST3 预设：CID 捕获 + 状态捕获/解码往返（sine-synth 真实插件）" {
-    const dll_z = std.testing.allocator.dupeZ(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll") catch return;
+    const dll_z = std.testing.allocator.dupeSentinel(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll", 0) catch return;
     defer std.testing.allocator.free(dll_z);
 
     var app = App{ .allocator = std.testing.allocator };
@@ -13128,14 +13127,12 @@ test "VST3 自愈：reboundFailedPluginSlots 按 CID 重定位失败槽（只碰
 
     const cid_a = "0102030405060708090a0b0c0d0e0f10";
     const cid_b = "ff02030405060708090a0b0c0d0e0f10";
-    const jsonl = try std.fmt.allocPrint(alloc,
-        "{{\"t\":\"begin\",\"n\":2}}\n" ++
+    const jsonl = try std.fmt.allocPrint(alloc, "{{\"t\":\"begin\",\"n\":2}}\n" ++
         "{{\"t\":\"start\",\"path\":\"{0s}\",\"dll\":\"{0s}\"}}\n" ++
         "{{\"t\":\"ok\",\"path\":\"{0s}\",\"dll\":\"{0s}\",\"name\":\"Vital\",\"role\":\"instrument\",\"classes\":[{{\"cid\":\"{2s}\",\"kind\":\"instrument\"}}]}}\n" ++
         "{{\"t\":\"start\",\"path\":\"{1s}\",\"dll\":\"{1s}\"}}\n" ++
         "{{\"t\":\"ok\",\"path\":\"{1s}\",\"dll\":\"{1s}\",\"name\":\"Nova\",\"role\":\"effect\",\"classes\":[{{\"cid\":\"{3s}\",\"kind\":\"effect\"}}]}}\n" ++
-        "{{\"t\":\"end\",\"ok\":2,\"err\":0}}\n",
-        .{ vital_path, nova_path, cid_a, cid_b });
+        "{{\"t\":\"end\",\"ok\":2,\"err\":0}}\n", .{ vital_path, nova_path, cid_a, cid_b });
     defer alloc.free(jsonl);
     app.plugin_cache = plugin_db.Cache.parseJsonl(alloc, jsonl);
 
@@ -13161,7 +13158,7 @@ test "VST3 自愈：reboundFailedPluginSlots 按 CID 重定位失败槽（只碰
 
 test "VST3 存档：类 CID 捕获（活实例/失败槽）+ JSON 往返" {
     const alloc = std.testing.allocator;
-    const dll_z = alloc.dupeZ(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll") catch return;
+    const dll_z = alloc.dupeSentinel(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll", 0) catch return;
     defer alloc.free(dll_z);
 
     var app = App{ .allocator = alloc };
@@ -13220,12 +13217,10 @@ test "效果器预设：fx 分类映射与可选性" {
     // 缓存驱动的 VST3「**纯效果**」分类（M4 遗留 bug：曾只合成乐器类 → TDR Nova 不可选）
     const fx_cid = "0de7aef2de004e4f544f4249424d3750";
     const inst_cid = "aa030405060708090a0b0c0d0e0f10ff";
-    const jsonl = try std.fmt.allocPrint(std.testing.allocator,
-        "{{\"t\":\"begin\",\"n\":2}}\n" ++
+    const jsonl = try std.fmt.allocPrint(std.testing.allocator, "{{\"t\":\"begin\",\"n\":2}}\n" ++
         "{{\"t\":\"ok\",\"path\":\"C:/v/Nova.vst3\",\"dll\":\"C:/v/Nova.vst3\",\"name\":\"Nova\",\"role\":\"effect\",\"classes\":[{{\"cid\":\"{0s}\",\"kind\":\"effect\"}}]}}\n" ++
         "{{\"t\":\"ok\",\"path\":\"C:/v/Both.vst3\",\"dll\":\"C:/v/Both.vst3\",\"name\":\"Both\",\"role\":\"both\",\"classes\":[{{\"cid\":\"{1s}\",\"kind\":\"instrument\"}},{{\"cid\":\"{2s}\",\"kind\":\"effect\"}}]}}\n" ++
-        "{{\"t\":\"end\",\"ok\":2,\"err\":0}}\n",
-        .{ fx_cid, inst_cid, "bb030405060708090a0b0c0d0e0f10ff" });
+        "{{\"t\":\"end\",\"ok\":2,\"err\":0}}\n", .{ fx_cid, inst_cid, "bb030405060708090a0b0c0d0e0f10ff" });
     defer std.testing.allocator.free(jsonl);
     app.plugin_cache = plugin_db.Cache.parseJsonl(std.testing.allocator, jsonl);
 
@@ -13282,8 +13277,7 @@ test "预设浏览：可见性规则（乐器/效果互不可见；未安装 VST
     // 缓存：一个纯效果插件 + 一个乐器插件（均已安装）
     const fx_cid = "0de7aef2de004e4f544f4249424d3750";
     const in_cid = "0102030405060708090a0b0c0d0e0f10";
-    const jsonl = try std.fmt.allocPrint(std.testing.allocator,
-        "{{\"t\":\"begin\",\"n\":1}}\n" ++
+    const jsonl = try std.fmt.allocPrint(std.testing.allocator, "{{\"t\":\"begin\",\"n\":1}}\n" ++
         "{{\"t\":\"ok\",\"path\":\"C:/v/Nova\",\"dll\":\"C:/v/Nova\",\"name\":\"Nova\",\"role\":\"effect\",\"classes\":[{{\"cid\":\"{s}\",\"kind\":\"effect\"}}]}}\n" ++
         "{{\"t\":\"ok\",\"path\":\"C:/v/Vita\",\"dll\":\"C:/v/Vita\",\"name\":\"Vita\",\"role\":\"instrument\",\"classes\":[{{\"cid\":\"{s}\",\"kind\":\"instrument\"}}]}}\n" ++
         "{{\"t\":\"end\",\"ok\":1,\"err\":0}}\n", .{ fx_cid, in_cid });
@@ -13322,7 +13316,7 @@ test "预设浏览：可见性规则（乐器/效果互不可见；未安装 VST
 
 test "VST3 乐器：多输出插件（SFLT，系统装有才跑）加载 + 处理不崩" {
     const alloc = std.testing.allocator;
-    const pz = alloc.dupeZ(u8, "C:\\Program Files\\Common Files\\VST3\\SFLT.vst3") catch return;
+    const pz = alloc.dupeSentinel(u8, "C:\\Program Files\\Common Files\\VST3\\SFLT.vst3", 0) catch return;
     defer alloc.free(pz);
     const pl = vst_host.loadPlugin(alloc, pz, 48000, 4096, .instrument) catch |e| switch (e) {
         error.LoadLibraryFailed, error.NoGetPluginFactory => return, // 未安装：跳过
@@ -13332,7 +13326,7 @@ test "VST3 乐器：多输出插件（SFLT，系统装有才跑）加载 + 处�
     // 0进17出：多输出协商成功（旧版直接 MultiOutputUnsupported 拒绝）
     try std.testing.expect(pl.out_bus_count >= 1);
     // 处理两块（无 sf2 → 静音，关键是**不崩**——旧版 SFLT 会在此崩）
-    var buf: [512 * 2]f32 = [_]f32{0} ** 1024;
+    var buf: [512 * 2]f32 = @splat(0);
     const ht = vst_host.HostTime{ .playing = true, .tempo = 120, .time_num = 4, .time_den = 4, .abs_samples = 0, .ppq = 0 };
     pl.processInstrument(&buf, 512, &.{}, ht);
     pl.processInstrument(&buf, 512, &.{}, ht);
@@ -13357,7 +13351,7 @@ test "VST3 加载：中文路径（LoadLibraryW 回归）" {
     defer alloc.free(dst);
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = dst, .data = src }) catch return error.IoFailure;
 
-    const dz = try alloc.dupeZ(u8, dst);
+    const dz = try alloc.dupeSentinel(u8, dst, 0);
     defer alloc.free(dz);
     const pl = vst_host.loadPlugin(alloc, dz, 48000, 4096, .instrument) catch return error.ChinesePathLoadFailed;
     defer vst_host.unloadPlugin(alloc, pl);
@@ -13367,7 +13361,7 @@ test "VST3 加载：中文路径（LoadLibraryW 回归）" {
 }
 
 test "VST3 状态：历史携带插件状态（池共享/去重）与撤销回退" {
-    const dll_z = std.testing.allocator.dupeZ(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll") catch return;
+    const dll_z = std.testing.allocator.dupeSentinel(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll", 0) catch return;
     defer std.testing.allocator.free(dll_z);
 
     var app = App{ .allocator = std.testing.allocator };
@@ -13620,7 +13614,6 @@ test "app: SONG 下静音轨道不调度其音符片段" {
 
     sequencer.reset(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, true, 0, 0);
     sequencer.scheduleRange(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, true, 0, 0, 64);
-    
 
     // 清空队列，静音轨道 0 后重扫
     var tmpq: [512]synth.SchedEvent = undefined;
@@ -13628,7 +13621,7 @@ test "app: SONG 下静音轨道不调度其音符片段" {
     app.setTrackMuted(0, true);
     sequencer.reset(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, true, 0, 0);
     sequencer.scheduleRange(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, true, 0, 0, 64);
-    
+
     var outq: [512]synth.SchedEvent = undefined;
     try std.testing.expectEqual(@as(usize, 0), app.sched_events.drain(&outq));
 }

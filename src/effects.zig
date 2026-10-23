@@ -450,7 +450,7 @@ test "effects: 延迟随机模糊——极端参数不越界（回归：读取�
     const d = try testing.allocator.create(Delay);
     defer testing.allocator.destroy(d);
     d.* = Delay{};
-    var p: [max_params]f32 = [_]f32{0} ** max_params;
+    var p: [max_params]f32 = @splat(0);
     p[0] = @floatFromInt(delay_tempo_default);
     p[1] = 0.35;
     var buf: [8192]f32 = undefined;

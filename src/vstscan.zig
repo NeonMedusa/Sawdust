@@ -97,7 +97,7 @@ pub fn cliMain(init: std.process.Init) !u8 {
             std.debug.print("用法：Sawdust --vst-scan --buses <文件.vst3>\n", .{});
             return 1;
         };
-        const pz = alloc.dupeZ(u8, p) catch return 1;
+        const pz = alloc.dupeSentinel(u8, p, 0) catch return 1;
         defer alloc.free(pz);
         host.dumpBuses(pz) catch |e| {
             std.debug.print("探测失败：{s}\n", .{@errorName(e)});
@@ -111,7 +111,7 @@ pub fn cliMain(init: std.process.Init) !u8 {
             std.debug.print("用法：Sawdust --vst-scan --classes <文件.vst3>\n", .{});
             return 1;
         };
-        const pz = alloc.dupeZ(u8, p) catch return 1;
+        const pz = alloc.dupeSentinel(u8, p, 0) catch return 1;
         defer alloc.free(pz);
         const s = host.scanModule(pz) catch |e| {
             std.debug.print("探测失败：{s}\n", .{@errorName(e)});
@@ -128,7 +128,7 @@ pub fn cliMain(init: std.process.Init) !u8 {
             std.debug.print("用法：Sawdust --vst-scan --params <文件.vst3>\n", .{});
             return 1;
         };
-        const pz = alloc.dupeZ(u8, p) catch return 1;
+        const pz = alloc.dupeSentinel(u8, p, 0) catch return 1;
         defer alloc.free(pz);
         const pl = host.loadEffect(alloc, pz, 48000, 4096) catch |e| {
             std.debug.print("加载失败：{s}\n", .{@errorName(e)});
@@ -213,7 +213,7 @@ pub fn cliMain(init: std.process.Init) !u8 {
 
 /// 音频试跑：加载 → 喂正弦（效果器）/静音（乐器）→ 打印输入/输出 RMS。
 fn runTest(alloc: std.mem.Allocator, path: []const u8, role: host.Role) void {
-    const pz = alloc.dupeZ(u8, path) catch return;
+    const pz = alloc.dupeSentinel(u8, path, 0) catch return;
     defer alloc.free(pz);
     const sr: f64 = 48000;
     const sr_u: u32 = 48000;
@@ -268,7 +268,7 @@ fn runTest(alloc: std.mem.Allocator, path: []const u8, role: host.Role) void {
 /// 编辑器接口冒烟：加载 → openEditor → 泵消息 N 秒 → closeEditor。
 /// （窗口会真实弹出；期间可交互测试；无 GUI 会话也能验证协议调用不崩）
 fn editorSmoke(alloc: std.mem.Allocator, path: []const u8, secs: u32) void {
-    const pz = alloc.dupeZ(u8, path) catch return;
+    const pz = alloc.dupeSentinel(u8, path, 0) catch return;
     defer alloc.free(pz);
     const pl = host.loadEffect(alloc, pz, 48000, 4096) catch |e| {
         std.debug.print("加载失败：{s}\n", .{@errorName(e)});
@@ -277,7 +277,7 @@ fn editorSmoke(alloc: std.mem.Allocator, path: []const u8, secs: u32) void {
     defer host.unloadPlugin(alloc, pl);
     // 先跑一小块音频（真实宿主里音频一直在跑；某些插件的 UI 依赖处理已开始）
     {
-        var warm: [512 * 2]f32 = [_]f32{0} ** 1024;
+        var warm: [512 * 2]f32 = @splat(0);
         pl.process(&warm, 512);
     }
     switch (pl.openEditor(null)) {

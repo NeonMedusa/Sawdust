@@ -418,9 +418,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             view_w,
             lane_y,
             lane_h,
-               lane_x,
-               scroll_x0,
-               zoom,
+            lane_x,
+            scroll_x0,
+            zoom,
             @floatFromInt(util.piano_step_w),
             spb,
             model.stepsPerBeat(app.time_den),
@@ -594,9 +594,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
 
         if (app.sel.song_mode) {
             // SONG：找当前样式最左片段 → 全局步换算为局部步；无片段/不在范围内不显示
-                // SONG 模式片段参照 = **锚**（双击的片段；无快照回退最左）——
-                // 标尺拖动/游标绘制/换算统一到锚（实测 bug：双击后片段后放游标跑到第一个片段）
-                if (app.patOriginClip()) |c| {
+            // SONG 模式片段参照 = **锚**（双击的片段；无快照回退最左）——
+            // 标尺拖动/游标绘制/换算统一到锚（实测 bug：双击后片段后放游标跑到第一个片段）
+            if (app.patOriginClip()) |c| {
                 if (model.clipSongToLocal(c, app.playback.song_step) != null) {
                     // **平滑小数步**（渲染帧线性；音频缓冲量化被吸收——实测“游标还是抖”的终解）
                     const local_f: f32 = app.cursorDisplay(true) - @as(f32, @floatFromInt(c.start)) + @as(f32, @floatFromInt(c.offset));
@@ -1071,7 +1071,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         const mode = app.piano.lane_mode;
         const near = view_note_lane.nearestNoteInPiano(app, ui.mouse_x, ui.mouse_y, lane_x, lane_y, step_ws, scroll_s, app.piano.key_h, app.piano.scroll, pattern);
         if (view_note_lane.altWheelAdjust(app, mode, ui.wheel, near)) {
-                app.touchGesture(if (mode == .velocity) "调整力度" else "调整声像");
+            app.touchGesture(if (mode == .velocity) "调整力度" else "调整声像");
         }
         ui.wheel = 0; // 消费
     }
@@ -1100,7 +1100,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             var tgt = app.piano.key_h_target;
             // 反向输入先抵消未完成的补间（同横向缩放；实测手感 bug）
             if ((ui.wheel > 0 and tgt < app.piano.key_h) or (ui.wheel < 0 and tgt > app.piano.key_h)) tgt = app.piano.key_h;
-                app.piano.key_h_target = std.math.clamp(tgt + ui.wheel * 2, zoom_min_h, util.piano_key_h_max);
+            app.piano.key_h_target = std.math.clamp(tgt + ui.wheel * 2, zoom_min_h, util.piano_key_h_max);
         } else {
             // 裸滚轮：纵向滚动——只设补间目标（滚轮离散 → 逐帧平滑）
             app.piano.scroll_target = std.math.clamp(app.piano.scroll_target - util.scrollDelta(ui), 0, @max(0, content_h - lane_h));
@@ -1269,7 +1269,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         else
             app.nudgeSelectedNotes(mv.d_step, mv.d_pitch);
         if (changed) {
-                app.touchGesture("移动音符");
+            app.touchGesture("移动音符");
         }
         app.pending_move = null;
     }

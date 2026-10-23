@@ -127,7 +127,7 @@ fn parseTrack(
     chan_pan: *[16]u8,
     chan_pan_set: *[16]bool,
 ) !void {
-    var pending: std.ArrayListUnmanaged(Pending) = .{ .items = &.{}, .capacity = 0 };
+    var pending: std.ArrayListUnmanaged(Pending) = .empty;
     defer pending.deinit(allocator);
 
     var i: usize = 0;
@@ -219,14 +219,14 @@ pub fn parse(allocator: std.mem.Allocator, data: []const u8) !Parsed {
     if (division & 0x8000 != 0) return error.SmpteTimeNotSupported; // SMPTE 时基暂不支持
     const tpq: i32 = @max(1, division);
 
-    var notes: std.ArrayListUnmanaged(ParsedNote) = .{ .items = &.{}, .capacity = 0 };
+    var notes: std.ArrayListUnmanaged(ParsedNote) = .empty;
     errdefer notes.deinit(allocator);
 
     var pos: usize = 8 + header_len;
     var track_i: usize = 0;
     // CC10 跨轨全局（format 1 多轨共享同一声像状态）
-    var chan_pan = [_]u8{64} ** 16;
-    var chan_pan_set = [_]bool{false} ** 16;
+    var chan_pan: [16]u8 = @splat(64);
+    var chan_pan_set: [16]bool = @splat(false);
     while (track_i < ntrks and pos + 8 <= data.len) : (track_i += 1) {
         if (!std.mem.eql(u8, data[pos .. pos + 4], "MTrk")) break; // 结构异常：宽容停止
         const tlen = std.mem.readInt(u32, data[pos + 4 .. pos + 8][0..4], .big);
@@ -349,11 +349,11 @@ pub fn write(allocator: std.mem.Allocator, song: ExportSong) ![]u8 {
     const tpq = export_tpq;
 
     // 按通道收集事件（音符 + 声像 CC10；CC 去重：同值连续不重发）
-    var evs: [16]std.ArrayListUnmanaged(Event) = [_]std.ArrayListUnmanaged(Event){.{ .items = &.{}, .capacity = 0 }} ** 16;
-    var ccs: [16]std.ArrayListUnmanaged(CcEvent) = [_]std.ArrayListUnmanaged(CcEvent){.{ .items = &.{}, .capacity = 0 }} ** 16;
+    var evs: [16]std.ArrayListUnmanaged(Event) = @splat(.empty);
+    var ccs: [16]std.ArrayListUnmanaged(CcEvent) = @splat(.empty);
     defer for (&evs) |*e| e.deinit(allocator);
     defer for (&ccs) |*c| c.deinit(allocator);
-    var used = [_]bool{false} ** 16;
+    var used: [16]bool = @splat(false);
 
     for (song.notes) |n| {
         const ch: u4 = @intCast(@min(n.channel, 15));
@@ -378,7 +378,7 @@ pub fn write(allocator: std.mem.Allocator, song: ExportSong) ![]u8 {
         if (u) ntrks += 1;
     }
 
-    var out: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 };
+    var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
     try out.appendSlice(allocator, "MThd");
@@ -389,7 +389,7 @@ pub fn write(allocator: std.mem.Allocator, song: ExportSong) ![]u8 {
 
     // 指挥轨
     {
-        var track: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 };
+        var track: std.ArrayListUnmanaged(u8) = .empty;
         defer track.deinit(allocator);
         try writeConductorTrack(allocator, &track, song);
         try appendChunk(allocator, &out, track.items);
@@ -397,7 +397,7 @@ pub fn write(allocator: std.mem.Allocator, song: ExportSong) ![]u8 {
     // 各通道音符轨
     for (&evs, 0..) |*e, ch| {
         if (!used[ch]) continue;
-        var track: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 };
+        var track: std.ArrayListUnmanaged(u8) = .empty;
         defer track.deinit(allocator);
         try writeNoteTrack(allocator, &track, e.items, ccs[ch].items, @intCast(ch));
         try appendChunk(allocator, &out, track.items);
@@ -431,7 +431,7 @@ test "midi: VLQ 编解码（边界值）" {
     const allocator = std.testing.allocator;
     const cases = [_]u64{ 0, 1, 127, 128, 255, 0x3FFF, 0x4000, 0x1FFFFF, 0x0FFFFFFF };
     for (cases) |v| {
-        var buf: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 };
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
         defer buf.deinit(allocator);
         try writeVlq(&buf, allocator, v);
         var i: usize = 0;
@@ -478,7 +478,7 @@ test "midi: 解析最小文件（running status + vel=0 off + 未配对收尾）
         0x40, 0x00, 0xFF, 0x2F,
         0x00,
     };
-    var file: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 };
+    var file: std.ArrayListUnmanaged(u8) = .empty;
     defer file.deinit(allocator);
     try file.appendSlice(allocator, "MThd");
     try appendU32(allocator, &file, 6);
@@ -516,7 +516,7 @@ test "midi: 同音高重叠——note-off FIFO 配对最早的一个" {
         0x30, 0x80, 0x3C, 0x40,
         0x00, 0xFF, 0x2F, 0x00,
     };
-    var file: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 };
+    var file: std.ArrayListUnmanaged(u8) = .empty;
     defer file.deinit(allocator);
     try file.appendSlice(allocator, "MThd");
     try appendU32(allocator, &file, 6);
@@ -575,7 +575,7 @@ test "midi: 力度/通道声像（CC10）导出 → 解析往返" {
         .{ .start_step = 24, .len_steps = 24, .pitch = 64, .channel = 0, .velocity = 127 },
         .{ .start_step = 48, .len_steps = 24, .pitch = 67, .channel = 1 }, // 通道 1：默认力度 / 声像
     };
-    var cpan = [_]u8{64} ** 16;
+    var cpan: [16]u8 = @splat(64);
     cpan[0] = 20; // 模拟乐器声像：通道 0 偏左
     const bytes = try write(allocator, .{ .notes = &notes, .channel_pan = cpan });
     defer allocator.free(bytes);
@@ -603,7 +603,7 @@ test "midi: 解析容错（坏头 / 截断轨道 / SMPTE）" {
     const allocator = std.testing.allocator;
     try std.testing.expectError(error.InvalidMidi, parse(allocator, "not midi at all!"));
     // 头块正常但轨道截断：能解析出已完成的事件（宽容）
-    var file: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 };
+    var file: std.ArrayListUnmanaged(u8) = .empty;
     defer file.deinit(allocator);
     try file.appendSlice(allocator, "MThd");
     try appendU32(allocator, &file, 6);
@@ -618,7 +618,7 @@ test "midi: 解析容错（坏头 / 截断轨道 / SMPTE）" {
     try std.testing.expectEqual(@as(usize, 1), parsed.notes.len); // 未配对 → 收尾
 
     // SMPTE 时基（division 高位 1）→ 明确报错
-    var smpte: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 };
+    var smpte: std.ArrayListUnmanaged(u8) = .empty;
     defer smpte.deinit(allocator);
     try smpte.appendSlice(allocator, "MThd");
     try appendU32(allocator, &smpte, 6);

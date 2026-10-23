@@ -509,7 +509,7 @@ fn legacySkip(ver: u8, comptime T: type, comptime name: []const u8) bool {
 
 const BinWriter = struct {
     a: std.mem.Allocator,
-    buf: std.ArrayListUnmanaged(u8) = .{ .items = &.{}, .capacity = 0 },
+    buf: std.ArrayListUnmanaged(u8) = .empty,
     /// 目标格式版本（默认当前；`toBinaryLegacyV5` 写旧布局时改为旧版本）
     version: u8 = binary_version,
 
@@ -612,21 +612,22 @@ fn binWriteValue(comptime T: type, w: *BinWriter, v: T) !void {
         .array => |arr| {
             for (v) |e| try binWriteValue(arr.child, w, e);
         },
-        .@"enum" => try w.putVarint(@intFromEnum(v)),
+        .@"enum" => try w.putVarint(@backingInt(v)),
         .@"struct" => |s| {
-            inline for (s.fields) |f| {
-                if (comptime introducedVersion(T, f.name) != null) {
-                    if (!legacySkip(w.version, T, f.name)) { // 目标版本更旧 → 不写该字段
-                        if (comptime isB64TextField(f.name, f.type)) {
-                            try binWriteB64Field(w, @field(v, f.name));
+            // 0.17：`@typeInfo` 改为数组结构体风格（field_names / field_types / field_attrs）
+            inline for (s.field_names, s.field_types) |fname, FType| {
+                if (comptime introducedVersion(T, fname) != null) {
+                    if (!legacySkip(w.version, T, fname)) { // 目标版本更旧 → 不写该字段
+                        if (comptime isB64TextField(fname, FType)) {
+                            try binWriteB64Field(w, @field(v, fname));
                         } else {
-                            try binWriteValue(f.type, w, @field(v, f.name));
+                            try binWriteValue(FType, w, @field(v, fname));
                         }
                     }
-                } else if (comptime isB64TextField(f.name, f.type)) {
-                    try binWriteB64Field(w, @field(v, f.name));
+                } else if (comptime isB64TextField(fname, FType)) {
+                    try binWriteB64Field(w, @field(v, fname));
                 } else {
-                    try binWriteValue(f.type, w, @field(v, f.name));
+                    try binWriteValue(FType, w, @field(v, fname));
                 }
             }
         },
@@ -685,22 +686,21 @@ fn binReadValue(comptime T: type, r: *BinReader, a: std.mem.Allocator) !T {
             for (&out) |*e| e.* = try binReadValue(arr.child, r, a);
             return out;
         },
-        .@"enum" => return @enumFromInt(try r.varint()),
+        .@"enum" => return @fromBackingInt(@intCast(try r.varint())),
         .@"struct" => |s| {
             var out: T = undefined;
-            inline for (s.fields) |f| {
-                if (comptime introducedVersion(T, f.name) != null) {
-                    if (legacySkip(r.version, T, f.name)) {
-                        // 旧版本没有该字段 → 用声明默认值
-                        const dv = f.default_value_ptr orelse @compileError("legacy v5 跳过字段必须有默认值：" ++ f.name);
-                        @field(out, f.name) = @as(*const f.type, @ptrCast(@alignCast(dv))).*;
+            inline for (s.field_names, s.field_types, s.field_attrs) |fname, FType, attrs| {
+                if (comptime introducedVersion(T, fname) != null) {
+                    if (legacySkip(r.version, T, fname)) {
+                        // 旧版本没有该字段 → 用声明默认值（0.17：默认值挂在 field_attrs 上）
+                        @field(out, fname) = attrs.defaultValue(FType) orelse @compileError("legacy v5 跳过字段必须有默认值：" ++ fname);
                     } else {
-                        @field(out, f.name) = try binReadValue(f.type, r, a);
+                        @field(out, fname) = try binReadValue(FType, r, a);
                     }
-                } else if (comptime isB64TextField(f.name, f.type)) {
-                    @field(out, f.name) = try binReadB64Field(r, a);
+                } else if (comptime isB64TextField(fname, FType)) {
+                    @field(out, fname) = try binReadB64Field(r, a);
                 } else {
-                    @field(out, f.name) = try binReadValue(f.type, r, a);
+                    @field(out, fname) = try binReadValue(FType, r, a);
                 }
             }
             return out;
@@ -1107,8 +1107,9 @@ fn deepEq(comptime T: type, a: T, b: T) bool {
             break :blk true;
         },
         .@"struct" => |s| blk: {
-            inline for (s.fields) |f| {
-                if (!deepEq(f.type, @field(a, f.name), @field(b, f.name))) break :blk false;
+            // 0.17：数组结构体风格（field_names / field_types 等长并列）
+            inline for (s.field_names, s.field_types) |fname, FType| {
+                if (!deepEq(FType, @field(a, fname), @field(b, fname))) break :blk false;
             }
             break :blk true;
         },

@@ -2,11 +2,8 @@
     .name = .Sawdust,
     .version = "0.0.0",
     .fingerprint = 0xb20f998bcb46ed2a,
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .license = .mit,
-    .dependencies = .{
-        .zig_vst3 = .{ .path = "libs/zig-vst3" },
-    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

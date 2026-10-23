@@ -43,10 +43,21 @@ pub fn build(b: *std.Build) void {
     }
 
     b.installArtifact(exe);
-    // 主程序也用 VST3 绑定（插件槽）——同一 path 依赖模块
-    // （build.zig.zon 的 path 依赖 → libs/zig-vst3 submodule；构建全程不碰网络——
-    //   避开 zig fetch 不走系统代理的痛点）
-    exe.root_module.addImport("zig_vst3", b.dependency("zig_vst3", .{ .target = target, .optimize = optimize }).module("zig-vst3"));
+    // VST3 绑定：**直接建模块**（不跑 submodule 的 build.zig）——
+    // 1) 构建全程不碰网络；2) submodule 的 build.zig 仍在用 0.16 构建 API（0.17 里
+    //    `getInstallPath` 等已移除），而我们只需要它的两个源码模块。
+    const vst3_core_mod = b.createModule(.{
+        .root_source_file = b.path("libs/zig-vst3/zig-vst3-plugin/src/core.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const vst3_mod = b.createModule(.{
+        .root_source_file = b.path("libs/zig-vst3/zig-vst3/src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    vst3_mod.addImport("zig-vst3-plugin-core", vst3_core_mod);
+    exe.root_module.addImport("zig_vst3", vst3_mod);
 
     // VST3 探测/扫描工具已**并入主程序**（`Sawdust.exe --vst-scan …` 同二进制自举；
     // 插件扫描以独立进程运行自身 = 保留坏插件崩溃隔离）；不再单独构建 vstscan.exe。
@@ -55,7 +66,8 @@ pub fn build(b: *std.Build) void {
     const run_cmd = b.addRunArtifact(exe);
     run_step.dependOn(&run_cmd.step);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
+    // 0.17：`--` 之后的透传参数统一由 Run 步骤自己添加（`b.args` 已移除）
+    run_cmd.addPassthruArgs();
 
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);

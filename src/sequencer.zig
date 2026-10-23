@@ -399,7 +399,7 @@ fn diffSide(
     emit_on: bool,
 ) void {
     // 本侧去重：seen[pitch] 的 bit i = 乐器 i 已处理
-    var seen: [128]u32 = [_]u32{0} ** 128;
+    var seen: [128]u32 = @splat(0);
     for (side_notes) |nt| {
         if (nt.pitch < 0 or nt.pitch > 127) continue;
         if (nt.instrument < 0 or nt.instrument >= @as(i32, @intCast(instrument_cap))) continue;

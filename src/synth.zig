@@ -55,7 +55,7 @@ pub const Waveform = enum(u8) {
     }
 
     pub fn next(self: Waveform) Waveform {
-        return @enumFromInt((@intFromEnum(self) + 1) % waveform_count);
+        return @fromBackingInt(@intCast((@backingInt(self) + 1) % waveform_count));
     }
 };
 
@@ -184,7 +184,7 @@ pub fn schedEventLess(_: void, a: SchedEvent, b: SchedEvent) bool {
 pub fn Ring(comptime T: type, comptime capacity: usize) type {
     return struct {
         const Self = @This();
-        buf: [capacity]T = [_]T{.{}} ** capacity,
+        buf: [capacity]T = @splat(.{}),
         /// 写位置（UI 线程）
         write: Atomic(usize) = Atomic(usize).init(0),
         /// 读位置（音频线程）
@@ -227,7 +227,7 @@ pub const Voice = struct {
     freq: f32 = 0,
     /// 各振荡器**各副本**的相位 [0,1)：`[osc][副本]`。
     /// 副本 0 = 基础音；1..copies-1 = 合奏副本（见 `OscParams.unison`）
-    phase: [osc_count][max_unison]f32 = [_][max_unison]f32{[_]f32{0} ** max_unison} ** osc_count,
+    phase: [osc_count][max_unison]f32 = @splat(@as([max_unison]f32, @splat(0))),
     env_stage: EnvStage = .idle,
     env_level: f32 = 0,
     /// 进入 release 时的电平（线性下降用）
@@ -256,7 +256,7 @@ pub const Voice = struct {
 /// 每池，16 层鼓组按整池算 1.36MB；小池 → 9.6KB/层。
 pub fn SynthN(comptime voice_count: usize) type {
     return struct {
-        voices: [voice_count]Voice = [_]Voice{.{}} ** voice_count,
+        voices: [voice_count]Voice = @splat(.{}),
         /// 主音量平滑（防 zipper 噪声）
         smoothed_master: f32 = 0,
         /// 声部分配的轮转起点（避免每次从头扫描）
@@ -457,7 +457,7 @@ pub fn render(
     for (0..osc_count) |i| {
         osc_on[i] = params.osc[i].enabled.load(.monotonic);
         osc_vol[i] = std.math.clamp(params.osc[i].volume.load(.monotonic), 0, 1);
-        osc_wave[i] = @enumFromInt(params.osc[i].waveform.load(.monotonic) % waveform_count);
+        osc_wave[i] = @fromBackingInt(@intCast(params.osc[i].waveform.load(.monotonic) % waveform_count));
     }
 
     // 合奏（unison）快照（每块一次）：副本数 / 每副本失谐 / 立体声展开 / 增益补偿。
@@ -644,7 +644,7 @@ test "synth: 合奏——立体声展开与响度量级（增益补偿）" {
     var p = SynthParams{};
     p.osc[0].enabled.store(true, .monotonic);
     p.osc[0].volume.store(1.0, .monotonic);
-    p.osc[0].waveform.store(@intFromEnum(Waveform.sawtooth), .monotonic);
+    p.osc[0].waveform.store(@backingInt(Waveform.sawtooth), .monotonic);
     p.attack.store(0.0, .monotonic); // → 1ms
     p.sustain.store(1.0, .monotonic);
 
@@ -697,7 +697,7 @@ test "synth: 合奏散布——0% 无拍频（每窗电平恒定）、50% 明显
     var p = SynthParams{};
     p.osc[0].enabled.store(true, .monotonic);
     p.osc[0].volume.store(1.0, .monotonic);
-    p.osc[0].waveform.store(@intFromEnum(Waveform.sawtooth), .monotonic);
+    p.osc[0].waveform.store(@backingInt(Waveform.sawtooth), .monotonic);
     p.osc[0].unison.store(8, .monotonic);
     p.attack.store(0.0, .monotonic); // → 1ms
     p.sustain.store(1.0, .monotonic); // 包络恒定（不干扰电平测量）
@@ -749,7 +749,7 @@ test "synth: 散布功率——参数参与渲染（输出与线性不同）" {
     var p = SynthParams{};
     p.osc[0].enabled.store(true, .monotonic);
     p.osc[0].volume.store(1.0, .monotonic);
-    p.osc[0].waveform.store(@intFromEnum(Waveform.sawtooth), .monotonic);
+    p.osc[0].waveform.store(@backingInt(Waveform.sawtooth), .monotonic);
     p.osc[0].unison.store(4, .monotonic);
     p.osc[0].unison_detune.store(1.0, .monotonic);
     p.attack.store(0.0, .monotonic);
@@ -906,7 +906,7 @@ test "synth: 噪声振荡器输出非恒定" {
     var p = SynthParams{};
     p.osc[0].enabled.store(true, .monotonic);
     p.osc[0].volume.store(1.0, .monotonic);
-    p.osc[0].waveform.store(@intFromEnum(Waveform.noise), .monotonic);
+    p.osc[0].waveform.store(@backingInt(Waveform.noise), .monotonic);
 
     var st = Synth{};
     var q = EventQueue{};
@@ -926,7 +926,7 @@ test "synth: 低通滤波衰减高频能量" {
     var p = SynthParams{};
     p.osc[0].enabled.store(true, .monotonic);
     p.osc[0].volume.store(1.0, .monotonic);
-    p.osc[0].waveform.store(@intFromEnum(Waveform.square), .monotonic);
+    p.osc[0].waveform.store(@backingInt(Waveform.square), .monotonic);
     p.attack.store(0.0, .monotonic);
     p.sustain.store(1.0, .monotonic);
 

@@ -36,8 +36,8 @@ pub const Folder = struct {
 
 pub const Config = struct {
     arena: std.heap.ArenaAllocator,
-    folders: std.ArrayListUnmanaged(Folder) = .{ .items = &.{}, .capacity = 0 },
-    files: std.ArrayListUnmanaged([]const u8) = .{ .items = &.{}, .capacity = 0 },
+    folders: std.ArrayListUnmanaged(Folder) = .empty,
+    files: std.ArrayListUnmanaged([]const u8) = .empty,
 
     fn alloc(self: *Config) std.mem.Allocator {
         return self.arena.allocator();
@@ -252,7 +252,7 @@ pub const Cache = struct {
     pub fn parseJsonl(backing: std.mem.Allocator, text: []const u8) Cache {
         var c = Cache{ .arena = std.heap.ArenaAllocator.init(backing) };
         const al = c.alloc();
-        var entries: std.ArrayListUnmanaged(Entry) = .{ .items = &.{}, .capacity = 0 };
+        var entries: std.ArrayListUnmanaged(Entry) = .empty;
         var pending: ?[]const u8 = null; // 已 start、未见结果的路径
 
         var lines = std.mem.splitScalar(u8, text, '\n');

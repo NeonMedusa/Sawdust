@@ -122,7 +122,7 @@ pub const Category = struct {
     name: []u8,
     dir: []u8 = &.{},
     label: ?[]u8 = null,
-    presets: std.ArrayListUnmanaged([]u8) = .{ .items = &.{}, .capacity = 0 },
+    presets: std.ArrayListUnmanaged([]u8) = .empty,
 
     fn deinit(self: *Category, allocator: std.mem.Allocator) void {
         allocator.free(self.name);
@@ -135,7 +135,7 @@ pub const Category = struct {
 
 /// 扫描结果（调用方 `deinit`）
 pub const Library = struct {
-    categories: std.ArrayListUnmanaged(Category) = .{ .items = &.{}, .capacity = 0 },
+    categories: std.ArrayListUnmanaged(Category) = .empty,
 
     pub fn deinit(self: *Library, allocator: std.mem.Allocator) void {
         for (self.categories.items) |*c| c.deinit(allocator);
@@ -910,9 +910,7 @@ test "preset: 目录名纯展示——身份从文件读（纯名目录）" {
     try std.testing.expectEqualStrings(dn, categoryDirName("TDR Nova", "0de7aef2de004e4f544f4249424d3754", true, &d2)); // 确定性
     try std.testing.expect(!std.mem.eql(u8, dn, categoryDirName("TDR Nova", "ff0de7aef2de004e4f544f4249424d3754", true, &d2))); // 不同 CID
     // 关键回归：TUID 前缀相似（Vital/TDR 实测）+ 直接截头会撞——哈希后缀不撞
-    try std.testing.expect(!std.mem.eql(u8,
-        categoryDirName("X", cid, true, &dirb),
-        categoryDirName("X", "56545356746976616974616c00001000", true, &d2))); // 仅尾部不同
+    try std.testing.expect(!std.mem.eql(u8, categoryDirName("X", cid, true, &dirb), categoryDirName("X", "56545356746976616974616c00001000", true, &d2))); // 仅尾部不同
     // 清洗非法字符/空名兑底
     try std.testing.expectEqualStrings("a_b", categoryDirName("a/b", "0de7aef2de004e4f544f4249424d3754", false, &dirb));
     try std.testing.expectEqualStrings("VST3", categoryDirName("", "0de7aef2de004e4f544f4249424d3754", false, &dirb));

@@ -85,7 +85,7 @@ const win = if (is_windows) struct {
         const filter_w = try toFilterUtf16Z(allocator, filter);
         defer allocator.free(filter_w);
 
-        var name_buf: [name_capacity]u16 = [_]u16{0} ** name_capacity;
+        var name_buf: [name_capacity]u16 = @splat(0);
         if (default_name.len > 0) {
             const n = try toUtf16(default_name, name_buf[0 .. name_capacity - 1]);
             name_buf[n] = 0;
@@ -229,8 +229,8 @@ pub fn pickFolder(allocator: std.mem.Allocator, owner: ?*anyopaque, title: []con
 // ── 工具（可测）──
 
 /// 「Sawdust 工程」过滤器字符串（人类可读形式；`toFilterUtf16Z` 会转成 Win32 格式）
-    pub const project_filter = "Sawdust 工程 (*.saw)\x00*.saw\x00所有文件 (*.*)\x00*.*\x00";
-    pub const audio_filter = "音频文件 (*.wav;*.flac;*.mp3;*.ogg)\x00*.wav;*.flac;*.mp3;*.ogg\x00所有文件 (*.*)\x00*.*\x00";
+pub const project_filter = "Sawdust 工程 (*.saw)\x00*.saw\x00所有文件 (*.*)\x00*.*\x00";
+pub const audio_filter = "音频文件 (*.wav;*.flac;*.mp3;*.ogg)\x00*.wav;*.flac;*.mp3;*.ogg\x00所有文件 (*.*)\x00*.*\x00";
 pub const wav_filter = "WAV 音频 (*.wav)\x00*.wav\x00所有文件 (*.*)\x00*.*\x00";
 pub const vst3_filter = "VST3 插件 (*.vst3)\x00*.vst3\x00所有文件 (*.*)\x00*.*\x00";
 
@@ -238,7 +238,7 @@ pub const vst3_filter = "VST3 插件 (*.vst3)\x00*.vst3\x00所有文件 (*.*)\x0
 /// 输入以单 NUL 分隔、单 NUL 结尾；输出在末尾再补一个 NUL。
 pub fn toFilterUtf16Z(allocator: std.mem.Allocator, filter: []const u8) ![:0]u16 {
     // 计算需要的码元数（UTF-8 → UTF-16 最坏情况 ×2，加上双 NUL）
-    var list: std.ArrayListUnmanaged(u16) = .{ .items = &.{}, .capacity = 0 };
+    var list: std.ArrayListUnmanaged(u16) = .empty;
     errdefer list.deinit(allocator);
 
     // 按 NUL 分段转换（保留分隔 NUL）

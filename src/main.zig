@@ -389,13 +389,13 @@ pub fn main(init: std.process.Init) !u8 {
                         continue;
                     }
                     if (k.code == 0x1B) { // Esc：关闭菜单 / 返回播放列表（**不退出程序**）
-        if (app.file_menu_open) {
-            app.file_menu_open = false;
-        } else if (app.help_win.open) {
-            app.help_win.open = false;
-        } else if (app.settings_win.open) {
-            app.settings_win.open = false;
-        } else if (app.preset_browser.open) {
+                        if (app.file_menu_open) {
+                            app.file_menu_open = false;
+                        } else if (app.help_win.open) {
+                            app.help_win.open = false;
+                        } else if (app.settings_win.open) {
+                            app.settings_win.open = false;
+                        } else if (app.preset_browser.open) {
                             app.preset_browser.open = false; // 预设浏览器
                         } else if (app.panels.ctx_pattern != null) {
                             app.panels.ctx_pattern = null; // 样式右键菜单
@@ -532,7 +532,7 @@ pub fn main(init: std.process.Init) !u8 {
                 0;
             app.params.instrument_channel[i].store(ch, .monotonic);
             // 乐器类型 + 鼓组层槽位（kind 边沿会在音频侧触发全释音）
-            app.params.instrument_kind[i].store(if (inst) |it| @intFromEnum(it.kind) else 0, .monotonic);
+            app.params.instrument_kind[i].store(if (inst) |it| @backingInt(it.kind) else 0, .monotonic);
             // VST3 乐器实例（kind == 2；帧末 syncInstrumentPlugins 惰性加载/发布）
             app.params.instrument_plugin[i].store(if (inst) |it| it.plugin else null, .monotonic);
             // 鼓组池惰性分配 / 清理挂起（池随乐器生存；删除/装载由帧末回收）
@@ -563,7 +563,7 @@ pub fn main(init: std.process.Init) !u8 {
                             app.params.kit_layer_trim_start[i][slot].store(ly.trim_start, .monotonic);
                             app.params.kit_layer_trim_len[i][slot].store(ly.trim_len, .monotonic);
                             app.params.kit_layer_speed[i][slot].store(ly.speed, .monotonic);
-                            app.params.kit_layer_kind[i][slot].store(@intFromEnum(ly.kind), .monotonic);
+                            app.params.kit_layer_kind[i][slot].store(@backingInt(ly.kind), .monotonic);
                             slot += 1;
                         }
                     }
@@ -600,7 +600,7 @@ pub fn main(init: std.process.Init) !u8 {
                 // 先备好/发布 DSP 状态盒（**指针先到、kind 后到**——防音频线程
                 // 在帧间看到“新 kind + 旧/空指针”或反向）
                 app.syncFxStateForSlot(ci, slot, es);
-                const k: u32 = @intFromEnum(es.kind);
+                const k: u32 = @backingInt(es.kind);
                 if (app.params.effect_kind[ci][slot].load(.monotonic) != k) {
                     app.params.effect_kind[ci][slot].store(k, .monotonic);
                     chain_changed = true;
@@ -732,7 +732,7 @@ pub fn main(init: std.process.Init) !u8 {
         if (app.file_menu_open) drawFileMenu(&ui, &app);
         // 样式右键菜单：同上（浮动窗口之后，否则会被盖住）
         if (app.panels.ctx_pattern != null) view_panels.drawPatternCtxMenu(&ui, &app);
-    if (app.panels.ctx_audio_style != null) view_panels.drawAudioStyleCtxMenu(&ui, &app);
+        if (app.panels.ctx_audio_style != null) view_panels.drawAudioStyleCtxMenu(&ui, &app);
         // 轨道右键菜单（最外层同上——在浮动窗口之后）
         if (app.panels.ctx_track != null) view_playlist.drawTrackCtxMenu(&ui, &app);
         // 预设浏览器（模态；同上——浮动窗口之后）
@@ -826,81 +826,81 @@ pub fn main(init: std.process.Init) !u8 {
                 .load => |l| loadPreset(&app, io, l.intent, l.cat, l.choice),
                 .save => |s| savePreset(&app, io, s.source, s.name_buf[0..s.name_len], s.overwrite),
                 .rename => |r| renamePreset(&app, io, r.cat, r.old_buf[0..r.old_len], r.new_buf[0..r.new_len]),
-            .delete => |d| deletePreset(&app, io, d.cat, d.name_buf[0..d.name_len]),
+                .delete => |d| deletePreset(&app, io, d.cat, d.name_buf[0..d.name_len]),
+            }
         }
-    }
 
-    // 4.4) 设置落盘（脏 → 写 settings.json；IO 在帧末）
-    if (app.settings_dirty) {
-        app.settings_dirty = false;
-        saveSettings(&app, io);
-    }
+        // 4.4) 设置落盘（脏 → 写 settings.json；IO 在帧末）
+        if (app.settings_dirty) {
+            app.settings_dirty = false;
+            saveSettings(&app, io);
+        }
 
-    // 4.4b) （已移除：加插件走预设面板；浏览文件走插件管理单文件条目）
-    // 4.4b3) 插件管理：文件夹/文件选择 + 扫描管理（帧末；io 在此可用）
-    if (app.pending_plugin_folder_pick) {
-        app.pending_plugin_folder_pick = false;
-        pickPluginFolder(&app, &win);
-    }
-    if (app.pending_plugin_file_pick) {
-        app.pending_plugin_file_pick = false;
-        pickPluginFile(&app, &win);
-    }
-    if (app.pending_scan_start) {
-        app.pending_scan_start = false;
-        startPluginScan(&app, io);
-    }
-    if (app.pending_scan_cancel) {
-        app.pending_scan_cancel = false;
-        cancelPluginScan(&app);
-    }
-    if (app.pending_relocate_instrument) |ri| {
-        app.pending_relocate_instrument = null;
-        relocateInstrumentDialog(&app, &win, ri);
-    }
-    // 系统拖入的音频文件 → 建样式 + 放到播放列表（游标处；同起点自动错开）
-    // 系统拖入的文件 → 按落点分区处理（播放列表=放片段 / 样式栏=只建样式 / 其他=忽略）
-    handleDroppedFiles(&app, &win, ui.mouse_x, ui.mouse_y);
-    if (app.pending_load_sample) |pls| {
-        app.pending_load_sample = null;
-        loadSampleDialog(&app, &win, pls.instrument, pls.pitch, pls.layer);
-    }
-    if (app.pending_relocate_effect) |re| {
-        app.pending_relocate_effect = null;
-        relocateEffectDialog(&app, &win, re.ch, re.slot);
-    }
-    pollPluginScan(&app, io);
-    // 自愈兑底（非扫描期；每 ~2s）：失败槽的**当前路径已消失**且缓存里有同 CID 的
-    // 真文件 → 自动重定位（覆盖“打开工程后插件被删/移动”场景——无需先扫描；
-    // 存在性门槛防两个坏文件来回跳，存在但加载失败 = 不换，等手动重定位）
-    if (!app.plugin_mgr.scanning) {
-        app.plugin_mgr.heal_tick +%= 1;
-        if (app.plugin_mgr.heal_tick % 240 == 0) {
-            const healed2 = app.reboundFailedPluginSlots(io);
-            if (healed2 > 0) app.setToastWith("已自动重新定位 {d} 个插件", .{healed2});
+        // 4.4b) （已移除：加插件走预设面板；浏览文件走插件管理单文件条目）
+        // 4.4b3) 插件管理：文件夹/文件选择 + 扫描管理（帧末；io 在此可用）
+        if (app.pending_plugin_folder_pick) {
+            app.pending_plugin_folder_pick = false;
+            pickPluginFolder(&app, &win);
         }
-    }
-    // 插件配置落盘（管理器改动；同 4.4 设置落盘模式）
-    if (app.plugin_cfg_dirty) {
-        app.plugin_cfg_dirty = false;
-        if (pluginDataRoot(&app)) |pdr| {
-            if (app.plugin_cfg) |*cfg| cfg.save(io, pdr) catch app.setToast("插件配置保存失败");
+        if (app.pending_plugin_file_pick) {
+            app.pending_plugin_file_pick = false;
+            pickPluginFile(&app, &win);
         }
-    }
-    // 4.4c) VST3 插件槽同步：退役实例回收 + 惰性加载（导入/撤销恢复后）
-    syncPluginSlots(&app);
-    // 4.4d) VST3 乐器实例同步（惰性加载 + 编辑器编辑轮询）
-    syncInstrumentPlugins(&app);
-    app.syncKitLayerPlugins();
-    app.rebuildAudioTable();
-    app.pollPreview();
-    app.pollOutMeter();
-    // 设备看门狗：意外停下（导出恢复失败等）→ 每帧尝试重启；正常时仅一次状态判断
-    if (app.engine.initialized and app.export_wav == null and app.engine.deviceState() != 2) {
-        app.engine.resumeDevice();
-    }
-    // 4.4e) VST3 插件界面嵌入同步（面板 → 子窗口；遮挡→隐藏；见函数注释）
-    syncPluginEditors(&app, &ui, @intCast(win.fb.width), @intCast(win.fb.height));
+        if (app.pending_scan_start) {
+            app.pending_scan_start = false;
+            startPluginScan(&app, io);
+        }
+        if (app.pending_scan_cancel) {
+            app.pending_scan_cancel = false;
+            cancelPluginScan(&app);
+        }
+        if (app.pending_relocate_instrument) |ri| {
+            app.pending_relocate_instrument = null;
+            relocateInstrumentDialog(&app, &win, ri);
+        }
+        // 系统拖入的音频文件 → 建样式 + 放到播放列表（游标处；同起点自动错开）
+        // 系统拖入的文件 → 按落点分区处理（播放列表=放片段 / 样式栏=只建样式 / 其他=忽略）
+        handleDroppedFiles(&app, &win, ui.mouse_x, ui.mouse_y);
+        if (app.pending_load_sample) |pls| {
+            app.pending_load_sample = null;
+            loadSampleDialog(&app, &win, pls.instrument, pls.pitch, pls.layer);
+        }
+        if (app.pending_relocate_effect) |re| {
+            app.pending_relocate_effect = null;
+            relocateEffectDialog(&app, &win, re.ch, re.slot);
+        }
+        pollPluginScan(&app, io);
+        // 自愈兑底（非扫描期；每 ~2s）：失败槽的**当前路径已消失**且缓存里有同 CID 的
+        // 真文件 → 自动重定位（覆盖“打开工程后插件被删/移动”场景——无需先扫描；
+        // 存在性门槛防两个坏文件来回跳，存在但加载失败 = 不换，等手动重定位）
+        if (!app.plugin_mgr.scanning) {
+            app.plugin_mgr.heal_tick +%= 1;
+            if (app.plugin_mgr.heal_tick % 240 == 0) {
+                const healed2 = app.reboundFailedPluginSlots(io);
+                if (healed2 > 0) app.setToastWith("已自动重新定位 {d} 个插件", .{healed2});
+            }
+        }
+        // 插件配置落盘（管理器改动；同 4.4 设置落盘模式）
+        if (app.plugin_cfg_dirty) {
+            app.plugin_cfg_dirty = false;
+            if (pluginDataRoot(&app)) |pdr| {
+                if (app.plugin_cfg) |*cfg| cfg.save(io, pdr) catch app.setToast("插件配置保存失败");
+            }
+        }
+        // 4.4c) VST3 插件槽同步：退役实例回收 + 惰性加载（导入/撤销恢复后）
+        syncPluginSlots(&app);
+        // 4.4d) VST3 乐器实例同步（惰性加载 + 编辑器编辑轮询）
+        syncInstrumentPlugins(&app);
+        app.syncKitLayerPlugins();
+        app.rebuildAudioTable();
+        app.pollPreview();
+        app.pollOutMeter();
+        // 设备看门狗：意外停下（导出恢复失败等）→ 每帧尝试重启；正常时仅一次状态判断
+        if (app.engine.initialized and app.export_wav == null and app.engine.deviceState() != 2) {
+            app.engine.resumeDevice();
+        }
+        // 4.4e) VST3 插件界面嵌入同步（面板 → 子窗口；遮挡→隐藏；见函数注释）
+        syncPluginEditors(&app, &ui, @intCast(win.fb.width), @intCast(win.fb.height));
 
         // 4.5) 同步窗口标题（脏标记 `*` + 工程名；仅在变化时刷 Win32）
         const cur_name = app.projectName();
@@ -1035,7 +1035,6 @@ fn appendVst3Categories(app: *App) void {
         };
     }
 }
-
 
 /// 预设面板选中回调（文件 IO 在这里）：按**意图**分派。
 /// **面板已统一**：任何入口都可点任意已实装插件——跨插件 = 顺带换插件
@@ -1512,8 +1511,8 @@ fn applyFxParams(es: *app_mod.EffectSlot, file: ?*const preset_mod.File) void {
         for (se.bands[0..n], 0..) |b, i| es.bands[i] = .{ .freq = b.freq, .gain_db = b.gain_db, .q = b.q };
     } else {
         es.enabled = true;
-        es.mix = fx.defaultMix(@intFromEnum(es.kind));
-        if (es.kind != .eq) es.p = fx.defaultParams(@intFromEnum(es.kind));
+        es.mix = fx.defaultMix(@backingInt(es.kind));
+        if (es.kind != .eq) es.p = fx.defaultParams(@backingInt(es.kind));
         if (es.kind == .eq) es.bands = (app_mod.EffectSlot{}).bands;
     }
 }
@@ -1613,7 +1612,7 @@ fn addLayerChoice(app: *App, ref: PresetIntent.KitPadRef, patch: ?*const persist
     }
     app.commitHistory("添加乐器");
     openKitLayerWindow(app, ref.instrument, ref.pitch);
-                app.setToast("已添加乐器 — 在窗口里点「预设」换音色");
+    app.setToast("已添加乐器 — 在窗口里点「预设」换音色");
 }
 
 /// 应用到**已有鼓组层**（层窗口「预设 ▾」）：换音色/默认 + 更新来源名
@@ -1773,7 +1772,7 @@ fn savePreset(app: *App, io: std.Io, source: PresetSaveSource, raw_name: []const
                     .version = 2,
                     .plugin = id,
                     .effect = .{
-                        .kind = @intFromEnum(es.kind),
+                        .kind = @backingInt(es.kind),
                         .enabled = es.enabled,
                         .mix = es.mix,
                         .bands = bands,
@@ -2010,7 +2009,7 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     // 对**同 prio 是覆盖**，后声明的把先声明的层顶掉 → 被顶那层点击穿透（实测 bug）。
     const rack_open = app.rack.open;
     const synth_open = app.synth_win.open;
-    const mixer_open = app.mixer_win.open;    // 效果器面板（依赖调音台的 panel 选择；通道/槽位有效才显示）
+    const mixer_open = app.mixer_win.open; // 效果器面板（依赖调音台的 panel 选择；通道/槽位有效才显示）
     const effect_open = app.mixer_win.panel != null;
     // 频谱目标（EQ 背景 = **该效果器的输入信号**）：每帧发布（关窗 → -1：
     // 音频线程停止捕获，省 CPU）。见 audio.captureSpectrum。
@@ -2159,8 +2158,7 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     app.layout.patterns_w = app.layout.mid_w;
     app.layout.playlist_x = right_x2;
     app.layout.playlist_w = right_w2;
-    {
-    }
+    {}
 
     // 状态栏
     view_panels.drawStatusBar(ui, app, w, h);
@@ -2626,7 +2624,7 @@ fn syncInstrumentPlugins(app: *App) void {
                 continue;
             }
             inst.fail_wait = plugin_retry_frames;
-            const pz = app.allocator.dupeZ(u8, inst.pluginPath()) catch continue;
+            const pz = app.allocator.dupeSentinel(u8, inst.pluginPath(), 0) catch continue;
             defer app.allocator.free(pz);
             inst.plugin = vst_host.loadPlugin(app.allocator, pz, sr, 4096, .instrument) catch |e| {
                 if (!inst.load_failed) {
@@ -2902,7 +2900,7 @@ fn syncPluginSlots(app: *App) void {
                     continue;
                 }
                 es.fail_wait = plugin_retry_frames;
-                const pz = app.allocator.dupeZ(u8, es.pluginPath()) catch continue;
+                const pz = app.allocator.dupeSentinel(u8, es.pluginPath(), 0) catch continue;
                 defer app.allocator.free(pz);
                 es.plugin = vst_host.loadEffect(app.allocator, pz, sr, 4096) catch |e| {
                     if (!es.load_failed) {
@@ -3073,7 +3071,7 @@ fn createAudioStyle(app: *App, path: []const u8) ?i32 {
 /// - **样式面板** → 只建样式（自动切到「音频」页并选中最后一个）
 /// - 其他区域 / 导出中 → 不响应（不建样式、不 toast、不弄脏工程）
 fn handleDroppedFiles(app: *App, win: *window.Window, px: i32, py: i32) void {
-    var paths: std.ArrayListUnmanaged([]u8) = .{ .items = &.{}, .capacity = 0 };
+    var paths: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
         for (paths.items) |p| app.allocator.free(p);
         paths.deinit(app.allocator);
@@ -3244,7 +3242,7 @@ fn startPluginScan(app: *App, io: std.Io) void {
     };
     const cfg = if (app.plugin_cfg) |*c| c else return;
 
-    var roots: std.ArrayListUnmanaged([]const u8) = .{ .items = &.{}, .capacity = 0 };
+    var roots: std.ArrayListUnmanaged([]const u8) = .empty;
     defer roots.deinit(app.allocator);
     for (cfg.folders.items) |f| {
         if (f.enabled and f.path.len > 0) roots.append(app.allocator, f.path) catch {};
@@ -3270,7 +3268,7 @@ fn startPluginScan(app: *App, io: std.Io) void {
     std.Io.Dir.cwd().createDirPath(io, root) catch {};
     std.Io.Dir.cwd().deleteFile(io, out_path) catch {};
 
-    var cmd: std.ArrayListUnmanaged(u16) = .{ .items = &.{}, .capacity = 0 };
+    var cmd: std.ArrayListUnmanaged(u16) = .empty;
     defer cmd.deinit(app.allocator);
     appendUtf16Quoted(&cmd, app.allocator, exe_path) catch return;
     appendUtf16(&cmd, app.allocator, " --vst-scan --jsonl ") catch return;
@@ -3870,8 +3868,8 @@ fn drawModal(ui: *Ui, app: *App) void {
         .preset_overwrite => drawPresetOverwrite(ui, app, w, h),
         .preset_delete => drawPresetDelete(ui, app, w, h),
         .pattern_delete => drawDeleteConfirm(ui, app, w, h),
-            .track_clear => drawDeleteConfirm(ui, app, w, h),
-            .track_delete => drawDeleteConfirm(ui, app, w, h),
+        .track_clear => drawDeleteConfirm(ui, app, w, h),
+        .track_delete => drawDeleteConfirm(ui, app, w, h),
         .save_upgrade => drawUpgradeConfirm(ui, app, w, h),
     }
 }
@@ -4126,13 +4124,13 @@ test {
     _ = @import("plugin_db.zig");
     _ = @import("ui_test.zig");
 }
- test "main: 编辑器遮挡矩形相交判定（插件子窗口隐藏用）" {
+test "main: 编辑器遮挡矩形相交判定（插件子窗口隐藏用）" {
     try std.testing.expect(rectsOverlap(0, 0, 10, 10, 5, 5, 10, 10));
     try std.testing.expect(rectsOverlap(5, 5, 10, 10, 0, 0, 10, 10));
     try std.testing.expect(!rectsOverlap(0, 0, 10, 10, 10, 10, 10, 10)); // 边贴边不算
     try std.testing.expect(!rectsOverlap(0, 0, 10, 10, 20, 20, 5, 5));
 }
- test "main: 相交矩形计算（插件子窗口裁切覆盖集用）" {
+test "main: 相交矩形计算（插件子窗口裁切覆盖集用）" {
     const r = intersectRect(0, 0, 10, 10, 5, 5, 10, 10) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(i32, 5), r.x);
     try std.testing.expectEqual(@as(i32, 5), r.y);
@@ -4197,7 +4195,6 @@ test "main: 旧版二进制 v5 → performUpgrade 备份并改写为当前版本
     try std.testing.expect(app.pending_upgrade_path == null);
     try std.testing.expect(!app.dirty);
 }
-
 
 test "main: dropZoneAt——播放列表 / 样式面板 / 其他区域" {
     const alloc = std.testing.allocator;

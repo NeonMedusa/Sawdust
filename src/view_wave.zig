@@ -202,9 +202,9 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         ui.label("速度", gx, ctl_y + 2, ui.theme.text_dim);
         gx += 36;
         {
-        var kv: f32 = std.math.clamp(@log2(std.math.clamp(tgt.speed.*, 0.5, 2.0) / 0.5) / 2.0, 0.0, 1.0); // 对数：100% 在旋钮正中
+            var kv: f32 = std.math.clamp(@log2(std.math.clamp(tgt.speed.*, 0.5, 2.0) / 0.5) / 2.0, 0.0, 1.0); // 对数：100% 在旋钮正中
             if (ui.knob(9702, &kv, gx, ctl_y - 2, ctl_h - 2)) {
-            tgt.speed.* = 0.5 * std.math.pow(f32, 4.0, kv); // 50%..200% 对数映射
+                tgt.speed.* = 0.5 * std.math.pow(f32, 4.0, kv); // 50%..200% 对数映射
                 app.history_pending = if (tgt.layer_ref != null) "调整采样速度" else "调整音频速度";
             }
             var vb: [8]u8 = undefined;

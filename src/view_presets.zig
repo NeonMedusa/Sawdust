@@ -189,7 +189,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) void {
             const list_area_h = @max(row_h, list_y + list_h - list_top);
             var n_match: i32 = 0;
             for (cat.presets.items) |name| {
-                if (q.len > 0 and std.ascii.indexOfIgnoreCase(name, q) == null) continue;
+                if (q.len > 0 and std.ascii.findIgnoreCase(name, q) == null) continue;
                 n_match += 1;
             }
             const content_h: i32 = n_match * row_h;
@@ -203,7 +203,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) void {
                 defer ui.renderer.popClip(saved);
                 var vi: i32 = 0;
                 for (cat.presets.items, 0..) |name, i| {
-                    if (q.len > 0 and std.ascii.indexOfIgnoreCase(name, q) == null) continue;
+                    if (q.len > 0 and std.ascii.findIgnoreCase(name, q) == null) continue;
                     const iy = list_top + vi * row_h - app.preset_browser.scroll;
                     vi += 1;
                     if (iy + row_h <= list_top) continue;
