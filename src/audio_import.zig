@@ -15,6 +15,7 @@
 //! - `done` 之后由 UI 线程 `takeBuffers()` **过继**缓冲给资产池，`destroyJob` 不再释放它们。
 const std = @import("std");
 const ma = @import("c/miniaudio.zig");
+const audio = @import("audio.zig");
 
 /// 波形峰值桶（`App.AudioAsset.Peak` 直接复用它当单一真源）
 pub const Peak = struct { min: f32, max: f32 };
@@ -36,6 +37,31 @@ pub const FailReason = enum(u8) {
     }
 };
 
+/// 存储计划（**P3a**：导入时定，解码/分配/取样三方共用）
+///
+/// 内存对比（立体声 48k，1 分钟）：
+/// - 16-bit 源 → `i16` 立体声 4 B/帧 = 11 MB；单声道再减半 = 5.5 MB
+/// - 24/32f 源 → `f32`（零损失，不省）
+pub const Plan = struct {
+    /// true = 存 `i16`（位深 ≤ 16、以及有损格式）；false = 存 `f32`
+    store_s16: bool = true,
+    /// 1 = 单声道（**保留**，不强制上混）；2 = 立体声
+    channels: u8 = 2,
+
+    pub fn maFormat(self: Plan) ma.ma_format {
+        return if (self.store_s16) ma.ma_format_s16 else ma.ma_format_f32;
+    }
+
+    pub fn maChannels(self: Plan) u32 {
+        return if (self.channels < 2) 1 else 2;
+    }
+
+    /// 每采样点字节数
+    pub fn bytesPerSample(self: Plan) u64 {
+        return if (self.store_s16) @sizeOf(i16) else @sizeOf(f32);
+    }
+};
+
 /// 阶段 A（UI 线程，毫秒级）读到的文件头信息
 pub const Header = struct {
     native_sr: u32,
@@ -43,7 +69,66 @@ pub const Header = struct {
     total_frames: u64,
     /// 引擎帧数（`total / ratio`；**解码前**就能算出片段长度）
     eng_frames: u64,
+    /// 存储计划（声道数 + i16/f32）
+    plan: Plan = .{},
 };
+
+/// 单文件内存预算：超过就拒绝导入。
+/// 替代旧的“30 分钟上限”——同样时长在不同格式/声道下能差 4 倍，按字节算才准。
+/// 16-bit 立体声 48k 下 ≈ 91 分钟。
+pub const max_file_bytes: u64 = 1 << 30; // 1 GB
+
+/// 只读文件头用的 IO（同步 open/read，不触发线程池）。
+/// Zig 0.17 起文件 API 必须带 `std.Io`，而 `probeFile`/`decodeAll` 的调用点
+/// （模型层、测试）手上没有 io —— 所以这里放一个惰性初始化的单例。
+var header_io: ?std.Io.Threaded = null;
+
+fn fileIo() std.Io {
+    if (header_io == null) header_io = .init(std.heap.page_allocator, .{});
+    return header_io.?.io();
+}
+
+/// 读容器位深（决定 i16 / f32）。`null` = 无法判断 → 用 f32 兜底（宁可不省也不降精度）。
+/// - WAV：`fmt ` 块的 `wBitsPerSample`；`WAVE_FORMAT_EXTENSIBLE` 一律当 >16（可能是 24-in-32）
+/// - FLAC：`STREAMINFO` 的 bits-per-sample
+/// - MP3 / OGG（有损）：16—— 编码噪底本来远高于 −96 dB
+fn sourceBitDepth(path: []const u8) ?u16 {
+    const io = fileIo();
+    const f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    defer f.close(io);
+    var buf: [4096]u8 = undefined;
+    const n = f.readPositionalAll(io, buf[0..], 0) catch return null;
+    const h: []const u8 = buf[0..n];
+
+    if (h.len >= 12 and std.mem.eql(u8, h[0..4], "RIFF") and std.mem.eql(u8, h[8..12], "WAVE")) {
+        var off: usize = 12;
+        while (off + 8 <= h.len) {
+            const sz: usize = std.mem.readInt(u32, h[off + 4 ..][0..4], .little);
+            if (std.mem.eql(u8, h[off .. off + 4], "fmt ")) {
+                if (off + 24 > h.len) return null;
+                const afmt = std.mem.readInt(u16, h[off + 8 ..][0..2], .little);
+                const bits = std.mem.readInt(u16, h[off + 22 ..][0..2], .little);
+                if (afmt == 0xFFFE) return null; // extensible：可能 24-in-32，保守走 f32
+                return if (bits == 0) null else bits;
+            }
+            off += 8 + sz + (sz & 1);
+        }
+        return null;
+    }
+    if (h.len >= 26 and std.mem.eql(u8, h[0..4], "fLaC")) {
+        // STREAMINFO 必须是第一个元数据块：magic(4) + 块头(4) → 数据从 8 开始
+        // 其内 offset 10 起是 8 字节打包字段：20b 采样率 + 3b 声道 + 5b 位深 + 36b 总帧数
+        const v = std.mem.readInt(u64, h[18..26], .big);
+        const bps: u16 = @intCast((v >> 36) & 0x1F);
+        return if (bps == 0) null else bps;
+    }
+    if (h.len >= 4) {
+        if (std.mem.eql(u8, h[0..4], "OggS")) return 16;
+        if (std.mem.eql(u8, h[0..3], "ID3")) return 16;
+        if (h[0] == 0xFF and (h[1] & 0xE0) == 0xE0) return 16; // MPEG 帧同步
+    }
+    return null;
+}
 
 /// 单次解码块（帧）：48 kHz 下约 0.68 s。取 64k 是"取消响应 vs 调用开销"的折中。
 const chunk_frames: usize = 65536;
@@ -63,7 +148,10 @@ pub const Job = struct {
     eng_frames: u64 = 0,
 
     // ── 提升为 active 时在 UI 线程分配（worker 只写内容）──
-    frames: []f32 = &.{},
+    /// 存储计划：决定 `frames_s16` / `frames_f32` 哪个非空
+    plan: Plan = .{},
+    frames_s16: []i16 = &.{},
+    frames_f32: []f32 = &.{},
     peaks: []Peak = &.{},
     peak_frames: u32 = 0,
     /// 完成时实际解出的帧数（< total 表示文件比头里声明的短）
@@ -103,12 +191,10 @@ pub const Manager = struct {
     /// 打开解码器只取格式与时长；失败/非音频/超长 → null
     pub fn probeFile(path: []const u8, eng_sr: u32) ?Header {
         var wbuf: [1024]u16 = undefined;
-        const wn = std.unicode.utf8ToUtf16Le(&wbuf, path) catch return null;
-        if (wn + 1 > wbuf.len) return null;
-        wbuf[wn] = 0;
-        const cfg = ma.ma_decoder_config_init(ma.ma_format_f32, 2, 0);
+        const w = toWide(path, &wbuf) orelse return null;
+        const cfg = ma.ma_decoder_config_init(ma.ma_format_f32, 0, 0);
         var dec: ma.ma_decoder = undefined;
-        if (ma.ma_decoder_init_file_w(@ptrCast(&wbuf[0]), &cfg, &dec) != ma.MA_SUCCESS) return null;
+        if (ma.ma_decoder_init_file_w(@ptrCast(w.ptr), &cfg, &dec) != ma.MA_SUCCESS) return null;
         defer _ = ma.ma_decoder_uninit(&dec);
 
         var native_sr: ma.ma_uint32 = eng_sr;
@@ -116,11 +202,19 @@ pub const Manager = struct {
         var fmt_out: ma.ma_format = ma.ma_format_f32;
         if (ma.ma_decoder_get_data_format(&dec, &fmt_out, &ch_out, &native_sr, null, 0) != ma.MA_SUCCESS) return null;
         if (native_sr == 0) native_sr = eng_sr;
+        if (ch_out == 0) ch_out = 2; // 防御：个别后端不给声道信息
         var total: ma.ma_uint64 = 0;
         if (ma.ma_decoder_get_length_in_pcm_frames(&dec, &total) != ma.MA_SUCCESS) return null;
+        if (total == 0) return null;
 
-        const max_frames: u64 = @as(u64, native_sr) * 60 * 30; // 30 分钟上限（沿用）
-        if (total == 0 or total > max_frames) return null;
+        // 存储计划：位深 ≤ 16 / 有损 → i16；24·32f / 未知 → f32。声道 ≥ 2 一律存 2。
+        const plan: Plan = .{
+            .store_s16 = (sourceBitDepth(path) orelse 32) <= 16,
+            .channels = if (ch_out >= 2) 2 else 1,
+        };
+        // 内存闸门（字节，不是时长）
+        const need: u64 = @as(u64, total) * plan.maChannels() * plan.bytesPerSample();
+        if (need > max_file_bytes) return null;
 
         const sr_eng: u64 = @max(1, eng_sr);
         const eng_frames: u64 = @intCast(@as(u64, total) * sr_eng / @as(u64, native_sr));
@@ -128,6 +222,7 @@ pub const Manager = struct {
             .native_sr = @intCast(native_sr),
             .total_frames = @intCast(total),
             .eng_frames = @max(1, eng_frames),
+            .plan = plan,
         };
     }
 
@@ -140,8 +235,33 @@ pub const Manager = struct {
     }
 
     /// 单遍峰值更新（供 worker 与同步导入共用——**唯一一份算法**）
+    /// 格式分支只判一次，内层循环无 switch。
     pub fn updatePeaks(
-        frames: []const f32,
+        frames: audio.SampleFrames,
+        channels: u8,
+        s0: usize,
+        s1: usize,
+        peaks: []Peak,
+        bucket: usize,
+        stride: usize,
+    ) void {
+        const mono = channels < 2;
+        switch (frames) {
+            .s16 => |fs| updatePeaksSlice(i16, fs, 1.0 / 32768.0, mono, s0, s1, peaks, bucket, stride),
+            .f32 => |fs| updatePeaksSlice(f32, fs, 1.0, mono, s0, s1, peaks, bucket, stride),
+        }
+    }
+
+    /// 样本值 → f32（i16/f32 两种元素类型共用一套循环）
+    inline fn toF32(comptime T: type, v: T) f32 {
+        return if (T == f32) v else @floatFromInt(v);
+    }
+
+    fn updatePeaksSlice(
+        comptime T: type,
+        fs: []const T,
+        scale: f32,
+        mono: bool,
         s0: usize,
         s1: usize,
         peaks: []Peak,
@@ -158,7 +278,10 @@ pub const Manager = struct {
             var mx: f32 = -1;
             var fi = b0;
             while (fi < b1) : (fi += stride) {
-                const m = (frames[fi * 2] + frames[fi * 2 + 1]) * 0.5;
+                const m: f32 = if (mono)
+                    toF32(T, fs[fi]) * scale
+                else
+                    (toF32(T, fs[fi * 2]) + toF32(T, fs[fi * 2 + 1])) * 0.5 * scale;
                 mn = @min(mn, m);
                 mx = @max(mx, m);
             }
@@ -206,6 +329,7 @@ pub const Manager = struct {
             .eng_sr = @max(1, eng_sr),
             .total_frames = hdr.total_frames,
             .eng_frames = hdr.eng_frames,
+            .plan = hdr.plan,
         };
         self.queue.append(self.allocator, job) catch {
             self.allocator.free(p);
@@ -235,14 +359,22 @@ pub const Manager = struct {
         self.active = job;
         const nframes: usize = @intCast(@max(1, job.total_frames));
         const b = bucketFor(job.total_frames);
-        job.frames = self.allocator.alloc(f32, nframes * 2) catch {
-            job.fail_reason.store(@backingInt(FailReason.decode_failed), .release);
-            job.state.store(.failed, .release);
-            return;
-        };
+        const n_samples = nframes * job.plan.maChannels();
+        if (job.plan.store_s16) {
+            job.frames_s16 = self.allocator.alloc(i16, n_samples) catch {
+                job.fail_reason.store(@backingInt(FailReason.decode_failed), .release);
+                job.state.store(.failed, .release);
+                return;
+            };
+        } else {
+            job.frames_f32 = self.allocator.alloc(f32, n_samples) catch {
+                job.fail_reason.store(@backingInt(FailReason.decode_failed), .release);
+                job.state.store(.failed, .release);
+                return;
+            };
+        }
         job.peaks = self.allocator.alloc(Peak, b.npeaks) catch {
-            self.allocator.free(job.frames);
-            job.frames = &.{};
+            freeFrames(self.allocator, job);
             job.fail_reason.store(@backingInt(FailReason.decode_failed), .release);
             job.state.store(.failed, .release);
             return;
@@ -333,7 +465,8 @@ pub const Manager = struct {
 
     /// 过继的缓冲（UI 线程拿到后写进资产池）
     pub const Buffers = struct {
-        frames: []f32,
+        frames: audio.SampleFrames,
+        plan: Plan,
         peaks: []Peak,
         peak_frames: u32,
         got_frames: u64,
@@ -343,19 +476,33 @@ pub const Manager = struct {
     pub fn takeBuffers(self: *Manager, job: *Job) Buffers {
         _ = self;
         const out: Buffers = .{
-            .frames = job.frames,
+            .frames = framesOf(job),
+            .plan = job.plan,
             .peaks = job.peaks,
             .peak_frames = job.peak_frames,
             .got_frames = job.got_frames,
         };
-        job.frames = &.{};
+        job.frames_s16 = &.{};
+        job.frames_f32 = &.{};
         job.peaks = &.{};
         return out;
     }
 
+    /// job 的帧存储（两种布局二选一）
+    inline fn framesOf(job: *const Job) audio.SampleFrames {
+        return if (job.plan.store_s16) .{ .s16 = job.frames_s16 } else .{ .f32 = job.frames_f32 };
+    }
+
+    /// 释放 job 的帧缓冲（不碰 peaks/path）
+    fn freeFrames(allocator: std.mem.Allocator, job: *Job) void {
+        framesOf(job).freeFrames(allocator);
+        job.frames_s16 = &.{};
+        job.frames_f32 = &.{};
+    }
+
     /// 销毁 job（未过继的缓冲在这里释放）
     pub fn destroyJob(self: *Manager, job: *Job) void {
-        if (job.frames.len > 0) self.allocator.free(job.frames);
+        freeFrames(self.allocator, job);
         if (job.peaks.len > 0) self.allocator.free(job.peaks);
         if (job.path.len > 0) self.allocator.free(job.path);
         self.allocator.destroy(job);
@@ -403,55 +550,153 @@ pub const Manager = struct {
             job.state.store(.cancelled, .release);
             return;
         }
-        var wbuf: [1024]u16 = undefined;
-        const wn = std.unicode.utf8ToUtf16Le(&wbuf, job.path) catch {
-            job.fail_reason.store(@backingInt(FailReason.open_failed), .release);
-            job.state.store(.failed, .release);
-            return;
-        };
-        if (wn + 1 > wbuf.len) {
-            job.fail_reason.store(@backingInt(FailReason.open_failed), .release);
-            job.state.store(.failed, .release);
-            return;
-        }
-        wbuf[wn] = 0;
-        const cfg = ma.ma_decoder_config_init(ma.ma_format_f32, 2, 0);
-        var dec: ma.ma_decoder = undefined;
-        if (ma.ma_decoder_init_file_w(@ptrCast(&wbuf[0]), &cfg, &dec) != ma.MA_SUCCESS) {
-            job.fail_reason.store(@backingInt(FailReason.open_failed), .release);
-            job.state.store(.failed, .release);
-            return;
-        }
-        defer _ = ma.ma_decoder_uninit(&dec);
-
-        const nframes: usize = @intCast(@max(1, job.total_frames));
         const bucket: usize = @intCast(@max(1, job.peak_frames));
-        const stride: usize = if (bucket > 32) @max(1, bucket / 16) else 1;
-        var got_total: usize = 0;
-        while (got_total < nframes) {
-            if (job.cancel.load(.acquire)) {
-                job.state.store(.cancelled, .release);
-                return;
-            }
-            const want: usize = @min(nframes - got_total, chunk_frames);
-            var got: ma.ma_uint64 = 0;
-            if (ma.ma_decoder_read_pcm_frames(&dec, job.frames.ptr + got_total * 2, @intCast(want), &got) != ma.MA_SUCCESS) {
+        switch (decodeInto(job.path, job.plan, job.total_frames, framesOf(job), job.peaks, bucket, &job.cancel, &job.done_frames)) {
+            .ok => |n| {
+                job.got_frames = @intCast(n);
+                job.done_frames.store(@intCast(n), .release);
+                job.state.store(.done, .release);
+            },
+            .cancelled => job.state.store(.cancelled, .release),
+            .open_failed => {
+                job.fail_reason.store(@backingInt(FailReason.open_failed), .release);
+                job.state.store(.failed, .release);
+            },
+            .decode_failed => {
                 job.fail_reason.store(@backingInt(FailReason.decode_failed), .release);
                 job.state.store(.failed, .release);
-                return;
-            }
-            if (got == 0) break;
-            const s0 = got_total;
-            const s1 = got_total + @as(usize, @intCast(got));
-            updatePeaks(job.frames, s0, s1, job.peaks, bucket, stride);
-            got_total = s1;
-            job.done_frames.store(@intCast(got_total), .release);
+            },
         }
-        // 尾部未解码到的桶置零（文件实际长度 < 头里声明的长度时）
-        var pz = got_total / bucket;
-        while (pz < job.peaks.len) : (pz += 1) job.peaks[pz] = .{ .min = 0, .max = 0 };
-        job.got_frames = @intCast(got_total);
-        job.done_frames.store(@intCast(got_total), .release);
-        job.state.store(.done, .release);
     }
 };
+
+/// UTF-8 → UTF-16LE（含 NUL）；失败 null。
+/// 中文路径必须走宽字符 API（同 VST3 加载的坑），这层在 3 处用到。
+fn toWide(path: []const u8, wbuf: []u16) ?[]u16 {
+    const wn = std.unicode.utf8ToUtf16Le(wbuf, path) catch return null;
+    if (wn + 1 > wbuf.len) return null;
+    wbuf[wn] = 0;
+    return wbuf[0 .. wn + 1];
+}
+
+/// 按存储计划打开解码器
+fn openDecoder(path: []const u8, plan: Plan, dec: *ma.ma_decoder) bool {
+    var wbuf: [1024]u16 = undefined;
+    const w = toWide(path, &wbuf) orelse return false;
+    const cfg = ma.ma_decoder_config_init(plan.maFormat(), plan.maChannels(), 0);
+    return ma.ma_decoder_init_file_w(@ptrCast(w.ptr), &cfg, dec) == ma.MA_SUCCESS;
+}
+
+/// 同步解码结果（同步路径用：采样器层 / 旧工程 / 测试夹具）
+pub const Decoded = struct {
+    frames: audio.SampleFrames,
+    plan: Plan,
+    peaks: []Peak,
+    peak_frames: u32,
+    frame_count: usize,
+    native_sr: u32,
+
+    pub fn deinit(self: Decoded, allocator: std.mem.Allocator) void {
+        self.frames.freeFrames(allocator);
+        if (self.peaks.len > 0) allocator.free(self.peaks);
+    }
+};
+
+/// 解码结果（worker 用它区分失败类型 → 写入 `fail_reason`）
+const DecodeOutcome = union(enum) {
+    /// 实际解码帧数
+    ok: usize,
+    cancelled,
+    open_failed,
+    decode_failed,
+};
+
+/// **唯一的解码循环**（worker 与同步路径共用）。
+/// `cancel` / `done` 传 null = 同步路径（不响应取消、不写进度）。
+/// 尾部未解码到的峰值桶会置零（文件实际长度 < 头里声明的长度时）。
+fn decodeInto(
+    path: []const u8,
+    plan: Plan,
+    total_frames: u64,
+    frames: audio.SampleFrames,
+    peaks: []Peak,
+    bucket: usize,
+    cancel: ?*const std.atomic.Value(bool),
+    done: ?*std.atomic.Value(u64),
+) DecodeOutcome {
+    var dec: ma.ma_decoder = undefined;
+    if (!openDecoder(path, plan, &dec)) return .open_failed;
+    defer _ = ma.ma_decoder_uninit(&dec);
+
+    const nframes: usize = @intCast(@max(1, total_frames));
+    const nch: usize = plan.maChannels();
+    const bk: usize = @max(1, bucket);
+    const stride: usize = if (bk > 32) @max(1, bk / 16) else 1;
+    var got_total: usize = 0;
+    while (got_total < nframes) {
+        if (cancel) |c| {
+            if (c.load(.acquire)) return .cancelled;
+        }
+        const want: usize = @min(nframes - got_total, chunk_frames);
+        var got: ma.ma_uint64 = 0;
+        const dst: ?*anyopaque = switch (frames) {
+            .s16 => |v| @ptrCast(@constCast(v.ptr) + got_total * nch),
+            .f32 => |v| @ptrCast(@constCast(v.ptr) + got_total * nch),
+        };
+        if (ma.ma_decoder_read_pcm_frames(&dec, dst, @intCast(want), &got) != ma.MA_SUCCESS) {
+            return .decode_failed;
+        }
+        if (got == 0) break;
+        const s0 = got_total;
+        const s1 = got_total + @as(usize, @intCast(got));
+        Manager.updatePeaks(frames, plan.channels, s0, s1, peaks, bk, stride);
+        got_total = s1;
+        if (done) |d| d.store(@intCast(got_total), .release);
+    }
+    var pz = got_total / bk;
+    while (pz < peaks.len) : (pz += 1) peaks[pz] = .{ .min = 0, .max = 0 };
+    return .{ .ok = got_total };
+}
+
+/// 同步整文件解码（与异步路径**共用**存储计划/解码循环/宽路径）。
+/// 失败/超预算 → null。
+pub fn decodeAll(allocator: std.mem.Allocator, path: []const u8, eng_sr: u32) ?Decoded {
+    const hdr = Manager.probeFile(path, eng_sr) orelse return null;
+    const plan = hdr.plan;
+    const nframes: usize = @intCast(@max(1, hdr.total_frames));
+    const b = Manager.bucketFor(hdr.total_frames);
+
+    var out: Decoded = .{
+        .frames = .{ .s16 = &.{} },
+        .plan = plan,
+        .peaks = &.{},
+        .peak_frames = @intCast(b.bucket),
+        .frame_count = 0,
+        .native_sr = hdr.native_sr,
+    };
+    const n_samples = nframes * plan.maChannels();
+    if (plan.store_s16) {
+        out.frames = .{ .s16 = allocator.alloc(i16, n_samples) catch return null };
+    } else {
+        out.frames = .{ .f32 = allocator.alloc(f32, n_samples) catch return null };
+    }
+    out.peaks = allocator.alloc(Peak, b.npeaks) catch {
+        out.deinit(allocator);
+        return null;
+    };
+
+    switch (decodeInto(path, plan, hdr.total_frames, out.frames, out.peaks, b.bucket, null, null)) {
+        .ok => |n| {
+            if (n == 0) {
+                out.deinit(allocator);
+                return null;
+            }
+            out.frame_count = n;
+        },
+        else => {
+            out.deinit(allocator);
+            return null;
+        },
+    }
+    return out;
+}

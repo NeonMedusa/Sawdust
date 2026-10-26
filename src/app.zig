@@ -101,6 +101,13 @@ pub const AudioAsset = struct {
 
     /// 峰值类型**单一真源**在 `audio_import.Peak`（异步导入的 worker 也要写同一布局）
     pub const Peak = audio_import.Peak;
+
+    /// 释放本资产持有的内存（**帧存储可能是 i16 或 f32**）
+    pub fn deinit(self: *AudioAsset, allocator: std.mem.Allocator) void {
+        self.data.frames.freeFrames(allocator);
+        if (self.peaks.len > 0) allocator.free(self.peaks);
+        if (self.path.len > 0) allocator.free(self.path);
+    }
 };
 
 /// 音频样式（编号 = 下标；与音符样式对称：**通道/增益共享给全部片段实例**）
@@ -2924,88 +2931,46 @@ pub const App = struct {
         return null;
     }
 
-    /// 解码音频文件进资产池（按路径去重；f32 立体声@**文件原生率**）。
-    /// 失败/超限 → null；上限 = 30 分钟（v1 整文件进内存）。
+    /// 解码音频文件进资产池（按路径去重）。
     ///
-    /// **P1 提速**：解码时**不重采样**（省一遍全量 SRC）；移动平均峰值
-    /// **与解码合并成一遍**（桶大于 32 帧时只取 16 个等距点估计包络——
-    /// 只影响显示精度，不影响声音）。播放侧靠 `SampleData.ratio` 换算采样帧。
+    /// **P3a**：存解码器**原生格式**（位深 ≤16 / 有损 → `i16`；24·32f / 未知 → `f32`）
+    /// 与**原生声道数**（单声道不再强制上混）——内存 2~4×。
+    /// 失败/超预算 → null（单文件预算见 `audio_import.max_file_bytes`）。
+    ///
+    /// **P1 提速**：解码时**不重采样**（省一遍全量 SRC）；峰值与解码合并成一遍
+    /// （桶大于 32 帧时只取 16 个等距点估包络——只影响显示精度，不影响声音）。
+    /// 播放侧靠 `SampleData.ratio` 换算采样帧。
     pub fn loadAudioAsset(self: *App, path: []const u8) ?i32 {
         if (path.len == 0) return null;
         if (self.findAssetByPath(path)) |i| return @intCast(i);
         const a = self.allocator;
-        // 宽字符路径（中文路径必须——同 VST3 加载的坑）
-        var wbuf: [1024]u16 = undefined;
-        const wbuf_out = std.unicode.utf8ToUtf16Le(&wbuf, path) catch return null;
-        if (wbuf_out + 1 > wbuf.len) return null;
-        wbuf[wbuf_out] = 0;
         const eng_sr: u32 = if (self.params.sample_rate > 0) @intCast(self.params.sample_rate) else audio_fallback_rate;
-        // 采样率传 0 = 不重采样（原生率直出）
-        const cfg = ma.ma_decoder_config_init(ma.ma_format_f32, 2, 0);
-        var dec: ma.ma_decoder = undefined;
-        if (ma.ma_decoder_init_file_w(@ptrCast(&wbuf[0]), &cfg, &dec) != ma.MA_SUCCESS) return null;
-        defer _ = ma.ma_decoder_uninit(&dec);
-        var native_sr: ma.ma_uint32 = eng_sr;
-        var ch_out: ma.ma_uint32 = 2;
-        var fmt_out: ma.ma_format = ma.ma_format_f32;
-        if (ma.ma_decoder_get_data_format(&dec, &fmt_out, &ch_out, &native_sr, null, 0) != ma.MA_SUCCESS) return null;
-        if (native_sr == 0) native_sr = eng_sr;
-        var total: ma.ma_uint64 = 0;
-        if (ma.ma_decoder_get_length_in_pcm_frames(&dec, &total) != ma.MA_SUCCESS) return null;
-        const max_frames: u64 = @as(u64, native_sr) * 60 * 30;
-        if (total == 0 or total > max_frames) return null;
-        const nframes: usize = @intCast(total);
-        const frames = a.alloc(f32, nframes * 2) catch return null;
-        errdefer a.free(frames);
-        // 峰值：桶大小先算（目标 ~4096 桶；桶大时抽样——与解码单遍完成）
-        const bucket: usize = @max(1, nframes / 4096);
-        const npeaks: usize = (nframes + bucket - 1) / bucket;
-        const peaks = a.alloc(AudioAsset.Peak, npeaks) catch {
-            a.free(frames);
-            return null;
-        };
-        errdefer a.free(peaks);
-        const stride: usize = if (bucket > 32) @max(1, bucket / 16) else 1;
-        var got_total: usize = 0;
-        while (got_total < nframes) {
-            var got: ma.ma_uint64 = 0;
-            const want: ma.ma_uint64 = @intCast(nframes - got_total);
-            if (ma.ma_decoder_read_pcm_frames(&dec, frames.ptr + got_total * 2, want, &got) != ma.MA_SUCCESS) break;
-            if (got == 0) break;
-            const s0 = got_total;
-            const s1 = got_total + @as(usize, @intCast(got));
-            // 峰值算法**单一真源**在 `audio_import.updatePeaks`（异步导入的 worker 用同一份）
-            audio_import.Manager.updatePeaks(frames, s0, s1, peaks, bucket, stride);
-            got_total = s1;
-        }
-        if (got_total == 0) return null;
-        // 未解码到的尾部桶：置零
-        var pz = got_total / bucket;
-        while (pz < npeaks) : (pz += 1) peaks[pz] = .{ .min = 0, .max = 0 };
+        // 探测（存储计划）+ 整文件解码：与异步导入**同一套**逻辑
+        var dec = audio_import.decodeAll(a, path, eng_sr) orelse return null;
         const path_dup = a.dupe(u8, path) catch {
-            a.free(frames);
-            a.free(peaks);
+            dec.deinit(a);
             return null;
         };
-        errdefer a.free(path_dup);
         // **单独分配**：池子扩容时资产本体不移动（播放表里存的是 &asset.data）
         const asset = a.create(AudioAsset) catch {
             a.free(path_dup);
-            a.free(frames);
-            a.free(peaks);
+            dec.deinit(a);
             return null;
         };
         asset.* = .{
             .path = path_dup,
-            .data = .{ .frames = frames, .frame_count = got_total, .ratio = @floatCast(@as(f64, @floatFromInt(native_sr)) / @as(f64, @floatFromInt(eng_sr))) },
-            .peaks = peaks,
-            .peak_frames = @intCast(bucket),
+            .data = .{
+                .frames = dec.frames,
+                .channels = dec.plan.channels,
+                .frame_count = dec.frame_count,
+                .ratio = @floatCast(@as(f64, @floatFromInt(dec.native_sr)) / @as(f64, @floatFromInt(@max(1, eng_sr)))),
+            },
+            .peaks = dec.peaks,
+            .peak_frames = dec.peak_frames,
         };
         self.audio_assets.append(a, asset) catch {
+            asset.deinit(a);
             a.destroy(asset);
-            a.free(path_dup);
-            a.free(frames);
-            a.free(peaks);
             return null;
         };
         return @intCast(self.audio_assets.items.len - 1);
@@ -3017,9 +2982,7 @@ pub const App = struct {
         self.import_mgr.cancelAll();
         self.import_mgr.drain();
         for (self.audio_assets.items) |asset| {
-            self.allocator.free(asset.path);
-            if (asset.data.frames.len > 0) self.allocator.free(asset.data.frames);
-            if (asset.peaks.len > 0) self.allocator.free(asset.peaks);
+            asset.deinit(self.allocator);
             self.allocator.destroy(asset);
         }
         self.audio_assets.deinit(self.allocator);
@@ -3113,6 +3076,12 @@ pub const App = struct {
         self.import_mgr.promote();
     }
 
+    /// 释放一份“还没挂进资产池”的导入结果（过继失败路径用）
+    fn freeBuffers(self: *App, bufs: audio_import.Manager.Buffers) void {
+        bufs.frames.freeFrames(self.allocator);
+        if (bufs.peaks.len > 0) self.allocator.free(bufs.peaks);
+    }
+
     fn finalizeImport(self: *App, job: *audio_import.Job) void {
         const st = job.state.load(.acquire);
         const a = self.allocator;
@@ -3121,8 +3090,7 @@ pub const App = struct {
             .done => {
                 const bufs = self.import_mgr.takeBuffers(job);
                 const pd = a.dupe(u8, job.path) catch {
-                    if (bufs.frames.len > 0) a.free(bufs.frames);
-                    if (bufs.peaks.len > 0) a.free(bufs.peaks);
+                    freeBuffers(self, bufs);
                     return;
                 };
                 const nat_sr: u32 = @max(1, job.native_sr);
@@ -3130,14 +3098,14 @@ pub const App = struct {
                 // **单独分配**：池子扩容时不移动已有资产（播放表存的是 `&asset.data`）
                 const asset = a.create(AudioAsset) catch {
                     a.free(pd);
-                    if (bufs.frames.len > 0) a.free(bufs.frames);
-                    if (bufs.peaks.len > 0) a.free(bufs.peaks);
+                    freeBuffers(self, bufs);
                     return;
                 };
                 asset.* = .{
                     .path = pd,
                     .data = .{
                         .frames = bufs.frames,
+                        .channels = bufs.plan.channels,
                         .frame_count = @intCast(bufs.got_frames),
                         .ratio = @floatCast(@as(f64, @floatFromInt(nat_sr)) / @as(f64, @floatFromInt(eng_sr))),
                     },
@@ -3145,10 +3113,8 @@ pub const App = struct {
                     .peak_frames = bufs.peak_frames,
                 };
                 self.audio_assets.append(a, asset) catch {
+                    asset.deinit(a);
                     a.destroy(asset);
-                    a.free(pd);
-                    if (bufs.frames.len > 0) a.free(bufs.frames);
-                    if (bufs.peaks.len > 0) a.free(bufs.peaks);
                     return;
                 };
                 const ai: i32 = @intCast(self.audio_assets.items.len - 1);
@@ -13992,30 +13958,46 @@ test "app: 存档容错——片段引用不存在的音频样式 → 加载时�
 
 // ── P2：异步导入（单 worker）────────────────────────────────────────────
 
-/// 测试用：写一个 16-bit PCM 立体声正弦 WAV（48 kHz）
-fn writeSineWavForTest(io: std.Io, alloc: std.mem.Allocator, path: []const u8, frames: usize, sample_rate: u32) !void {
+/// 测试用：写 PCM WAV（支持 16 / 24 bit、1 / 2 声道）
+fn writeWavForTest(io: std.Io, alloc: std.mem.Allocator, path: []const u8, frames: usize, sample_rate: u32, channels: u16, bits: u16) !void {
+    const bytes_per_sample: u16 = bits / 8;
+    const block_align: u16 = channels * bytes_per_sample;
     var w = std.ArrayListUnmanaged(u8).empty;
     defer w.deinit(alloc);
-    const data_bytes: u32 = @intCast(frames * 4);
+    const data_bytes: u32 = @intCast(frames * block_align);
     try w.appendSlice(alloc, "RIFF");
     try w.appendSlice(alloc, std.mem.asBytes(&(@as(u32, 36) + data_bytes)));
     try w.appendSlice(alloc, "WAVEfmt ");
     try w.appendSlice(alloc, std.mem.asBytes(&@as(u32, 16)));
-    try w.appendSlice(alloc, std.mem.asBytes(&@as(u16, 1)));
-    try w.appendSlice(alloc, std.mem.asBytes(&@as(u16, 2)));
+    try w.appendSlice(alloc, std.mem.asBytes(&@as(u16, 1))); // PCM
+    try w.appendSlice(alloc, std.mem.asBytes(&channels));
     try w.appendSlice(alloc, std.mem.asBytes(&sample_rate));
-    try w.appendSlice(alloc, std.mem.asBytes(&(sample_rate * 4)));
-    try w.appendSlice(alloc, std.mem.asBytes(&@as(u16, 4)));
-    try w.appendSlice(alloc, std.mem.asBytes(&@as(u16, 16)));
+    try w.appendSlice(alloc, std.mem.asBytes(&(sample_rate * @as(u32, block_align))));
+    try w.appendSlice(alloc, std.mem.asBytes(&block_align));
+    try w.appendSlice(alloc, std.mem.asBytes(&bits));
     try w.appendSlice(alloc, "data");
     try w.appendSlice(alloc, std.mem.asBytes(&data_bytes));
     var i: usize = 0;
     while (i < frames) : (i += 1) {
-        const s: i16 = @intFromFloat(@sin(@as(f64, @floatFromInt(i)) * 0.03) * 12000.0);
-        try w.appendSlice(alloc, std.mem.asBytes(&s));
-        try w.appendSlice(alloc, std.mem.asBytes(&s));
+        const vf: f64 = @sin(@as(f64, @floatFromInt(i)) * 0.03) * 12000.0;
+        var c: u16 = 0;
+        while (c < channels) : (c += 1) {
+            if (bits == 24) {
+                const s24: i32 = @intFromFloat(vf * 256.0);
+                const u: u32 = @bitCast(s24);
+                try w.appendSlice(alloc, &[_]u8{ @truncate(u), @truncate(u >> 8), @truncate(u >> 16) });
+            } else {
+                const s16: i16 = @intFromFloat(vf);
+                try w.appendSlice(alloc, std.mem.asBytes(&s16));
+            }
+        }
     }
     try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = w.items });
+}
+
+/// 测试用：写一个 16-bit PCM 立体声正弦 WAV（48 kHz）
+fn writeSineWavForTest(io: std.Io, alloc: std.mem.Allocator, path: []const u8, frames: usize, sample_rate: u32) !void {
+    return writeWavForTest(io, alloc, path, frames, sample_rate, 2, 16);
 }
 
 /// 测试用：等异步导入收尾（UI 侧 poll；最多 5 s）
@@ -14227,7 +14209,7 @@ test "音频资产池：追加资产不移动已有 Asset —— 播放表指针
     try std.testing.expectEqual(@as(usize, 1), tbl.rows.len);
     const sample0 = tbl.rows[0].asset.?; // 音频线程看到的就是这个指针
     const frames0 = sample0.frame_count;
-    const first0 = sample0.frames[0];
+    const first0 = sample0.frameAt(0)[0];
 
     // 追加 12 个资产（必然触发多次扩容）
     var i: usize = 0;
@@ -14241,8 +14223,66 @@ test "音频资产池：追加资产不移动已有 Asset —— 播放表指针
 
     // 旧指针仍指向有效数据（内容不变）
     try std.testing.expectEqual(frames0, sample0.frame_count);
-    try std.testing.expectEqual(first0, sample0.frames[0]);
+    try std.testing.expectEqual(first0, sample0.frameAt(0)[0]);
     try std.testing.expectEqual(frames0, app.audioStyleAsset(@intCast(s0)).?.data.frame_count);
+}
+
+test "P3a 存储计划：16-bit→i16（立体声/单声道）、24-bit→f32" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.dir.close(io);
+    const dirp = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(dirp);
+
+    // 16-bit 立体声：i16、2 声道、4 B/帧（旧实现 8 B/帧）
+    {
+        const p = try std.fmt.allocPrint(alloc, "{s}/s16_st.wav", .{dirp});
+        defer alloc.free(p);
+        try writeWavForTest(io, alloc, p, 240, 48000, 2, 16);
+        var d = audio_import.decodeAll(alloc, p, 48000) orelse return error.DecodeFailed;
+        defer d.deinit(alloc);
+        try std.testing.expectEqual(@as(u8, 2), d.plan.channels);
+        try std.testing.expectEqual(@as(usize, 240 * 2), d.frames.count());
+        try std.testing.expectEqual(@as(usize, 240 * 4), d.frames.bytes());
+        try std.testing.expect(d.peaks.len > 0);
+        switch (d.frames) {
+            .s16 => {},
+            .f32 => return error.ExpectedS16,
+        }
+    }
+
+    // 16-bit 单声道：**保留单声道**（2 B/帧 = 4× 省），取样双臂相等
+    {
+        const p = try std.fmt.allocPrint(alloc, "{s}/s16_mono.wav", .{dirp});
+        defer alloc.free(p);
+        try writeWavForTest(io, alloc, p, 240, 48000, 1, 16);
+        var d = audio_import.decodeAll(alloc, p, 48000) orelse return error.DecodeFailed;
+        defer d.deinit(alloc);
+        try std.testing.expectEqual(@as(u8, 1), d.plan.channels);
+        try std.testing.expectEqual(@as(usize, 240), d.frames.count());
+        try std.testing.expectEqual(@as(usize, 240 * 2), d.frames.bytes());
+        const sd = audio.SampleData{ .frames = d.frames, .channels = 1, .frame_count = d.frame_count, .ratio = 1.0 };
+        const s = sd.frameAt(10);
+        try std.testing.expectEqual(s[0], s[1]); // 单声道展开：左右相等（防“单耳”）
+        try std.testing.expect(s[0] != 0);
+    }
+
+    // 24-bit 立体声：不降精度 → f32
+    {
+        const p = try std.fmt.allocPrint(alloc, "{s}/s24_st.wav", .{dirp});
+        defer alloc.free(p);
+        try writeWavForTest(io, alloc, p, 240, 48000, 2, 24);
+        var d = audio_import.decodeAll(alloc, p, 48000) orelse return error.DecodeFailed;
+        defer d.deinit(alloc);
+        try std.testing.expectEqual(@as(u8, 2), d.plan.channels);
+        try std.testing.expectEqual(@as(usize, 240 * 2), d.frames.count());
+        try std.testing.expectEqual(@as(usize, 240 * 2 * 4), d.frames.bytes());
+        switch (d.frames) {
+            .f32 => {},
+            .s16 => return error.ExpectedF32,
+        }
+    }
 }
 
 test "工程加载（异步解码）：工程立刻可见，音频随后就位" {

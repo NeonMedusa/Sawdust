@@ -817,20 +817,95 @@ pub const KitSamplerState = struct {
     };
 };
 
-/// 不可变采样数据（UI 解码后发布；音频线程只读。帧 = f32 交错立体声@引擎率）
+/// 采样帧存储：解码器**原生格式**（`s16`）/ 高位深与未知容器（`f32`）。
+/// 内存：16-bit 立体声 4 B/帧、单声道 2 B/帧（f32 分别是 8 / 4 B/帧）。
+pub const SampleFrames = union(enum) {
+    s16: []const i16,
+    f32: []const f32,
+
+    /// 采样点总数（= 帧数 × 声道）
+    pub fn count(self: SampleFrames) usize {
+        return switch (self) {
+            .s16 => |v| v.len,
+            .f32 => |v| v.len,
+        };
+    }
+
+    /// 占用字节数（内存统计/诊断用）
+    pub fn bytes(self: SampleFrames) usize {
+        return switch (self) {
+            .s16 => |v| v.len * @sizeOf(i16),
+            .f32 => |v| v.len * @sizeOf(f32),
+        };
+    }
+
+    /// 释放帧存储（**两种布局统一入口**；空切片安全）
+    pub fn freeFrames(self: SampleFrames, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .s16 => |v| if (v.len > 0) allocator.free(v),
+            .f32 => |v| if (v.len > 0) allocator.free(v),
+        }
+    }
+};
+
+/// 不可变采样数据（UI 解码后发布；音频线程只读）。
+///
+/// **P3a**：不再一律 f32 立体声——存解码器**原生格式 + 原生声道数**（1/2），
+/// 内存从 8 B/帧 降到 4 B/帧（16-bit 立体声）或 2 B/帧（16-bit 单声道）。
+/// ⚠️ 取样**只准走 `frameAt` / `sampleStereoAt`**——直接下标会让单声道只出一只耳朵。
 pub const SampleData = struct {
-    frames: []const f32,
-    /// 采样点数（**原生采样率**下的帧数——`frames` 的索引上限）
+    frames: SampleFrames,
+    /// 声道数：1 = 单声道（取样时双臂共用）；2 = 立体声交错
+    channels: u8 = 2,
+    /// 采样点数（**原生采样率**下的帧数——`frames` 的帧索引上限）
     frame_count: usize,
     /// 原生率 / 引擎率（播放位置换算：引擎帧 × ratio = 采样帧；1.0 = 同率）
     /// 解码时**不重采样**（P1 提速）：所有 UI/trim 仍以引擎帧为单位，
     /// 只在真正取样本时乘这个系数。
     ratio: f32 = 1.0,
 
+    const k16: f32 = 1.0 / 32768.0;
+
     /// 引擎帧域长度（UI/trim 域：= frame_count / ratio）
     pub inline fn engFrames(self: *const SampleData) usize {
         if (self.ratio <= 0.0) return self.frame_count;
         return @intFromFloat(@as(f64, @floatFromInt(self.frame_count)) / @as(f64, self.ratio));
+    }
+
+    /// 取第 `i` 采样帧的立体声样本（单声道自动展开到 L/R）。
+    /// **不做越界检查**（调用方先判范围）——热循环用这个。
+    pub inline fn frameAt(self: *const SampleData, i: usize) [2]f32 {
+        const mono = self.channels < 2;
+        switch (self.frames) {
+            .s16 => |fs| {
+                if (mono) {
+                    const v = k16 * @as(f32, @floatFromInt(fs[i]));
+                    return .{ v, v };
+                }
+                return .{ k16 * @as(f32, @floatFromInt(fs[i * 2])), k16 * @as(f32, @floatFromInt(fs[i * 2 + 1])) };
+            },
+            .f32 => |fs| {
+                if (mono) {
+                    const v = fs[i];
+                    return .{ v, v };
+                }
+                return .{ fs[i * 2], fs[i * 2 + 1] };
+            },
+        }
+    }
+
+    /// 原生帧域的小数位置取立体声（**线性插值**；越界 clamp 到首/尾帧）。
+    pub inline fn sampleStereoAt(self: *const SampleData, pos: f64) [2]f32 {
+        if (self.frame_count == 0) return .{ 0, 0 };
+        const last = self.frame_count - 1;
+        if (!(pos > 0)) return self.frameAt(0);
+        if (pos >= @as(f64, @floatFromInt(last))) return self.frameAt(last);
+        const ia: usize = @intFromFloat(pos);
+        const ib = @min(ia + 1, last);
+        const t: f32 = @floatCast(pos - @floor(pos));
+        const a = self.frameAt(ia);
+        const b = self.frameAt(ib);
+        return .{ a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t };
     }
 };
 
@@ -994,7 +1069,7 @@ pub fn mixKitSamplerLayer(
     const st = kitSamplerState(engine, i) orelse return;
     if (l >= kit_max_layers) return;
     const asset = params.kit_layer_asset[i][l].load(.acquire) orelse return;
-    if (asset.frame_count < 2 or asset.frames.len < 4) return;
+    if (asset.frame_count < 2) return;
     const total: usize = asset.frame_count;
     const ld = &st.layers[l];
     for (&ld.voices) |*v| {
@@ -1010,13 +1085,10 @@ pub fn mixKitSamplerLayer(
                 v.active = false;
                 break;
             }
-            const fr: f32 = @floatCast(v.pos - @as(f64, @floatFromInt(idx)));
-            const a0 = asset.frames[idx * 2];
-            const b0 = asset.frames[(idx + 1) * 2];
-            const a1 = asset.frames[idx * 2 + 1];
-            const b1 = asset.frames[(idx + 1) * 2 + 1];
-            cbuf[k] += (a0 + (b0 - a0) * fr) * v.gain_l * g * lg;
-            cbuf[k + 1] += (a1 + (b1 - a1) * fr) * v.gain_r * g * lg;
+            // 取样（含插值 / 单声道展开 / i16 换算）统一走 `sampleStereoAt`
+            const s = asset.sampleStereoAt(v.pos);
+            cbuf[k] += s[0] * v.gain_l * g * lg;
+            cbuf[k + 1] += s[1] * v.gain_r * g * lg;
             v.pos += v.step;
         }
     }
@@ -1568,7 +1640,7 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
             if (params.playing.load(.monotonic)) {
                 for (tbl.rows) |row| {
                     const asset = row.asset orelse continue;
-                    if (asset.frame_count == 0 or asset.frames.len < 2) continue;
+                    if (asset.frame_count == 0) continue;
                     const sp = clipSpan(
                         @intCast(abs0),
                         @as(i64, @intCast(frames)),
@@ -1593,19 +1665,10 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
                         const ip: usize = @intFromFloat(posf);
                         if (ip >= asset.frame_count) break;
                         // **线性插值**（采样率与引擎不同/变速时不再取最近邻——减少混叠噪声）
-                        const g = row.gain;
-                        if (ip + 1 < asset.frame_count) {
-                            const t: f32 = @floatCast(posf - @floor(posf));
-                            const l0 = asset.frames[ip * 2];
-                            const r0 = asset.frames[ip * 2 + 1];
-                            const l1 = asset.frames[(ip + 1) * 2];
-                            const r1 = asset.frames[(ip + 1) * 2 + 1];
-                            cb[w * 2] += (l0 + (l1 - l0) * t) * g;
-                            cb[w * 2 + 1] += (r0 + (r1 - r0) * t) * g;
-                        } else {
-                            cb[w * 2] += asset.frames[ip * 2] * g;
-                            cb[w * 2 + 1] += asset.frames[ip * 2 + 1] * g;
-                        }
+                        // 取样统一走 `sampleStereoAt`（单声道 / i16 都在里面展开）
+                        const s = asset.sampleStereoAt(posf);
+                        cb[w * 2] += s[0] * row.gain;
+                        cb[w * 2 + 1] += s[1] * row.gain;
                     }
                 }
             }
@@ -1644,8 +1707,9 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
                         }
                         const pi: usize = @intFromFloat(ppos);
                         if (pi >= p_end) break;
-                        cb2[f2 * 2] += pa.frames[pi * 2] * pg;
-                        cb2[f2 * 2 + 1] += pa.frames[pi * 2 + 1] * pg;
+                        const psamp = pa.frameAt(pi);
+                        cb2[f2 * 2] += psamp[0] * pg;
+                        cb2[f2 * 2 + 1] += psamp[1] * pg;
                         f2 += 1;
                         ppos += pspd;
                     }
@@ -2798,6 +2862,31 @@ test "audio: clipSpan——按段坐标计算（多段渲染不越界、不重�
     try std.testing.expectApproxEqAbs(@as(f64, 2.0), s5.step, 1e-9);
 }
 
+test "audio: SampleData 取样——s16/f32 × 单声道/立体声 + 插值与 clamp" {
+    // 立体声 s16：2 帧 → (0, 0.5), (1.0, -1.0)
+    const st = [_]i16{ 0, 16384, 32767, -32768 };
+    const d = SampleData{ .frames = .{ .s16 = &st }, .channels = 2, .frame_count = 2 };
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), d.frameAt(0)[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), d.frameAt(0)[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), d.frameAt(1)[0], 1e-4);
+    const mid = d.sampleStereoAt(0.5); // 线性插值
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), mid[0], 1e-3);
+
+    // 单声道 s16：双臂共用（回归：“单耳”/“音量减半”）
+    const mono = [_]i16{ -16384, 16384 };
+    const m = SampleData{ .frames = .{ .s16 = &mono }, .channels = 1, .frame_count = 2 };
+    const mf = m.frameAt(0);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.5), mf[0], 1e-6);
+    try std.testing.expectEqual(mf[0], mf[1]);
+
+    // 立体声 f32：越界 clamp 到末帧
+    const ff = [_]f32{ 0.25, -0.25 };
+    const f = SampleData{ .frames = .{ .f32 = &ff }, .channels = 2, .frame_count = 1 };
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), f.frameAt(0)[0], 1e-6);
+    const clamped = f.sampleStereoAt(99.0);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.25), clamped[1], 1e-6);
+}
+
 test "audio: 鼓组采样器层——触发后能发声，trim 到点自动收声" {
     const alloc = std.testing.allocator;
     var env: KitTestEnv = undefined;
@@ -2809,7 +2898,7 @@ test "audio: 鼓组采样器层——触发后能发声，trim 到点自动收�
     const frames = try alloc.alloc(f32, nframes * 2);
     defer alloc.free(frames);
     for (frames, 0..) |*s, k| s.* = if (k / 2 < 200) 0.5 else 0.0;
-    var data = SampleData{ .frames = frames, .frame_count = nframes, .ratio = 1.0 };
+    var data = SampleData{ .frames = .{ .f32 = frames }, .frame_count = nframes, .ratio = 1.0 };
 
     // 采样器声部池（对应 App.ensureKitSampler）
     const kss = try alloc.create(KitSamplerState);
@@ -2880,7 +2969,7 @@ test "audio: 鼓组采样器层——声像居中时左右声道都响（回归�
     const frames = try alloc.alloc(f32, nframes * 2);
     defer alloc.free(frames);
     for (frames) |*s| s.* = 0.5;
-    var data = SampleData{ .frames = frames, .frame_count = nframes, .ratio = 1.0 };
+    var data = SampleData{ .frames = .{ .f32 = frames }, .frame_count = nframes, .ratio = 1.0 };
 
     const kss = try alloc.create(KitSamplerState);
     kss.* = .{};

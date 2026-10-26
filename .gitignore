@@ -1,8 +1,9 @@
 zig-out/
-.zig-cache/
+.zig-cache*/
 zig-pkg/
 tmp/
 .firecrawl/
 *.saw
 *.pdb
 nul
+sawdust-crash.log

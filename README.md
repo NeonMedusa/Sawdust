@@ -46,7 +46,8 @@ https://drive.google.com/drive/folders/1vHJcw6CiEt24WLKBgtTzmiMKY8IMpbfF?usp=sha
   多输出 VSTi（SFLT）/ 扫描管理器 + 预设浏览器）
 - [x] 音频文件（WAV/MP3）加载与波形缓存（音频样式 / 音频片段 / 波形窗 / 采样器层，
   见 `docs/audio-files.md`）
-- [ ] 音频导入性能：**P3** 长文件流式解码与峰值懒算（详见 `docs/audio-files.md` §8）
+- [ ] 音频内存：**P3a** i16 / 保留单声道存储（2~4×）+ 字节预算闸门；
+  （流式播放与热集 LRU 已评估，**延后**；峰值懒算已作废——详见 `docs/audio-files.md` §8）
 - [ ] 性能打磨（长工程滚动、打开/保存耗时、内存峰值）
 - [ ] 自动化曲线（声像、音量、颤音、bpm变速等等等，还有 MIDI 通道声像的完整还原）
 - [ ] 音频、音符录制
