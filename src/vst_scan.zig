@@ -18,7 +18,31 @@
 //!   {"t":"end","ok":N,"err":M}
 
 const std = @import("std");
+const builtin = @import("builtin");
 const host = @import("vst_host.zig");
+
+/// 本平台的可加载模块扩展名（VST3 规范：Linux 是 `.so`，Windows 是 `.vst3`/`.dll`）。
+const module_exts: []const []const u8 = if (builtin.os.tag == .linux)
+    &.{ ".so", ".vst3" }
+else
+    &.{ ".vst3", ".dll" };
+
+/// bundle 内放本平台模块的子目录（按优先级；`""` = 包根，兼容扁平包）。
+const bundle_subs: []const []const u8 = if (builtin.os.tag == .linux)
+    &.{ "Contents/x86_64-linux", "" }
+else
+    &.{ "Contents/x86_64-win", "Contents/x86-win", "" };
+
+/// 扫描目录里遇到的**普通文件**是否算插件模块。
+/// Linux 上裸 `.so` 很容易和普通库混淆 → 只有位于 `.vst3` 包里（或本身叫 `.vst3`）才算。
+fn acceptModuleFile(dir_path: []const u8, name: []const u8) bool {
+    if (std.mem.endsWith(u8, name, ".vst3")) return true;
+    if (builtin.os.tag == .linux) {
+        if (!std.mem.endsWith(u8, name, ".so")) return false;
+        return std.mem.endsWith(u8, dir_path, ".vst3");
+    }
+    return std.mem.endsWith(u8, name, ".dll");
+}
 
 /// 扫描候选：`path` = 发现的根（.vst3 目录包 / 裸文件；展示、去重、写存档用）；
 /// `dll` = 真正可加载的模块路径（包内 `Contents/<arch>/` 模块；裸文件 = 自身）。
@@ -98,15 +122,17 @@ fn findFirstModule(io: std.Io, alloc: std.mem.Allocator, dir_path: []const u8, e
 /// 解析 .vst3 目录包的模块路径：按 VST3 规范找 `Contents/<arch>/` 下的模块；
 /// 找不到 → 包根兜底（加载会失败，但错误对外可见）。
 fn addBundle(io: std.Io, alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(Candidate), bundle_root: []const u8) !void {
-    const subs = [_][]const u8{ "Contents/x86_64-win", "Contents/x86-win", "" };
     var found: ?[]u8 = null;
-    for (subs) |sub| {
+    for (bundle_subs) |sub| {
         var buf: [1024]u8 = undefined;
         const dir_path: []const u8 = if (sub.len == 0)
             bundle_root
         else
             std.fmt.bufPrint(&buf, "{s}/{s}", .{ bundle_root, sub }) catch continue;
-        found = findFirstModule(io, alloc, dir_path, ".vst3") orelse findFirstModule(io, alloc, dir_path, ".dll");
+        for (module_exts) |ext| {
+            found = findFirstModule(io, alloc, dir_path, ext);
+            if (found != null) break;
+        }
         if (found != null) break;
     }
     const dll = found orelse try alloc.dupe(u8, bundle_root);
@@ -132,7 +158,7 @@ fn walkContents(io: std.Io, alloc: std.mem.Allocator, dir: std.Io.Dir, dir_path:
                 }
             },
             .file => {
-                if (std.mem.endsWith(u8, entry.name, ".vst3") or std.mem.endsWith(u8, entry.name, ".dll")) {
+                if (acceptModuleFile(dir_path, entry.name)) {
                     addFile(alloc, out, full) catch {};
                 }
             },
@@ -141,14 +167,26 @@ fn walkContents(io: std.Io, alloc: std.mem.Allocator, dir: std.Io.Dir, dir_path:
     }
 }
 
-/// 发现候选：`root` 是目录 → 递归遍历；不是目录（裸文件）→ 自身即候选。
+/// 发现候选：
+/// - `root` 本身是 `*.vst3` **目录** → 当作 bundle 解析（不是"遍历它的内容"）；
+/// - `root` 是普通目录 → 递归遍历；
+/// - `root` 是文件 → 自身即候选；
+/// - `root` **不存在** → 跳过（早先会当成裸文件，缓存里因此留下
+///   `/usr/local/lib/vst3`、`~/.vst3` 这类"LoadLibraryFailed"的幽灵条目）。
 pub fn discover(io: std.Io, alloc: std.mem.Allocator, root: []const u8, out: *std.ArrayListUnmanaged(Candidate)) !void {
-    var dir = std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true }) catch {
-        try addFile(alloc, out, root);
+    if (std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true })) |dir| {
+        defer dir.close(io);
+        if (std.mem.endsWith(u8, root, ".vst3")) {
+            try addBundle(io, alloc, out, root); // 用户直接指定了某个插件包
+            return;
+        }
+        walkContents(io, alloc, dir, root, out);
         return;
-    };
-    walkContents(io, alloc, dir, root, out);
-    dir.close(io);
+    } else |_| {}
+    // 不是目录：**存在**才当裸文件候选（不存在就跳过）
+    var f = std.Io.Dir.cwd().openFile(io, root, .{}) catch return;
+    f.close(io);
+    try addFile(alloc, out, root);
 }
 
 fn sortCandidates(items: []Candidate) void {
@@ -317,6 +355,83 @@ test "vst_scan: JSON 转义（引号/反斜杠/控制字符/UTF-8）" {
     try std.testing.expectEqualStrings("\"C:\\\\程序\\\\a\\\"b\\n\\t\"", w.buffered());
 }
 
+test "vst_scan: 真实系统目录（/usr/lib/vst3）里每个 .vst3 包都能解析出可加载模块" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+
+    var root = std.Io.Dir.cwd().openDir(io, "/usr/lib/vst3", .{ .iterate = true }) catch return error.SkipZigTest;
+    defer root.close(io);
+
+    // 收集系统里实际存在的 bundle 名（本机：Dexed.vst3、Vital.vst3 …）
+    var bundles: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (bundles.items) |b| alloc.free(b);
+        bundles.deinit(alloc);
+    }
+    var it = root.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".vst3")) continue;
+        const dup = alloc.dupe(u8, entry.name) catch continue;
+        bundles.append(alloc, dup) catch {
+            alloc.free(dup);
+            continue;
+        };
+    }
+    if (bundles.items.len == 0) return error.SkipZigTest; // 机器上没装插件 → 跳过
+
+    var cands: std.ArrayListUnmanaged(Candidate) = .empty;
+    defer freeCandidates(alloc, &cands);
+    try discover(io, alloc, "/usr/lib/vst3", &cands);
+    try std.testing.expect(cands.items.len >= bundles.items.len);
+
+    // 对每个真实存在的 bundle：必须有候选，且 dll 指向**存在**的本平台模块
+    for (bundles.items) |b| {
+        var found = false;
+        for (cands.items) |c| {
+            try std.testing.expect(std.mem.indexOf(u8, c.dll, "x86_64-win") == null);
+            if (!std.mem.endsWith(u8, c.path, b)) continue;
+            found = true;
+            try std.testing.expect(std.mem.endsWith(u8, c.dll, ".so") or std.mem.endsWith(u8, c.dll, ".vst3"));
+            var f = std.Io.Dir.cwd().openFile(io, c.dll, .{}) catch {
+                std.debug.print("候选 dll 不存在：{s}\n", .{c.dll});
+                return error.MissingModule;
+            };
+            f.close(io);
+        }
+        if (!found) {
+            std.debug.print("bundle 没被扫到：{s}\n", .{b});
+            return error.BundleNotFound;
+        }
+    }
+}
+
+test "vst_scan: 不存在的根不产生候选；.vst3 目录当 bundle 解析" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.dir.close(io);
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+    try makeTestTree(io, root);
+
+    // ① 不存在的根：不该冒出一个"幽灵候选"（旧实现会当成裸文件）
+    var none: std.ArrayListUnmanaged(Candidate) = .empty;
+    defer freeCandidates(alloc, &none);
+    try discover(io, alloc, "/definitely/not/here/vst3", &none);
+    try std.testing.expectEqual(@as(usize, 0), none.items.len);
+
+    // ② 直接把 bundle 目录当根：应解析出包内模块，而不是遍历 Contents 一无所获
+    var one: std.ArrayListUnmanaged(Candidate) = .empty;
+    defer freeCandidates(alloc, &one);
+    const bundle = try std.fmt.allocPrint(alloc, "{s}/A.vst3", .{root});
+    defer alloc.free(bundle);
+    try discover(io, alloc, bundle, &one);
+    try std.testing.expectEqual(@as(usize, 1), one.items.len);
+    try std.testing.expect(std.mem.endsWith(u8, one.items[0].dll, ".so") or std.mem.endsWith(u8, one.items[0].dll, ".vst3"));
+}
+
 test "vst_scan: 候选发现（包结构 / 裸文件 / 递归 / 单文件根）" {
     const io = std.testing.io;
     const alloc = std.testing.allocator;
@@ -331,17 +446,21 @@ test "vst_scan: 候选发现（包结构 / 裸文件 / 递归 / 单文件根）"
     try discover(io, alloc, root, &cands);
     try std.testing.expectEqual(@as(usize, 4), cands.items.len);
 
-    // 包内模块解析（path = 包根；dll = 包内模块）
+    // 包内模块解析（path = 包根；dll = 包内模块）——期望值按**本平台**形状拼
+    var want_a: [1024]u8 = undefined;
+    const want_a_path = try std.fmt.bufPrint(&want_a, "/A.vst3/{s}/A{s}", .{ bundle_subs[0], module_exts[0] });
+    var want_f: [1024]u8 = undefined;
+    const want_f_path = try std.fmt.bufPrint(&want_f, "/F.vst3/F{s}", .{module_exts[0]});
     var found_a = false;
     var found_f = false;
     for (cands.items) |c| {
         if (std.mem.endsWith(u8, c.path, "/A.vst3")) {
             found_a = true;
-            try std.testing.expect(std.mem.endsWith(u8, c.dll, "/A.vst3/Contents/x86_64-win/A.vst3"));
+            try std.testing.expect(std.mem.endsWith(u8, c.dll, want_a_path));
         }
         if (std.mem.endsWith(u8, c.path, "/F.vst3")) {
             found_f = true;
-            try std.testing.expect(std.mem.endsWith(u8, c.dll, "/F.vst3/F.vst3")); // 包根兜底
+            try std.testing.expect(std.mem.endsWith(u8, c.dll, want_f_path)); // 包根兜底
         }
     }
     try std.testing.expect(found_a and found_f);
@@ -356,17 +475,22 @@ test "vst_scan: 候选发现（包结构 / 裸文件 / 递归 / 单文件根）"
     try std.testing.expectEqualStrings(one.items[0].path, one.items[0].dll);
 }
 
-/// 造测试树：规范包 A.vst3（Contents/x86_64-win）、扁平包 F.vst3（模块在包根）、
-/// 裸文件 B.vst3、嵌套目录里的 C.dll——全部 0 字节假模块（LoadLibrary 必败）。
+/// 造测试树（**按本平台形状**）：规范包 A.vst3（`bundle_subs[0]`）、扁平包 F.vst3（模块在包根）、
+/// 裸文件 B.vst3、嵌套目录里的 C 模块——全部 0 字节假模块（加载必败）。
+/// Linux 上模块扩展名是 `.so`，Windows 上是 `.vst3`/`.dll`，所以扩展名走 `module_exts`。
 fn makeTestTree(io: std.Io, root: []const u8) !void {
     var buf: [1024]u8 = undefined;
-    std.Io.Dir.cwd().createDirPath(io, try std.fmt.bufPrint(&buf, "{s}/A.vst3/Contents/x86_64-win", .{root})) catch return error.IoFailure;
+    const arch = bundle_subs[0];
+    const ext = module_exts[0];
+    std.Io.Dir.cwd().createDirPath(io, try std.fmt.bufPrint(&buf, "{s}/A.vst3/{s}", .{ root, arch })) catch return error.IoFailure;
     std.Io.Dir.cwd().createDirPath(io, try std.fmt.bufPrint(&buf, "{s}/F.vst3", .{root})) catch return error.IoFailure;
     std.Io.Dir.cwd().createDirPath(io, try std.fmt.bufPrint(&buf, "{s}/sub", .{root})) catch return error.IoFailure;
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&buf, "{s}/A.vst3/Contents/x86_64-win/A.vst3", .{root}), .data = "" }) catch return error.IoFailure;
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&buf, "{s}/F.vst3/F.vst3", .{root}), .data = "" }) catch return error.IoFailure;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&buf, "{s}/A.vst3/{s}/A{s}", .{ root, arch, ext }), .data = "" }) catch return error.IoFailure;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&buf, "{s}/F.vst3/F{s}", .{ root, ext }), .data = "" }) catch return error.IoFailure;
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&buf, "{s}/B.vst3", .{root}), .data = "" }) catch return error.IoFailure;
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&buf, "{s}/sub/C.dll", .{root}), .data = "" }) catch return error.IoFailure;
+    // 嵌套目录里的"普通模块文件"：Windows 用 .dll（合法候选）；Linux 的裸 .so 不在 .vst3 包里
+    // → 按设计**不算**插件（防止把 /usr/lib 下的库当插件），所以这里也用 .vst3 保证计数一致。
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&buf, "{s}/sub/C{s}", .{ root, if (builtin.os.tag == .linux) ".vst3" else ".dll" }), .data = "" }) catch return error.IoFailure;
 }
 
 test "vst_scan: runScan 端到端——fake 模块全部加载失败但 JSONL 结构完整" {

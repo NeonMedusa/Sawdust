@@ -37,8 +37,11 @@ const view_drumkit = @import("view_drumkit.zig");
 const view_help = @import("view_help.zig");
 const view_wave = @import("view_wave.zig");
 const view_settings = @import("view_settings.zig");
+const font_info = @import("font_info.zig");
+const audio_pref = @import("audio_pref.zig");
 const view_plugins = @import("view_plugins.zig");
 const plugin_db = @import("plugin_db.zig");
+const vst_scan_mod = @import("vst_scan.zig");
 const app_mod = @import("app.zig");
 const fx = @import("effects.zig");
 const vst_host = @import("vst_host.zig");
@@ -46,10 +49,21 @@ const eq = @import("eq.zig");
 const audio = @import("audio.zig");
 const vstscan = @import("vstscan.zig"); // 插件扫描工具（同二进制自举入口 `--vst-scan`）
 const crash = @import("crash.zig"); // 崩溃日志（GUI 子系统下 panic 看不见）
+const port_io = @import("port_io.zig");
+const file_picker = @import("file_picker.zig"); // 内置文件选择器（B 方案，不阻塞主循环）
+const text_edit = @import("text_edit.zig"); // 文本编辑公共部分（选择器 / 重命名输入框共用）
+const builtin = @import("builtin");
+
+// ⚠️ 临时脚手架：Linux 实验构建下把 Win32 符号补成空实现（VST/扫描/子进程仍未移植）。
+// 细节与"真正的修法"见 `port_win_shims.zig` 顶部注释；VST 移植（P3）时删掉本块。
+comptime {
+    if (builtin.os.tag != .windows) _ = @import("port_win_shims.zig");
+}
 
 /// 自定义 panic：消息追加进 `sawdust-crash.log`，再走默认处理器
 pub const panic = std.debug.FullPanic(crash.panicFn);
 
+/// 程序入口（GUI）。`--vst-scan` 是隐藏的插件扫描 CLI（同二进制自举）。
 pub fn main(init: std.process.Init) !u8 {
     const allocator = init.gpa;
     const io = init.io;
@@ -60,12 +74,16 @@ pub fn main(init: std.process.Init) !u8 {
     if (hasScanArg(init)) return vstscan.cliMain(init);
 
     vstscan.attachParentConsole(); // 从终端启动时接回父控制台（panic/日志可见）
+    // 内置文件选择器（B 方案）：非 null = 模态选择器开着（主循环照常跑）
+    var picker: ?file_picker.Picker = null;
+    defer if (picker) |*pk| pk.deinit();
+
     var win: window.Window = undefined;
     try win.init(allocator, "Sawdust — Simple Audio Workstation", 1280, 760);
     defer win.deinit();
 
     var font = loadFont(allocator, io) catch |e| {
-        std.debug.print("字体加载失败（{s}）：请把任意 .ttf 放到 fonts/ 目录\n", .{@errorName(e)});
+        std.debug.print("字体加载失败（{s}）\n", .{@errorName(e)});
         return 1;
     };
     defer font.deinit();
@@ -83,7 +101,7 @@ pub fn main(init: std.process.Init) !u8 {
     // 数据目录（预设库）+ 首次扫描（IO 统一在帧末 pending 处理）
     {
         var edir_buf: [1024]u8 = undefined;
-        const edir = exeDir(allocator, &edir_buf);
+        const edir = exeDir(allocator, io, &edir_buf);
         var root_buf: [512]u8 = undefined;
         if (preset_mod.resolveDataRoot(io, edir, &root_buf)) |root| app.setDataRoot(root);
         app.pending_preset = .scan;
@@ -94,6 +112,11 @@ pub fn main(init: std.process.Init) !u8 {
         app.plugin_cache = plugin_db.Cache.load(io, allocator, pdr);
     }
     defer app.deinitPluginDb();
+    // 隐藏开关 `--scan-plugins`：启动后立刻跑一次插件扫描（无需点 UI；用于修缓存/自动化验证）
+    if (hasCliArg(init, "--scan-plugins")) {
+        app.plugin_mgr.open = true;
+        app.pending_scan_start = true;
+    }
     loadSettings(&app, io); // 设置（settings.json；缺失 = 默认）+ 启动打开上次工程
     // 初始片段（空基线）：样式 1 放在 Track 1 的最左边（长度 = 样式有效长度）
     app.addClip(.{
@@ -109,6 +132,7 @@ pub fn main(init: std.process.Init) !u8 {
     app.params.events = &app.events;
     app.params.sched_events = &app.sched_events;
 
+    audio_pref.load(io, app.dataRoot()); // 音频后端偏好（data/audio.txt）
     app.engine.init(&app.params, allocator) catch |e| {
         std.debug.print("音频初始化失败（{s}）：UI 仍可运行\n", .{@errorName(e)});
     };
@@ -304,6 +328,24 @@ pub fn main(init: std.process.Init) !u8 {
         ui_input.wheel_shift = false;
 
         // 1) 输入
+        // 选择器 / 重命名输入框：剪贴板数据到了就自动粘贴
+        // （X11 异步：请求与数据分两帧，不泵就得按两次 Ctrl+V）
+        if (picker) |*pk0| {
+            if (pk0.pending_paste) {
+                if (win.clipboardTake()) |txt| {
+                    defer app.allocator.free(txt);
+                    pk0.editInsertSlice(txt);
+                    pk0.pending_paste = false;
+                }
+            }
+        } else if (app.text_input.pending_paste) {
+            if (win.clipboardTake()) |txt| {
+                defer app.allocator.free(txt);
+                app.textInputInsertSlice(txt);
+                app.text_input.pending_paste = false;
+            }
+        }
+
         const events = try win.pollEvents();
         // 修饰键（每帧读“当前”状态——框选手势需要实时状态，
         // 而键盘事件里只有按下瞬间的状态）
@@ -313,6 +355,111 @@ pub fn main(init: std.process.Init) !u8 {
             ui_input.mods_shift = m.shift;
         }
         for (events) |ev| {
+            // 内置选择器开着：模态吞输入——但**鼠标/滚轮状态必须照常喂给 UI**（否则选择器
+            // 收不到点击，实测就是"点了没反应"）；键盘只放行 Esc/Enter。
+            // 渲染与音频线程照常 → 界面不冻结、音乐不断（B 方案的核心目的）。
+            if (picker) |*pk| {
+                switch (ev) {
+                    .mouse_move => |m| {
+                        ui_input.mouse_x = m.x;
+                        ui_input.mouse_y = m.y;
+                    },
+                    .mouse_double => |m| {
+                        ui_input.mouse_double = true;
+                        ui_input.mouse_x = m.x;
+                        ui_input.mouse_y = m.y;
+                    },
+                    .mouse_down => |m| {
+                        ui_input.mouse_x = m.x;
+                        ui_input.mouse_y = m.y;
+                        switch (m.button) {
+                            .left => {
+                                ui_input.mouse_down = true;
+                                ui_input.mouse_pressed = true;
+                            },
+                            .right => {
+                                ui_input.mouse_right_down = true;
+                                ui_input.mouse_right_pressed = true;
+                            },
+                            .middle => {
+                                ui_input.mouse_middle_down = true;
+                                ui_input.mouse_middle_pressed = true;
+                            },
+                        }
+                    },
+                    .mouse_up => |m| {
+                        switch (m.button) {
+                            .left => {
+                                ui_input.mouse_down = false;
+                                ui_input.mouse_released = true;
+                            },
+                            .right => ui_input.mouse_right_down = false,
+                            .middle => ui_input.mouse_middle_down = false,
+                        }
+                    },
+                    .mouse_wheel => |m| {
+                        ui_input.wheel += m.delta;
+                        ui_input.wheel_ctrl = m.ctrl;
+                        ui_input.wheel_alt = m.alt;
+                        ui_input.wheel_shift = m.shift;
+                        ui_input.mouse_x = m.x;
+                        ui_input.mouse_y = m.y;
+                    },
+                    .key_down => |k| {
+                        // 编辑态：把按键喂给选择器的文本编辑器；否则只认 Esc/Enter
+                        if (pk.isEditing()) {
+                            switch (k.code) {
+                                0x1B => pk.want_cancel = true, // Esc = 退出编辑（不生效）
+                                0x0D => pk.want_accept = true, // Enter = 提交（路径跳转/确定文件名）
+                                0x08 => pk.editBackspace(),
+                                0x2E => pk.editDelete(),
+                                0x25 => pk.editMoveCursor(-1, k.shift),
+                                0x27 => pk.editMoveCursor(1, k.shift),
+                                0x24 => pk.editHome(k.shift),
+                                0x23 => pk.editEndPos(k.shift),
+                                0x56 => { // Ctrl+V 粘贴（X11 是异步：第一次请求，下一帧再按取结果）
+                                    if (k.ctrl) {
+                                        if (win.clipboardTake()) |txt| {
+                                            defer app.allocator.free(txt);
+                                            pk.editInsertSlice(txt);
+                                        } else {
+                                            win.clipboardRequestText();
+                                            pk.pending_paste = true; // 数据下一帧到达 → 自动粘贴
+                                        }
+                                    }
+                                },
+                                0x43 => { // Ctrl+C 复制（无选区时复制整个字段）
+                                    if (k.ctrl) {
+                                        if (pk.editSelectionText()) |sel_txt| {
+                                            win.clipboardSetText(sel_txt);
+                                        }
+                                    }
+                                },
+                                0x58 => { // Ctrl+X 剪切
+                                    if (k.ctrl) {
+                                        if (pk.editSelectionText()) |sel_txt| {
+                                            win.clipboardSetText(sel_txt);
+                                            pk.editClearSelection();
+                                        }
+                                    }
+                                },
+                                0x41 => { // Ctrl+A 全选
+                                    if (k.ctrl) pk.editSelectAll();
+                                },
+                                else => {},
+                            }
+                        } else {
+                            if (k.code == 0x1B) pk.want_cancel = true;
+                            if (k.code == 0x0D) pk.want_accept = true;
+                        }
+                    },
+                    .char => |cp| pk.editInsert(cp),
+                    .quit => pk.want_cancel = true,
+                    else => {},
+                }
+                continue;
+            }
+
             switch (ev) {
                 .quit => {},
                 .mouse_move => |m| {
@@ -387,6 +534,29 @@ pub fn main(init: std.process.Init) !u8 {
                             0x27 => app.textInputMoveCursor(1, k.shift), // →
                             0x24 => app.textInputMoveCursor(-2, k.shift), // Home
                             0x23 => app.textInputMoveCursor(2, k.shift), // End
+                            'C', 'c' => {
+                                if (k.ctrl) {
+                                    if (app.textInputSelectionText()) |sel_txt| win.clipboardSetText(sel_txt);
+                                }
+                            },
+                            'X', 'x' => {
+                                if (k.ctrl) {
+                                    if (app.textInputSelectionText()) |sel_txt| win.clipboardSetText(sel_txt);
+                                    app.textInputCut();
+                                }
+                            },
+                            'V', 'v' => {
+                                if (k.ctrl) {
+                                    // X11 异步：先请求，数据到了由每帧泵插入
+                                    if (win.clipboardTake()) |txt| {
+                                        defer app.allocator.free(txt);
+                                        app.textInputInsertSlice(txt);
+                                    } else {
+                                        win.clipboardRequestText();
+                                        app.text_input.pending_paste = true;
+                                    }
+                                }
+                            },
                             else => {
                                 // Ctrl+A：全选
                                 if (k.ctrl and (k.code == 'A' or k.code == 'a')) app.textInputSelectAll();
@@ -722,6 +892,22 @@ pub fn main(init: std.process.Init) !u8 {
         ui.mods_ctrl = ui_input.mods_ctrl;
         ui.mods_shift = ui_input.mods_shift;
 
+        // 内置选择器开着：**背景 UI 看不到输入**（否则点击会穿透到播放列表放片段），
+        // 但选择器自己要能点 → 先把输入暂存，画到选择器时再恢复。
+        var modal_input: @TypeOf(ui_input) = undefined;
+        if (picker != null) {
+            modal_input = ui_input;
+            ui.mouse_down = false;
+            ui.mouse_pressed = false;
+            ui.mouse_released = false;
+            ui.mouse_right_pressed = false;
+            ui.mouse_right_down = false;
+            ui.mouse_middle_pressed = false;
+            ui.mouse_middle_down = false;
+            ui.mouse_double = false;
+            ui.wheel = 0;
+        }
+
         // □ 缩放拖动：鼠标冻结（光标隐藏 + 锚定不动，位移经 frozen_dy 传入）
         if (ui.mouse_capture) {
             win.beginMouseCapture();
@@ -756,9 +942,40 @@ pub fn main(init: std.process.Init) !u8 {
         if (app.text_input.active) {
             const ti = &app.text_input;
             ti.view_off = ui.textFieldSyncOffset(ti.text(), ti.cursor, ti.w, ti.view_off);
+            if (ti.caret_epoch == 0) ti.caret_epoch = text_edit.nowMs(); // 刚激活 → 从"亮"开始
             ui.noteOverlayRect(ti.x, ti.y, ti.w, text_input_h); // 遮挡插件子窗口
             ui.renderer.fillRect(ti.x + 2, ti.y + 2, ti.w, text_input_h, r_mod.rgb(12, 13, 16)); // 阴影
-            ui.textField(ti.text(), ti.cursor, ti.selection(), ti.view_off, ti.x, ti.y, ti.w, text_input_h);
+            ui.textFieldEx(ti.text(), ti.cursor, ti.selection(), ti.view_off, ti.x, ti.y, ti.w, text_input_h, text_edit.blinkOnSince(ti.caret_epoch));
+        }
+        // 内置文件选择器（模态，绘于最上层）——先画它，再统一 present
+        if (picker) |*pk| {
+            // 恢复本帧输入给选择器（背景在 drawApp 期间看到的是“空输入”）
+            ui.mouse_x = modal_input.mouse_x;
+            ui.mouse_y = modal_input.mouse_y;
+            ui.mouse_down = modal_input.mouse_down;
+            ui.mouse_pressed = modal_input.mouse_pressed;
+            ui.mouse_released = modal_input.mouse_released;
+            ui.mouse_right_pressed = modal_input.mouse_right_pressed;
+            ui.mouse_right_down = modal_input.mouse_right_down;
+            ui.mouse_middle_pressed = modal_input.mouse_middle_pressed;
+            ui.mouse_middle_down = modal_input.mouse_middle_down;
+            ui.mouse_double = modal_input.mouse_double;
+            ui.wheel = modal_input.wheel;
+            switch (file_picker.draw(&ui, pk, @intCast(win.fb.width), @intCast(win.fb.height))) {
+                .pending => {},
+                .cancelled => {
+                    if (filedialog.supported()) app.setToast(pk.cancel_text);
+                    pk.deinit();
+                    picker = null;
+                },
+                .chosen => |path| {
+                    const use_ = pk.use_;
+                    pk.deinit();
+                    picker = null;
+                    dispatchPick(&app, io, use_, path);
+                    app.allocator.free(path);
+                },
+            }
         }
         ui.endFrame();
 
@@ -778,8 +995,8 @@ pub fn main(init: std.process.Init) !u8 {
         //    未遮挡=整矩形跳过（防闪烁）；被弹窗/窗口遮挡的（已 SetWindowRgn 裁掉）
         //    部分照常回写（保证盖在插件上的窗口/弹窗正常覆盖，不破洞）
         collectEditorPresents(&app, &win);
-        win.present();
 
+        win.present();
         // 4.1) 历史提交（拖动类操作 **coalesce**：鼠标松开才提交一次——
         // 一次拖动 = 一条历史，而不是每帧一条；左右键都算）
         // 注：滚轮/插件侧改动走“起手提交 + 静置钉值”手势（`touchGesture`）。
@@ -792,6 +1009,9 @@ pub fn main(init: std.process.Init) !u8 {
         }
         app.pollGestureHistory();
         app.pollCapacityReclaim(); // 容量自动回收（删除/装载后滞回缩容；无声时几乎零开销）
+
+        // 4.1z) 文件对话框：推进待处理的"选文件"请求（B 方案；内部目前仍是外部对话框）
+        handlePick(&app, &win, io, &picker);
 
         // 4.2) 帧末执行待定的文件操作（对话框在此弹出——不在事件迭代/绘制中，
         // 避免 pushEvent realloc 使迭代中的 events slice 悬空）
@@ -837,6 +1057,24 @@ pub fn main(init: std.process.Init) !u8 {
         }
 
         // 4.4) 设置落盘（脏 → 写 settings.json；IO 在帧末）
+        // 4.25) 音频后端偏好落盘（设置页刚改；**重启生效**）
+        if (audio_pref.pending) |pb| {
+            audio_pref.pending = null;
+            audio_pref.current = pb;
+            audio_pref.save(io, app.dataRoot());
+            audio_pref.saved = true;
+        }
+
+        // 4.3) 字体重载'（设置页点“重新加载字体”；装完新字体不必重启）
+        if (font_info.reload_requested) {
+            font_info.reload_requested = false;
+            // 先加载新的，成功后再换（失败就继续用旧的，不让 UI 变空）
+            if (loadFont(allocator, io)) |nf| {
+                font.deinit();
+                font = nf;
+            } else |_| {}
+        }
+
         if (app.settings_dirty) {
             app.settings_dirty = false;
             saveSettings(&app, io);
@@ -866,7 +1104,12 @@ pub fn main(init: std.process.Init) !u8 {
         }
         // 系统拖入的音频文件 → 建样式 + 放到播放列表（游标处；同起点自动错开）
         // 系统拖入的文件 → 按落点分区处理（播放列表=放片段 / 样式栏=只建样式 / 其他=忽略）
-        handleDroppedFiles(&app, &win, ui.mouse_x, ui.mouse_y);
+        // 落点用**拖放协议给的坐标**（`win.dropPoint()`）：外部拖放期间指针被源程序抓住，
+        // 我们收不到 mousemove，`ui.mouse_x/y` 是**旧的**（实测：片段落在离松手处很远的地方）。
+        {
+            const dp = win.dropPoint();
+            handleDroppedFiles(&app, &win, if (dp) |p| p.x else ui.mouse_x, if (dp) |p| p.y else ui.mouse_y);
+        }
         if (app.pending_load_sample) |pls| {
             app.pending_load_sample = null;
             loadSampleDialog(&app, &win, pls.instrument, pls.pitch, pls.layer);
@@ -882,6 +1125,7 @@ pub fn main(init: std.process.Init) !u8 {
         if (!app.plugin_mgr.scanning) {
             app.plugin_mgr.heal_tick +%= 1;
             if (app.plugin_mgr.heal_tick % 240 == 0) {
+                // CID 精确 + 按包名兜底，**静默应用**（用户确认已移除：插件未扫描时根本没候选）
                 const healed2 = app.reboundFailedPluginSlots(io);
                 if (healed2 > 0) app.setToastWith("已自动重新定位 {d} 个插件", .{healed2});
             }
@@ -908,6 +1152,8 @@ pub fn main(init: std.process.Init) !u8 {
         }
         // 4.4e) VST3 插件界面嵌入同步（面板 → 子窗口；遮挡→隐藏；见函数注释）
         syncPluginEditors(&app, &ui, @intCast(win.fb.width), @intCast(win.fb.height));
+        // X11：把插件编辑器窗口的事件抽干（Windows 由系统消息泵处理，这里是空操作）
+        _ = vst_host.pumpEditorEvents();
 
         // 4.5) 同步窗口标题（脏标记 `*` + 工程名；仅在变化时刷 Win32）
         const cur_name = app.projectName();
@@ -939,7 +1185,12 @@ pub fn main(init: std.process.Init) !u8 {
         // 固定尾部睡眠会与渲染耗时叠加，帧率随内容复杂度浮动）
     }
     // 退出清理：扫描 worker 还在跑 → 杀（防孤儿进程；主进程退出不管子进程）
-    if (app.plugin_mgr.scan_handle) |h| _ = TerminateProcess(h, 3);
+    killScanWorker(&app.plugin_mgr, 3);
+    // 扫描队列/累积 JSONL 是堆分配 → 退出前显式释放（否则 Debug 的 SafeAllocator 会报泄漏）
+    clearScanQueue(&app);
+    // Linux：直接 `_exit`（不跑 atexit / 全局析构）。理由：插件（Vital）的后台线程在进程
+    // 析构期间会踩到已释放内存 → 退出时 segfault。进程整体消失即可，无需优雅收尾。
+    if (comptime builtin.os.tag != .windows) std.c.exit(0);
     return 0;
 }
 
@@ -954,7 +1205,14 @@ extern "kernel32" fn GetModuleFileNameW(hModule: ?*anyopaque, lpFilename: [*]u16
 
 /// 可执行文件所在目录（UTF-8 写入 `buf`；失败返回 ""）。
 /// 用于定位便携数据目录 `<exe>/data`（见 `preset.resolveDataRoot`）。
-fn exeDir(allocator: std.mem.Allocator, buf: []u8) []const u8 {
+fn exeDir(allocator: std.mem.Allocator, io: std.Io, buf: []u8) []const u8 {
+    // **非 Windows：读 `/proc/self/exe`**（否则返回 "."，导致 `<exe>/data`、`<exe>/fonts`
+    // 退化成 CWD 相对——「单 exe 便携」就失效了）。
+    if (comptime builtin.os.tag != .windows) {
+        const n = std.Io.Dir.readLinkAbsolute(io, "/proc/self/exe", buf) catch return ".";
+        const dir = std.fs.path.dirname(buf[0..n]) orelse return ".";
+        return dir;
+    }
     var wbuf: [1024]u16 = undefined;
     const n = GetModuleFileNameW(null, &wbuf, wbuf.len);
     if (n == 0 or n >= wbuf.len) return "";
@@ -975,9 +1233,25 @@ fn hasScanArg(init: std.process.Init) bool {
     return std.mem.eql(u8, a, "--vst-scan");
 }
 
+/// 是否带某个 CLI 开关（隐藏用法，主要用于"无交互地跑一次动作"，例如 `--scan-plugins`）
+fn hasCliArg(init: std.process.Init, name: []const u8) bool {
+    var it = std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa) catch return false;
+    defer it.deinit();
+    _ = it.skip(); // argv0
+    while (it.next()) |a| {
+        if (std.mem.eql(u8, a, name)) return true;
+    }
+    return false;
+}
+
 /// 可执行文件**完整路径**（UTF-8 写入 `buf`；失败返回 ""）。
 /// 扫描 worker 用同二进制自举（`--vst-scan`）——需把自身路径传给 CreateProcessW。
 fn selfExePath(allocator: std.mem.Allocator, buf: []u8) []const u8 {
+    if (comptime builtin.os.tag != .windows) {
+        // Linux：UTF-8 路径，无需 UTF-16 转换（allocator 用不上）
+        const n = std.process.executablePath(port_io.blocking(), buf) catch return "";
+        return buf[0..n];
+    }
     var wbuf: [1024]u16 = undefined;
     const n = GetModuleFileNameW(null, &wbuf, wbuf.len);
     if (n == 0 or n >= wbuf.len) return "";
@@ -986,6 +1260,42 @@ fn selfExePath(allocator: std.mem.Allocator, buf: []u8) []const u8 {
     const m = @min(utf8.len, buf.len);
     @memcpy(buf[0..m], utf8[0..m]);
     return buf[0..m];
+}
+
+/// 结束扫描 worker：Windows = `TerminateProcess`，Linux = `SIGKILL`
+/// 备份当前工程文件（`<path>.bak-<unix秒>`）；没有工程路径或读失败 → null
+fn killScanWorker(pm: *@import("app.zig").PluginMgrWindow, code: u32) void {
+    if (comptime builtin.os.tag == .windows) {
+        if (pm.scan_handle) |h| _ = TerminateProcess(h, code);
+    } else {
+        if (pm.scan_child) |*ch| {
+            if (ch.id) |pid| std.posix.kill(@intCast(pid), std.posix.SIG.KILL) catch {};
+        }
+    }
+}
+
+/// 扫描 worker 是否已退出；是 → 返回退出码
+fn scanWorkerExitCode(pm: *@import("app.zig").PluginMgrWindow) ?u32 {
+    if (comptime builtin.os.tag == .windows) {
+        if (pm.scan_handle) |h| {
+            var code: u32 = 0;
+            if (GetExitCodeProcess(h, &code) != 0 and code != still_active) return code;
+        }
+        return null;
+    }
+    if (pm.scan_child) |*ch| {
+        const id = ch.id orelse return null;
+        const pid: i32 = @intCast(id);
+        var status: i32 = 0;
+        // 非阻塞回收：0 = 还在跑；== pid = 已退出
+        const r = std.os.linux.waitpid(pid, &status, std.os.linux.W.NOHANG);
+        if (r != @as(usize, @bitCast(@as(isize, pid)))) return null;
+        ch.id = null; // 已回收：`wait`/`kill` 不能再调
+        const st: u32 = @bitCast(status);
+        const exited_normally = (st & 0x7f) == 0;
+        return if (exited_normally) (st >> 8) & 0xff else 128 + (st & 0x7f);
+    }
+    return null;
 }
 
 /// 扫描预设库（启动/保存后；损坏分类/文件静默跳过——见 preset.scan）
@@ -2497,37 +2807,32 @@ fn drawFileMenu(ui: *Ui, app: *App) void {
 /// - 否则：有 `project_path` 直接存；无路径（新工程首次保存）→ 弹对话框；
 /// - 用户在对话框中取消 → 不保存（不是错误）。
 /// 成功后清除脏标记并刷新标题。
+/// 保存工程（**命令**，B 方案）：有路径且非“另存为” → 直接存；否则**登记对话框请求**。
+/// 弹框期间主循环照常跑（界面不冻结、调度前瞻不断）。
 fn saveProject(app: *App, win: *window.Window, io: std.Io, force_dialog: bool) void {
-    // 决定目标路径
-    var chosen: ?[]u8 = null;
-    defer if (chosen) |p| app.allocator.free(p);
-
-    const path: []const u8 = blk: {
-        if (!force_dialog) {
-            if (app.project_path) |p| break :blk p;
-        }
-        // 需要对话框（首次保存 / 另存为 / 无对话框平台回退到默认名）
-        const default_name = if (force_dialog)
-            (if (app.project_path) |p| std.fs.path.basename(p) else persist.default_file_name)
-        else
-            persist.default_file_name;
-        const picked = filedialog.save(app.allocator, win.hwnd, "保存工程", default_name, filedialog.project_filter) catch |e| {
-            app.setToastWith("保存失败：对话框出错（{s}）", .{@errorName(e)});
-            return;
-        };
-        if (picked) |p| {
-            chosen = p;
-            break :blk p;
-        }
-        // 取消（或平台不支持对话框）
-        if (filedialog.supported()) {
-            app.setToast("已取消保存");
+    _ = win;
+    if (!force_dialog) {
+        if (app.project_path) |p| {
+            saveProjectToPath(app, io, p);
             return;
         }
-        break :blk persist.default_file_name; // 无对话框平台的回退
-    };
+    }
+    const default_name = if (force_dialog)
+        (if (app.project_path) |p| std.fs.path.basename(p) else persist.default_file_name)
+    else
+        persist.default_file_name;
+    app.requestPick(.{
+        .kind = .save,
+        .use_ = .{ .project_save = .{ .force_dialog = force_dialog } },
+        .title = "保存工程",
+        .filter = filedialog.project_filter,
+        .default_name = default_name,
+    });
+}
 
-    // 导出 → 序列化（**v5 二进制默认**；JSON 保留为导入/导出通道）→ 写文件 → 释放
+/// 保存工程到指定路径（对话框结果 / 快路径共用）
+fn saveProjectToPath(app: *App, io: std.Io, path: []const u8) void {
+    // 导出 → 序列化（**v5 二进制默认**）→ 写文件 → 释放
     // 基准目录 = 目标工程目录（音频相对路径按它导出）
     app.setBaseDirFromPath(path);
     const project = app.exportProject() catch |e| {
@@ -2558,17 +2863,20 @@ fn saveProject(app: *App, win: *window.Window, io: std.Io, force_dialog: bool) v
 /// 弹对话框选文件并加载（替换当前工程）。
 /// **脏检查**：当前工程有未保存修改时，先弹自绘确认框（保存/不保存/取消），
 /// 用户确认后才真正替换（避免无提示丢修改——实测漏洞）。
+/// 打开工程（**命令**）：登记对话框请求；脏检查在拿到路径后做（见 `openProjectAtPath`）。
 fn openProjectWithDialog(app: *App, win: *window.Window, io: std.Io) void {
-    const picked = filedialog.open(app.allocator, win.hwnd, "打开工程", filedialog.project_filter) catch |e| {
-        app.setToastWith("打开失败：对话框出错（{s}）", .{@errorName(e)});
-        return;
-    };
-    const path = picked orelse {
-        if (filedialog.supported()) app.setToast("已取消打开");
-        return;
-    };
-    defer app.allocator.free(path);
+    _ = win;
+    _ = io;
+    app.requestPick(.{
+        .kind = .open,
+        .use_ = .project_open,
+        .title = "打开工程",
+        .filter = filedialog.project_filter,
+    });
+}
 
+/// 打开指定路径的工程（对话框结果）：脏 → 先走确认框；否则直接载入。
+fn openProjectAtPath(app: *App, io: std.Io, path: []const u8) void {
     // 脏 → 先确认（确认框文案与退出场景共用）
     if (app.dirty) {
         app.setPendingOpen(path);
@@ -2733,7 +3041,10 @@ fn intersectRect(ax: i32, ay: i32, aw: i32, ah: i32, bx: i32, by: i32, bw: i32, 
 fn ensureEditor(app: *App, pl: *vst_host.Plugin) void {
     if (pl.editor_fail_wait > 0) pl.editor_fail_wait -= 1;
     if (pl.view == null and !pl.editor_no_ui and pl.editor_fail_wait == 0) {
-        if (pl.openEditor(app.main_hwnd) == .failed) pl.editor_fail_wait = 120;
+        // Linux：**独立顶层窗口**（parent = null）。不嵌进主窗口 → 不存在"插件盖住自绘 UI"，
+        // 因此不需要任何裁切/镜像（那套会在拖动时闪）。
+        const parent: ?*anyopaque = if (comptime builtin.os.tag == .linux) null else app.main_hwnd;
+        if (pl.openEditor(parent) == .failed) pl.editor_fail_wait = 120;
     }
 }
 
@@ -2793,6 +3104,15 @@ fn collectEditorPresents(app: *App, win: *window.Window) void {
 }
 
 fn syncPluginEditors(app: *App, ui: *Ui, fw: i32, fh: i32) void {
+    // 用户用窗口自己的关闭按钮关掉了插件 UI → 清掉 owner（否则按钮状态会滞后）
+    if (vst_host.Plugin.takeUserClosedEditor()) |h| {
+        if (app.vst_editor_owner) |o| {
+            if (o.editorHandle() == h) {
+                o.markEditorHidden();
+                app.vst_editor_owner = null;
+            }
+        }
+    }
     // 期望挂载：乐器面板（.instrument 目标 + VST3）/ 效果面板（插件槽）
     var instr_pl: ?*vst_host.Plugin = null;
     if (app.synth_win.open) {
@@ -2822,6 +3142,9 @@ fn syncPluginEditors(app: *App, ui: *Ui, fw: i32, fh: i32) void {
         }
     }
 
+    // 面板都关着：清掉"编辑器目标"（下次打开任意面板算目标变化 → 会重新显示窗口）
+    if (instr_pl == null and fx_pl == null) app.vst_editor_target = null;
+
     // 1) 归属对不上的编辑器：关闭（面板关闭/切目标/插件被换的残留）
     for (app.instruments.items) |*inst| {
         if (inst.plugin) |pl| {
@@ -2832,7 +3155,10 @@ fn syncPluginEditors(app: *App, ui: *Ui, fw: i32, fh: i32) void {
                 for (pad.layers.items) |*ly| {
                     if (ly.kind != .vst3) continue;
                     if (ly.plugin) |pl| {
-                        if (pl.view != null and pl != instr_pl and pl != fx_pl) pl.closeEditor();
+                        if (pl.view != null and pl != instr_pl and pl != fx_pl) {
+                            if (app.vst_editor_owner == pl) app.vst_editor_owner = null;
+                            pl.closeEditor();
+                        }
                     }
                 }
             }
@@ -2851,7 +3177,25 @@ fn syncPluginEditors(app: *App, ui: *Ui, fw: i32, fh: i32) void {
     // 2) 乐器面板：尺寸固定=插件尺寸；坐标同步；遮挡则隐藏
     if (instr_pl) |pl| {
         ensureEditor(app, pl);
-        if (pl.view != null) {
+        if (comptime builtin.os.tag == .linux) {
+            // Linux 独立窗口：面板保持原尺寸（画参数表 + "打开插件 UI" 按钮）。
+            // **切目标时关旧开新**：记住当前窗口属于谁，换了就把旧的隐藏、把新的摆出来。
+            if (pl.view != null) {
+                // 只有**目标变化**（切到别的乐器）才"关旧开新"；
+                // 用户手动关掉窗口（owner=null，目标不变）时**保持关闭**，否则会立刻弹回来。
+                if (app.vst_editor_target != pl) {
+                    if (app.vst_editor_owner) |old_pl| {
+                        if (old_pl != pl) old_pl.setEditorVisible(false);
+                    }
+                    app.vst_editor_target = pl;
+                    if (app.vst_editor_owner != pl) {
+                        pl.showEditorAt(160, 120);
+                        app.vst_editor_owner = pl;
+                    }
+                }
+            }
+            pl.setEditorEnabled(app.modal == null and ui.overlay_n == 0);
+        } else if (pl.view != null) {
             app.synth_win.w = pl.editor_w + 2;
             app.synth_win.h = pl.editor_h + vst_panel_title_h + 1;
             // 保险钳制：拖拽途中面板 x/y 可能瞬时未钳制（顶部 clamp 下帧才生效）——
@@ -2871,7 +3215,24 @@ fn syncPluginEditors(app: *App, ui: *Ui, fw: i32, fh: i32) void {
     // 3) 效果面板（保留顶部控制行：启用开关）
     if (fx_pl) |pl| {
         ensureEditor(app, pl);
-        if (pl.view != null) {
+        if (comptime builtin.os.tag == .linux) {
+            // Linux 独立窗口：效果面板同样不嵌入（切效果器也是关旧开新）
+            if (pl.view != null) {
+                // 只有**目标变化**（切到别的乐器）才"关旧开新"；
+                // 用户手动关掉窗口（owner=null，目标不变）时**保持关闭**，否则会立刻弹回来。
+                if (app.vst_editor_target != pl) {
+                    if (app.vst_editor_owner) |old_pl| {
+                        if (old_pl != pl) old_pl.setEditorVisible(false);
+                    }
+                    app.vst_editor_target = pl;
+                    if (app.vst_editor_owner != pl) {
+                        pl.showEditorAt(240, 200);
+                        app.vst_editor_owner = pl;
+                    }
+                }
+            }
+            pl.setEditorEnabled(app.modal == null and ui.overlay_n == 0);
+        } else if (pl.view != null) {
             app.effect_win.w = pl.editor_w + 2;
             app.effect_win.h = pl.editor_h + vst_fx_row_h + 1;
             // 保险钳制（同乐器侧）
@@ -3007,17 +3368,18 @@ fn pluginDataRoot(app: *const App) ?[]const u8 {
 }
 
 /// 「+ 添加文件夹…」：文件夹选择框 → 存入配置（去重）
+/// 「+ 添加文件夹…」（**命令**）：登记文件夹选择请求
 fn pickPluginFolder(app: *App, win: *window.Window) void {
+    _ = win;
     if (pluginDataRoot(app) == null) {
         app.setToast("数据目录不可用");
         return;
     }
-    const picked = filedialog.pickFolder(app.allocator, win.hwnd, "选择 VST3 插件文件夹") catch |e| {
-        app.setToastWith("文件夹选择出错（{s}）", .{@errorName(e)});
-        return;
-    };
-    const path = picked orelse return;
-    defer app.allocator.free(path);
+    app.requestPick(.{ .kind = .folder, .use_ = .plugin_folder, .title = "选择 VST3 插件文件夹" });
+}
+
+/// 把选到的文件夹加入插件扫描配置
+fn addPluginFolderPath(app: *App, path: []const u8) void {
     const cfg = if (app.plugin_cfg) |*c| c else return;
     const added = cfg.addFolder(path) catch false;
     if (added) {
@@ -3029,17 +3391,18 @@ fn pickPluginFolder(app: *App, win: *window.Window) void {
 }
 
 /// 「+ 添加文件…」：单文件条目（兜底：不在任何扫描文件夹里的插件）
+/// 「+ 添加文件…」（**命令**）：登记文件选择请求
 fn pickPluginFile(app: *App, win: *window.Window) void {
+    _ = win;
     if (pluginDataRoot(app) == null) {
         app.setToast("数据目录不可用");
         return;
     }
-    const picked = filedialog.open(app.allocator, win.hwnd, "选择 VST3 插件文件", filedialog.vst3_filter) catch |e| {
-        app.setToastWith("文件选择出错（{s}）", .{@errorName(e)});
-        return;
-    };
-    const path = picked orelse return;
-    defer app.allocator.free(path);
+    app.requestPick(.{ .kind = .open, .use_ = .plugin_file, .title = "选择 VST3 插件文件", .filter = filedialog.vst3_filter });
+}
+
+/// 把选到的插件文件加入扫描配置
+fn addPluginFilePath(app: *App, path: []const u8) void {
     const cfg = if (app.plugin_cfg) |*c| c else return;
     const added = cfg.addFile(path) catch false;
     if (added) {
@@ -3051,20 +3414,6 @@ fn pickPluginFile(app: *App, win: *window.Window) void {
 }
 
 /// 手动重新定位（右键「重新定位插件…」→ 帧末弹框；pending 状态保留）
-/// 拖入/选择音频文件：建音频样式 + 放到播放列表（游标处；同起点自动错开；
-/// v1 不区分拖入位置——落点 = 播放游标/PAT 虚拟位置，片段可再拖）
-/// 拖入文件的落点区域（播放列表 / 样式面板 / 其他 = 不响应）
-const DropZone = enum { playlist, styles, none };
-
-/// 落点分区（与绘制同一套面板矩形：见 `App.layout`）
-fn dropZoneAt(app: *const App, px: i32, py: i32) DropZone {
-    const b = app.layout;
-    if (b.body_h <= 0) return .none;
-    if (util.inRect(px, py, b.playlist_x, b.body_y, b.playlist_w, b.body_h)) return .playlist;
-    if (util.inRect(px, py, b.patterns_x, b.body_y, b.patterns_w, b.body_h)) return .styles;
-    return .none;
-}
-
 /// 建音频样式（**不建片段**）。失败 → toast + null
 /// P2：异步（只读文件头，立刻返回；解码在 worker 线程）
 fn createAudioStyle(app: *App, path: []const u8) ?i32 {
@@ -3074,10 +3423,91 @@ fn createAudioStyle(app: *App, path: []const u8) ?i32 {
     };
 }
 
-/// 系统拖入文件的分发：
-/// - **播放列表** → 在落点（吸附网格）放音频片段；多文件依次放到**下面的轨道**
-/// - **样式面板** → 只建样式（自动切到「音频」页并选中最后一个）
-/// - 其他区域 / 导出中 → 不响应（不建样式、不 toast、不弄脏工程）
+// ─────────────────────────────────────────────────────────────────────
+// 文件对话框（B 方案）：调用点只"登记请求"，这里逐帧推进 + 派发结果。
+// 主循环不阻塞 → 界面不冻结、序列器调度前瞻不被耗干（音乐不会十秒后停）。
+//
+// **当前决策**（详见 docs/file-dialogs.md「决策记录」）：
+// - Linux：**一律内置自绘选择器**（不看桌面装没装 kdialog/zenity）；
+//   `filedialog.zig` 里的 kdialog/zenity 适配代码已停用保留（`linux_external_enabled = false`）；
+// - Windows：**继续用系统对话框**（原生观感）。它是同步调用 → 阻塞 UI 线程 →
+//   "弹框约十秒后音乐停"在 Windows 上**仍然存在**，作为**独立问题**跟踪：
+//   根治方案（工作线程跑系统对话框 + 每帧轮询）见 docs/file-dialogs.md §3。
+// ─────────────────────────────────────────────────────────────────────
+
+/// 每帧调用（帧末）：有请求就**启动内置选择器**（Linux）或系统对话框（其它平台）。
+/// Linux 走内置选择器 → 主循环不阻塞 → 界面不冻结、序列器前瞻不断（音乐不会十秒后停）。
+fn handlePick(app: *App, win: *window.Window, io: std.Io, picker: *?file_picker.Picker) void {
+    if (picker.* != null) return; // 选择器开着：由绘制阶段推进
+    const req = app.takePick() orelse return;
+
+    if (comptime builtin.os.tag == .linux) {
+        picker.* = file_picker.begin(app.allocator, req) catch {
+            app.setToast("无法打开文件选择器");
+            return;
+        };
+        return;
+    }
+
+    // 其它平台（Windows）：系统对话框。⚠️ 同步调用 → 阻塞 UI（已知问题，见 docs/file-dialogs.md §13）
+    const picked: ?[]u8 = switch (req.kind) {
+        .open => filedialog.open(app.allocator, win.hwnd, req.title, req.filter) catch null,
+        .save => filedialog.save(app.allocator, win.hwnd, req.title, req.default_name, req.filter) catch null,
+        .folder => filedialog.pickFolder(app.allocator, win.hwnd, req.title) catch null,
+    };
+    const path = picked orelse {
+        if (filedialog.supported()) app.setToast(req.cancelText());
+        if (!filedialog.supported()) {
+            switch (req.use_) {
+                .project_save => saveProjectToPath(app, io, persist.default_file_name),
+                else => {},
+            }
+        }
+        return;
+    };
+    defer app.allocator.free(path);
+    dispatchPick(app, io, req.use_, path);
+}
+
+/// 拿到路径后按用途执行（原 12 个 handler 的"后半段"都收敛到这里）
+fn dispatchPick(app: *App, io: std.Io, use_: app_mod.PickUse, path: []const u8) void {
+    switch (use_) {
+        .project_save => saveProjectToPath(app, io, path),
+        .project_open => openProjectAtPath(app, io, path),
+        .import_midi => importMidiFromPath(app, io, path),
+        .import_json => loadProjectFromPath(app, io, path),
+        .export_json => exportJsonToPath(app, io, path),
+        .export_midi => exportMidiToPath(app, io, path),
+        .export_wav => exportWavToPath(app, io, path),
+        .plugin_folder => addPluginFolderPath(app, path),
+        .plugin_file => addPluginFilePath(app, path),
+        .load_sample => |u| applySamplePath(app, u.instrument, u.pitch, u.layer, path),
+        .relocate_instrument => |u| app.relocateInstrument(@intCast(u.index), path),
+        .relocate_effect => |u| app.relocateEffect(u.ch, u.slot, path),
+    }
+}
+
+/// 系统拖入文件的分发（**只有两片区域**）：
+/// - **播放列表网格内** → 建样式 + 在落点（吸附网格）放片段；多文件依次放到下面的轨道
+/// - **网格外（任意位置）** → 只建样式
+/// 两片都：切到样式栏「音频」页 + 选中本次最后导入的样式；导出期间一律不接。
+/// 批量导入为音频样式（**不建片段**）；返回成功条数。
+/// 两片区域共用：不管落在哪，都会切到样式栏「音频」页并选中最后导入的那条。
+fn dropAsStyles(app: *App, paths: []const []u8) usize {
+    var created: usize = 0;
+    var last: ?i32 = null;
+    for (paths) |p| {
+        if (createAudioStyle(app, p)) |s| {
+            created += 1;
+            last = s;
+        }
+    }
+    if (created == 0) return 0;
+    app.panels.patterns_tab_audio = true; // 自动切到音频页
+    if (last) |s| app.audio_style_sel = s; // 选中本次最后导入的样式
+    app.commitHistory("拖入音频样式");
+    return created;
+}
 fn handleDroppedFiles(app: *App, win: *window.Window, px: i32, py: i32) void {
     var paths: std.ArrayListUnmanaged([]u8) = .empty;
     defer {
@@ -3087,30 +3517,13 @@ fn handleDroppedFiles(app: *App, win: *window.Window, px: i32, py: i32) void {
     while (win.takeDropped()) |p| paths.append(app.allocator, p) catch app.allocator.free(p);
     if (paths.items.len == 0) return;
     if (app.export_wav != null) return; // 导出期间不接编辑
-    const zone = dropZoneAt(app, px, py);
-    if (zone == .none) return;
-
-    if (zone == .styles) {
-        var created: usize = 0;
-        var last: ?i32 = null;
-        for (paths.items) |p| {
-            if (createAudioStyle(app, p)) |s| {
-                created += 1;
-                last = s;
-            }
-        }
-        if (created == 0) return;
-        if (last) |s| {
-            app.panels.patterns_tab_audio = true; // 自动切到音频页
-            app.audio_style_sel = s;
-        }
-        app.commitHistory("拖入音频样式");
-        app.setToastWith("已新建 {d} 个音频样式", .{created});
+    // **只有两片**：播放列表网格内（→ 样式 + 片段）/ 网格外（→ 只建样式）。
+    // 网格外不再"静默丢弃"（实测：松手偏一点就毫无反应，而文件管理器已显示“复制成功”，很容易误会）。
+    const hit = view_playlist.hitAt(app, px, py) orelse {
+        const n = dropAsStyles(app, paths.items);
+        if (n > 0) app.setToastWith("已导入 {d} 个音频样式（拖到播放列表网格内可直接放片段）", .{n});
         return;
-    }
-
-    // 播放列表：先算落点（不在轨道内容区 → 忽略）
-    const hit = view_playlist.hitAt(app, px, py) orelse return;
+    };
     var track = hit.track;
     var created: usize = 0;
     var last_style: ?i32 = null;
@@ -3134,13 +3547,19 @@ fn handleDroppedFiles(app: *App, win: *window.Window, px: i32, py: i32) void {
 }
 
 /// 鼓垫采样：加载/更换（layer = null → 新增采样器层）
+/// 鼓垫采样：选文件（**命令**）；`layer = null` → 新增采样器层
 fn loadSampleDialog(app: *App, win: *window.Window, instrument: i32, pitch: u8, layer: ?usize) void {
-    const picked = filedialog.open(app.allocator, win.hwnd, "加载采样音频", filedialog.audio_filter) catch |e| {
-        app.setToastWith("文件选择出错（{s}）", .{@errorName(e)});
-        return;
-    };
-    const path = picked orelse return;
-    defer app.allocator.free(path);
+    _ = win;
+    app.requestPick(.{
+        .kind = .open,
+        .use_ = .{ .load_sample = .{ .instrument = instrument, .pitch = pitch, .layer = layer } },
+        .title = "加载采样音频",
+        .filter = filedialog.audio_filter,
+    });
+}
+
+/// 把选到的采样装到鼓垫（换采样 / 新增层）
+fn applySamplePath(app: *App, instrument: i32, pitch: u8, layer: ?usize, path: []const u8) void {
     if (layer) |li| {
         if (app.kitSamplerSetSample(instrument, pitch, li, path)) {
             app.commitHistory("更换采样");
@@ -3159,23 +3578,13 @@ fn loadSampleDialog(app: *App, win: *window.Window, instrument: i32, pitch: u8, 
 }
 
 fn relocateInstrumentDialog(app: *App, win: *window.Window, ii: usize) void {
-    const picked = filedialog.open(app.allocator, win.hwnd, "重新定位 VST3 乐器插件", filedialog.vst3_filter) catch |e| {
-        app.setToastWith("文件选择出错（{s}）", .{@errorName(e)});
-        return;
-    };
-    const path = picked orelse return;
-    defer app.allocator.free(path);
-    app.relocateInstrument(@intCast(ii), path);
+    _ = win;
+    app.requestPick(.{ .kind = .open, .use_ = .{ .relocate_instrument = .{ .index = ii } }, .title = "重新定位 VST3 乐器插件", .filter = filedialog.vst3_filter });
 }
 
 fn relocateEffectDialog(app: *App, win: *window.Window, ch: usize, slot: usize) void {
-    const picked = filedialog.open(app.allocator, win.hwnd, "重新定位 VST3 效果器插件", filedialog.vst3_filter) catch |e| {
-        app.setToastWith("文件选择出错（{s}）", .{@errorName(e)});
-        return;
-    };
-    const path = picked orelse return;
-    defer app.allocator.free(path);
-    app.relocateEffect(ch, slot, path);
+    _ = win;
+    app.requestPick(.{ .kind = .open, .use_ = .{ .relocate_effect = .{ .ch = ch, .slot = slot } }, .title = "重新定位 VST3 效果器插件", .filter = filedialog.vst3_filter });
 }
 
 const scan_no_window: u32 = 0x0800_0000;
@@ -3244,10 +3653,6 @@ fn appendUtf16Quoted(list: *std.ArrayListUnmanaged(u16), alloc: std.mem.Allocato
 fn startPluginScan(app: *App, io: std.Io) void {
     const pm = &app.plugin_mgr;
     if (pm.scanning) return;
-    const root = pluginDataRoot(app) orelse {
-        app.setToast("数据目录不可用");
-        return;
-    };
     const cfg = if (app.plugin_cfg) |*c| c else return;
 
     var roots: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -3263,51 +3668,134 @@ fn startPluginScan(app: *App, io: std.Io) void {
         return;
     }
 
-    // 扫描 worker = **自身 exe**（--vst-scan 自举）；不再依赖单独构建的 vstscan.exe
+    // **先发现候选**（纯目录遍历，不加载任何插件），再**逐个模块**起 worker。
+    // 为什么一个模块一个进程：坏插件（实测 AIDA-X 在 getFactoryInfo 里崩）会把 worker 打死；
+    // 一进程扫全部时，它后面的插件全扫不到、前面的结果也会被覆盖 → 用户看到"插件全没了"。
+    clearScanQueue(app); // 清掉上一轮残留（含容量），避免重复扫描越占越多
+    {
+        var cands: std.ArrayListUnmanaged(vst_scan_mod.Candidate) = .empty;
+        defer vst_scan_mod.freeCandidates(app.allocator, &cands);
+        for (roots.items) |r| vst_scan_mod.discover(io, app.allocator, r, &cands) catch {};
+        for (cands.items) |c| {
+            // 存**包根**（c.path）而不是模块（c.dll）：缓存里的 path 是"插件身份"的一部分，
+            // 自愈的"包名兜底"要靠它（曾经存 dll → path 变成 xxx.so → 兜底永远不匹配）。
+            const dup = app.allocator.dupe(u8, c.path) catch continue;
+            pm.scan_mods.append(app.allocator, dup) catch app.allocator.free(dup);
+        }
+    }
+    if (pm.scan_mods.items.len == 0) {
+        app.setToast("没有扫到任何 .vst3 模块");
+        return;
+    }
+    pm.scan_next = 0;
+    pm.scan_json.clearRetainingCapacity();
+    pm.scan_crashes = 0;
+    pm.scan_discard = false;
+    app.setToastWith("插件扫描开始（{d} 个模块）…（可手动取消）", .{pm.scan_mods.items.len});
+    spawnNextScanWorker(app, io);
+}
+
+/// 清掉扫描队列（收尾/取消时）
+fn clearScanQueue(app: *App) void {
+    const pm = &app.plugin_mgr;
+    for (pm.scan_mods.items) |m| app.allocator.free(m);
+    // **deinit 而不是 clearRetainingCapacity**：后者会长期占着峰值容量
+    // （`scan_json` 累积整批 JSONL，扫完还攥着几 MB 不放 —— 实测泄漏报告就是这么来的）
+    pm.scan_mods.deinit(app.allocator);
+    pm.scan_mods = .empty;
+    pm.scan_json.deinit(app.allocator);
+    pm.scan_json = .empty;
+    pm.scan_next = 0;
+    pm.scan_crashes = 0;
+}
+
+/// JSON 字符串内部的转义（只处理 `"` 与 `\\`，路径足够）
+fn appendJsonInner(list: *std.ArrayListUnmanaged(u8), a: std.mem.Allocator, text: []const u8) void {
+    for (text) |ch| switch (ch) {
+        '"' => list.appendSlice(a, "\\\"") catch {},
+        '\\' => list.appendSlice(a, "\\\\") catch {},
+        else => list.append(a, ch) catch {},
+    };
+}
+
+/// 起**下一个模块**的扫描 worker；队列跑完 → 收尾。
+fn spawnNextScanWorker(app: *App, io: std.Io) void {
+    const pm = &app.plugin_mgr;
+    if (pm.scan_next >= pm.scan_mods.items.len) {
+        finishPluginScan(app, io, 0);
+        return;
+    }
+    const root = pluginDataRoot(app) orelse {
+        pm.scanning = false;
+        return;
+    };
     var exe_buf: [1200]u8 = undefined;
     const exe_path = selfExePath(app.allocator, &exe_buf);
     if (exe_path.len == 0) {
         app.setToast("无法定位程序路径");
+        pm.scanning = false;
         return;
     }
-
     var out_buf: [640]u8 = undefined;
-    const out_path = std.fmt.bufPrint(&out_buf, "{s}/scan_tmp.jsonl", .{root}) catch return;
+    const out_path = std.fmt.bufPrint(&out_buf, "{s}/scan_tmp.jsonl", .{root}) catch {
+        pm.scanning = false;
+        return;
+    };
     std.Io.Dir.cwd().createDirPath(io, root) catch {};
     std.Io.Dir.cwd().deleteFile(io, out_path) catch {};
+    const mod = pm.scan_mods.items[pm.scan_next];
 
-    var cmd: std.ArrayListUnmanaged(u16) = .empty;
-    defer cmd.deinit(app.allocator);
-    appendUtf16Quoted(&cmd, app.allocator, exe_path) catch return;
-    appendUtf16(&cmd, app.allocator, " --vst-scan --jsonl ") catch return;
-    appendUtf16Quoted(&cmd, app.allocator, out_path) catch return;
-    for (roots.items) |r| {
+    if (comptime builtin.os.tag != .windows) {
+        var argv: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer argv.deinit(app.allocator);
+        argv.append(app.allocator, exe_path) catch return;
+        argv.append(app.allocator, "--vst-scan") catch return;
+        argv.append(app.allocator, "--jsonl") catch return;
+        argv.append(app.allocator, out_path) catch return;
+        argv.append(app.allocator, mod) catch return;
+        const child = std.process.spawn(port_io.blocking(), .{
+            .argv = argv.items,
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+            .create_no_window = true,
+        }) catch {
+            app.setToast("无法启动扫描进程（自身 exe 自举失败）");
+            pm.scanning = false;
+            return;
+        };
+        pm.scan_child = child;
+    } else {
+        var cmd: std.ArrayListUnmanaged(u16) = .empty;
+        defer cmd.deinit(app.allocator);
+        appendUtf16Quoted(&cmd, app.allocator, exe_path) catch return;
+        appendUtf16(&cmd, app.allocator, " --vst-scan --jsonl ") catch return;
+        appendUtf16Quoted(&cmd, app.allocator, out_path) catch return;
         appendUtf16(&cmd, app.allocator, " ") catch return;
-        appendUtf16Quoted(&cmd, app.allocator, r) catch return;
+        appendUtf16Quoted(&cmd, app.allocator, mod) catch return;
+        const cmd_z = cmd.toOwnedSliceSentinel(app.allocator, 0) catch return;
+        defer app.allocator.free(cmd_z);
+        var si = STARTUPINFOW{ .cb = @sizeOf(STARTUPINFOW) };
+        var pi = PROCESS_INFORMATION{};
+        if (CreateProcessW(null, cmd_z.ptr, null, null, 0, scan_no_window, null, null, &si, &pi) == 0) {
+            app.setToast("无法启动扫描进程（自身 exe 自举失败）");
+            pm.scanning = false;
+            return;
+        }
+        if (pi.hThread) |h| _ = CloseHandle(h);
+        pm.scan_handle = pi.hProcess;
     }
-    const cmd_z = cmd.toOwnedSliceSentinel(app.allocator, 0) catch return;
-    defer app.allocator.free(cmd_z);
 
-    var si = STARTUPINFOW{ .cb = @sizeOf(STARTUPINFOW) };
-    var pi = PROCESS_INFORMATION{};
-    if (CreateProcessW(null, cmd_z.ptr, null, null, 0, scan_no_window, null, null, &si, &pi) == 0) {
-        app.setToast("无法启动扫描进程（自身 exe 自举失败）");
-        return;
-    }
-    if (pi.hThread) |h| _ = CloseHandle(h);
-    pm.scan_handle = pi.hProcess;
     pm.scanning = true;
-    pm.scan_discard = false;
     pm.scan_ok = 0;
     pm.scan_err = 0;
-    pm.scan_total = 0;
+    pm.scan_total = 1;
     pm.scan_current_len = 0;
     pm.scan_frame = 0;
     pm.scan_idle = 0;
     const n = @min(out_path.len, pm.scan_out_buf.len);
     @memcpy(pm.scan_out_buf[0..n], out_path[0..n]);
     pm.scan_out_len = n;
-    app.setToast("插件扫描开始…（可手动取消）");
 }
 
 /// 「取消扫描」：置丢弃标记 + 杀 worker（收尾在 `pollPluginScan`——统一出口）
@@ -3315,7 +3803,7 @@ fn cancelPluginScan(app: *App) void {
     const pm = &app.plugin_mgr;
     if (!pm.scanning) return;
     pm.scan_discard = true; // 用户取消：保留旧缓存，不落部分结果
-    if (pm.scan_handle) |h| _ = TerminateProcess(h, 1);
+    killScanWorker(pm, 1);
     app.setToast("扫描已取消");
 }
 
@@ -3335,15 +3823,41 @@ fn pollPluginScan(app: *App, io: std.Io) void {
     }
     if (pm.scan_idle > scan_watchdog_frames) {
         pm.scan_idle = 0;
-        if (pm.scan_handle) |h| _ = TerminateProcess(h, 2);
+        killScanWorker(pm, 2);
         app.setToast("扫描进程长时间无响应，已强行结束（保留部分结果）");
     }
-    if (pm.scan_handle) |h| {
-        var code: u32 = 0;
-        if (GetExitCodeProcess(h, &code) != 0 and code != still_active) {
-            finishPluginScan(app, io, code);
-        }
+    if (scanWorkerExitCode(pm)) |code| {
+        finishPluginScan(app, io, code);
     }
+}
+
+test "main: 扫描 worker 的非阻塞回收机制（spawn + waitpid(NOHANG) + 退出码）" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const io = port_io.blocking();
+
+    // 与 `startPluginScan` 完全同款：忽略 stdio 起子进程，然后每帧非阻塞回收
+    const child = try std.process.spawn(io, .{
+        .argv = &.{ "/bin/sh", "-c", "exit 7" },
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    var ch = child;
+    const pid: i32 = @intCast(ch.id.?);
+
+    var status: i32 = 0;
+    var spins: usize = 0;
+    while (true) : (spins += 1) {
+        const r = std.os.linux.waitpid(pid, &status, std.os.linux.W.NOHANG);
+        if (r == @as(usize, @bitCast(@as(isize, pid)))) break;
+        if (spins > 3000) return error.Timeout;
+        std.Io.sleep(io, .fromNanoseconds(2 * std.time.ns_per_ms), .awake) catch {}; // 模拟"每帧轮询"
+    }
+    ch.id = null;
+
+    const st: u32 = @bitCast(status);
+    try std.testing.expectEqual(@as(u32, 0), st & 0x7f); // 正常退出
+    try std.testing.expectEqual(@as(u32, 7), (st >> 8) & 0xff); // 退出码原样带回
 }
 
 /// 从 JSONL 文本重数进度（oi/err/总数/当前路径）；返回是否有变化（看门狗用）
@@ -3406,40 +3920,90 @@ fn updateScanProgress(pm: *@import("app.zig").PluginMgrWindow, data: []const u8)
 /// 保留部分结果（孤立 start → `crashed_after` 在管理器里红字提示）。
 fn finishPluginScan(app: *App, io: std.Io, exit_code: u32) void {
     const pm = &app.plugin_mgr;
-    if (pm.scan_handle) |h| {
-        _ = CloseHandle(h);
-        pm.scan_handle = null;
+    if (comptime builtin.os.tag == .windows) {
+        if (pm.scan_handle) |h| {
+            _ = CloseHandle(h);
+            pm.scan_handle = null;
+        }
+    } else {
+        if (pm.scan_child) |*ch| ch.id = null; // 已 waitpid 回收，只清标记
+        pm.scan_child = null;
     }
     pm.scanning = false;
     pm.scan_current_len = 0;
     const path = pm.scan_out_buf[0..pm.scan_out_len];
+
+    // 取消：整次扫描作废（保留旧缓存）
     if (pm.scan_discard) {
         pm.scan_discard = false;
         std.Io.Dir.cwd().deleteFile(io, path) catch {};
-        return; // 取消：保留旧缓存（toast 已在取消时提示）
+        clearScanQueue(app);
+        return;
     }
-    const root = pluginDataRoot(app) orelse return;
-    const data = std.Io.Dir.cwd().readFileAlloc(io, path, app.allocator, .limited(64 * 1024 * 1024)) catch {
-        app.setToastWith("扫描结果读取失败（退出码 {d}）", .{exit_code});
+
+    const cur_mod: []const u8 = if (pm.scan_next < pm.scan_mods.items.len) pm.scan_mods.items[pm.scan_next] else "";
+
+    // 把**本次 worker** 的 ok/err 行并入累积缓冲；没有结果行 = 崩在这个模块上
+    var got_result = false;
+    if (std.Io.Dir.cwd().readFileAlloc(io, path, app.allocator, .limited(16 * 1024 * 1024))) |data| {
+        defer app.allocator.free(data);
+        var it = std.mem.splitScalar(u8, data, '\n');
+        while (it.next()) |line| {
+            if (line.len == 0) continue;
+            if (std.mem.startsWith(u8, line, "{\"t\":\"ok\"") or std.mem.startsWith(u8, line, "{\"t\":\"err\"")) {
+                got_result = true;
+                pm.scan_json.appendSlice(app.allocator, line) catch {};
+                pm.scan_json.append(app.allocator, '\n') catch {};
+            }
+        }
+    } else |_| {}
+    if (!got_result and cur_mod.len > 0) {
+        // 崩溃：补一条 err（让管理器里显示"失败"而不是凭空消失）
+        pm.scan_crashes += 1;
+        var line: std.ArrayListUnmanaged(u8) = .empty;
+        defer line.deinit(app.allocator);
+        line.appendSlice(app.allocator, "{\"t\":\"err\",\"path\":\"") catch {};
+        appendJsonInner(&line, app.allocator, cur_mod);
+        line.appendSlice(app.allocator, "\",\"dll\":\"") catch {};
+        appendJsonInner(&line, app.allocator, cur_mod);
+        line.appendSlice(app.allocator, "\",\"error\":\"WorkerCrashed\"}\n") catch {};
+        pm.scan_json.appendSlice(app.allocator, line.items) catch {};
+    }
+    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    pm.scan_next += 1;
+
+    // 还有模块 → 继续下一个（崩溃不影响后续）
+    if (pm.scan_next < pm.scan_mods.items.len) {
+        spawnNextScanWorker(app, io);
+        return;
+    }
+
+    // ── 全部跑完：解析累积结果 → 与旧缓存合并 → 存盘 ──
+    const root = pluginDataRoot(app) orelse {
+        clearScanQueue(app);
         return;
     };
-    defer app.allocator.free(data);
-    var c = plugin_db.Cache.parseJsonl(app.allocator, data);
+    var c = plugin_db.Cache.parseJsonl(app.allocator, pm.scan_json.items);
     c.scanned_at = plugin_db.unixTime();
+    c.completed = true;
+    if (app.plugin_cache) |*old| c.mergeMissingFrom(old);
     c.save(io, root) catch app.setToast("扫描缓存保存失败");
     if (app.plugin_cache) |*old| old.deinit();
     app.plugin_cache = c;
     scanPresets(app, io); // 缓存变化 → 合成 VST3 分类立即进预设面板
     const cache = &app.plugin_cache.?;
-    if (cache.crashed_after) |cp| {
-        app.setToastWith("扫描完成（可用 {d} · 失败 {d}）；{s} 使扫描进程崩溃——已跳过", .{ cache.okCount(), cache.errCount(), std.fs.path.basename(cp) });
+    if (pm.scan_crashes > 0) {
+        app.setToastWith("扫描完成：可用 {d} · 失败 {d}（{d} 个插件使扫描进程崩溃，已跳过）", .{
+            cache.okCount(), cache.errCount(), pm.scan_crashes,
+        });
     } else {
         app.setToastWith("扫描完成：可用 {d} · 失败 {d}", .{ cache.okCount(), cache.errCount() });
     }
+    clearScanQueue(app);
     // 重绑定自愈：失败槽按记录的 CID 匹配到扫描到的新路径（只碰失败槽；同路径不动）
     const healed = app.reboundFailedPluginSlots(io);
     if (healed > 0) app.setToastWith("已自动重新定位 {d} 个失败插件（扫描找到新路径）", .{healed});
-    std.Io.Dir.cwd().deleteFile(io, path) catch {};
+    _ = exit_code;
 }
 
 /// 读取设置（缺失/损坏 → 默认值，静默）。“启动打开上次工程”走既有
@@ -3625,16 +4189,13 @@ pub const midi_filter = "MIDI 文件 (*.mid;*.midi)\x00*.mid;*.midi\x00所有文
 /// 导入**不替换**当前工程（追加）；有脏修改时提示先保存？——不拦截：
 /// 导入是增量操作，不会丢数据。
 fn importMidiWithDialog(app: *App, win: *window.Window, io: std.Io) void {
-    const picked = filedialog.open(app.allocator, win.hwnd, "导入 MIDI", midi_filter) catch |e| {
-        app.setToastWith("导入失败：对话框出错（{s}）", .{@errorName(e)});
-        return;
-    };
-    const path = picked orelse {
-        if (filedialog.supported()) app.setToast("已取消导入");
-        return;
-    };
-    defer app.allocator.free(path);
+    _ = win;
+    _ = io;
+    app.requestPick(.{ .kind = .open, .use_ = .import_midi, .title = "导入 MIDI", .filter = midi_filter });
+}
 
+/// 导入 MIDI 的实际执行（对话框结果）
+fn importMidiFromPath(app: *App, io: std.Io, path: []const u8) void {
     const data = std.Io.Dir.cwd().readFileAlloc(io, path, app.allocator, .unlimited) catch |e| {
         app.setToastWith("导入失败：读取失败（{s}）", .{@errorName(e)});
         return;
@@ -3665,30 +4226,20 @@ const json_filter = "JSON 文件 (*.json)\x00*.json\x00所有文件 (*.*)\x00*.*
 
 /// 导入 JSON（可读/迁移格式；与“打开”同流程——旧档同样走备份升级弹窗）
 fn importJsonWithDialog(app: *App, win: *window.Window, io: std.Io) void {
-    const picked = filedialog.open(app.allocator, win.hwnd, "导入 JSON（可读/迁移格式）", json_filter) catch |e| {
-        app.setToastWith("导入失败：对话框出错（{s}）", .{@errorName(e)});
-        return;
-    };
-    const path = picked orelse {
-        if (filedialog.supported()) app.setToast("已取消导入");
-        return;
-    };
-    defer app.allocator.free(path);
-    loadProjectFromPath(app, io, path);
+    _ = win;
+    _ = io;
+    app.requestPick(.{ .kind = .open, .use_ = .import_json, .title = "导入 JSON（可读/迁移格式）", .filter = json_filter });
 }
 
 /// 导出 JSON（可读文本格式，便于迁移到其他 DAW）——不改变当前工程路径/保存态
 fn exportJsonWithDialog(app: *App, win: *window.Window, io: std.Io) void {
-    const picked = filedialog.save(app.allocator, win.hwnd, "导出 JSON（可读/迁移格式）", "song.json", json_filter) catch |e| {
-        app.setToastWith("导出失败：对话框出错（{s}）", .{@errorName(e)});
-        return;
-    };
-    const path = picked orelse {
-        if (filedialog.supported()) app.setToast("已取消导出");
-        return;
-    };
-    defer app.allocator.free(path);
+    _ = win;
+    _ = io;
+    app.requestPick(.{ .kind = .save, .use_ = .export_json, .title = "导出 JSON（可读/迁移格式）", .filter = json_filter, .default_name = "song.json" });
+}
 
+/// 导出 JSON 的实际执行（对话框结果）
+fn exportJsonToPath(app: *App, io: std.Io, path: []const u8) void {
     const project = app.exportProject() catch |e| {
         app.setToastWith("导出失败：导出失败（{s}）", .{@errorName(e)});
         return;
@@ -3708,17 +4259,13 @@ fn exportJsonWithDialog(app: *App, win: *window.Window, io: std.Io) void {
 
 /// 导出 MIDI：全部片段按全局时间展开 → 写出文件。
 fn exportMidiWithDialog(app: *App, win: *window.Window, io: std.Io) void {
-    const default_name = "song.mid";
-    const picked = filedialog.save(app.allocator, win.hwnd, "导出 MIDI", default_name, midi_filter) catch |e| {
-        app.setToastWith("导出失败：对话框出错（{s}）", .{@errorName(e)});
-        return;
-    };
-    const path = picked orelse {
-        if (filedialog.supported()) app.setToast("已取消导出");
-        return;
-    };
-    defer app.allocator.free(path);
+    _ = win;
+    _ = io;
+    app.requestPick(.{ .kind = .save, .use_ = .export_midi, .title = "导出 MIDI", .filter = midi_filter, .default_name = "song.mid" });
+}
 
+/// 导出 MIDI 的实际执行（对话框结果）
+fn exportMidiToPath(app: *App, io: std.Io, path: []const u8) void {
     const notes = app.exportMidiNotes(app.allocator) catch |e| {
         app.setToastWith("导出失败：收集音符失败（{s}）", .{@errorName(e)});
         return;
@@ -3747,30 +4294,29 @@ fn exportMidiWithDialog(app: *App, win: *window.Window, io: std.Io) void {
 /// 导出音频（WAV, 24-bit）/ 整曲**离线渲染**：停播 + 暂停设备 → 快照 → 逐块渲染写盘。
 /// 默认文件名 = 工程名.wav（新建未保存的工程 → Sawdust.wav）。
 fn exportWavWithDialog(app: *App, win: *window.Window, io: std.Io) void {
-    var name_buf: [300]u8 = undefined;
+    _ = win;
+    _ = io;
+    // 默认文件名：<工程名>.wav（缓冲是栈上的，所以拷贝到静态缓冲里保存）
+    const S = struct {
+        var buf: [300]u8 = undefined;
+    };
     const default_name = blk: {
         if (app.project_path) |p| {
             const base = std.fs.path.basename(p);
             const stem = if (std.mem.lastIndexOfScalar(u8, base, '.')) |i| base[0..i] else base;
-            if (stem.len > 0 and stem.len < 290) break :blk std.fmt.bufPrint(&name_buf, "{s}.wav", .{stem}) catch "Sawdust.wav";
+            if (stem.len > 0 and stem.len < 290) break :blk std.fmt.bufPrint(&S.buf, "{s}.wav", .{stem}) catch "Sawdust.wav";
         }
         break :blk "Sawdust.wav";
     };
-    const picked = filedialog.save(app.allocator, win.hwnd, "导出音频 (WAV)", default_name, filedialog.wav_filter) catch |e| {
-        app.setToastWith("导出失败：对话框出错（{s}）", .{@errorName(e)});
-        return;
-    };
-    const path = picked orelse {
-        if (filedialog.supported()) app.setToast("已取消导出");
-        return;
-    };
-    defer app.allocator.free(path);
+    app.requestPick(.{ .kind = .save, .use_ = .export_wav, .title = "导出音频 (WAV)", .filter = filedialog.wav_filter, .default_name = default_name });
+}
 
+/// 开始导出 WAV（对话框结果）；进度/取消/完成由主循环的导出状态机负责
+fn exportWavToPath(app: *App, io: std.Io, path: []const u8) void {
     app.exportWavBegin(io, path) catch |e| {
         app.setToastWith("导出失败：{s}", .{@errorName(e)});
         return;
     };
-    // 进度/取消/完成收尾由主循环的导出状态机负责（`exportWavFrame` + `drawExportDialog`）
 }
 
 /// 导出进度窗（模态；绘于最上层）。进度条 + 取消按钮；标题可拖动（位置记忆在
@@ -4092,17 +4638,190 @@ fn drawModalButtons(
 
 // ── 字体 ──
 
-fn loadFont(allocator: std.mem.Allocator, io: std.Io) !Font {
-    const candidates = [_][]const u8{
-        "fonts/ui.ttf",
-        "C:\\Windows\\Fonts\\msyh.ttc",
-        "C:\\Windows\\Fonts\\segoeui.ttf",
-        "C:\\Windows\\Fonts\\consola.ttf",
-    };
-    for (candidates) |p| {
-        std.Io.Dir.cwd().access(io, p, .{}) catch continue;
-        return Font.initFromFile(allocator, io, p, 16);
+/// 环境变量取值的便捷包装（`WINDIR` / `HOME`）
+fn envValue(name: [*:0]const u8) ?[]const u8 {
+    const v = std.c.getenv(name) orelse return null;
+    return std.mem.span(v);
+}
+
+/// 读 `<exe>/data/font.txt`（一行字体路径；用户在设置里自选的字体，优先于一切自动探测）
+fn readFontChoice(io: std.Io, exe_dir: []const u8, out: []u8) ?[]const u8 {
+    var pbuf: [1024]u8 = undefined;
+    const p = std.fmt.bufPrint(&pbuf, "{s}/data/font.txt", .{exe_dir}) catch return null;
+    const data = std.Io.Dir.cwd().readFileAlloc(io, p, std.heap.page_allocator, 4096) catch return null;
+    defer std.heap.page_allocator.free(data);
+    const t = std.mem.trim(u8, data, " \t\r\n");
+    if (t.len == 0 or t.len >= out.len) return null;
+    @memcpy(out[0..t.len], t);
+    return out[0..t.len];
+}
+
+/// 问 fontconfig：用户配置的 sans-serif 实际落到哪个文件（非 Linux 返回 null）
+/// 用 `std.c.system` 而不是 spawn+管道：只是一次性读一行，同步最省事
+fn probeFontconfig(io: std.Io, exe_dir: []const u8, out: []u8) ?[]const u8 {
+    if (comptime builtin.os.tag != .linux) return null;
+    var pbuf: [1024]u8 = undefined;
+    const probe = std.fmt.bufPrint(&pbuf, "{s}/data/.fc_probe", .{exe_dir}) catch return null;
+    var cbuf: [1200]u8 = undefined;
+    const cmd = std.fmt.bufPrintZ(
+        &cbuf,
+        "fc-match -f '%{{file}}' sans-serif > '{s}' 2>/dev/null",
+        .{probe},
+    ) catch return null;
+    if (std.c.system(cmd.ptr) != 0) return null;
+    const data = std.Io.Dir.cwd().readFileAlloc(io, probe, std.heap.page_allocator, 4096) catch return null;
+    defer std.heap.page_allocator.free(data);
+    std.Io.Dir.cwd().deleteFile(io, probe) catch {}; // 探针文件用完即删（不留在 data/ 里）
+    const t = std.mem.trim(u8, data, " \t\r\n");
+    if (t.len == 0 or t.len >= out.len) return null;
+    @memcpy(out[0..t.len], t);
+    return out[0..t.len];
+}
+
+/// 记录实际生效的字体并加载（统一出口，顺带把路径报给设置页）
+fn useFont(allocator: std.mem.Allocator, io: std.Io, p: []const u8) !Font {
+    const f = try Font.initFromFile(allocator, io, p, 16);
+    font_info.setActive(p);
+    return f;
+}
+
+fn isFontFileName(name: []const u8) bool {
+    return std.mem.endsWith(u8, name, ".ttf") or
+        std.mem.endsWith(u8, name, ".ttc") or
+        std.mem.endsWith(u8, name, ".otf");
+}
+
+/// 在 `dir_path` 里找第一个字体文件（最多下潜 `depth` 层）；找到就把完整路径写进 `out`
+fn findFontInDir(io: std.Io, dir_path: []const u8, depth: u8, out: []u8) ?[]const u8 {
+    var d = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return null;
+    defer d.close(io);
+    var it = d.iterate();
+    while (it.next(io) catch null) |e| {
+        if (isFontFileName(e.name)) {
+            return std.fmt.bufPrint(out, "{s}/{s}", .{ dir_path, e.name }) catch null;
+        }
+        if (depth > 0 and e.kind == .directory) {
+            var sub: [1024]u8 = undefined;
+            const sub_path = std.fmt.bufPrint(&sub, "{s}/{s}", .{ dir_path, e.name }) catch continue;
+            if (findFontInDir(io, sub_path, depth - 1, out)) |p| return p;
+        }
     }
+    return null;
+}
+
+/// 字体解析顺序（见 `docs/linux.md` §1.1）：
+/// 0 `data/font.txt`（用户自选）→ 1 fontconfig（尊重用户配置）→ 2 系统名单
+/// → 3 `<exe>/data/fonts/` → 4 任意一种系统字体 → 报错
+fn loadFont(allocator: std.mem.Allocator, io: std.Io) !Font {
+    var ebuf: [1024]u8 = undefined;
+    const exe_dir = exeDir(allocator, io, &ebuf);
+
+    // 1) 系统已装字体：Windows 优先微软雅黑；Linux 优先文泉驿微米黑/Noto CJK
+    if (comptime builtin.os.tag == .windows) {
+        const names = [_][]const u8{ "msyh.ttc", "msyhbd.ttc", "segoeui.ttf", "tahoma.ttf", "arial.ttf" };
+        if (envValue("WINDIR")) |windir| {
+            for (names) |n| {
+                var p1: [1024]u8 = undefined;
+                const p = std.fmt.bufPrint(&p1, "{s}\\Fonts\\{s}", .{ windir, n }) catch continue;
+                if (std.Io.Dir.cwd().access(io, p, .{})) |_| {
+                    return useFont(allocator, io, p);
+                } else |_| {}
+            }
+        }
+    } else {
+        const abs = [_][]const u8{
+            "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
+            "/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",
+            "/usr/share/fonts/TTF/wqy-microhei.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/adobe-source-han-sans/SourceHanSansSC-Regular.otf",
+            "/usr/share/fonts/opentype/source-han-sans/SourceHanSansSC-Regular.otf",
+            "/usr/share/fonts/TTF/DroidSansFallbackFull.ttf",
+            "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+            "/usr/share/fonts/wqy-zenhei/wqy-zenhei.ttc",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/TTF/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/Adwaita/AdwaitaSans-Regular.ttf",
+        };
+        for (abs) |p| {
+            if (std.Io.Dir.cwd().access(io, p, .{})) |_| {
+                return useFont(allocator, io, p);
+            } else |_| {}
+        }
+        // 用户自己装的字体（`~/.local/share/fonts` / `~/.fonts`）：只试同名文件
+        const rel = [_][]const u8{
+            ".local/share/fonts/wqy-microhei.ttc",
+            ".local/share/fonts/NotoSansCJK-Regular.ttc",
+            ".local/share/fonts/SourceHanSansSC-Regular.otf",
+            ".fonts/wqy-microhei.ttc",
+        };
+        if (envValue("HOME")) |home| {
+            for (rel) |r| {
+                var p1: [1024]u8 = undefined;
+                const p = std.fmt.bufPrint(&p1, "{s}/{s}", .{ home, r }) catch continue;
+                if (std.Io.Dir.cwd().access(io, p, .{})) |_| {
+                    return useFont(allocator, io, p);
+                } else |_| {}
+            }
+        }
+    }
+
+    // 2) `<exe目录>/fonts/` 里第一个字体（单 exe 便携用法：把字体丢进这里）
+    {
+        var dbuf: [1024]u8 = undefined;
+        const dir = std.fmt.bufPrint(&dbuf, "{s}/data/fonts", .{exe_dir}) catch "data/fonts";
+        var fbuf: [1024]u8 = undefined;
+        if (findFontInDir(io, dir, 1, &fbuf)) |p| {
+            return useFont(allocator, io, p);
+        }
+    }
+
+    // 3) 任意一种系统字体（只求“能跑起来”）
+    {
+        var fbuf: [1024]u8 = undefined;
+        if (comptime builtin.os.tag == .windows) {
+            if (envValue("WINDIR")) |windir| {
+                var dbuf: [1024]u8 = undefined;
+                const dir = std.fmt.bufPrint(&dbuf, "{s}\\Fonts", .{windir}) catch "";
+                if (dir.len > 0) {
+                    if (findFontInDir(io, dir, 0, &fbuf)) |p| {
+                        return useFont(allocator, io, p);
+                    }
+                }
+            }
+        } else {
+            const roots = [_][]const u8{ "/usr/share/fonts", "/usr/local/share/fonts" };
+            for (roots) |r| {
+                if (findFontInDir(io, r, 2, &fbuf)) |p| {
+                    return useFont(allocator, io, p);
+                }
+            }
+            if (envValue("HOME")) |home| {
+                const rel = [_][]const u8{ ".local/share/fonts", ".fonts" };
+                for (rel) |r| {
+                    var dbuf: [1024]u8 = undefined;
+                    const dir = std.fmt.bufPrint(&dbuf, "{s}/{s}", .{ home, r }) catch continue;
+                    if (findFontInDir(io, dir, 2, &fbuf)) |p| {
+                        return useFont(allocator, io, p);
+                    }
+                }
+            }
+        }
+    }
+
+    std.debug.print(
+        \\未找到任何可用字体。请任选一种解决：
+        \\  · 安装系统字体：Arch `sudo pacman -S wqy-microhei`
+        \\                  Debian `sudo apt install fonts-wqy-microhei fonts-noto-cjk`
+        \\  · 或把任意 .ttf/.ttc/.otf 放进 {s}/data/fonts/
+        \\  · 或在 {s}/data/font.txt 里写一行字体路径
+        \\
+    , .{ exe_dir, exe_dir });
     return error.FontNotFound;
 }
 
@@ -4201,29 +4920,21 @@ test "main: 旧版二进制 v5 → performUpgrade 备份并改写为当前版本
     try std.testing.expect(!app.dirty);
 }
 
-test "main: dropZoneAt——播放列表 / 样式面板 / 其他区域" {
+test "main: 拖放只有两片——播放列表网格内 vs 网格外" {
     const alloc = std.testing.allocator;
     var app = App{ .allocator = alloc };
     defer app.clips.deinit(alloc);
     defer app.notes.deinit(alloc);
     defer app.deinitAll();
-    app.layout = .{
-        .initialized = true,
-        .left_w = 140,
-        .mid_w = 140,
-        .body_y = 100,
-        .body_h = 400,
-        .patterns_x = 140 + 6,
-        .patterns_w = 140,
-        .playlist_x = 140 + 6 + 140 + 6,
-        .playlist_w = 600,
-    };
-    try std.testing.expectEqual(DropZone.styles, dropZoneAt(&app, 200, 200));
-    try std.testing.expectEqual(DropZone.playlist, dropZoneAt(&app, 400, 200));
-    try std.testing.expectEqual(DropZone.none, dropZoneAt(&app, 50, 200)); // 历史栏
-    try std.testing.expectEqual(DropZone.none, dropZoneAt(&app, 400, 50)); // 工具栏
-    try std.testing.expectEqual(DropZone.none, dropZoneAt(&app, 400, 600)); // 状态栏
-    // 未初始化布局（body_h = 0）→ 一律不响应
-    app.layout.body_h = 0;
-    try std.testing.expectEqual(DropZone.none, dropZoneAt(&app, 400, 200));
+    // 用播放列表**画过一帧后的几何**来判落点（与真实绘制同一套坐标）
+    app.playlist.geom = .{ .lane_x = 300, .tracks_y = 120, .view_w = 600, .tracks_h = 400, .track_h = 40 };
+    // 网格内 → 有落点（→ 建样式 + 放片段）
+    try std.testing.expect(view_playlist.hitAt(&app, 400, 200) != null);
+    // 网格外（左侧面板/时间尺/状态栏）→ 无落点（→ 只建样式）
+    try std.testing.expect(view_playlist.hitAt(&app, 200, 200) == null);
+    try std.testing.expect(view_playlist.hitAt(&app, 400, 50) == null);
+    try std.testing.expect(view_playlist.hitAt(&app, 400, 600) == null);
+    // 没有几何（未绘制/布局未初始化）→ 一律无落点
+    app.playlist.geom = .{};
+    try std.testing.expect(view_playlist.hitAt(&app, 400, 200) == null);
 }

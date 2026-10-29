@@ -1218,3 +1218,238 @@ const names = if (total == 1) first.? else
   不是代码里的版本号。未提交、未发布、无外部文件的版本 = 零兼容义务，可直接改形。
 - **完整约定**见 AGENTS.md《版本与兼容纪律》；当前实例见 docs/save-format.md
   《v4 未发布——定型自由度》。
+## Linux / X11（WSLg 实测踩坑）
+
+> 背景：Linux 移植（X11 后端 + 自绘选择器 + VST3 宿主）期间的实测教训。
+> 症状 → 根因 → 修法，都是踩过才写的。
+
+### X11 后端
+
+- **拖动推子后光标崩溃（BadCursor）**：`XFreeCursor` 被用在了 Pixmap 上。
+  → 对应释放函数必须配对（`XFreePixmap`/`XFreeCursor`/`XFree`）；
+  光标**惰性建一次**复用；并装**非致命 `XSetErrorHandler`**——Xlib 默认处理协议错误会
+  直接 `exit()` 整个进程（插件也会踩，见下）。
+- **推子拖动时快时慢/反向**：用 `XWarpPointer` 把指针钉住会与真实 Motion 事件打架。
+  → 改为**相邻 Motion 事件的根坐标差累积**（不要主动 warp 指针）。
+- **滚轮快 120 倍**：X11 的 Button4/5 是"格"，Windows 的 `WM_MOUSEWHEEL` 是 120 单位。
+  → 统一成 ±1/格再乘平台系数，否则速度差两个数量级。
+- **Shift 打不出大写/符号**：字符别自己按 keysym 算。
+  → 字符输入用 `XLookupString`，VK 映射仍用 **unshifted** keysym。
+- **`modifiers()` 每帧 `XQueryPointer` 太贵**：→ 用事件跟踪的 `last_mask`。
+- **没有窗口管理器（WSLg）就没人做 click-to-focus**：焦点一直留在宿主窗口，
+  内嵌窗口收不到键盘。→ 需要自己 `XSetInputFocus`（在合适的时机，别每次点击都抢）。
+- **抓屏全黑**：WSLg（XWayland rootless）下 `xwd` / `import` / `ffmpeg -f x11grab`
+  抓 root 或窗口都是黑的。→ 想在 X11 侧"看"画面，只能读**应用自己的 framebuffer**
+  （调试选择器"闪一下"就是这么定位的：给路径栏区域算逐帧哈希）。
+- **自动化输入**：`xdotool key --window` 的合成事件我们的窗口收不到；
+  → 用 `xdotool windowfocus $WID` + `xdotool key`（XTest 真事件）；
+  鼠标坐标用 `xdotool mousemove --window $WID x y`（窗口不在根原点，绝对坐标会偏）。
+
+### 即时式 UI 的模态窗（自绘选择器/对话框）
+
+- **整块面板漏画 = "闪一下"**：模态窗的取消/提交逻辑若在"画面板之前"`return`，
+  那一帧连暗化层都不画 → 视觉上闪一下。→ **先改状态、画完再执行**取消动作。
+- **模态窗点了没反应**：鼠标事件被上层先消费了（即时 UI 先画先得）。
+  → 背景 UI 看"空输入"，画模态窗前**恢复真实输入**（背景不可点、模态窗可点）。
+- **点击穿透到背景**（例如在选择器上点击却给播放列表放了片段）：同上，必须做输入隔离。
+- **方向键/Enter 无效但鼠标正常**：`mouse_pressed` 等在 `endFrame()` 之后被清空，
+  绘制顺序错了就永远读不到 → 模态窗必须在 `endFrame()` **之前**画。
+
+### 平台移植纪律
+
+- **Win32 垫片绝不能被运行时调用**：`src/port_win_shims.zig` 只为满足链接器。
+  `exeDir()` 这类"看起来跨平台"的工具函数内部调了 `GetModuleFileNameW` 垫片 →
+  **Release 下启动即崩**（Debug 凑巧无害）。→ 每个被垫入口都要用 `comptime` 隔开。
+- **子进程拿不到 `DISPLAY`**：`std.Io.Threaded` 初始化时若不继承 libc `environ`，
+  spawn 出来的 zenity/kdialog 里 `$DISPLAY` 为空 → 对话框静默失败。
+  → `port_io.blocking()` 里显式继承 environ（附回归测试）。
+- **`std.process.Child`（Zig 0.17）只有阻塞 `wait`**：没有 `tryWait`。
+  → 非阻塞回收自己 `waitpid(pid, W.NOHANG)`；回收后把 `child.id` 置空，
+  否则后续 `wait/kill` 会二次作用；fd 自己关。
+- **`std.Thread.sleep` 在 0.17 不存在** → `std.Io.sleep(io, .fromNanoseconds(n), .awake)`。
+- **取自身 exe 路径**：`std.process.executablePath(io, buf)`（= `/proc/self/exe`）。
+
+### XDND 拖放
+
+- 拖源侧必须 `XSetSelectionOwner(XdndSelection)`，否则对方取不到数据；
+- `XdndDrop` 里 `XGetWindowProperty` 读 `text/uri-list`，`%XX` 解码；
+- 落点用 `XdndPosition` 的根坐标经 `XTranslateCoordinates` 转客户区；
+- **任何"没命中落区就静默 return"都会变成用户眼里的"拖进去没反应"** →
+  至少给 toast / 走通配兜底。
+
+### VST3 在 Linux
+
+- bundle 内模块位置：`Foo.vst3/Contents/x86_64-linux/Foo.so`（Windows 是 `x86_64-win/Foo.vst3`）；
+  裸 `.so` **只有位于 `.vst3` 目录内**才算插件（否则会把 `/usr/lib` 下普通库当插件）。
+- 模块加载：Linux 用 `std.DynLib`（`dlopen/dlsym` + `GetPluginFactory`），
+  Windows 继续用 `LoadLibraryW`（ANSI 版按代码页解路径，中文名会失败）。
+- **永不 `dlclose` 插件模块**（与扫描 worker 的既有纪律一致）：插件后台/GL 线程在卸载后
+  继续跑已卸载代码 → segfault。关闭编辑器同理：**只 unmap 不销毁**（`IPlugView` 留着，
+  下次重开面板重新 map，更快）。
+- **XEmbed**：插件窗口带 `_XEMBED_INFO` 属性说明它走 XEmbed。宿主需要
+  `_XEMBED` ClientMessage：`XEMBED_EMBEDDED_NOTIFY`（`data.l[3]` = embedder 窗口）/
+  `XEMBED_WINDOW_ACTIVATE` / `XEMBED_FOCUS_IN`，并处理对方的 `XEMBED_REQUEST_FOCUS`。
+  （JUCE：`EMBEDDED_NOTIFY` 会触发它 `setParentWindow(data.l[3])`；它**接受合成的
+  ButtonPress**——宿主转发点击正是这条路径；它不用 XShape 做点击穿透。）
+- 转发合成事件给插件窗口时，`XSendEvent` 的 `event_mask` 用 **0**（投递给窗口所属客户端）；
+  用具体掩码会在客户端没选该掩码时冒泡回父窗口 → 形成"转发→回父→再转发"的循环。
+
+### AUR / 构建环境（WSL Arch）
+
+- `makepkg` **不许 root** → 建 `builder` 用户（`sudoers.d` 免密），AUR 助手用它跑。
+- `paru-bin` 可能链接了 `libalpm.so.15` 而本机 pacman 7.1 提供 `libalpm.so.16` →
+  `error while loading shared libraries`。改用 `yay-bin`（同上风险，实测可用）。
+- **AUR 拆分包（split package）的 git 仓库按 `pkgbase` 命名**，
+  直接用 pkgname clone 会得到空仓库 → 用助手 `-S <pkgname>`。
+- 有些 PKGBUILD 用 `$(xdg-user-dir DOWNLOAD)` 找安装包，而新建用户没有
+  `~/.config/user-dirs.dirs` → 回退成 `$HOME` → 找不到文件。写一份 `user-dirs.dirs` 即可。
+- 个别插件（如某些商业合成器）**安装包要用户自己登录官网下载**，AUR 只负责装；
+  GitHub 上未必有 release。
+
+## 跨平台/工程教训（与平台无关）
+
+- **批量编辑被整体拒绝后，重发必须逐条清点**：只补报错那一条会留下"漏网之鱼"
+  （症状：某处行为莫名不生效）。
+- **周期量的取样点要贴着消费者**：`frame_dt_ns` 测在错误位置 → 整个动画"全局慢 N 倍"，
+  极难从症状反推。
+- **拖动类控件的钳制必须在手势尾部**：在每帧绘制开头钳制，会被随后写入的
+  "未钳制跟随值"覆盖（症状：拖动时子窗口跑出面板/窗口）。
+- **新弹层必须登记进"菜单开着"的判定**（否则层级/输入顺序不对）；
+  固定底栏盖住列表时，命中判定要一并避让裁剪矩形（否则"点穿"）。
+- **脏标记不要逐点手动 set**（散在几十处，漏一处就是"改了不提示保存"）→
+  用状态比较/哈希统一推导。
+
+## 工程流程纪律（构建/改文件）
+
+- **`zig build test` 不分析 UI 代码**：测试只跟测试引用链（`main.zig` / `drawApp` / `view_*`
+  的绘制代码不在链上）。→ **动过 `view_*` / `ui.zig` / `main.zig` 的改动，`zig build` 和
+  `zig build test` 两个都要跑**（前者抓 UI 编译错、后者抓逻辑）。
+- **永不用 PowerShell `Set-Content` / shell 重定向写源码**：曾把 `app.zig` 的行尾/切片写坏
+  （症状：编译错误一片 + diff 全红）。→ 一律用专用编辑工具做定点替换；
+  万一写坏，`git checkout` 回滚重做，别在坏文件上继续打补丁。
+- Linux 构建**别把 `zig-out` / `.zig-cache` 放 9p 挂载上**（`/mnt/c`）：
+  用 `--cache-dir "$HOME/.cache/sawdust-build"`，二进制再拷到 Linux 侧运行目录。
+- **自动化点击测试的前提**：测试窗口必须在**最前**、且**用户没有同时在用鼠标/键盘**。
+  否则会出现两类假阴性：① 别的窗口盖住测试窗口 → 点击落到别人身上；
+  ② 用户一动鼠标就把 `xdotool mousemove` 摆好的指针抢走 → 拖动序列被扯断。
+  → 脚本里先用 `xdotool windowraise/windowfocus`，每个点前用 `getmouselocation` 校验指针位置。
+### 插件扫描：一个坏插件不能带走整批（2026-10 实测）
+
+- **症状**：扫描时某个插件让 worker 崩溃，随后**列表里所有插件都消失了**（连之前扫到的也没了）。
+- **根因两条**：
+  1. 一次 worker 扫**全部**插件 → 崩在第一个（按字母序靠前）时，后面的根本没扫；
+  2. 收尾时用本次 JSONL **整体替换**缓存 → 本次 0 条结果就把旧缓存覆盖成空。
+- **修法**：
+  - **一个插件一个 worker**（崩溃隔离），收尾时若该模块没有 `ok`/`err` 行 → 补一条
+    `{"t":"err",...,"error":"WorkerCrashed"}`（管理器里显示"失败"而不是凭空消失），然后**继续下一个**；
+  - 结果**累积**后一次性解析，并与旧缓存 `mergeMissingFrom`（同 path 以本次为准、本次没扫到的保留旧的）；
+  - `discover()` 修正：**不存在的根路径直接跳过**（旧实现当裸文件 → 缓存里留下
+    `/usr/local/lib/vst3`、`~/.vst3` 这类 `LoadLibraryFailed` 幽灵条目）；
+    `root` 本身是 `*.vst3` 目录时按 bundle 解析（而不是遍历它的 Contents）。
+- **附带**：新增隐藏 CLI **`--scan-plugins`**（启动后立刻跑一次扫描再退出），
+  无交互修缓存/做自动化验证都用它。
+- **实测**（`/usr/lib/vst3` 里 5 个插件，AIDA-X 在 `getFactoryInfo` 里崩）：
+  修前 → 列表全空；修后 → `OB-Xf/Dexed/JC303/Vital` 4 个可用 + AIDA-X 标为 `WorkerCrashed`。
+#### 编辑器输入：JUCE 插件为什么"点不动"（2026-10 实测结论）
+
+- JUCE 的 `windowMessageReceive()` 里，**真实核心鼠标事件在 XI2 可用时会被丢弃**
+  （`case ButtonPress/Release/Motion: if (!send_event) return;`），它只等 XInput2 版本；
+  而 **合成事件（`send_event=1`）的 `ButtonPress` 是被接受的**（注释原文：宿主像系统托盘那样转发点击）。
+- 实测：`JC303` 的窗口不吞事件 → 事件落到宿主容器 → 宿主转发**合成**事件 → **能改参数** ✅
+  （证明"宿主转发"这条路在本环境可用）。
+- `OB-Xf`/`Vital` 的窗口会吞掉真实事件（容器收不到）→ 宿主没机会转发 → **输入死掉**。
+  修法：把**插件窗口的 input shape 清空**（`XShapeCombineRectangles(..., ShapeInput, 0 rects)`），
+  事件穿透到宿主容器 → 宿主转发合成事件。实测 `OB-Xf` 因此**恢复可点** ✅。
+- `Vital`（JUCE + OpenGL 自绘）仍不响应（同法无效）：它的 GL UI 可能还有别的门槛，
+  待继续查（源码 `mtytel/vital` 已可获取）。
+- ⚠️ **后续修正（重要）**：上面那层"清空输入区 + 转发合成事件"**最终被删掉了**。
+  用户手动实测时点到 OB-Xf 里的一个链接按钮，**浏览器被打开**——证明**原生输入本来就是通的**，
+  之前"0 条编辑"的结论来自**坏的测量口径**（初始化事件 + 窗口被盖住 + 指针被抢）。
+  ⇒ 教训：**先做"删掉这层"的对照，再决定要不要引入复杂度**；自动化点击指标必须先排除
+  "初始化事件 / 窗口被遮挡 / 指针争用"。
+  （`vst_editor_x11.zig` 现在只剩：容器窗口 + XEmbed 握手 + 非致命 X 错误处理 + 事件抽干。）
+- （历史记录）曾尝试的修法：每帧把**插件窗口的 input shape 清空**
+  （`XShapeCombineRectangles(..., ShapeInput, 0 rects, ShapeSet)`）→ 真实事件穿透到宿主容器
+  → 宿主用 `XSendEvent(mask=0)` 转发**合成**事件（JUCE 接受 `send_event` 的 ButtonPress）。
+  - 必须**每帧**做：JUCE 在 `resized()`/可见性变化时会自己重设形状，做成一次性会被覆盖。
+  - 实测：`JC303` 18 条、`OB-Xf` 10 条真实参数编辑（修前 `OB-Xf` 60 次密集拖动 = 0）。
+- **Vital 仍不行，但原因变了**：它现在**能收到输入**（拖动/滚轮都送到了），
+  但它的 GL 线程在 WSLg（MESA `DRI3 error`、纯软件 GL）下**会自己崩**：
+  - 对照组（只开窗、完全不点）30~45s 内也崩；
+  - 试过 `LIBGL_ALWAYS_SOFTWARE=1`、`GALLIUM_DRIVER=llvmpipe`、`MESA_LOADER_DRIVER_OVERRIDE` 都不解决；
+  - ⇒ 结论：**WSLg 软件 GL + Vital 的 GL UI 不稳定**，需要在真 Linux 桌面/真 GPU 上验证。
+    宿主侧能做的是：插件编辑器崩溃会带走整个进程（同进程内的插件没有隔离）。
+### X11：`XDestroyImage` 会释放 `img->data`（double free 陷阱）
+
+- **症状**：加了原生叠加窗之后，一旦窗口尺寸变化/被回收，进程 `double free or corruption (!prev)` → abort。
+- **根因**：`XDestroyImage(img)` **会连 `img->data`（我们传进去的像素缓冲）一起 `free`**。
+  代码里"`XDestroyImage(img)` 之后再 `c_allocator.free(pixels)`" = 同一块内存释放两次。
+- **规则**：**销毁 XImage 之后绝不能再 free 那块像素内存**；只有在"没有 XImage 时"才自己 free。
+  统一收口成一个 `overlayRelease()` 函数（本文件已这么做），并加了回归测试
+  「x11: 镜像叠加窗 创建/缩放/隐藏/销毁 不崩溃」。
+### 独立插件窗口：用户点"关闭"会把宿主一起打死（已修）
+
+- **症状**：Linux 独立插件 UI 窗口点关闭后，**Sawdust 整个进程也消失了**；终端里先出现
+  `X connection to :0 broken`，随后一串 `request=12/15/18/20` 的 BadWindow。
+- **根因**：插件窗口现在是**顶层窗口**，窗口管理器提供"关闭"按钮；我们没声明/没处理
+  `WM_DELETE_WINDOW` → WM 直接把窗口**销毁** → 插件（JUCE）在已销毁的窗口上继续操作、
+  宿主也在 `pump()` 里继续查询它 → 连锁 BadWindow，最后 X 连接被拉断。
+- **修法**：
+  1. 创建容器窗口时 `XSetWMProtocols(WM_DELETE_WINDOW)` + `XSelectInput(StructureNotifyMask)`；
+  2. `pump()` 收到 `WM_DELETE_WINDOW` → **只 `XUnmapWindow`（隐藏）**，绝不让 WM 销毁窗口
+     （插件对象与窗口都留着，和 `closeEditor` 的"只隐藏"策略一致）；
+  3. 真收到 `DestroyNotify` → 把该窗口从容器表里摘掉并标 retired，之后不再触碰；
+  4. 用 **MapNotify/UnmapNotify 跟踪真实 map 状态**，`Plugin.editorIsShown()` 以它为准
+     （否则用户关掉后按钮状态不对，还会被"自动重新显示"逻辑立刻弹回来）。
+### 关掉插件 UI 窗口后"又冒出一个新窗口"（已修）
+
+- **症状**：点面板按钮的"关闭"或点窗口自己的 × 之后，插件 UI 窗口消失一瞬又出现一个新的。
+- **根因**：Linux 分支的"关旧开新"用的是 `owner != 目标` 判断：用户一关，`owner = null` →
+  下一帧这句又把当前插件当成"新目标"，立刻 `showEditorAt()` 把它打开了。
+- **修法**：把"**目标**"和"**当前开着的**"分开记：
+  - `vst_editor_target`：面板当前指向的插件（只有**它变化**才触发关旧开新）；
+  - `vst_editor_owner`：真正显示中的插件（用户关掉 → 置 null，但 target 不变 → 不会自动重开）；
+  - 两个面板都关着时清空 target（下次打开面板 = 目标变化 → 会重新显示，符合直觉）。
+## 简化收尾（Linux 插件 UI 定型后）
+
+定型为"**独立顶层窗口**"之后，前面三套试错方案全部成了死代码，已删除：
+
+| 删除项 | 内容 |
+|---|---|
+| **镜像叠加窗**整套 | `window_x11.setOverlays/overlayOffset/Overlay`、`OverlayRect` 类型、`app.editor_overlays*`、`main` 里的收集/调用/调试日志（约 200 行） |
+| **XShape 裁切** | `vst_editor_x11.setClip/repaintPlugin`、Shape 常量与 extern、`vst_host.setEditorClip` 的 Linux 分支、`clip_union/clip_settle_pending/clip_last_ms` 字段（约 120 行） |
+| **诊断探针/实验** | `installXI2Probe`（XI2 投递探针）、`probePointer`、`detachToRoot`（reparent 实验）、`SAWDUST_XI2_PROBE` / `SAWDUST_EDITOR_DETACH` 开关、`build.zig` 里的 `Xi` 链接 |
+| 冗余注释 | 两处提到"镜像叠加窗/XShape"的过时注释 |
+
+**保留**（都还在用）：容器窗口 `create/show/move/hide/destroy`、**XEmbed 握手**、
+非致命 X 错误处理、`WM_DELETE_WINDOW→隐藏` 与 `DestroyNotify` 安全处理、事件抽干 `pump()`、
+`takeUserClosed()`（按钮状态同步）、`editorIsShown`/`setEditorVisible`/`showEditorAt`。
+
+规模变化：`vst_editor_x11.zig` **510 → 约 345 行**；`vst_host.zig` 减约 90 行。
+验证：Linux **352 pass / 22 skip（374）**、Windows **370 pass / 3 skip（373）**，两端构建通过。
+
+> 过程教训（写下来提醒自己）：用"标记区间批量删除"做重构很容易切掉相邻的类型/函数
+> （这次就切掉了 `XEvent`/`Atom`/`setEditorClip` 函数尾部），**每删一块就该立刻编译一次**，
+> 而不是一次删完再编。
+### `clearRetainingCapacity()` 不是"释放"（插件扫描的内存泄漏）
+
+- **症状**：Windows Debug 跑 `zig build run`，退出时 SafeAllocator 报两处泄漏，都指向插件扫描：
+  - `startPluginScan` 的 `scan_mods.append(...)`；
+  - `finishPluginScan` 的 `scan_json.appendSlice(...)`。
+- **根因两条**：
+  1. `clearScanQueue()` 用的是 `clearRetainingCapacity()` —— **只清长度、保留容量**，
+     而 `scan_json` 累积的是整批插件 JSONL（可达 MB 级）→ **扫完还一直占着**（正是运行期的无谓常驻内存）；
+  2. 扫描途中**退出程序**（或直接关窗）时没人释放队列 → 退出时泄漏。
+- **修法**：`clearScanQueue()` 改用 `deinit()` + 置 `.empty`（连同容量一起还给分配器），
+  并在 `main` 退出清理处（`killScanWorker` 之后）调用一次。
+- **规则**：容器"用完即弃"时用 `deinit()`；只有"马上要复用、且复用规模相当"才用 `clearRetainingCapacity()`。
+### Linux 上 `exeDir()` 返回 `"."` → 「单 exe 便携」失效（已修）
+
+- **现象**：Windows 上 `<exe>/data`、`<exe>/data/fonts` 都正常（`GetModuleFileNameW`）；
+  Linux 上却变成 `./data`（相对 **CWD**），用户必须"在某个目录里启动"才找得到数据与字体。
+- **根因**：`exeDir()` 在非 Windows 直接 `return "."`——当年为修"Linux release 启动即崩"
+  （`GetModuleFileNameW` 经垫片被运行时调用）临时加的守卫，一直没补真实现。
+- **修法**：非 Windows 用 `std.Io.Dir.readLinkAbsolute(io, "/proc/self/exe", buf)`
+  再 `dirname`。（注意 Zig 0.17 没有 `std.posix.readlink`，要用 `Io.Dir.readLinkAbsolute`。）
+- **连带**：字体解析顺序重写为「`data/font.txt` → fontconfig → 系统已装字体（按名字逐个试）→ `<exe>/data/fonts/`
+  → 任意一种系统字体 → 报错并给安装命令」，`<cwd>/fonts` **取消**。

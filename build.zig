@@ -46,6 +46,14 @@ pub fn build(b: *std.Build) void {
         exe.subsystem = .windows;
     }
 
+    // Linux 系统库：X11 窗口后端（`src/window_x11.zig`）。
+    // miniaudio 的 ALSA/PulseAudio 后端是**运行时 dlopen**，无需链接。
+    if (target.result.os.tag == .linux) {
+        for ([_][]const u8{ "X11", "Xext" }) |lib| {
+            exe.root_module.linkSystemLibrary(lib, .{});
+        }
+    }
+
     b.installArtifact(exe);
     // VST3 绑定：**直接建模块**（不跑 submodule 的 build.zig）——
     // 1) 构建全程不碰网络；2) submodule 的 build.zig 仍在用 0.16 构建 API（0.17 里
@@ -76,5 +84,26 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     const test_step = b.step("test", "Run tests");
+    // 测试夹具：示例 VST3 插件（**只给单元测试用**）。直接从子模块源码编译，
+    // 不跑它的 build.zig；装到 zig-out/bin，与测试里写死的路径一致
+    //→ `zig build test` / `zig build` 一条命令就够，干净 clone 也不会缺夹具。
+    if (target.result.os.tag == .windows) {
+        for ([_][]const u8{ "sine_synth", "gain" }) |fname| {
+            const fixture = b.addLibrary(.{
+                .name = b.fmt("zig_vst3_{s}", .{fname}),
+                .linkage = .dynamic,
+                .root_module = b.createModule(.{
+                    .root_source_file = b.path(b.fmt("libs/zig-vst3/zig-vst3/src/{s}_plugin.zig", .{fname})),
+                    .target = target,
+                    .optimize = optimize,
+                }),
+            });
+            fixture.root_module.addImport("zig-vst3", vst3_mod);
+            fixture.root_module.addImport("zig-vst3-plugin-core", vst3_core_mod);
+            const inst = b.addInstallFileWithDir(fixture.getEmittedBin(), .bin, b.fmt("zig_vst3_{s}.dll", .{fname}));
+            // 只挂在 test 上：`zig build run` 不该为跑测试而多编两个 DLL
+            test_step.dependOn(&inst.step);
+        }
+    }
     test_step.dependOn(&run_exe_tests.step);
 }

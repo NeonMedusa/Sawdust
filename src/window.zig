@@ -1,58 +1,33 @@
-//! 窗口层：Win32 直接调用（零第三方依赖）。
+//! 窗口层：平台分派（Windows = Win32 直调；Linux = X11）。
 //!
 //! 设计要点：
 //! - 只负责「窗口 + 消息 + 帧缓冲呈现」，不含任何 UI 逻辑；
-//! - 帧缓冲用 `CreateDIBSection` 拿到**可直接写的内存指针**（软件光栅化的基础）；
-//! - 每帧流程：UI 往 framebuffer 写像素 → `present()` 用 BitBlt 推到窗口；
-//! - 输入事件（鼠标/键盘）转成统一的 `Event`，由上层（UI 层）消费。
-//!
-//! 将来跨平台时，只需替换本文件（Linux: X11/Wayland + 共享内存；macOS: Cocoa + CGContext）。
+//! - 帧缓冲用平台提供的**可直接写的内存**（Win32: `CreateDIBSection`；X11: `XCreateImage`
+//!   指向我们用 c_allocator 分配的缓冲）——软件光栅化的基础；
+//! - 每帧流程：UI 往 framebuffer 写像素 → `present()` 推到窗口；
+//! - 输入事件（鼠标/键盘）转成统一的 `Event`（见 `window_types.zig`），由上层（UI 层）消费。
+//! - 键码统一用 **Windows 虚拟键码**，所以两个后端的翻译职责必须对齐。
 
 const std = @import("std");
 const builtin = @import("builtin");
+const types = @import("window_types.zig");
 
-pub const Window = if (builtin.os.tag == .windows) WindowsWindow else UnsupportedWindow;
+pub const Window = if (builtin.os.tag == .windows)
+    WindowsWindow
+else if (builtin.os.tag == .linux)
+    @import("window_x11.zig").X11Window
+else
+    UnsupportedWindow;
 
-/// 统一输入事件（跨平台抽象）
-pub const Event = union(enum) {
-    quit,
-    /// 鼠标移动（客户区坐标）
-    mouse_move: struct { x: i32, y: i32 },
-    mouse_down: struct { x: i32, y: i32, button: MouseButton },
-    mouse_up: struct { x: i32, y: i32, button: MouseButton },
-    /// 双击（左键；窗口类需 CS_DBLCLKS）。
-    /// **注意**：系统在双击时间窗内不发第二次 WM_LBUTTONDOWN，只发 WM_LBUTTONDBLCLK，
-    /// 因此本事件会**同时**发一条 mouse_down（否则快速连点的第二下被吞）。
-    mouse_double: struct { x: i32, y: i32 },
-    /// 滚轮（delta > 0 = 向上/远离用户；ctrl = 按下 Ctrl，用于横向缩放；
-    /// shift = 按下 Shift，用于纵向缩放）
-    mouse_wheel: struct { x: i32, y: i32, delta: i32, ctrl: bool, alt: bool, shift: bool },
-    key_down: struct { code: u32, repeat: bool, ctrl: bool, shift: bool, alt: bool },
-    key_up: struct { code: u32 },
-    /// 已翻译的字符（含 IME 结果）
-    char: u21,
-    /// 窗口尺寸变化
-    resize: struct { width: u32, height: u32 },
-};
-
-pub const MouseButton = enum { left, right, middle };
-
+/// 统一输入事件（跨平台抽象；定义在 `window_types.zig`）
+pub const Event = types.Event;
+pub const MouseButton = types.MouseButton;
 /// 修饰键状态（每帧由 main 从窗口读取；框选/批量操作用）
-pub const Modifiers = struct {
-    ctrl: bool = false,
-    shift: bool = false,
-};
-
+pub const Modifiers = types.Modifiers;
+/// 拖放落点（客户区坐标；外部拖放期间“鼠标位置”是陈的，必须用它）
+pub const DropPoint = types.DropPoint;
 /// 帧缓冲：BGRA 像素（与 Win32 的 32 位 DIB 格式一致，可直接 blit）
-pub const Framebuffer = struct {
-    pixels: []u32,
-    width: u32,
-    height: u32,
-
-    pub fn fill(self: *Framebuffer, color: u32) void {
-        @memset(self.pixels, color);
-    }
-};
+pub const Framebuffer = types.Framebuffer;
 
 // ── Windows 实现 ──
 
@@ -77,6 +52,8 @@ const WindowsWindow = struct {
     should_quit: bool = false,
     /// 待消费的拖入文件路径（UTF-8；WM_DROPFILES 收集，App 帧初取走）
     dropped: std.ArrayListUnmanaged([]u8) = .empty,
+    /// 本次拖放的落点（`DragQueryPoint`；null = 无）
+    drop_pt: ?DropPoint = null,
     /// 当前系统光标（避免重复设置）
     cursor_kind: @import("ui.zig").CursorKind = .arrow,
     /// 当前光标句柄（WM_SETCURSOR 时重设，防止系统改回默认）
@@ -162,9 +139,51 @@ const WindowsWindow = struct {
         try self.resizeFramebuffer(width, height);
     }
 
+    /// 本次拖放落点（客户区）——**只读**：由 `takeDropped()` 在队列取空时清空
+    /// 请求剪贴板文本（Windows 同步读取；OpenClipboard 失败 → 无动作）
+    pub fn clipboardRequestText(self: *WindowsWindow) void {
+        _ = self;
+    }
+
+    /// 写入剪贴板（UTF-8 → UTF-16 + CF_UNICODETEXT）
+    pub fn clipboardSetText(self: *WindowsWindow, text: []const u8) void {
+        const w = std.unicode.utf8ToUtf16LeAllocZ(self.allocator, text) catch return;
+        defer self.allocator.free(w);
+        if (OpenClipboard(null) == 0) return;
+        defer _ = CloseClipboard();
+        _ = EmptyClipboard();
+        const bytes = (w.len + 1) * @sizeOf(u16);
+        const h = GlobalAlloc(0x0002, bytes) orelse return; // GMEM_MOVEABLE
+        const p = GlobalLock(h) orelse {
+            _ = GlobalFree(h);
+            return;
+        };
+        const dst: [*]u8 = @ptrCast(p);
+        @memcpy(dst[0..bytes], std.mem.sliceAsBytes(w[0 .. w.len + 1]));
+        _ = GlobalUnlock(h);
+        _ = SetClipboardData(13, h); // 13 = CF_UNICODETEXT
+    }
+    /// 取剪贴板文本（UTF-8；null = 没有）。返回的串由调用方 free
+    pub fn clipboardTake(self: *WindowsWindow) ?[]u8 {
+        if (OpenClipboard(null) == 0) return null;
+        defer _ = CloseClipboard();
+        const h = GetClipboardData(13) orelse return null; // 13 = CF_UNICODETEXT
+        const p = GlobalLock(h) orelse return null;
+        defer _ = GlobalUnlock(h);
+        const w: [*:0]const u16 = @ptrCast(@alignCast(p));
+        const len = std.mem.len(w);
+        return std.unicode.utf16LeToUtf8Alloc(self.allocator, w[0..len]) catch null;
+    }
+
+    pub fn dropPoint(self: *WindowsWindow) ?DropPoint {
+        return self.drop_pt;
+    }
+
     pub fn takeDropped(self: *WindowsWindow) ?[]u8 {
         if (self.dropped.items.len == 0) return null;
-        return self.dropped.orderedRemove(0);
+        const p = self.dropped.orderedRemove(0);
+        if (self.dropped.items.len == 0) self.drop_pt = null;
+        return p;
     }
 
     pub fn deinit(self: *WindowsWindow) void {
@@ -405,6 +424,9 @@ const WindowsWindow = struct {
                 // 系统文件拖入：收集路径（UTF-16 → UTF-8），App 帧初消费
                 if (self) |s| {
                     const hdrop: ?*anyopaque = @ptrFromInt(wparam);
+                    // 落点：**不能用当前鼠标位置**（拖放期间由源程序抓指针，我们收不到 WM_MOUSEMOVE）
+                    var dpt = POINT{ .x = 0, .y = 0 };
+                    if (DragQueryPoint(hdrop, &dpt) != 0) s.drop_pt = .{ .x = dpt.x, .y = dpt.y };
                     const n = DragQueryFileW(hdrop, 0xFFFFFFFF, null, 0);
                     var i: u32 = 0;
                     while (i < n) : (i += 1) {
@@ -682,6 +704,16 @@ extern "kernel32" fn GetModuleHandleW(?[*:0]const u16) callconv(.winapi) ?*anyop
 extern "shell32" fn DragAcceptFiles(hwnd: ?*anyopaque, accept: i32) callconv(.winapi) void;
 extern "shell32" fn DragQueryFileW(hdrop: ?*anyopaque, ifile: u32, lpsz: ?[*]u16, cch: u32) callconv(.winapi) u32;
 extern "shell32" fn DragFinish(hdrop: ?*anyopaque) callconv(.winapi) void;
+extern "shell32" fn DragQueryPoint(hdrop: ?*anyopaque, pt: *POINT) callconv(.winapi) i32;
+extern "user32" fn OpenClipboard(hwnd: ?*anyopaque) callconv(.winapi) i32;
+extern "user32" fn CloseClipboard() callconv(.winapi) i32;
+extern "user32" fn GetClipboardData(format: u32) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GlobalLock(h: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GlobalUnlock(h: ?*anyopaque) callconv(.winapi) i32;
+extern "kernel32" fn GlobalAlloc(flags: u32, bytes: usize) callconv(.winapi) ?*anyopaque;
+extern "kernel32" fn GlobalFree(h: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+extern "user32" fn EmptyClipboard() callconv(.winapi) i32;
+extern "user32" fn SetClipboardData(format: u32, mem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "shell32" fn ShellExecuteA(?*anyopaque, [*:0]const u8, [*:0]const u8, ?[*:0]const u8, ?[*:0]const u8, i32) callconv(.winapi) ?*anyopaque;
 extern "user32" fn RegisterClassExW(*const WNDCLASSEXW) callconv(.winapi) u16;
 extern "user32" fn UnregisterClassW([*:0]const u16, ?*anyopaque) callconv(.winapi) i32;
@@ -733,20 +765,28 @@ const RGN_DIFF: i32 = 4;
 /// 用系统默认浏览器打开 URL（帮助页「项目仓库」链接；ASCII 地址用 A 版即可）。
 /// 非 Windows：与 `Window` 同策略的编译期占位（移植时换 `xdg-open` / `open`）。
 pub fn openExternalUrl(url: [:0]const u8) void {
-    if (builtin.os.tag != .windows) {
-        @compileError("window.openExternalUrl: 需移植（Linux: xdg-open；macOS: open）");
+    if (builtin.os.tag == .windows) {
+        _ = ShellExecuteA(null, "open", url, null, null, 1); // 1 = SW_SHOWNORMAL
+        return;
     }
-    _ = ShellExecuteA(null, "open", url, null, null, 1); // 1 = SW_SHOWNORMAL
+    // Linux/macOS：后续用 `xdg-open` / `open`（需 io，而本函数签名不带 io；
+    // 只影响帮助页的“项目仓库”链接，先静默不做事）。
 }
 
 const UnsupportedWindow = struct {
-    pub fn init(allocator: std.mem.Allocator, title: []const u8, width: u32, height: u32) !UnsupportedWindow {
+    pub fn init(self: *UnsupportedWindow, allocator: std.mem.Allocator, title: []const u8, width: u32, height: u32) !void {
+        _ = self;
         _ = allocator;
         _ = title;
         _ = width;
         _ = height;
-        @compileError("窗口层尚未移植到该平台：请实现 src/window.zig 的对应后端（Linux: X11/Wayland；macOS: Cocoa）");
+        @compileError("窗口层尚未移植到该平台：请实现对应后端（Linux: src/window_x11.zig；macOS: Cocoa）");
     }
+    pub fn dropPoint(self: *UnsupportedWindow) ?DropPoint {
+        _ = self;
+        return null;
+    }
+
     pub fn takeDropped(self: *UnsupportedWindow) ?[]u8 {
         _ = self;
         return null;
@@ -792,6 +832,11 @@ const UnsupportedWindow = struct {
         return true;
     }
 };
+
+test {
+    // 平台后端的测试要显式拉进测试图（`Window` 里那个 comptime 分支不算）
+    if (builtin.os.tag == .linux) _ = @import("window_x11.zig");
+}
 
 test "framebuffer: fill 写入所有像素" {
     var buf: [4]u32 = undefined;

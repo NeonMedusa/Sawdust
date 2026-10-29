@@ -10,6 +10,7 @@
 //! supersaw ≈ 50%）。数值控件与 BPM 同款（上下拖动、光标冻结）。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const r_mod = @import("render.zig");
 const Ui = @import("ui.zig").Ui;
 const App = @import("app.zig").App;
@@ -371,7 +372,23 @@ fn drawVst3Body(
     hh: i32,
 ) void {
     if (pl_opt) |p| {
-        if (p.view != null) return; // 嵌入中：子窗口覆盖内容区
+        if (p.view != null) {
+            // Windows：编辑器嵌在面板里（原生子窗口覆盖内容区）→ 这里不用画
+            if (comptime builtin.os.tag != .linux) return;
+            // Linux：编辑器是**独立顶层窗口**。按钮是开关——开关状态就是 `app.vst_editor_owner`
+            // （用户用窗口自己的关闭按钮关掉时，main 每帧会把这个 owner 清空 → 状态自然同步）。
+            const is_open = app.vst_editor_owner == p;
+            const label: []const u8 = if (is_open) "关闭插件 UI（独立窗口）" else "打开插件 UI（独立窗口）";
+            if (ui.button(id_base + 9001, label, x + 10, y + win_title_h + 8, ww - 20, 26)) {
+                if (is_open) {
+                    p.setEditorVisible(false);
+                    app.vst_editor_owner = null;
+                } else {
+                    p.showEditorAt(160, 120);
+                    app.vst_editor_owner = p;
+                }
+            }
+        }
     }
     const body_y = y + win_title_h;
     var yy = body_y + 10;

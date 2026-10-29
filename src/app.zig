@@ -4,6 +4,7 @@
 //! 字段按归属分组为子结构体（`playlist` / `piano` / `rack` / `panels` / `sel`），
 //! 避免 50+ 个平铺字段互相混淆。
 
+const text_edit = @import("text_edit.zig");
 const std = @import("std");
 const audio = @import("audio.zig");
 const model = @import("model.zig");
@@ -13,7 +14,11 @@ const persist = @import("persist.zig");
 const ivstevents = @import("zig_vst3").pluginterfaces.vst.ivstevents;
 const midi = @import("midi.zig");
 // 0.17：`@cImport` 已移除——改用 `zig translate-c` 预生成的绑定（免网络、免构建期翻译）
-const ma = @import("c/miniaudio.zig");
+// miniaudio 绑定：**按平台选择**。结构体布局随编译期启用的后端变化
+// （Linux 的 ma_device/ma_context 内嵌 pulse/alsa/jack 状态 → sizeof 比 Windows 大 464 字节），
+// 所以用同一份绑定会在跨平台时**越界写**。两份都由 `zig translate-c` 生成并入库。
+const builtin = @import("builtin");
+const ma = if (builtin.os.tag == .windows) @import("c/miniaudio_win.zig") else @import("c/miniaudio_linux.zig");
 const eq = @import("eq.zig");
 const fx = @import("effects.zig");
 const plugin_db = @import("plugin_db.zig");
@@ -758,6 +763,10 @@ pub const TextInput = struct {
     drag_active: bool = false,
     /// 水平滚动偏移（px；`textFieldSyncOffset` 每帧更新）
     view_off: i32 = 0,
+    /// 光标闪烁起点（ms；0 = 刚激活，绘制时换成 now）
+    caret_epoch: i64 = 0,
+    /// 已发出剪贴板请求、等数据到达后自动粘贴（X11 异步：否则要按两次 Ctrl+V）
+    pending_paste: bool = false,
     /// 输入框弹出位置（屏幕坐标；由右键菜单激活时快照）
     x: i32 = 0,
     y: i32 = 0,
@@ -1064,6 +1073,59 @@ pub const MixerWindow = struct {
 /// 效果器定位（通道 × 槽位）
 pub const EffectRef = struct { ch: usize, slot: usize, scroll: i32 = 0 };
 
+// ── 文件对话框请求（**B 方案：App 状态机，主循环不阻塞**）──
+//
+// 背景：系统对话框（Win32 `GetOpenFileName` / Linux `zenity`·`kdialog`）都是**同步模态**——
+// 调用期间 UI 线程被占住：界面冻结、VST 编辑器不刷新，
+// 而且序列器的调度前瞻（4 小节 ≈ 8~10 s）会被耗干 → **音乐会在十秒左右停住**（实测）。
+//
+// 所以对话框改成"请求 + 完成派发"：`requestPick()` 只登记意图，主循环每帧推进
+// （`main.handlePick`），拿到路径后再由 `dispatchPick()` 按用途执行。
+// 这样主循环（含调度续推、`rebuildAudioTable`、`pollPreview`）始终在跑。
+
+/// 拿到路径之后要做什么（12 个调用点各一支）
+pub const PickUse = union(enum) {
+    /// 保存工程（`force_dialog` = 另存为；否则有路径时直接存、不弹框）
+    project_save: struct { force_dialog: bool },
+    project_open,
+    import_midi,
+    import_json,
+    export_json,
+    export_midi,
+    export_wav,
+    /// 插件管理：添加扫描文件夹 / 单文件
+    plugin_folder,
+    plugin_file,
+    /// 鼓垫采样：给某层设采样（`layer = null` → 新增采样器层）
+    load_sample: struct { instrument: i32, pitch: u8, layer: ?usize },
+    relocate_instrument: struct { index: usize },
+    relocate_effect: struct { ch: usize, slot: usize },
+};
+
+pub const PickKind = enum { open, save, folder };
+
+/// 一个待处理的文件对话框请求（字段全是静态字面量，不需要释放）
+pub const PickRequest = struct {
+    kind: PickKind,
+    use_: PickUse,
+    title: []const u8,
+    filter: []const u8 = "",
+    default_name: []const u8 = "",
+    /// 起始目录（空 = 主目录）；只给内置选择器用
+    start_dir: []const u8 = "",
+
+    /// 取消时的提示文案（空 = 不提示）
+    pub fn cancelText(self: PickRequest) []const u8 {
+        return switch (self.use_) {
+            .project_save => "已取消保存",
+            .project_open => "已取消打开",
+            .import_midi, .import_json => "已取消导入",
+            .export_json, .export_midi, .export_wav => "已取消导出",
+            .plugin_folder, .plugin_file, .load_sample => "已取消选择",
+            .relocate_instrument, .relocate_effect => "已取消重新定位",
+        };
+    }
+};
 /// 导出进行中的状态（`App.export_wav`）——生命周期：`exportWavBegin` → 每帧
 /// `exportWavFrame` 分块推进 → 完成/取消/失败统一收尾清理。
 pub const ExportWav = struct {
@@ -1126,8 +1188,9 @@ pub const SettingsWindow = struct {
     open: bool = false,
     x: i32 = 460,
     y: i32 = 130,
-    w: i32 = 440,
-    h: i32 = 240,
+    w: i32 = 520,
+    /// 高度要装得下“启动时 / 帧率 / 数据交换 / 字体”四段（加段时同步调）
+    h: i32 = 470,
     /// Z 序（越大越靠上；点窗口即置顶）——见 `RackState.z` 注释
     z: i32 = 27,
     grab_dx: i32 = 0,
@@ -1155,6 +1218,16 @@ pub const PluginMgrWindow = struct {
     scanning: bool = false,
     /// worker 进程句柄（CreateProcess 返回；结束时 CloseHandle）
     scan_handle: ?*anyopaque = null,
+    /// Linux：扫描 worker 的子进程句柄（Windows 走 `scan_handle`）
+    scan_child: ?std.process.Child = null,
+    /// 本次扫描要逐个尝试的模块路径（一个插件一个 worker：坏插件不影响其它）
+    scan_mods: std.ArrayListUnmanaged([]u8) = .empty,
+    /// 下一个要扫的模块下标
+    scan_next: usize = 0,
+    /// 累积的 JSONL（各次 worker 的 ok/err 行；收尾时一次性解析）
+    scan_json: std.ArrayListUnmanaged(u8) = .empty,
+    /// 崩溃次数（诊断用）
+    scan_crashes: usize = 0,
     /// 用户取消 → 丢弃本次结果（崩溃/看门狗杀 → 保留部分结果）
     scan_discard: bool = false,
     /// 自愈兑底节拍（帧；每 ~2s 尝试一次——覆盖“打开工程后插件已删”场景）
@@ -1241,6 +1314,11 @@ pub const App = struct {
     state_pool: StatePool = .{},
     /// 主窗口句柄（VST3 编辑器窗口的 owner；main 初始化时写入；无窗口环境为 null）
     main_hwnd: ?*anyopaque = null,
+    /// Linux 独立窗口模式：当前显示中的插件编辑器属于哪个插件（切目标时据此关旧开新）
+    vst_editor_owner: ?*@import("vst_host.zig").Plugin = null,
+    /// 上一次看到的"编辑器目标"（面板指向的插件）。**和 owner 分开记**：
+    /// 用户手动关掉窗口后 owner 会变 null，但目标没变 → 不该自动重新打开。
+    vst_editor_target: ?*@import("vst_host.zig").Plugin = null,
 
     // ── 文档数据（所有视图共享）──
     /// 已放置的样式片段
@@ -1390,6 +1468,7 @@ pub const App = struct {
     // ── 模态对话框与脏确认流程 ──
     /// 当前模态框（null = 无）
     modal: ?ModalKind = null,
+    /// 本轮"按包名猜测"可自愈的插件数（>0 时弹确认；应用前先备份工程）
     /// 模态框的用户选择（鼠标点击 / 键盘 Enter/Esc 均写入这里；
     /// 语义按 `modal` 而定：脏确认 = 保存/不保存/取消；覆写/删除确认 = 确认(.save)/取消）
     modal_choice: ?QuitChoice = null,
@@ -1473,6 +1552,8 @@ pub const App = struct {
     fps_limit: i32 = 120,
     /// 设置需要落盘（变更 / 工程路径变化时置位）
     settings_dirty: bool = false,
+    /// 待处理的文件对话框请求（null = 无；见 `PickRequest`）
+    pick: ?PickRequest = null,
     drumkit_win: DrumKitWindow = .{},
     /// 浮动窗口 Z 序的**全局计数器**（点窗口置顶时 +1，见 `bringToFront`）
     z_top: i32 = 50,
@@ -3826,6 +3907,17 @@ pub const App = struct {
     // ── 预设库（数据根目录 / 扫描结果 / 弹窗状态）──
 
     /// 设置数据根目录（拷贝；由 main 启动时解析）
+    /// 登记一个文件对话框请求（主循环下一帧开始处理；已有请求时覆盖）
+    pub fn requestPick(self: *App, req: PickRequest) void {
+        self.pick = req;
+    }
+
+    /// 取走当前请求（主循环拿到后负责推进/派发）
+    pub fn takePick(self: *App) ?PickRequest {
+        const r = self.pick;
+        self.pick = null;
+        return r;
+    }
     pub fn setDataRoot(self: *App, path: []const u8) void {
         const n = @min(path.len, self.data_root_buf.len);
         @memcpy(self.data_root_buf[0..n], path[0..n]);
@@ -4260,9 +4352,8 @@ pub const App = struct {
         for (self.mixer_channels_state.items) |*mc| {
             for (mc.effects.items) |*es| {
                 if (es.kind != .plugin or es.plugin != null or !es.load_failed) continue;
-                if (es.pluginCid().len != 32) continue;
                 if (!self.pluginPathGone(io, es.pluginPath())) continue;
-                const e = self.findLiveEntryFor(io, es.pluginCid(), false) orelse continue;
+                const e = (if (es.pluginCid().len == 32) self.findLiveEntryFor(io, es.pluginCid(), false) else null) orelse self.findEntryByBundleName(io, es.pluginPath(), false) orelse continue;
                 var keep: [32]u8 = undefined;
                 @memcpy(&keep, es.pluginCid());
                 es.setPluginPath(e.dll); // 重置失败态
@@ -4272,17 +4363,68 @@ pub const App = struct {
         }
         for (self.instruments.items) |*inst| {
             if (inst.kind != .vst3 or inst.plugin != null or !inst.load_failed) continue;
-            if (inst.pluginCid().len != 32) continue;
             if (!self.pluginPathGone(io, inst.pluginPath())) continue;
-            const e = self.findLiveEntryFor(io, inst.pluginCid(), true) orelse continue;
+            const e = (if (inst.pluginCid().len == 32) self.findLiveEntryFor(io, inst.pluginCid(), true) else null) orelse self.findEntryByBundleName(io, inst.pluginPath(), true) orelse continue;
             var keep: [32]u8 = undefined;
             @memcpy(&keep, inst.pluginCid());
             inst.setPluginPath(e.dll);
             inst.setPluginCid(&keep);
             n += 1;
         }
+        // 鼓组层（VST3 层）——之前完全没被自愈覆盖
+        for (self.instruments.items) |*inst| {
+            const kit_ptr = if (inst.kit) |*k| k else continue;
+            for (kit_ptr.*.pads.items) |*pad| {
+                for (pad.layers.items) |*ly| {
+                    if (ly.kind != .vst3 or ly.plugin != null or !ly.load_failed) continue;
+                    if (!self.pluginPathGone(io, ly.pluginPath())) continue;
+                    const exact = if (ly.pluginCid().len == 32) self.findLiveEntryFor(io, ly.pluginCid(), true) else null;
+                    const e = exact orelse self.findEntryByBundleName(io, ly.pluginPath(), true) orelse continue;
+                    var keep: [32]u8 = undefined;
+                    @memcpy(&keep, ly.pluginCid());
+                    ly.setPluginPath(e.dll);
+                    ly.setPluginCid(&keep);
+                    n += 1;
+                }
+            }
+        }
         if (n > 0) self.commitHistory("重新定位插件");
         return n;
+    }
+
+    /// 从路径里取插件包名（`…\Vital.vst3` / `…/Vital.vst3` → `Vital.vst3`）
+    fn pluginBundleName(path: []const u8) []const u8 {
+        var i = path.len;
+        while (i > 0) : (i -= 1) {
+            const ch = path[i - 1];
+            if (ch == '/' or ch == @as(u8, 92)) return path[i..];
+        }
+        return path;
+    }
+
+    /// 插件"名字主干"：`…/Vital.vst3`、`…/Vital.so` → `Vital`（缓存 path 可能是包根也可能是模块）
+    fn pluginStem(path: []const u8) []const u8 {
+        const base = pluginBundleName(path);
+        if (std.mem.indexOfScalar(u8, base, '.')) |dot| return base[0..dot];
+        return base;
+    }
+
+    /// 只在**唯一命中**时返回，避免把不同插件错配。
+    fn findEntryByBundleName(self: *const App, io: std.Io, path: []const u8, want_instrument: bool) ?*const plugin_db.Entry {
+        const cache = if (self.plugin_cache) |*c| c else return null;
+        const want = pluginStem(path);
+        if (want.len == 0) return null;
+        var hit: ?*const plugin_db.Entry = null;
+        for (cache.entries, 0..) |e, i| {
+            if (!e.ok or e.dll.len == 0) continue;
+            if (want_instrument and !e.roleHasInstrument()) continue;
+            if (!want_instrument and !e.roleHasEffect()) continue;
+            if (!std.ascii.eqlIgnoreCase(pluginStem(e.path), want)) continue;
+            std.Io.Dir.cwd().access(io, e.dll, .{}) catch continue;
+            if (hit != null) return null; // 多个同名 → 不猜
+            hit = &cache.entries[i];
+        }
+        return hit;
     }
 
     /// 路径是否已从磁盘消失（空路径视为消失）
@@ -5250,6 +5392,10 @@ pub const App = struct {
 
     /// 把一个插件实例送入退役列表（延迟销毁；可安全地对音频线程正在引用的实例）
     pub fn retirePlugin(self: *App, pl: *vst_host.Plugin) void {
+        // **先摘掉 owner/target**：它们持有裸指针，实例退役后再解引用 = use-after-free
+        // （实测：自愈替换失败插件后，syncPluginEditors 里 `old_pl.setEditorVisible(false)` 崩）
+        if (self.vst_editor_owner == pl) self.vst_editor_owner = null;
+        if (self.vst_editor_target == pl) self.vst_editor_target = null;
         // 嵌入面板的编辑器子窗口必须先关（实例退役后没人再同步它）
         if (pl.view != null) pl.closeEditor();
         self.retired_plugins.append(self.allocator, .{ .pl = pl, .countdown = 30 }) catch {
@@ -5257,7 +5403,32 @@ pub const App = struct {
         };
     }
 
-    /// 插件请求暴露界面（`requestOpenEditor`）→ 打开其所属面板（嵌入路径由帧末同步接手）。
+    /// 该插件实例是否仍然存活（owner/target 是裸指针，用前必须校验——退役后即悬垂）
+    pub fn isLivePluginPtr(self: *const App, p: *const vst_host.Plugin) bool {
+        for (self.instruments.items) |*inst| {
+            if (inst.plugin) |pl| {
+                if (pl == p) return true;
+            }
+            const kit = if (inst.kit) |*k| k else continue;
+            for (kit.pads.items) |*pad| {
+                for (pad.layers.items) |*ly| {
+                    if (ly.plugin) |pl| {
+                        if (pl == p) return true;
+                    }
+                }
+            }
+        }
+        for (self.mixer_channels_state.items) |*mc| {
+            for (mc.effects.items) |*es| {
+                if (es.plugin) |pl| {
+                    if (pl == p) return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /// 插件请求暴露界面（`requestOpenEditor`）→ 打开其所属面板（嵌入路径由帧末同步接手）。'
     /// 找不到归属（已退役/待卸载）→ 忽略。
     pub fn openPanelForPlugin(self: *App, pl: *vst_host.Plugin) void {
         for (self.instruments.items, 0..) |*inst, ii| {
@@ -7085,7 +7256,10 @@ pub const App = struct {
         const p = self.project_path orelse return null;
         if (p.len == 0 or std.mem.indexOfScalar(u8, p, 0) != null) return null; // 防御：非法路径
         if (!std.unicode.utf8ValidateSlice(p)) return null; // 防御：非法 UTF-8
-        const base = std.fs.path.basename(p);
+        // 取文件名：**两种分隔符都认**（Linux 下 `std.fs.path.basename` 只认 `/`，
+        // 而工程里可能存着 Windows 风格的 `C:\\proj\\x.saw`——跨平台打开时不能变成整个路径）
+        const cut = std.mem.lastIndexOfAny(u8, p, "\\\\/") orelse return if (p.len > 0) p else null;
+        const base = p[cut + 1 ..];
         if (base.len == 0) return null;
         return base;
     }
@@ -8415,31 +8589,17 @@ pub const App = struct {
     /// 删除选区（无选区 = 空操作）；光标置于选区起点
     fn textInputDeleteSelection(self: *App) void {
         const ti = &self.text_input;
-        const sel = ti.selection() orelse return;
-        const lo = sel[0];
-        const hi = sel[1];
-        const tail = ti.len - hi;
-        std.mem.copyForwards(u8, ti.buf[lo .. lo + tail], ti.buf[hi..ti.len]);
-        ti.len -= hi - lo;
-        ti.cursor = lo;
-        ti.sel_anchor = null;
+        _ = text_edit.deleteSelection(ti.buf[0..], &ti.len, &ti.cursor, &ti.sel_anchor);
     }
 
     /// 光标前一个 code point 的起始偏移（用于退格/左移）
     fn prevCp(self: *const App, from: usize) usize {
-        if (from == 0) return 0;
-        var i = from - 1;
-        while (i > 0 and (self.text_input.buf[i] & 0xC0) == 0x80) : (i -= 1) {}
-        return i;
+        return text_edit.prevCodePoint(self.text_input.buf[0..self.text_input.len], from);
     }
 
     /// 光标后一个 code point 的结束偏移（用于 Del/右移）
     fn nextCp(self: *const App, from: usize) usize {
-        const ti = &self.text_input;
-        if (from >= ti.len) return ti.len;
-        var i = from + 1;
-        while (i < ti.len and (ti.buf[i] & 0xC0) == 0x80) : (i += 1) {}
-        return i;
+        return text_edit.nextCodePoint(self.text_input.buf[0..self.text_input.len], from);
     }
 
     /// 开始重命名样式（预填当前名字）
@@ -8484,16 +8644,42 @@ pub const App = struct {
     pub fn textInputAppend(self: *App, cp: u21) void {
         const ti = &self.text_input;
         if (!ti.active) return;
-        self.textInputDeleteSelection();
         var tmp: [4]u8 = undefined;
         const n = std.unicode.utf8Encode(cp, &tmp) catch return; // 非法 code point：丢弃
-        if (ti.len + n > ti.buf.len) return;
-        // 光标后的尾部右移 n 字节（从后往前——重叠安全）
-        const tail = ti.len - ti.cursor;
-        std.mem.copyBackwards(u8, ti.buf[ti.cursor + n .. ti.cursor + n + tail], ti.buf[ti.cursor .. ti.cursor + tail]);
-        @memcpy(ti.buf[ti.cursor .. ti.cursor + n], tmp[0..n]);
-        ti.len += n;
-        ti.cursor += n;
+        _ = text_edit.insertSlice(ti.buf[0..], &ti.len, &ti.cursor, &ti.sel_anchor, tmp[0..n]);
+        ti.caret_epoch = text_edit.nowMs();
+    }
+
+    /// 当前"被复制/剪切"的内容：有选区 → 选区；否则 → 整个字段
+    /// （和文件选择器一致：无选区时 Ctrl+C 复制整串）
+    pub fn textInputSelectionText(self: *App) ?[]const u8 {
+        const ti = &self.text_input;
+        if (!ti.active) return null;
+        if (ti.selection()) |sel| return ti.buf[sel[0]..sel[1]];
+        if (ti.len == 0) return null;
+        return ti.text();
+    }
+
+    /// 剪切：有选区删选区，否则清空整个字段
+    pub fn textInputCut(self: *App) void {
+        const ti = &self.text_input;
+        if (!ti.active) return;
+        if (ti.selection() != null) {
+            self.textInputDeleteSelection();
+        } else {
+            ti.len = 0;
+            ti.cursor = 0;
+            ti.sel_anchor = null;
+        }
+        ti.caret_epoch = text_edit.nowMs();
+    }
+
+    /// 粘贴：插入整串（有选区先删选区；放不下就截断）
+    pub fn textInputInsertSlice(self: *App, s: []const u8) void {
+        const ti = &self.text_input;
+        if (!ti.active) return;
+        _ = text_edit.insertSlice(ti.buf[0..], &ti.len, &ti.cursor, &ti.sel_anchor, s);
+        ti.caret_epoch = text_edit.nowMs();
     }
 
     /// 退格：有选区 → 删选区；否则删光标前一个 code point
@@ -9827,11 +10013,17 @@ test "app: 鼓组 VST3 层槽位引用——slotPlugin 解析 + 层脏标置位/
     try std.testing.expect(!app.kit_layer_state_dirty[0][1]);
 }
 
+/// VST3 宿主尚未移植到非 Windows（Linux 里程碑 L3）：依赖真实插件的测试统一跳过
+fn skipIfNoVst() !void {
+    if (@import("builtin").os.tag != .windows) return error.SkipZigTest;
+}
+
 test "app: 鼓组两层 VST3 各自编辑 → 历史各自成条 + 撤销 + 无幽灵（Vital 优先/自带测试插件兑底）" {
+    try skipIfNoVst(); // VST3 宿主未移植（非 Windows 跳过）
     const alloc = std.testing.allocator;
     // 优先 Vital（用户实症：恢复后 getState 回声字节与存档不同）；无 → 自带测试插件；都无 → 跳过
     const vital_path = "C:\\Program Files\\Common Files\\VST3\\Vital.vst3";
-    const sine_path = "libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll";
+    const sine_path = "zig-out/bin/zig_vst3_sine_synth.dll";
     var dll: []const u8 = vital_path;
     var pz = alloc.dupeSentinel(u8, dll, 0) catch return;
     var pl1 = vst_host.loadPlugin(alloc, pz, 48000, 4096, .instrument) catch blk: {
@@ -10714,6 +10906,52 @@ test "app: 导入工程恢复主音量（并同步到音频线程）" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.77), app.params.volume.load(.monotonic), 1e-6);
 }
 
+test "app: 重命名输入框——选区复制/剪切/粘贴（与文件选择器同语义）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("Kick");
+    app.resetHistory("初始状态");
+
+    app.beginRenameInstrument(0, 0, 0);
+    try std.testing.expectEqualStrings("Kick", app.text_input.text());
+
+    // ① 无选区 → Ctrl+C 复制整个字段
+    try std.testing.expectEqualStrings("Kick", app.textInputSelectionText().?);
+
+    // ② 全选 → 选区文本 = 全串；粘贴整串替换掉选区
+    app.textInputSelectAll();
+    try std.testing.expectEqualStrings("Kick", app.textInputSelectionText().?);
+    app.textInputInsertSlice("Snare");
+    try std.testing.expectEqualStrings("Snare", app.text_input.text());
+
+    // ③ 部分选区（光标 0..=2）→ 复制出来是 "Sn"
+    app.text_input.cursor = 2;
+    app.text_input.sel_anchor = 0;
+    try std.testing.expectEqualStrings("Sn", app.textInputSelectionText().?);
+
+    // ④ 剪切：删掉选区，字段变 "are"
+    app.textInputCut();
+    try std.testing.expectEqualStrings("are", app.text_input.text());
+    try std.testing.expectEqual(@as(usize, 0), app.text_input.cursor);
+
+    // ⑤ 无选区剪切 = 清空整个字段
+    app.textInputCut();
+    try std.testing.expectEqual(@as(usize, 0), app.text_input.len);
+
+    // ⑥ 光标处插入（不是追加）：先打 abc，光标回中间插 X → abXc
+    app.textInputInsertSlice("abc");
+    app.text_input.cursor = 2;
+    app.textInputInsertSlice("X");
+    try std.testing.expectEqualStrings("abXc", app.text_input.text());
+
+    // ⑦ 闪烁起点被刷新（输入后立刻是"亮"）
+    try std.testing.expect(app.text_input.caret_epoch > 0);
+    try std.testing.expect(text_edit.blinkOnSince(app.text_input.caret_epoch));
+}
 test "app: 重命名乐器——预填/追加/退格（多字节）/提交/历史；空名不改" {
     var app = App{ .allocator = std.testing.allocator };
     defer app.clips.deinit(app.allocator);
@@ -12495,8 +12733,9 @@ test "app: 插件槽——添加 / 存档往返（plugin_path）/ 无实例删�
 }
 
 test "插件实例：deinitAll 同步卸载链上实例与退役项（无泄漏）" {
+    try skipIfNoVst(); // VST3 宿主未移植（非 Windows 跳过）
     // 用 zig-vst3 自带示例 DLL 真加载（缺失则跳过——示例未构建的环境）
-    const dll_z = std.testing.allocator.dupeSentinel(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll", 0) catch return;
+    const dll_z = std.testing.allocator.dupeSentinel(u8, "zig-out/bin/zig_vst3_gain.dll", 0) catch return;
     defer std.testing.allocator.free(dll_z);
     const pl = vst_host.loadEffect(std.testing.allocator, dll_z, 48000, 4096) catch return;
 
@@ -12517,7 +12756,8 @@ test "插件实例：deinitAll 同步卸载链上实例与退役项（无泄漏�
 }
 
 test "VST3 参数：元数据/设置/音频生效/编辑器编辑轮询" {
-    const dll_z = std.testing.allocator.dupeSentinel(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll", 0) catch return;
+    try skipIfNoVst(); // VST3 宿主未移植（非 Windows 跳过）
+    const dll_z = std.testing.allocator.dupeSentinel(u8, "zig-out/bin/zig_vst3_gain.dll", 0) catch return;
     defer std.testing.allocator.free(dll_z);
     const pl = vst_host.loadEffect(std.testing.allocator, dll_z, 48000, 4096) catch return;
     defer vst_host.unloadPlugin(std.testing.allocator, pl);
@@ -12545,7 +12785,8 @@ test "VST3 参数：元数据/设置/音频生效/编辑器编辑轮询" {
 }
 
 test "VST3 状态：捕获/恢复往返（参数值保留、音频生效）" {
-    const dll_z = std.testing.allocator.dupeSentinel(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll", 0) catch return;
+    try skipIfNoVst(); // VST3 宿主未移植（非 Windows 跳过）
+    const dll_z = std.testing.allocator.dupeSentinel(u8, "zig-out/bin/zig_vst3_gain.dll", 0) catch return;
     defer std.testing.allocator.free(dll_z);
     const p1 = vst_host.loadEffect(std.testing.allocator, dll_z, 48000, 4096) catch return;
     defer vst_host.unloadPlugin(std.testing.allocator, p1);
@@ -12564,7 +12805,8 @@ test "VST3 状态：捕获/恢复往返（参数值保留、音频生效）" {
 }
 
 test "VST3 状态：工程存档往返（base64 → pending 解码 → 恢复）" {
-    const dll_z = std.testing.allocator.dupeSentinel(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll", 0) catch return;
+    try skipIfNoVst(); // VST3 宿主未移植（非 Windows 跳过）
+    const dll_z = std.testing.allocator.dupeSentinel(u8, "zig-out/bin/zig_vst3_gain.dll", 0) catch return;
     defer std.testing.allocator.free(dll_z);
     const pl = vst_host.loadEffect(std.testing.allocator, dll_z, 48000, 4096) catch return;
 
@@ -12579,7 +12821,7 @@ test "VST3 状态：工程存档往返（base64 → pending 解码 → 恢复）
         return error.TestUnexpectedResult;
     };
     const es = &app.mixer_channels_state.items[0].effects.items[slot];
-    es.setPluginPath("libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll");
+    es.setPluginPath("zig-out/bin/zig_vst3_gain.dll");
     es.plugin = pl;
     pl.setParamHost(0, 0.3);
 
@@ -12615,7 +12857,8 @@ test "VST3 状态：工程存档往返（base64 → pending 解码 → 恢复）
 }
 
 test "VST3 乐器：无输入插件按乐器角色加载与 process（sine-synth 示例）" {
-    const dll_z = std.testing.allocator.dupeSentinel(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll", 0) catch return;
+    try skipIfNoVst(); // VST3 宿主未移植（非 Windows 跳过）
+    const dll_z = std.testing.allocator.dupeSentinel(u8, "zig-out/bin/zig_vst3_sine_synth.dll", 0) catch return;
     defer std.testing.allocator.free(dll_z);
     // 效果器角色：应报 NoMainInput（它没有主音频输入）
     if (vst_host.loadPlugin(std.testing.allocator, dll_z, 48000, 4096, .effect)) |pl| {
@@ -12635,7 +12878,8 @@ test "VST3 乐器：无输入插件按乐器角色加载与 process（sine-synth
 }
 
 test "VST3 乐器：音符事件送达插件（sine-synth：noteOn 发声、noteOff 停）" {
-    const dll_z = std.testing.allocator.dupeSentinel(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll", 0) catch return;
+    try skipIfNoVst(); // VST3 宿主未移植（非 Windows 跳过）
+    const dll_z = std.testing.allocator.dupeSentinel(u8, "zig-out/bin/zig_vst3_sine_synth.dll", 0) catch return;
     defer std.testing.allocator.free(dll_z);
     const pl = vst_host.loadPlugin(std.testing.allocator, dll_z, 48000, 4096, .instrument) catch return;
     defer vst_host.unloadPlugin(std.testing.allocator, pl);
@@ -12677,7 +12921,8 @@ test "VST3 乐器：音符事件送达插件（sine-synth：noteOn 发声、note
 }
 
 test "VST3 乐器：音色随工程存档与撤销往返（pending → restoreState）" {
-    const dll_z = std.testing.allocator.dupeSentinel(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll", 0) catch return;
+    try skipIfNoVst(); // VST3 宿主未移植（非 Windows 跳过）
+    const dll_z = std.testing.allocator.dupeSentinel(u8, "zig-out/bin/zig_vst3_sine_synth.dll", 0) catch return;
     defer std.testing.allocator.free(dll_z);
     const pl = vst_host.loadPlugin(std.testing.allocator, dll_z, 48000, 4096, .instrument) catch return;
 
@@ -12689,7 +12934,7 @@ test "VST3 乐器：音色随工程存档与撤销往返（pending → restoreSt
     defer app.notes.deinit(app.allocator);
     app.resetHistory("初始");
 
-    const ni = app.addInstrumentVst3("libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll");
+    const ni = app.addInstrumentVst3("zig-out/bin/zig_vst3_sine_synth.dll");
     try std.testing.expect(ni >= 0);
     const idx: usize = @intCast(ni);
     app.instruments.items[idx].plugin = pl;
@@ -12722,6 +12967,7 @@ test "VST3 乐器：音色随工程存档与撤销往返（pending → restoreSt
 }
 
 test "工程加载恢复后：插件回声字节不算编辑（单击不产生幽灵历史）" {
+    try skipIfNoVst(); // VST3 宿主未移植（非 Windows 跳过）
     // Vital 实测陷阱：setState(自己的存档字节) 后再 getState，字节不同（插件重归一化）——
     // 若非“已采纳”处理：①单击片段提交→幽灵历史条目（实测 v4 工程）；
     // ②幽灵条目 blob 与基线不同 → 条目间跳转每次对全部实例整块 setState（卡顿）。
@@ -12773,7 +13019,8 @@ test "工程加载恢复后：插件回声字节不算编辑（单击不产生�
 }
 
 test "就地替换插件状态记账：提交建条目且快照现取（预设加载路径回归锁）" {
-    const dll_path = "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll";
+    try skipIfNoVst(); // VST3 宿主未移植（非 Windows 跳过）
+    const dll_path = "zig-out/bin/zig_vst3_gain.dll";
     const dll_z = std.testing.allocator.dupeSentinel(u8, dll_path, 0) catch return;
     defer std.testing.allocator.free(dll_z);
 
@@ -12864,7 +13111,8 @@ fn guiSetParam(pl: *vst_host.Plugin, idx: usize, v: f64) void {
 }
 
 test "编辑器参数手势：同旋钮连拧合并为一条（静置语义；撤销一次全回退）" {
-    const dll_path = "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll";
+    try skipIfNoVst(); // VST3 宿主未移植（非 Windows 跳过）
+    const dll_path = "zig-out/bin/zig_vst3_gain.dll";
     const dll_z = std.testing.allocator.dupeSentinel(u8, dll_path, 0) catch return;
     defer std.testing.allocator.free(dll_z);
 
@@ -12923,6 +13171,7 @@ test "编辑器参数手势：同旋钮连拧合并为一条（静置语义；�
 }
 
 test "编辑器参数手势：同一插件换旋钮切历史（Vital 实测场景：Level→Pan）" {
+    try skipIfNoVst(); // VST3 宿主未移植（非 Windows 跳过）
     const vital_path = "C:\\Program Files\\Common Files\\VST3/Vital.vst3";
     const dll_z = std.testing.allocator.dupeSentinel(u8, vital_path, 0) catch return;
     defer std.testing.allocator.free(dll_z);
@@ -13090,7 +13339,8 @@ test "撤销：VST3 乐器状态未变时跳过重放（pending 不设）" {
 }
 
 test "VST3 编辑队列：多条排空/最后一条兼容/溢出降级" {
-    const dll_z = std.testing.allocator.dupeSentinel(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll", 0) catch return;
+    try skipIfNoVst(); // VST3 宿主未移植（非 Windows 跳过）
+    const dll_z = std.testing.allocator.dupeSentinel(u8, "zig-out/bin/zig_vst3_gain.dll", 0) catch return;
     defer std.testing.allocator.free(dll_z);
     const pl = vst_host.loadEffect(std.testing.allocator, dll_z, 48000, 4096) catch return;
     defer vst_host.unloadPlugin(std.testing.allocator, pl);
@@ -13145,7 +13395,8 @@ test "VST3 编辑队列：多条排空/最后一条兼容/溢出降级" {
 }
 
 test "撤销：参数增量回放（不 setState）+ 未变槽捕获复用（零 getState）" {
-    const dll_path = "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll";
+    try skipIfNoVst(); // VST3 宿主未移植（非 Windows 跳过）
+    const dll_path = "zig-out/bin/zig_vst3_gain.dll";
     const dll_z = std.testing.allocator.dupeSentinel(u8, dll_path, 0) catch return;
     defer std.testing.allocator.free(dll_z);
 
@@ -13186,7 +13437,8 @@ test "撤销：参数增量回放（不 setState）+ 未变槽捕获复用（零
 }
 
 test "撤销：结构性信号存在时参数回放降级为整块恢复（pending 就绪）" {
-    const dll_path = "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll";
+    try skipIfNoVst(); // VST3 宿主未移植（非 Windows 跳过）
+    const dll_path = "zig-out/bin/zig_vst3_gain.dll";
     const dll_z = std.testing.allocator.dupeSentinel(u8, dll_path, 0) catch return;
     defer std.testing.allocator.free(dll_z);
 
@@ -13287,7 +13539,8 @@ test "VST3 乐器：applyVst3Instrument 清 pending/退役旧实例，保留名�
 }
 
 test "VST3 预设：CID 捕获 + 状态捕获/解码往返（sine-synth 真实插件）" {
-    const dll_z = std.testing.allocator.dupeSentinel(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll", 0) catch return;
+    try skipIfNoVst(); // VST3 宿主未移植（非 Windows 跳过）
+    const dll_z = std.testing.allocator.dupeSentinel(u8, "zig-out/bin/zig_vst3_sine_synth.dll", 0) catch return;
     defer std.testing.allocator.free(dll_z);
 
     var app = App{ .allocator = std.testing.allocator };
@@ -13306,7 +13559,7 @@ test "VST3 预设：CID 捕获 + 状态捕获/解码往返（sine-synth 真实�
     const hex = pl.cidHex(&hb);
     try std.testing.expect(!std.mem.eql(u8, hex, "00000000000000000000000000000000"));
 
-    try std.testing.expect(app.addInstrumentVst3("libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll") == 0);
+    try std.testing.expect(app.addInstrumentVst3("zig-out/bin/zig_vst3_sine_synth.dll") == 0);
     app.instruments.items[0].plugin = pl;
     pl.setParamHost(0, 0.42); // level
 
@@ -13388,8 +13641,9 @@ test "VST3 自愈：reboundFailedPluginSlots 按 CID 重定位失败槽（只碰
 }
 
 test "VST3 存档：类 CID 捕获（活实例/失败槽）+ JSON 往返" {
+    try skipIfNoVst(); // VST3 宿主未移植（非 Windows 跳过）
     const alloc = std.testing.allocator;
-    const dll_z = alloc.dupeSentinel(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll", 0) catch return;
+    const dll_z = alloc.dupeSentinel(u8, "zig-out/bin/zig_vst3_sine_synth.dll", 0) catch return;
     defer alloc.free(dll_z);
 
     var app = App{ .allocator = alloc };
@@ -13402,7 +13656,7 @@ test "VST3 存档：类 CID 捕获（活实例/失败槽）+ JSON 往返" {
     app.resetHistory("初始");
 
     const pl = vst_host.loadPlugin(alloc, dll_z, 48000, 4096, .instrument) catch return;
-    try std.testing.expect(app.addInstrumentVst3("libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll") == 0);
+    try std.testing.expect(app.addInstrumentVst3("zig-out/bin/zig_vst3_sine_synth.dll") == 0);
     app.instruments.items[0].plugin = pl; // 由 deinitAll 统一卸载
     // 另一个失败槽（无实例、只有记录 CID）
     try std.testing.expect(app.addInstrumentVst3("C:\\missing.vst3") == 1);
@@ -13546,6 +13800,7 @@ test "预设浏览：可见性规则（乐器/效果互不可见；未安装 VST
 }
 
 test "VST3 乐器：多输出插件（SFLT，系统装有才跑）加载 + 处理不崩" {
+    try skipIfNoVst(); // VST3 宿主未移植（非 Windows 跳过）
     const alloc = std.testing.allocator;
     const pz = alloc.dupeSentinel(u8, "C:\\Program Files\\Common Files\\VST3\\SFLT.vst3", 0) catch return;
     defer alloc.free(pz);
@@ -13568,6 +13823,7 @@ test "VST3 乐器：多输出插件（SFLT，系统装有才跑）加载 + 处�
 }
 
 test "VST3 加载：中文路径（LoadLibraryW 回归）" {
+    try skipIfNoVst(); // VST3 宿主未移植（非 Windows 跳过）
     const io = std.testing.io;
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -13576,7 +13832,7 @@ test "VST3 加载：中文路径（LoadLibraryW 回归）" {
     defer alloc.free(root);
 
     // 把 sine-synth 复制成中文名（修复前：LoadLibraryA 按系统代码页解路径 → 加载失败）
-    const src = std.Io.Dir.cwd().readFileAlloc(io, "libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll", alloc, .unlimited) catch return; // 示例未构建：跳过
+    const src = std.Io.Dir.cwd().readFileAlloc(io, "zig-out/bin/zig_vst3_sine_synth.dll", alloc, .unlimited) catch return; // 示例未构建：跳过
     defer alloc.free(src);
     const dst = try std.fmt.allocPrint(alloc, "{s}/GuitarD - 副本.vst3", .{root});
     defer alloc.free(dst);
@@ -13592,7 +13848,8 @@ test "VST3 加载：中文路径（LoadLibraryW 回归）" {
 }
 
 test "VST3 状态：历史携带插件状态（池共享/去重）与撤销回退" {
-    const dll_z = std.testing.allocator.dupeSentinel(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll", 0) catch return;
+    try skipIfNoVst(); // VST3 宿主未移植（非 Windows 跳过）
+    const dll_z = std.testing.allocator.dupeSentinel(u8, "zig-out/bin/zig_vst3_gain.dll", 0) catch return;
     defer std.testing.allocator.free(dll_z);
 
     var app = App{ .allocator = std.testing.allocator };
@@ -13604,7 +13861,7 @@ test "VST3 状态：历史携带插件状态（池共享/去重）与撤销回�
     app.resetHistory("初始");
 
     const slot = app.addEffect(0, .plugin) orelse return error.TestUnexpectedResult;
-    app.mixer_channels_state.items[0].effects.items[slot].setPluginPath("libs/zig-vst3/zig-out/bin/zig_vst3_gain.dll");
+    app.mixer_channels_state.items[0].effects.items[slot].setPluginPath("zig-out/bin/zig_vst3_gain.dll");
     app.mixer_channels_state.items[0].effects.items[slot].plugin = vst_host.loadEffect(std.testing.allocator, dll_z, 48000, 4096) catch return;
     // 注：zig-vst3 示例插件的参数是**进程级全局存储**（多实例共享）——先设一个专属基线值，
     // 避免与前面测试残留的全局值相撞导致去重误跳（测试环境特有问题）

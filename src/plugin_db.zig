@@ -13,6 +13,7 @@
 //! （`data_root` 由 main 启动时解析，同预设库）。
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const config_file = "plugins.json";
 pub const cache_file = "plugins_cache.json";
@@ -52,6 +53,16 @@ pub const Config = struct {
     /// （只会得到 BadImage 噪音），需要时用户手动加。
     pub fn initDefaults(backing: std.mem.Allocator) Config {
         var cfg = Config{ .arena = std.heap.ArenaAllocator.init(backing) };
+        if (builtin.os.tag == .linux) {
+            // VST3 规范位置：系统级 + 用户级；再补一个常见的额外目录。
+            _ = cfg.addFolder("/usr/lib/vst3") catch false;
+            _ = cfg.addFolder("/usr/local/lib/vst3") catch false;
+            if (std.c.getenv("HOME")) |p| {
+                const s = std.fmt.allocPrint(cfg.alloc(), "{s}/.vst3", .{std.mem.span(p)}) catch null;
+                if (s) |s2| _ = cfg.addFolder(s2) catch false;
+            }
+            return cfg;
+        }
         _ = cfg.addFolder("C:\\Program Files\\Common Files\\VST3") catch false;
         if (std.c.getenv("LOCALAPPDATA")) |p| {
             const env = std.mem.span(p);
@@ -214,6 +225,31 @@ pub const Cache = struct {
 
     pub fn deinit(self: *Cache) void {
         self.arena.deinit();
+    }
+
+    /// 把 `old` 里**本次没扫到**的条目补进来（按 path 判重）。
+    ///
+    /// 为什么需要：扫描是分模块跑的，一个坏插件会让某个 worker 崩掉；
+    /// 若直接用本次结果替换缓存，崩溃前没轮到的插件就会**从列表里消失**（用户实测踩过）。
+    /// 规则：同 path 以本次为准（能更新失败/成功状态），本次没有的保留旧的。
+    pub fn mergeMissingFrom(self: *Cache, old: *const Cache) void {
+        if (old.entries.len == 0) return;
+        var extra: std.ArrayListUnmanaged(Entry) = .empty;
+        for (old.entries) |oe| {
+            var seen = false;
+            for (self.entries) |ne| {
+                if (std.mem.eql(u8, ne.path, oe.path)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) extra.append(self.alloc(), oe) catch {};
+        }
+        if (extra.items.len == 0) return;
+        const merged = self.alloc().alloc(Entry, self.entries.len + extra.items.len) catch return;
+        @memcpy(merged[0..self.entries.len], self.entries);
+        @memcpy(merged[self.entries.len..], extra.items);
+        self.entries = merged;
     }
 
     pub fn okCount(self: *const Cache) usize {
@@ -465,17 +501,22 @@ test "plugin_db: 配置——默认值 / 往返 / 去重 / 删除" {
     const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(root);
 
-    // 文件缺失 → 默认配置（含系统路径）
+    // 文件缺失 → 默认配置（含**本平台**的系统路径）
     var cfg = Config.load(io, alloc, root);
     defer cfg.deinit();
+    const sys_path = if (builtin.os.tag == .linux) "/usr/lib/vst3" else "C:\\Program Files\\Common Files\\VST3";
     var has_sys = false;
     for (cfg.folders.items) |f| {
-        if (std.mem.eql(u8, f.path, "C:\\Program Files\\Common Files\\VST3")) has_sys = true;
+        if (std.mem.eql(u8, f.path, sys_path)) has_sys = true;
     }
     try std.testing.expect(has_sys);
 
     // 去重（忽略大小写；文件夹与单文件各自）
-    try std.testing.expect(!(try cfg.addFolder("c:\\program files\\common files\\vst3")));
+    if (builtin.os.tag == .linux) {
+        try std.testing.expect(!(try cfg.addFolder("/usr/lib/vst3"))); // 默认已有
+    } else {
+        try std.testing.expect(!(try cfg.addFolder("c:\\program files\\common files\\vst3")));
+    }
     try std.testing.expect(try cfg.addFolder("D:\\VST3"));
     try std.testing.expect(try cfg.addFile("D:\\x\\A.vst3"));
     try std.testing.expect(!(try cfg.addFile("d:\\X\\a.VST3")));

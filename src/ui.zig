@@ -636,6 +636,11 @@ pub const Ui = struct {
     /// - `view_off`：水平滚动偏移（px；由 `textFieldSyncOffset` 每帧算）。
     /// 纯绘制：字符/退格/光标/选区由 `App.text_input` + main 的输入路由驱动。
     pub fn textField(self: *Ui, text: []const u8, cursor: usize, sel: ?[2]usize, view_off: i32, x: i32, y: i32, w: i32, h: i32) void {
+        self.textFieldEx(text, cursor, sel, view_off, x, y, w, h, true);
+    }
+
+    /// 同上，但可以指定**是否画光标**（`show_caret`：闪烁/失去焦点时隐藏）
+    pub fn textFieldEx(self: *Ui, text: []const u8, cursor: usize, sel: ?[2]usize, view_off: i32, x: i32, y: i32, w: i32, h: i32, show_caret: bool) void {
         self.renderer.fillRect(x, y, w, h, self.theme.toolbar);
         self.renderer.strokeRect(x, y, w, h, self.theme.accent);
         const inner_w = w - 8;
@@ -652,9 +657,11 @@ pub const Ui = struct {
             self.renderer.fillRect(sx0, y + 3, @max(1, sx1 - sx0), h - 6, hilite);
         }
         self.font.draw(self.renderer, text, @floatFromInt(tx), @floatFromInt(by), self.theme.text);
-        // 光标（文本之上；不闪烁——简化）
-        const cx = tx + @as(i32, @intFromFloat(self.font.measure(text[0..cursor])));
-        self.renderer.vline(cx, y + 4, h - 8, self.theme.text);
+        // 光标（文本之上；是否闪烁由调用方决定）
+        if (show_caret) {
+            const cx = tx + @as(i32, @intFromFloat(self.font.measure(text[0..cursor])));
+            self.renderer.vline(cx, y + 4, h - 8, self.theme.text);
+        }
     }
 
     /// 文本输入框：让**光标可见**的水平滚动偏移（px）。

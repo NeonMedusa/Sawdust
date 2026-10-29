@@ -9,8 +9,10 @@
 //! 复用 `src/vst_host.zig` 的模块加载/枚举（主程序接入同一实现）。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const host = @import("vst_host.zig");
 const vst_scan = @import("vst_scan.zig");
+const ivstevents = @import("zig_vst3").pluginterfaces.vst.ivstevents;
 
 // 消息泵（--editor 冒烟用）
 const POINT = extern struct { x: i32, y: i32 };
@@ -49,6 +51,8 @@ extern "kernel32" fn CreateFileW(
 /// - 句柄为 NULL 时 → 重开 `CONOUT$` 并 SetStdHandle。
 /// 从终端启动时把自己接到父控制台（GUI 子系统下 panic/日志才看得见）
 pub fn attachParentConsole() void {
+    // Linux：stdio 本来就继承终端，没有"GUI 子系统"问题 → 不需要这个补丁
+    if (comptime builtin.os.tag != .windows) return;
     if (AttachConsole(0xFFFF_FFFF) == 0) return; // ATTACH_PARENT_PROCESS
     const h = CreateFileW(std.unicode.utf8ToUtf16LeStringLiteral("CONOUT$"), 0x8000_0000 | 0x4000_0000, 1 | 2, null, 3, 0, null);
     const raw = @intFromPtr(h orelse return);
@@ -166,53 +170,53 @@ pub fn cliMain(init: std.process.Init) !u8 {
         editorSmoke(alloc, p, secs);
         return 0;
     }
-    const defaults = [_][]const u8{
+    // 默认扫描目录（按平台）
+    const defaults_linux = [_][]const u8{ "/usr/lib/vst3", "/usr/local/lib/vst3" };
+    const defaults_win = [_][]const u8{
         "C:\\Program Files\\Common Files\\VST3",
         "C:\\Program Files (x86)\\Common Files\\VST3",
     };
-    const scan: []const []const u8 = if (nd > 0) dirs[0..nd] else &defaults;
+    const scan: []const []const u8 = if (nd > 0)
+        dirs[0..nd]
+    else if (comptime builtin.os.tag == .linux)
+        &defaults_linux
+    else
+        &defaults_win;
 
-    var found_files: usize = 0;
+    // 用**统一**的候选发现（和 JSONL worker 同一条代码路径）：
+    // `.vst3` 包目录 → 包内 `Contents/<arch>/` 模块；裸文件 → 自身。
+    var cands: std.ArrayListUnmanaged(vst_scan.Candidate) = .empty;
+    defer vst_scan.freeCandidates(alloc, &cands);
     for (scan) |d| {
-        const dir_res = if (std.fs.path.isAbsolute(d))
-            std.Io.Dir.openDirAbsolute(io, d, .{ .iterate = true })
-        else
-            std.Io.Dir.cwd().openDir(io, d, .{ .iterate = true });
-        var dir = dir_res catch {
-            std.debug.print("跳过（打不开）：{s}\n", .{d});
+        vst_scan.discover(io, alloc, d, &cands) catch |e| {
+            std.debug.print("跳过（{s}）：{s}\n", .{ @errorName(e), d });
+        };
+    }
+
+    for (cands.items) |c| {
+        std.debug.print("\n▸ {s}\n    {s}\n", .{ c.path, c.dll });
+        const dllz = alloc.dupeSentinel(u8, c.dll, 0) catch continue;
+        defer alloc.free(dllz);
+        const s = host.scanModule(dllz) catch |e| {
+            std.debug.print("    （探测失败：{s}）\n", .{@errorName(e)});
             continue;
         };
-        defer dir.close(io);
-        var walker = dir.walk(alloc) catch continue;
-        defer walker.deinit();
-        while (walker.next(io) catch null) |ent| {
-            if (ent.kind != .file) continue;
-            if (!std.mem.endsWith(u8, ent.basename, ".vst3")) continue;
-            found_files += 1;
-            const full = std.fs.path.joinZ(alloc, &.{ d, ent.path }) catch continue;
-            defer alloc.free(full);
-            std.debug.print("\n▸ {s}\n", .{ent.path});
-            const s = host.scanModule(full) catch |e| {
-                std.debug.print("    （探测失败：{s}）\n", .{@errorName(e)});
-                continue;
-            };
-            var printed: usize = 0;
-            for (s.slice()) |c| {
-                if (!c.isAudioEffect()) continue;
-                std.debug.print("    [{d}] {s}", .{ printed, c.name() });
-                if (c.vendor().len > 0) std.debug.print(" · {s}", .{c.vendor()});
-                if (c.version().len > 0) std.debug.print(" · v{s}", .{c.version()});
-                std.debug.print("\n", .{});
-                printed += 1;
-            }
-            if (printed == 0) std.debug.print("    （无 Audio Module Class 类）\n", .{});
+        var printed: usize = 0;
+        for (s.slice()) |cls| {
+            if (!cls.isAudioEffect()) continue;
+            std.debug.print("    [{d}] {s}", .{ printed, cls.name() });
+            if (cls.vendor().len > 0) std.debug.print(" · {s}", .{cls.vendor()});
+            if (cls.version().len > 0) std.debug.print(" · v{s}", .{cls.version()});
+            std.debug.print("\n", .{});
+            printed += 1;
         }
+        if (printed == 0) std.debug.print("    （无 Audio Module Class 类）\n", .{});
     }
-    std.debug.print("\n共扫描到 {d} 个 .vst3 模块\n", .{found_files});
+    std.debug.print("\n共扫描到 {d} 个 .vst3 模块\n", .{cands.items.len});
     return 0;
 }
 
-/// 音频试跑：加载 → 喂正弦（效果器）/静音（乐器）→ 打印输入/输出 RMS。
+/// 音频试跑：加载 → 效果器喂正弦 / 乐器发音符 → 打印 RMS、峰值。
 fn runTest(alloc: std.mem.Allocator, path: []const u8, role: host.Role) void {
     const pz = alloc.dupeSentinel(u8, path, 0) catch return;
     defer alloc.free(pz);
@@ -229,6 +233,52 @@ fn runTest(alloc: std.mem.Allocator, path: []const u8, role: host.Role) void {
         pl.latency,
         @as(f64, @floatFromInt(pl.latency)) / sr * 1000.0,
     });
+
+    // ── 乐器：发 noteOn → 渲染约 1 秒 → 统计峰值/RMS（无声 = 宿主链路有问题）──
+    if (role == .instrument) {
+        const note_on = ivstevents.Event{
+            .sampleOffset = 0,
+            .type = @backingInt(ivstevents.Event.EventTypes.kNoteOnEvent),
+            .data = .{ .noteOn = .{ .channel = 0, .pitch = 69, .velocity = 1.0, .noteId = -1 } },
+        };
+        const note_off = ivstevents.Event{
+            .sampleOffset = 0,
+            .type = @backingInt(ivstevents.Event.EventTypes.kNoteOffEvent),
+            .data = .{ .noteOff = .{ .channel = 0, .pitch = 69, .velocity = 0, .noteId = -1 } },
+        };
+        const block_frames: u32 = 512;
+        var buf: [512 * 2]f32 = undefined;
+        const blocks: usize = 48000 / block_frames; // ≈1 秒
+        var peak: f32 = 0;
+        var sum: f64 = 0;
+        var total: usize = 0;
+        const host_time = host.HostTime{ .playing = true, .tempo = 120, .time_num = 4, .time_den = 4 };
+        for (0..blocks) |b| {
+            @memset(&buf, 0);
+            const ev: []const ivstevents.Event = if (b == 0)
+                &.{note_on}
+            else if (b + 2 == blocks)
+                &.{note_off}
+            else
+                &.{};
+            pl.processInstrument(&buf, block_frames, ev, host_time);
+            var blk_peak: f32 = 0;
+            for (buf) |v| {
+                const a = @abs(v);
+                if (a > blk_peak) blk_peak = a;
+                sum += @as(f64, v) * v;
+            }
+            if (blk_peak > peak) peak = blk_peak;
+            total += block_frames;
+            if (b < 3 or b % 20 == 0) std.debug.print("  块 {d:3} 峰值 {d:.4}\n", .{ b, blk_peak });
+        }
+        const rms = @sqrt(sum / @as(f64, @floatFromInt(total * 2)));
+        std.debug.print("\n乐器发声：峰值 {d:.4} · RMS {d:.4} → {s}\n", .{
+            peak, rms,
+            if (peak > 1e-4) "✅ 有声" else "❌ 无声",
+        });
+        return;
+    }
 
     const frames: u32 = 4096; // 适配 max_block
     var buf: [4096 * 2]f32 = undefined;
@@ -271,9 +321,13 @@ fn runTest(alloc: std.mem.Allocator, path: []const u8, role: host.Role) void {
 fn editorSmoke(alloc: std.mem.Allocator, path: []const u8, secs: u32) void {
     const pz = alloc.dupeSentinel(u8, path, 0) catch return;
     defer alloc.free(pz);
-    const pl = host.loadEffect(alloc, pz, 48000, 4096) catch |e| {
-        std.debug.print("加载失败：{s}\n", .{@errorName(e)});
-        return;
+
+    // 乐器优先（Dexed/Vital 都是乐器），失败再按效果器试——CLI 冒烟不想让用户先想清楚角色
+    const pl = host.loadPlugin(alloc, pz, 48000, 4096, .instrument) catch blk: {
+        break :blk host.loadEffect(alloc, pz, 48000, 4096) catch |e| {
+            std.debug.print("加载失败（乐器/效果器都不行）：{s}\n", .{@errorName(e)});
+            return;
+        };
     };
     defer host.unloadPlugin(alloc, pl);
     // 先跑一小块音频（真实宿主里音频一直在跑；某些插件的 UI 依赖处理已开始）
@@ -281,8 +335,19 @@ fn editorSmoke(alloc: std.mem.Allocator, path: []const u8, secs: u32) void {
         var warm: [512 * 2]f32 = @splat(0);
         pl.process(&warm, 512);
     }
-    switch (pl.openEditor(null)) {
-        .opened => std.debug.print("编辑器已打开（{s}）— 泵消息 {d} 秒，期间可交互测试…\n", .{ pl.name(), secs }),
+    // 诊断用：SAWDUST_EDITOR_WRAP=1 时先建一个"包装父窗口"，把编辑器嵌进去
+    // （复现主程序里的"嵌进宿主窗口"场景；null = 顶层窗口）
+    var wrap: ?*anyopaque = null;
+    if (comptime builtin.os.tag != .windows) {
+        if (std.c.getenv("SAWDUST_EDITOR_WRAP") != null) {
+            wrap = @import("vst_editor_x11.zig").create(null, "Sawdust - 包装窗口", 1000, 800);
+            if (wrap) |w| @import("vst_editor_x11.zig").show(w);
+        }
+    }
+    switch (pl.openEditor(wrap)) {
+        .opened => std.debug.print("编辑器已打开（{s}，{d}×{d}）— 泵消息 {d} 秒，期间可交互测试…\n", .{
+            pl.name(), pl.editor_w, pl.editor_h, secs,
+        }),
         .no_editor => {
             std.debug.print("此插件没有编辑器界面\n", .{});
             return;
@@ -292,16 +357,68 @@ fn editorSmoke(alloc: std.mem.Allocator, path: []const u8, secs: u32) void {
             return;
         },
     }
-    var msg: MSG = undefined;
-    var n: usize = 0;
-    const steps: usize = @as(usize, secs) * 200; // 200 × 5ms = 1s
-    while (n < steps) : (n += 1) {
-        if (!pl.editorOpen()) break; // 用户点右上角 X 关闭了编辑器：立即结束等待
-        while (PeekMessageW(&msg, null, 0, 0, 1) != 0) { // PM_REMOVE
-            _ = TranslateMessage(&msg);
-            _ = DispatchMessageW(&msg);
+    if (comptime builtin.os.tag == .windows) {
+        var msg: MSG = undefined;
+        var n: usize = 0;
+        const steps: usize = @as(usize, secs) * 200; // 200 × 5ms = 1s
+        while (n < steps) : (n += 1) {
+            if (!pl.editorOpen()) break; // 用户点右上角 X 关闭了编辑器：立即结束等待
+            while (PeekMessageW(&msg, null, 0, 0, 1) != 0) { // PM_REMOVE
+                _ = TranslateMessage(&msg);
+                _ = DispatchMessageW(&msg);
+            }
+            Sleep(5);
         }
-        Sleep(5);
+    } else {
+        // X11：先定位并 map（顶层窗口就放在 (80,80)），然后每帧抽干事件
+        pl.syncEditorRect(80, 80);
+        const io = @import("port_io.zig").blocking();
+        var n: usize = 0;
+        const steps: usize = @as(usize, secs) * 60; // ≈60fps
+        var edits_total: usize = 0;
+        var ev_total: usize = 0;
+        var base_state: host.StateBlobs = .{};
+        // **静置期**：插件开窗/初始化时会自己发一堆 setParamNormalized（默认值 0.5 那类），
+        // 那不是"用户改动"。先空转 drain 掉，再开始计数，否则会把初始化误判成"能点"。
+        {
+            const settle_steps: usize = 90; // ≈1.5s
+            var k: usize = 0;
+            while (k < settle_steps) : (k += 1) {
+                _ = host.pumpEditorEvents();
+                var junk: [32]host.ParamEdit = undefined;
+                _ = pl.drainEditorEdits(&junk);
+                std.Io.sleep(io, .fromNanoseconds(16 * std.time.ns_per_ms), .awake) catch {};
+            }
+            std.debug.print("静置完成，开始计数（此后收到的参数编辑才算用户操作）\n", .{});
+            base_state = pl.captureState(alloc);
+        }
+        var log_budget: usize = 12; // 只打前 12 条，免得刷屏
+        while (n < steps) : (n += 1) {
+            ev_total += host.pumpEditorEvents();
+            // 插件 GUI 上改参数 → 会回调我们的 IComponentHandler → 这里能"看到"输入是否到达
+            var edits: [32]host.ParamEdit = undefined;
+            const ne = pl.drainEditorEdits(&edits);
+            if (ne > 0) {
+                edits_total += ne;
+                if (log_budget > 0) {
+                    log_budget -= 1;
+                    std.debug.print("GUI 参数编辑：id={d} → {d:.4}\n", .{ edits[0].id, edits[0].value });
+                }
+            }
+            std.Io.sleep(io, .fromNanoseconds(16 * std.time.ns_per_ms), .awake) catch {};
+        }
+        // **状态快照对比**：不依赖 IComponentHandler 手势——凡"界面真的改到参数"都算数
+        const now_state = pl.captureState(alloc);
+        const state_changed = !std.mem.eql(u8, base_state.comp, now_state.comp) or
+            !std.mem.eql(u8, base_state.ctrl, now_state.ctrl);
+        std.debug.print("本次共收到 {d} 条 GUI 参数编辑事件；容器收到 {d} 个 X 事件；插件状态是否变化：{s}\n", .{
+            edits_total, ev_total,
+            if (state_changed) "**变了 ✅（界面确实改到了插件）**" else "没变 ❌",
+        });
+        var ns = now_state;
+        ns.deinit(alloc);
+        var bs = base_state;
+        bs.deinit(alloc);
     }
     pl.closeEditor();
     std.debug.print("编辑器已关闭（removed → 销毁窗口）— OK\n", .{});

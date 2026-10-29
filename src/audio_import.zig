@@ -14,8 +14,13 @@
 //! - 状态转移：`queued` --(UI 提升)--> `running` --(worker)--> `done|failed|cancelled`；
 //! - `done` 之后由 UI 线程 `takeBuffers()` **过继**缓冲给资产池，`destroyJob` 不再释放它们。
 const std = @import("std");
-const ma = @import("c/miniaudio.zig");
+// miniaudio 绑定：**按平台选择**。结构体布局随编译期启用的后端变化
+// （Linux 的 ma_device/ma_context 内嵌 pulse/alsa/jack 状态 → sizeof 比 Windows 大 464 字节），
+// 所以用同一份绑定会在跨平台时**越界写**。两份都由 `zig translate-c` 生成并入库。
+const builtin = @import("builtin");
+const ma = if (builtin.os.tag == .windows) @import("c/miniaudio_win.zig") else @import("c/miniaudio_linux.zig");
 const audio = @import("audio.zig");
+const port_io = @import("port_io.zig");
 
 /// 波形峰值桶（`App.AudioAsset.Peak` 直接复用它当单一真源）
 pub const Peak = struct { min: f32, max: f32 };
@@ -78,22 +83,14 @@ pub const Header = struct {
 /// 16-bit 立体声 48k 下 ≈ 91 分钟。
 pub const max_file_bytes: u64 = 1 << 30; // 1 GB
 
-/// 只读文件头用的 IO（同步 open/read，不触发线程池）。
-/// Zig 0.17 起文件 API 必须带 `std.Io`，而 `probeFile`/`decodeAll` 的调用点
-/// （模型层、测试）手上没有 io —— 所以这里放一个惰性初始化的单例。
-var header_io: ?std.Io.Threaded = null;
-
-fn fileIo() std.Io {
-    if (header_io == null) header_io = .init(std.heap.page_allocator, .{});
-    return header_io.?.io();
-}
+// 文件头探测/同步解码用的阻塞 io（见 `port_io.zig`）
 
 /// 读容器位深（决定 i16 / f32）。`null` = 无法判断 → 用 f32 兜底（宁可不省也不降精度）。
 /// - WAV：`fmt ` 块的 `wBitsPerSample`；`WAVE_FORMAT_EXTENSIBLE` 一律当 >16（可能是 24-in-32）
 /// - FLAC：`STREAMINFO` 的 bits-per-sample
 /// - MP3 / OGG（有损）：16—— 编码噪底本来远高于 −96 dB
 fn sourceBitDepth(path: []const u8) ?u16 {
-    const io = fileIo();
+    const io = port_io.blocking();
     const f = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
     defer f.close(io);
     var buf: [4096]u8 = undefined;
@@ -190,11 +187,11 @@ pub const Manager = struct {
     // ── 阶段 A：读文件头（UI 线程；毫秒级）──
     /// 打开解码器只取格式与时长；失败/非音频/超长 → null
     pub fn probeFile(path: []const u8, eng_sr: u32) ?Header {
-        var wbuf: [1024]u16 = undefined;
+        var wbuf: [wide_cap]WideChar = undefined;
         const w = toWide(path, &wbuf) orelse return null;
         const cfg = ma.ma_decoder_config_init(ma.ma_format_f32, 0, 0);
         var dec: ma.ma_decoder = undefined;
-        if (ma.ma_decoder_init_file_w(@ptrCast(w.ptr), &cfg, &dec) != ma.MA_SUCCESS) return null;
+        if (ma.ma_decoder_init_file_w(widePtr(w), &cfg, &dec) != ma.MA_SUCCESS) return null;
         defer _ = ma.ma_decoder_uninit(&dec);
 
         var native_sr: ma.ma_uint32 = eng_sr;
@@ -570,21 +567,44 @@ pub const Manager = struct {
     }
 };
 
-/// UTF-8 → UTF-16LE（含 NUL）；失败 null。
-/// 中文路径必须走宽字符 API（同 VST3 加载的坑），这层在 3 处用到。
-fn toWide(path: []const u8, wbuf: []u16) ?[]u16 {
-    const wn = std.unicode.utf8ToUtf16Le(wbuf, path) catch return null;
-    if (wn + 1 > wbuf.len) return null;
-    wbuf[wn] = 0;
-    return wbuf[0 .. wn + 1];
+/// 宽字符路径缓冲：**Windows = UTF-16（u16）**，**Linux/macOS = UTF-32（u32）**
+/// （C 的 `wchar_t` 宽度不同：Windows 2 字节，Unix 4 字节）。
+/// 中文路径必须走宽字符 API（同 VST3 加载的坑）。
+const WideChar = if (builtin.os.tag == .windows) u16 else u32;
+const wide_cap: usize = 1024;
+
+/// UTF-8 → 宽字符（含 NUL）；失败 null。
+fn toWide(path: []const u8, wbuf: []WideChar) ?[]WideChar {
+    if (builtin.os.tag == .windows) {
+        const wn = std.unicode.utf8ToUtf16Le(wbuf, path) catch return null;
+        if (wn + 1 > wbuf.len) return null;
+        wbuf[wn] = 0;
+        return wbuf[0 .. wn + 1];
+    }
+    // Unix：wchar_t = UTF-32（标准库只有 utf16 转换，这里手动跑一遍）
+    var view = std.unicode.Utf8View.init(path) catch return null;
+    var it = view.iterator();
+    var n: usize = 0;
+    while (it.nextCodepoint()) |cp| {
+        if (n + 1 >= wbuf.len) return null;
+        wbuf[n] = cp;
+        n += 1;
+    }
+    wbuf[n] = 0;
+    return wbuf[0 .. n + 1];
+}
+
+/// 宽缓冲 → miniaudio 的 `const wchar_t*` 参数
+inline fn widePtr(w: []WideChar) [*c]const if (builtin.os.tag == .windows) u16 else c_int {
+    return @ptrCast(w.ptr);
 }
 
 /// 按存储计划打开解码器
 fn openDecoder(path: []const u8, plan: Plan, dec: *ma.ma_decoder) bool {
-    var wbuf: [1024]u16 = undefined;
+    var wbuf: [wide_cap]WideChar = undefined;
     const w = toWide(path, &wbuf) orelse return false;
     const cfg = ma.ma_decoder_config_init(plan.maFormat(), plan.maChannels(), 0);
-    return ma.ma_decoder_init_file_w(@ptrCast(w.ptr), &cfg, dec) == ma.MA_SUCCESS;
+    return ma.ma_decoder_init_file_w(widePtr(w), &cfg, dec) == ma.MA_SUCCESS;
 }
 
 /// 同步解码结果（同步路径用：采样器层 / 旧工程 / 测试夹具）

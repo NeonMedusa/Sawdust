@@ -53,21 +53,22 @@ https://drive.google.com/drive/folders/1vHJcw6CiEt24WLKBgtTzmiMKY8IMpbfF?usp=sha
 - [ ] 音频、音符录制
 - [ ] 将自带的减法合成器升级成更强大的波表合成器
 - [ ] 更多效果器（合唱 / 失真 / 滤波器……）
-- [ ] 跨平台（Linux: X11/Wayland；macOS: Cocoa）
+- [x] 跨平台：**Linux（X11）已支持**（在 WSLg 上开发并验证，**尚未在真机 Linux 上实测**，见 [`docs/linux.md`](docs/linux.md)）；
+  macOS 未开始
 - [ ] asio支持
 
 ## 构建与运行
 
-**环境：Windows + Zig 0.17**（仓库含 submodule，克隆必须带 `--recursive`）：
-
+**环境：Windows + Zig 0.17**（仓库含 submodule，克隆必须带 `--recursive`）。
+Linux（X11）同样适用：命令完全相同，依赖与差异见 [`docs/linux.md`](docs/linux.md)。
 ```bash
 git clone --recursive https://github.com/NeonMedusa/Sawdust.git
 cd Sawdust
 zig build run             # 构建并运行
 ```
 
-编译结果在 zig-out\bin\ 目录中，文件名 Sawdust.exe，
-正式编译发布请用:```zig build -Dcpu=baseline -Doptimize=ReleaseFast```
+编译结果在 `zig-out\bin\` 目录中（Windows 为 `Sawdust.exe`，Linux 为 `Sawdust`），
+正式编译发布请用：```zig build -Dcpu=baseline -Doptimize=ReleaseFast```
 
 **C 绑定（Zig 0.17 起）**：`@cImport` 已被 Zig 移除，本项目改为**预生成绑定**：
 `src/c/miniaudio.zig`、`src/c/stb_truetype.zig` 由 `zig translate-c` 生成并入库（构建期
@@ -112,8 +113,15 @@ VST3 宿主见 `docs/plugin-hosting.md`；**Zig 0.17 迁移实录**见 `docs/zig
 参数用 `std.atomic.Value` 传递（无锁，实时安全）；编辑提交走"重扫"机制
 （作废未触发的旧事件、按新数据补齐，播放不中断）。
 
-**平台支持**：目前仅 Windows。`src/window.zig` 有非 Windows 的编译期占位
-（会给出明确的编译错误指向需要移植的文件）。
+**平台支持**：
+
+| 平台 | 状态 |
+|---|---|
+| **Windows** | 主要开发平台，功能完整 |
+| **Linux（X11）** | 已支持：窗口/输入/剪贴板/拖放/音频（PulseAudio、可选 JACK）/VST3 宿主均可用。**在 WSLg 上开发并验证，尚未在真机 Linux 上实测**——已知差异、限制与待办见 [`docs/linux.md`](docs/linux.md) |
+| macOS | 未开始 |
+
+> Linux 构建/运行与 Windows 相同（`zig build run`）；依赖、已知问题、与 Windows 的差异详见 [`docs/linux.md`](docs/linux.md)。
 
 ## 开发工具
 

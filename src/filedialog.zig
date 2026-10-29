@@ -1,25 +1,335 @@
-//! 系统文件对话框（打开 / 保存）与消息框。
+//! 系统文件对话框（打开 / 保存 / 选文件夹）。
 //!
-//! **平台**：当前仅实现 Windows（comdlg32）。
-//! 其他平台：`supported()` 返回 false，对话框 API 返回 null（视作取消）——
-//! 上层无需 #if，只要在 `supported()` 为 false 时走"内联输入文件名"的回退路径。
+//! ## 当前状态（见 `docs/file-dialogs.md` 的「决策记录」）
 //!
-//! **Windows 实现说明**：
+//! | 平台 | 用的是什么 | 阻塞吗 |
+//! |---|---|---|
+//! | **Linux** | **内置自绘选择器**（`src/file_picker.zig`）——**无条件**，不看桌面装了谁 | 否（主循环每帧推进） |
+//! | **Windows** | 本文件的 `GetOpenFileNameW` / `SHBrowseForFolderW`（系统原生观感） | **是**（已知问题，单独立项，见文档 §13） |
+//!
+//! ### Linux 的 kdialog / zenity（**停用保留**）
+//!
+//! 下面 `linux` 命名空间里的 kdialog → zenity 适配代码**保留但不启用**：
+//! 它们只是 toolkik CLI 垫片（不是标准），而且同步 `std.process.run` 会卡住 UI 线程
+//! → 序列器 4 小节前瞻被耗干 → 音乐十秒后停。
+//! 将来若要用（想要 KDE/GNOME 原生观感、或想接 XDG Portal），先把
+//! `linux_external_enabled` 改成 `true`、并按文档把它改成**异步 spawn**，别直接打开。
+//!
+//! ### Windows 实现说明
+//!
 //! - 用 `GetOpenFileNameW` / `GetSaveFileNameW`（comdlg32）。Vista 之后这套旧 API
 //!   仍显示**系统新式对话框**（内部转发到 shell 对话框），代码量远小于手写 COM。
 //! - `OPENFILENAMEW` 必须精确匹配 Win32 布局（`lStructSize` 不对则函数直接失败）；
 //!   本文件末尾有 `@sizeOf` 断言测试。
 //! - 需要链接 `comdlg32`（见 build.zig）。
+//! - ⚠️ **这里是同步调用**：它会阻塞 UI 线程。Windows 上"弹框约十秒后音乐停"的根治方案
+//!   （工作线程跑系统对话框 + 主循环每帧轮询）见 `docs/file-dialogs.md` §3，属于**独立问题**。
 
 const std = @import("std");
 const builtin = @import("builtin");
+const port_io = @import("port_io.zig");
 
 const is_windows = builtin.os.tag == .windows;
+const is_linux = builtin.os.tag == .linux;
 
-/// 本平台是否支持系统文件对话框
+/// **Linux 外部对话框提供者（kdialog → zenity）：已停用，仅保留代码。**
+///
+/// 原因：同步 `std.process.run` 会阻塞 UI 线程 → 调度前瞻耗尽 → 音乐十秒后停；
+/// 而 Linux 现在一律用内置自绘选择器（`file_picker.zig`），不依赖桌面装了什么。
+/// 要重新启用：改成 `true` **并且**把 `linux` 里的等待改成异步 spawn（见 docs）。
+pub const linux_external_enabled = false;
+
+/// 本平台是否"有可用的文件选择能力"（含内置自绘选择器）。
+/// 注意：Windows 是系统对话框；Linux 是内置自绘；两者都算 supports。
 pub fn supported() bool {
-    return is_windows;
+    return is_windows or is_linux;
 }
+
+/// Linux 实现：**外部 zenity**（GTK 对话框）——比自己写 XDG portal 便宜得多。
+/// 约定：exit 0 = 选中（stdout 是路径），其它 = 取消。
+/// Linux 实现：**外部对话框程序**（不作自绘，见 docs/linux.md §文件对话框）。
+///
+/// 优先级：**KDE 会话 → `kdialog`**（原生观感 + 记得上次目录），否则 **`zenity`**；
+/// 两者都不可用时返回 `.failed`，由上层决定是否退到"极简自绘选择器"。
+/// 约定：exit 0 = 选中（stdout 是路径），exit 1 = 用户取消，其它 = 失败（可回退）。
+const linux = if (is_linux) struct {
+    const Outcome = union(enum) {
+        /// page_allocator 分配（调用方 free）
+        ok: []const u8,
+        cancelled,
+        /// 程序不存在/启动失败/异常退出 → 上游可换下一个提供者
+        failed,
+    };
+
+    fn runOutcome(argv: []const []const u8) Outcome {
+        const res = std.process.run(std.heap.page_allocator, port_io.blocking(), .{ .argv = argv }) catch return .failed;
+        defer std.heap.page_allocator.free(res.stderr);
+        switch (res.term) {
+            .exited => |code| {
+                if (code == 0) return .{ .ok = res.stdout };
+                std.heap.page_allocator.free(res.stdout);
+                return if (code == 1) .cancelled else .failed;
+            },
+            else => {
+                std.heap.page_allocator.free(res.stdout);
+                return .failed;
+            },
+        }
+    }
+
+    fn envValue(name: [:0]const u8) ?[]const u8 {
+        const p = std.c.getenv(name) orelse return null;
+        return std.mem.span(p);
+    }
+
+    /// 大小写无关的子串查找（0.17 里 std.ascii 没有 indexOfIgnoreCase）
+    fn containsIgnoreCase(hay: []const u8, needle: []const u8) bool {
+        if (needle.len == 0 or hay.len < needle.len) return false;
+        var i: usize = 0;
+        while (i + needle.len <= hay.len) : (i += 1) {
+            if (std.ascii.eqlIgnoreCase(hay[i .. i + needle.len], needle)) return true;
+        }
+        return false;
+    }
+    /// 是否 KDE 会话（`KDE_FULL_SESSION` / `XDG_CURRENT_DESKTOP` 含 KDE）
+    fn isKdeSession() bool {
+        if (envValue("KDE_FULL_SESSION") != null) return true;
+        if (envValue("XDG_CURRENT_DESKTOP")) |d| {
+            if (containsIgnoreCase(d, "kde")) return true;
+        }
+        return false;
+    }
+
+    /// `描述\0*.a;*.b\0…` → kdialog 的 `描述(*.a *.b)\n…`（kdialog 用空格分隔通配、`\n` 分隔多组）
+    fn toKdialogFilter(allocator: std.mem.Allocator, filter: []const u8) !?[]u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+        var it = std.mem.splitScalar(u8, filter, 0);
+        while (it.next()) |desc| {
+            const pats = it.next() orelse break;
+            if (desc.len == 0 or pats.len == 0) continue;
+            if (out.items.len > 0) try out.append(allocator, '\n');
+            // 描述里**通常已带** `(*.ext)` 后缀（我们的 filter 就是这么写的）→ 先去掉，避免出现 `(…)(…)`
+            const name = if (std.mem.indexOfScalar(u8, desc, '(')) |i| std.mem.trimEnd(u8, desc[0..i], " ") else desc;
+            try out.appendSlice(allocator, name);
+            try out.append(allocator, '(');
+            for (pats) |c| try out.append(allocator, if (c == ';') ' ' else c);
+            try out.append(allocator, ')');
+        }
+        if (out.items.len == 0) {
+            out.deinit(allocator);
+            return null;
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
+    /// `描述\0*.a;*.b\0…` → zenity 的多个 `--file-filter=描述 | *.a *.b`
+    fn addZenityFilters(cmd: *Cmd, filter: []const u8) !void {
+        var it = std.mem.splitScalar(u8, filter, 0);
+        while (it.next()) |desc| {
+            const pats = it.next() orelse break;
+            if (desc.len == 0 or pats.len == 0) continue;
+            const pats_sp = try std.mem.replaceOwned(u8, cmd.allocator, pats, ";", " ");
+            defer cmd.allocator.free(pats_sp);
+            try cmd.ownedArg("--file-filter={s} | {s}", .{ desc, pats_sp });
+        }
+    }
+
+    // ── kdialog ──
+
+    fn kdialogOpen(allocator: std.mem.Allocator, title: []const u8, filter: []const u8) ?Outcome {
+        const f = toKdialogFilter(allocator, filter) catch null;
+        defer if (f) |s| allocator.free(s);
+        // ⚠️ 必须带 `--getopenfilename`（漏了它 kdialog 会打印 usage 并以 0 退出——实测踩过）
+        const argv = [_][]const u8{ "kdialog", "--getopenfilename", ":sawdust-open", f orelse "", "--title", title };
+        return runOutcome(&argv);
+    }
+
+    fn kdialogSave(allocator: std.mem.Allocator, title: []const u8, default_name: []const u8, filter: []const u8) ?Outcome {
+        const f = toKdialogFilter(allocator, filter) catch null;
+        defer if (f) |s| allocator.free(s);
+        const start = std.fmt.allocPrint(allocator, "{s}", .{default_name}) catch return null;
+        defer allocator.free(start);
+        const argv = [_][]const u8{ "kdialog", "--getsavefilename", start, f orelse "", "--title", title };
+        return runOutcome(&argv);
+    }
+
+    fn kdialogFolder(title: []const u8) ?Outcome {
+        const argv = [_][]const u8{ "kdialog", "--getexistingdirectory", ":sawdust-folder", "--title", title };
+        return runOutcome(&argv);
+    }
+
+    // ── zenity ──
+
+    /// 命令行组装：`argv` 存借用的字面量，`owned` 存需要释放的拼接串
+    const Cmd = struct {
+        owned: std.ArrayListUnmanaged([]u8) = .empty,
+        argv: std.ArrayListUnmanaged([]const u8) = .empty,
+        allocator: std.mem.Allocator,
+
+        fn init(allocator: std.mem.Allocator) Cmd {
+            return .{ .allocator = allocator };
+        }
+
+        fn deinit(self: *Cmd) void {
+            for (self.owned.items) |s| self.allocator.free(s);
+            self.owned.deinit(self.allocator);
+            self.argv.deinit(self.allocator);
+            self.* = undefined;
+        }
+
+        /// 借用字面量参数
+        fn arg(self: *Cmd, a: []const u8) !void {
+            try self.argv.append(self.allocator, a);
+        }
+
+        /// 拼接出来的参数（`deinit` 时统一释放）
+        fn ownedArg(self: *Cmd, comptime fmt: []const u8, args: anytype) !void {
+            const s = try std.fmt.allocPrint(self.allocator, fmt, args);
+            errdefer self.allocator.free(s);
+            try self.owned.append(self.allocator, s);
+            try self.argv.append(self.allocator, s);
+        }
+    };
+
+    fn takePath(allocator: std.mem.Allocator, out: []const u8) !?[]u8 {
+        const path = std.mem.trimEnd(u8, out, "\r\n");
+        if (path.len == 0) return null;
+        return try allocator.dupe(u8, path);
+    }
+
+    fn open(allocator: std.mem.Allocator, title: []const u8, filter: []const u8) !?[]u8 {
+        // ① KDE 会话且有 kdialog → 原生观感
+        if (isKdeSession()) {
+            if (kdialogOpen(allocator, title, filter)) |r| switch (r) {
+                .ok => |out| {
+                    defer std.heap.page_allocator.free(out);
+                    const trimmed = std.mem.trim(u8, out, " \\r\\n");
+                    // 空输出 = kdialog 静默失败（实测：WSLg 下 0 退出但不弹窗）→ 回退 zenity
+                    if (trimmed.len > 0) return try allocator.dupe(u8, trimmed);
+                },
+                .cancelled => return null,
+                .failed => {}, // 退回 zenity
+            };
+        }
+        // ② zenity
+        var cmd = Cmd.init(allocator);
+        defer cmd.deinit();
+        try cmd.arg("zenity");
+        try cmd.arg("--file-selection");
+        try cmd.ownedArg("--title={s}", .{title});
+        try addZenityFilters(&cmd, filter);
+        switch (runOutcome(cmd.argv.items)) {
+            .ok => |out| {
+                defer std.heap.page_allocator.free(out);
+                return takePath(allocator, out);
+            },
+            else => return null,
+        }
+    }
+
+    fn save(allocator: std.mem.Allocator, title: []const u8, default_name: []const u8, filter: []const u8) !?[]u8 {
+        if (isKdeSession()) {
+            if (kdialogSave(allocator, title, default_name, filter)) |r| switch (r) {
+                .ok => |out| {
+                    defer std.heap.page_allocator.free(out);
+                    const trimmed = std.mem.trim(u8, out, " \\r\\n");
+                    if (trimmed.len > 0) return try allocator.dupe(u8, trimmed); // 空 = kdialog 静默失败 → 回退 zenity
+                },
+                .cancelled => return null,
+                .failed => {},
+            };
+        }
+        var cmd = Cmd.init(allocator);
+        defer cmd.deinit();
+        try cmd.arg("zenity");
+        try cmd.arg("--file-selection");
+        try cmd.arg("--save");
+        try cmd.arg("--confirm-overwrite");
+        try cmd.ownedArg("--title={s}", .{title});
+        try cmd.ownedArg("--filename={s}", .{default_name});
+        try addZenityFilters(&cmd, filter);
+        switch (runOutcome(cmd.argv.items)) {
+            .ok => |out| {
+                defer std.heap.page_allocator.free(out);
+                return takePath(allocator, out);
+            },
+            else => return null,
+        }
+    }
+
+    fn pickFolder(allocator: std.mem.Allocator, title: []const u8) !?[]u8 {
+        if (isKdeSession()) {
+            if (kdialogFolder(title)) |r| switch (r) {
+                .ok => |out| {
+                    defer std.heap.page_allocator.free(out);
+                    const trimmed = std.mem.trim(u8, out, " \\r\\n");
+                    if (trimmed.len > 0) return try allocator.dupe(u8, trimmed); // 空 = kdialog 静默失败 → 回退 zenity
+                },
+                .cancelled => return null,
+                .failed => {},
+            };
+        }
+        var cmd = Cmd.init(allocator);
+        defer cmd.deinit();
+        try cmd.arg("zenity");
+        try cmd.arg("--file-selection");
+        try cmd.arg("--directory");
+        try cmd.ownedArg("--title={s}", .{title});
+        switch (runOutcome(cmd.argv.items)) {
+            .ok => |out| {
+                defer std.heap.page_allocator.free(out);
+                return takePath(allocator, out);
+            },
+            else => return null,
+        }
+    }
+
+    fn alert(allocator: std.mem.Allocator, text: []const u8) void {
+        if (isKdeSession()) {
+            const argv = [_][]const u8{ "kdialog", "--msgbox", text };
+            if (runOutcome(&argv)) |r| switch (r) {
+                .ok => |out| std.heap.page_allocator.free(out),
+                else => {},
+            };
+            return;
+        }
+        var cmd = Cmd.init(allocator);
+        defer cmd.deinit();
+        cmd.arg("zenity") catch return;
+        cmd.arg("--info") catch return;
+        cmd.ownedArg("--text={s}", .{text}) catch return;
+        if (runOutcome(cmd.argv.items)) |r| switch (r) {
+            .ok => |out| std.heap.page_allocator.free(out),
+            else => {},
+        };
+    }
+
+    fn confirmSave(allocator: std.mem.Allocator, text: []const u8) ConfirmResult {
+        _ = allocator;
+        if (isKdeSession()) {
+            const argv = [_][]const u8{ "kdialog", "--yesnocancel", text };
+            return switch (runOutcome(&argv) orelse .failed) {
+                .ok => |out| blk: {
+                    std.heap.page_allocator.free(out);
+                    break :blk .save;
+                },
+                .cancelled => .discard, // kdialog: exit 1 = No
+                .failed => .cancel,
+            };
+        }
+        const argv = [_][]const u8{ "zenity", "--question", text, "--ok-label=保存", "--extra-button=不保存", "--cancel-label=取消" };
+        const res = std.process.run(std.heap.page_allocator, port_io.blocking(), .{ .argv = &argv }) catch return .cancel;
+        std.heap.page_allocator.free(res.stdout);
+        std.heap.page_allocator.free(res.stderr);
+        if (res.term != .exited) return .cancel;
+        return switch (res.term.exited) {
+            0 => .save,
+            1 => .discard, // --extra-button
+            else => .cancel,
+        };
+    }
+} else struct {};
 
 /// Windows 部分（其他平台不编译）
 const win = if (is_windows) struct {
@@ -191,6 +501,16 @@ const win = if (is_windows) struct {
     }
 } else struct {};
 
+// 停用代码的防腐烂守卫：只取函数地址，确保它们**仍然能编译**。
+// （`linux_external_enabled = false` 会让上面的调用点在编译期被剪掉，若没有这层守卫，
+// 停用的适配代码会在无人察觉的情况下烂掉。）
+test "filedialog: Linux 外部提供者（停用中）仍然编译得过" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+    const refs = .{ &linux.open, &linux.save, &linux.pickFolder, &linux.confirmSave, &linux.alert };
+    try std.testing.expect(@sizeOf(@TypeOf(refs)) > 0);
+    try std.testing.expect(!linux_external_enabled); // 现实中必须是停用状态
+}
+
 /// 三选一结果
 pub const ConfirmResult = enum { save, discard, cancel };
 
@@ -198,32 +518,36 @@ pub const ConfirmResult = enum { save, discard, cancel };
 
 /// "打开"对话框：返回选择的路径（null = 取消或不支持）
 pub fn open(allocator: std.mem.Allocator, owner: ?*anyopaque, title: []const u8, filter: []const u8) !?[]u8 {
-    if (!is_windows) return null;
-    return win.open(allocator, owner, title, filter);
+    if (is_windows) return win.open(allocator, owner, title, filter);
+    if (is_linux and linux_external_enabled) return linux.open(allocator, title, filter);
+    return null;
 }
 
 /// "保存"对话框：`default_name` 为建议文件名（null = 取消或不支持）
 pub fn save(allocator: std.mem.Allocator, owner: ?*anyopaque, title: []const u8, default_name: []const u8, filter: []const u8) !?[]u8 {
-    if (!is_windows) return null;
-    return win.save(allocator, owner, title, default_name, filter);
+    if (is_windows) return win.save(allocator, owner, title, default_name, filter);
+    if (is_linux and linux_external_enabled) return linux.save(allocator, title, default_name, filter);
+    return null;
 }
 
 /// 保存/不保存/取消（其他平台固定返回 .cancel——上层应避免在无对话框平台走此路径）
 pub fn confirmSave(allocator: std.mem.Allocator, owner: ?*anyopaque, text: []const u8) ConfirmResult {
-    if (!is_windows) return .cancel;
-    return win.confirmSave(allocator, owner, text);
+    if (is_windows) return win.confirmSave(allocator, owner, text);
+    if (is_linux and linux_external_enabled) return linux.confirmSave(allocator, text);
+    return .cancel;
 }
 
 /// 信息提示框
 pub fn alert(allocator: std.mem.Allocator, owner: ?*anyopaque, text: []const u8) void {
-    if (!is_windows) return;
-    win.alert(allocator, owner, text);
+    if (is_windows) return win.alert(allocator, owner, text);
+    if (is_linux and linux_external_enabled) return linux.alert(allocator, text);
 }
 
 /// 选择文件夹（null = 取消或不支持）——插件管理的“+ 添加文件夹…”
 pub fn pickFolder(allocator: std.mem.Allocator, owner: ?*anyopaque, title: []const u8) !?[]u8 {
-    if (!is_windows) return null;
-    return win.pickFolder(allocator, owner, title);
+    if (is_windows) return win.pickFolder(allocator, owner, title);
+    if (is_linux and linux_external_enabled) return linux.pickFolder(allocator, title);
+    return null;
 }
 
 // ── 工具（可测）──

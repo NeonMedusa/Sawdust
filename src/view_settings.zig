@@ -7,6 +7,8 @@ const Ui = @import("ui.zig").Ui;
 const app_mod = @import("app.zig");
 const App = app_mod.App;
 const util = @import("view_util.zig");
+const font_info = @import("font_info.zig");
+const audio_pref = @import("audio_pref.zig");
 
 const title_h: i32 = 22;
 const min_w: i32 = 360;
@@ -95,6 +97,52 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     }
     ui.label("JSON：可读文本格式，便于迁移到其他 DAW。", x + 14, yy + 46, ui.theme.text_dim);
     ui.label("导入 = 替换当前工程；导出 = 写出副本。", x + 14, yy + 60, ui.theme.text_dim);
+    yy += 84;
+
+    // ── 字体（当前实际生效的文件）──
+    ui.label("字体（当前生效）", x + 14, yy, ui.theme.text_dim);
+    ui.label(font_info.active(), x + 14, yy + 16, ui.theme.text);
+    if (ui.button(9525, "重新加载字体", x + 14, yy + 36, 120, 22)) {
+        font_info.reload_requested = true; // 主循环帧首重跑查找（装完新字体不用重启）
+    }
+    ui.label("预览：中文 ABC 123 ♪ ⏵ 文件.saw", x + 144, yy + 40, ui.theme.text);
+    ui.label("改字体：在 <程序目录>/data/font.txt 里写一行字体路径。", x + 14, yy + 64, ui.theme.text_dim);
+    ui.label("自动顺序：fontconfig → 微软雅黑/文泉驿微米黑等 → data/fonts/ → 任意系统字体。", x + 14, yy + 78, ui.theme.text_dim);
+    yy += 100;
+
+    // ── 音频后端（改完重启生效；Windows 只有 WASAPI）──
+    // 分段控件：选中段用强调色（同设置页“打开上次工程/新建工程”与工具栏标签的观感）
+    ui.label("音频后端（重启生效）", x + 14, yy, ui.theme.text_dim);
+    {
+        const seg_w: i32 = 96;
+        const seg_h: i32 = 24;
+        const n: i32 = @intCast(audio_pref.options.len);
+        const total = seg_w * n;
+        const sy = yy + 16;
+        // 整条边框 + 分隔线
+        ui.renderer.strokeRect(x + 14, sy, total, seg_h, ui.theme.panel_border);
+        for (audio_pref.options, 0..) |opt, oi| {
+            const sx = x + 14 + seg_w * @as(i32, @intCast(oi));
+            const on = audio_pref.current == opt;
+            const hovered = ui.hitRect(sx, sy, seg_w, seg_h);
+            const bg = if (on) ui.theme.accent else if (hovered and ui.mouse_down) r_mod.rgb(70, 130, 200) else if (hovered) r_mod.rgb(60, 66, 76) else ui.theme.panel;
+            ui.renderer.fillRect(sx, sy, seg_w, seg_h, bg);
+            if (oi > 0) ui.renderer.vline(sx, sy, seg_h, ui.theme.panel_border);
+            // `labelCentered` 只居中**纵向**（x 是左边缘）→ 横向自己算（同 `buttonEx`）
+            const tw: i32 = @intFromFloat(ui.font.measure(audio_pref.label(opt)));
+            ui.labelCentered(audio_pref.label(opt), sx + @divTrunc(seg_w - tw, 2), sy, seg_h, if (on) r_mod.rgb(240, 244, 250) else ui.theme.text);
+            if (ui.hitRect(sx, sy, seg_w, seg_h) and ui.mouse_pressed) {
+                audio_pref.pending = opt;
+                audio_pref.saved = false;
+            }
+        }
+    }
+    if (audio_pref.saved) {
+        ui.label("已保存，重启后生效", x + 14, yy + 42, ui.theme.text);
+    } else {
+        var cb: [64]u8 = undefined;
+        ui.label(std.fmt.bufPrint(&cb, "当前：{s}", .{audio_pref.label(audio_pref.current)}) catch "", x + 14, yy + 42, ui.theme.text_dim);
+    }
 
     return util.inRect(ui.mouse_x, ui.mouse_y, x, y, ww, hh);
 }

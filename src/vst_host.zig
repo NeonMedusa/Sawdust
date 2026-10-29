@@ -23,7 +23,10 @@
 //!    JUCE 返回 E_NOTIMPL 属正常）。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const vst3 = @import("zig_vst3");
+/// X11 编辑器后端（仅非 Windows 编译；Windows 用本文件里的 Win32 实现）
+const editor_x11 = if (builtin.os.tag == .windows) struct {} else @import("vst_editor_x11.zig");
 
 /// 编辑器编辑环形队列长度（每条 16B；UI 每帧排空，容量按“极端扫动一帧上百条”留裕量）
 const edit_ring_len = 256;
@@ -346,7 +349,7 @@ extern "kernel32" fn SetErrorMode(u32) callconv(.winapi) u32;
 /// SEM_NOGPFAULTERRORBOX 抑制默认异常框；子进程继承（worker 也安静）。
 const SEM_FAILCRITICALERRORS: u32 = 0x0001;
 const SEM_NOGPFAULTERRORBOX: u32 = 0x0002;
-var error_mode_set: bool = false;
+var error_mode_set: bool = if (builtin.os.tag == .windows) false else true;
 extern "kernel32" fn FreeLibrary(*anyopaque) callconv(.winapi) i32;
 extern "kernel32" fn GetProcAddress(*anyopaque, [*:0]const u8) callconv(.winapi) ?*const anyopaque;
 
@@ -763,39 +766,66 @@ pub const Scan = struct {
     }
 };
 
+/// 模块句柄：Windows = HMODULE（走 `LoadLibraryW`，中文路径才对）；
+/// 其它平台 = `std.DynLib`（`dlopen`）。
+const LibHandle = if (builtin.os.tag == .windows) *anyopaque else std.DynLib;
+
 /// 已加载的模块（工厂句柄）
 const Mod = struct {
-    lib: *anyopaque,
+    lib: LibHandle,
     raw_factory: *anyopaque,
     factory: *const ipb.IPluginFactory,
 
     fn deinit(self: Mod) void {
-        _ = FreeLibrary(self.lib);
+        if (comptime builtin.os.tag == .windows) {
+            _ = FreeLibrary(self.lib);
+        } else {
+            // **Linux：故意不 dlclose**（与扫描 worker 同一教训）。
+            // 很多插件（Vital 的 GL/网络线程实测）在卸载后仍有线程在跑已卸载代码 → segfault。
+            // 插件实例数量有限，泄漏这点地址空间换来稳定性；进程退出时由系统回收。
+            // 句柄原样丢弃（`self.lib` 在 Windows 分支里已被使用，这里无需再显式引用）
+
+        }
     }
 };
 
+/// VST3 模块的入口符号（规范要求）：`InitDll`（可选）+ `GetPluginFactory`（必需）
 fn loadModule(path: [:0]const u8) !Mod {
-    // 首次加载前抑制 loader 弹框（见 SetErrorMode 注释；咽喉点——主程序/worker/
-    // 测试所有加载都经此，不会漏）
-    if (!error_mode_set) {
-        error_mode_set = true;
-        _ = SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+    if (comptime builtin.os.tag == .windows) {
+        // 首次加载前抑制 loader 弹框（见 SetErrorMode 注释；咽喉点——主程序/worker/
+        // 测试所有加载都经此，不会漏）
+        if (!error_mode_set) {
+            error_mode_set = true;
+            _ = SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+        }
+        // **必须 LoadLibraryW**：ANSI 版按系统代码页解路径，中文名会加载失败
+        // （实测 bug）。UTF-8 → UTF-16 走栈缓冲（UTF-16 长度 ≤ UTF-8 字节数）
+        var wbuf: [2048]u16 = undefined;
+        const wlen = std.unicode.utf8ToUtf16Le(&wbuf, path) catch return error.InvalidPath;
+        if (wlen >= wbuf.len) return error.PathTooLong;
+        wbuf[wlen] = 0;
+        const lib = LoadLibraryW(@ptrCast(&wbuf)) orelse return error.LoadLibraryFailed;
+        errdefer _ = FreeLibrary(lib);
+        if (GetProcAddress(lib, "InitDll")) |fp| {
+            const f: *const fn () callconv(.c) bool = @ptrCast(fp);
+            _ = f();
+        }
+        const gp = GetProcAddress(lib, "GetPluginFactory") orelse return error.NoGetPluginFactory;
+        const get_factory: *const fn () callconv(.c) ?*anyopaque = @ptrCast(gp);
+        const raw = get_factory() orelse return error.NullFactory;
+        return .{
+            .lib = lib,
+            .raw_factory = raw,
+            .factory = @ptrCast(@alignCast(raw)),
+        };
     }
-    // **必须 LoadLibraryW**：ANSI 版按系统代码页解路径，中文名会加载失败
-    // （实测 bug）。UTF-8 → UTF-16 走栈缓冲（UTF-16 长度 ≤ UTF-8 字节数）
-    var wbuf: [2048]u16 = undefined;
-    const wlen = std.unicode.utf8ToUtf16Le(&wbuf, path) catch return error.InvalidPath;
-    if (wlen >= wbuf.len) return error.PathTooLong;
-    wbuf[wlen] = 0;
-    const lib = LoadLibraryW(@ptrCast(&wbuf)) orelse return error.LoadLibraryFailed;
-    errdefer _ = FreeLibrary(lib);
-    // InitDll（可选导出：初始化模块全局状态）
-    if (GetProcAddress(lib, "InitDll")) |fp| {
-        const f: *const fn () callconv(.c) bool = @ptrCast(fp);
-        _ = f();
-    }
-    const gp = GetProcAddress(lib, "GetPluginFactory") orelse return error.NoGetPluginFactory;
-    const get_factory: *const fn () callconv(.c) ?*anyopaque = @ptrCast(gp);
+
+    // Linux：`dlopen`。Linux 没有"坏映像弹框"问题，也不需要控制台补丁。
+    var lib = std.DynLib.openZ(path) catch return error.LoadLibraryFailed;
+    errdefer lib.close();
+    if (lib.lookup(*const fn () callconv(.c) bool, "InitDll")) |f| _ = f();
+    const get_factory = lib.lookup(*const fn () callconv(.c) ?*anyopaque, "GetPluginFactory") orelse
+        return error.NoGetPluginFactory;
     const raw = get_factory() orelse return error.NullFactory;
     return .{
         .lib = lib,
@@ -863,9 +893,20 @@ fn collectClasses(m: Mod, out: *Scan) void {
     }
 }
 
+/// 每帧调用（UI 线程）：把编辑器窗口的 X11 事件抽干（Windows 由系统消息泵处理，无需）。
+pub fn pumpEditorEvents() usize {
+    if (comptime builtin.os.tag != .windows) return editor_x11.pump();
+    return 0;
+}
+
 /// 扫描一个 `.vst3` 模块（加载 → 枚举全部类 → 卸载）
 /// 诊断：打印模块中**第一个音频类**的全部总线布局（`Sawdust --vst-scan --buses` 用）——
 /// 多输出插件（如 SFLT 0进17出）支持前的探测：总线数/类型/通道数/默认激活位。
+/// 编辑器窗口是否存在且在显示（CLI 冒烟/诊断用）
+pub fn editorVisible(pl: *const Plugin) bool {
+    return pl.editor_hwnd != null and pl.editor_shown;
+}
+
 pub fn dumpBuses(path: [:0]const u8) !void {
     const m = try loadModule(path);
     var s = Scan{};
@@ -950,6 +991,8 @@ pub const Plugin = struct {
     /// 子窗口是否已**首次显示**（创建时隐藏——先定位再 ShowWindow，
     /// 否则会在主窗 (0,0) 左上角闪现一个小黑框，实测）
     editor_shown: bool = false,
+    /// Linux 独立窗口：是否已经"自动摆过一次位置"（之后交给按钮控制，别每帧抢回）
+    editor_ever_shown: bool = false,
     /// 宿主侧 IPlugFrame 实例（打开中）
     frame: ?*EditorFrame = null,
     /// 插件请求的内容尺寸（面板按它定尺寸；`resizeView` 更新）
@@ -1367,8 +1410,12 @@ pub const Plugin = struct {
             _ = view.vtable.release(view);
         };
 
-        if (view.vtable.isPlatformTypeSupported(view, iplugview.PlatformType.kPlatformTypeHWND) != btypes.kResultOk) {
-            std.debug.print("[vst] 编辑器：插件不支持 HWND 平台\n", .{});
+        const platform_type = if (comptime builtin.os.tag == .windows)
+            iplugview.PlatformType.kPlatformTypeHWND
+        else
+            iplugview.PlatformType.kPlatformTypeX11EmbedWindowID;
+        if (view.vtable.isPlatformTypeSupported(view, platform_type) != btypes.kResultOk) {
+            std.debug.print("[vst] 编辑器：插件不支持本平台窗口类型（{s}）\n", .{platform_type});
             self.editor_no_ui = true;
             return .no_editor;
         }
@@ -1382,38 +1429,56 @@ pub const Plugin = struct {
         const ch = rect.bottom - rect.top;
         if (cw <= 0 or ch <= 0 or cw > 8192 or ch > 8192) return .failed;
 
-        if (!ensureEditorClass()) return .failed;
+        if (comptime builtin.os.tag == .windows) {
+            if (!ensureEditorClass()) return .failed;
+        }
 
         // 子窗口：无标题栏/边框（规范：attached 的 parent 是 HWND，“should attach a
         // child window to it”）；外框与标题栏由我们的软渲染面板提供。
         // 注：子窗口坐标 = 物理像素（规范 Coordinates 段）。
-        const hwnd = CreateWindowExW(
-            0,
-            editor_class_name,
-            null,
-            0x40000000, // WS_CHILD（**不带 VISIBLE**：先隐藏创建，首次定位后再显示——防左上角小黑框闪现）
-            0,
-            0,
-            cw,
-            ch,
-            parent,
-            null,
-            GetModuleHandleW(null),
-            null,
-        ) orelse return .failed;
-        _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, @bitCast(@intFromPtr(self)));
-
-        const frame = self.alloc.create(EditorFrame) catch {
-            _ = DestroyWindow(hwnd);
-            return .failed;
+        const hwnd: *anyopaque = if (comptime builtin.os.tag == .windows) blk: {
+            const h = CreateWindowExW(
+                0,
+                editor_class_name,
+                null,
+                0x40000000, // WS_CHILD（**不带 VISIBLE**：先隐藏创建，首次定位后再显示——防左上角小黑框闪现）
+                0,
+                0,
+                cw,
+                ch,
+                parent,
+                null,
+                GetModuleHandleW(null),
+                null,
+            ) orelse return .failed;
+            _ = SetWindowLongPtrW(h, GWLP_USERDATA, @bitCast(@intFromPtr(self)));
+            break :blk h;
+        } else blk: {
+            // X11：容器窗口（`parent` 就是宿主窗口 id；null = 顶层窗口，CLI 冒烟用）
+            break :blk editor_x11.create(parent, "Sawdust - VST3 编辑器", cw, ch) orelse return .failed;
         };
+
+        // Linux 上这个 frame 是**故意不释放**的（编辑器只隐藏不销毁），
+        // 所以用 page_allocator，别让调试用的泄漏检测把它当 bug 报出来。
+        const frame = if (comptime builtin.os.tag == .windows)
+            (self.alloc.create(EditorFrame) catch {
+                _ = DestroyWindow(hwnd);
+                return .failed;
+            })
+        else
+            (std.heap.page_allocator.create(EditorFrame) catch return .failed);
+
         frame.* = .{ .hwnd = hwnd, .owner = self };
         self.frame = frame;
 
         _ = view.vtable.setFrame(view, frame.asInterface());
-        if (view.vtable.attached(view, hwnd, iplugview.PlatformType.kPlatformTypeHWND) != btypes.kResultOk) {
+        if (view.vtable.attached(view, hwnd, platform_type) != btypes.kResultOk) {
             _ = view.vtable.setFrame(view, null);
-            _ = DestroyWindow(hwnd);
+            if (comptime builtin.os.tag == .windows) {
+                _ = DestroyWindow(hwnd);
+            } else {
+                editor_x11.destroy(hwnd);
+            }
             self.alloc.destroy(frame);
             self.frame = null;
             return .failed;
@@ -1435,23 +1500,82 @@ pub const Plugin = struct {
     /// 面板侧每帧同步：移动子窗口到面板内容区（变化才 SetWindowPos）。
     /// 大小以 `editor_w/h`（插件请求）为准；**首次定位后才显示**（创建时隐藏，
     /// 防在主窗左上角闪现小黑框）；显示时才抢焦点。
+    /// Linux「独立窗口」模式：显示/隐藏编辑器窗口（**不销毁**，见 `closeEditor` 注释）
+    pub fn setEditorVisible(self: *Plugin, visible: bool) void {
+        if (comptime builtin.os.tag == .windows) return;
+        const h = self.editor_hwnd orelse return;
+        if (visible) {
+            editor_x11.show(h);
+            self.editor_shown = true;
+        } else {
+            editor_x11.hide(h);
+            self.editor_shown = false;
+        }
+    }
+
+    /// 每帧调用：若用户用窗口自己的关闭按钮关掉了某个编辑器，返回它的句柄（否则 null）
+    pub fn takeUserClosedEditor() ?*anyopaque {
+        if (comptime builtin.os.tag == .windows) return null;
+        return editor_x11.takeUserClosed();
+    }
+
+    /// 该插件编辑器的原生窗口句柄（用于和 `takeUserClosedEditor()` 比对）
+    pub fn editorHandle(self: *const Plugin) ?*anyopaque {
+        return self.editor_hwnd;
+    }
+
+    /// 标记编辑器已隐藏（用户关掉时由上层调用；只改标志，不碰 X）
+    pub fn markEditorHidden(self: *Plugin) void {
+        self.editor_shown = false;
+    }
+
+    /// Linux 独立窗口：摆到屏幕坐标 (x,y) 并显示（**幂等**：已开着就是置顶）。
+    /// 切乐器时用它把"新目标"的窗口打开，配合 `setEditorVisible(false)` 关掉旧的——
+    /// 这样"双击 A 关掉 B、打开 A"的行为不需要跟踪 map 状态。
+    pub fn showEditorAt(self: *Plugin, x: i32, y: i32) void {
+        if (comptime builtin.os.tag == .windows) return;
+        const h = self.editor_hwnd orelse return;
+        editor_x11.move(h, x, y, self.editor_w, self.editor_h);
+        editor_x11.show(h);
+        self.editor_shown = true;
+    }
+
+    /// 编辑器窗口是否显示（Linux 独立窗口模式下**只用于显示提示**：
+    /// 用户可能用窗口管理器关掉它，我们不再跟踪这个状态——按钮只管"打开/置顶"）
+    pub fn editorIsShown(self: *const Plugin) bool {
+        return self.editor_shown;
+    }
+
     pub fn syncEditorRect(self: *Plugin, x: i32, y: i32) void {
         const hwnd = self.editor_hwnd orelse return;
-        if (x != self.editor_x or y != self.editor_y) {
-            self.editor_x = x;
-            self.editor_y = y;
-            _ = SetWindowPos(hwnd, null, x, y, self.editor_w, self.editor_h, SWP_NOZORDER | SWP_NOACTIVATE);
-        }
-        if (!self.editor_shown) {
-            self.editor_shown = true;
-            _ = ShowWindow(hwnd, SW_SHOW);
-            _ = SetFocus(hwnd);
+        if (comptime builtin.os.tag == .windows) {
+            if (x != self.editor_x or y != self.editor_y) {
+                self.editor_x = x;
+                self.editor_y = y;
+                _ = SetWindowPos(hwnd, null, x, y, self.editor_w, self.editor_h, SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+            if (!self.editor_shown) {
+                self.editor_shown = true;
+                _ = ShowWindow(hwnd, SW_SHOW);
+                _ = SetFocus(hwnd);
+            }
+        } else {
+            if (x != self.editor_x or y != self.editor_y) {
+                self.editor_x = x;
+                self.editor_y = y;
+            }
+            editor_x11.move(hwnd, self.editor_x, self.editor_y, self.editor_w, self.editor_h);
+            if (!self.editor_shown) {
+                self.editor_shown = true;
+                editor_x11.show(hwnd);
+            }
         }
     }
 
     /// 子窗口的 client 矩形（主窗坐标；`present` 回写裁切用）。
     /// 未显示 → null（隐藏期间该区域仍是我们的面板像素，必须照常回写）。
     pub fn editorClientRect(self: *const Plugin) ?[4]i32 {
+        if (comptime builtin.os.tag != .windows) return null; // X11：present 无需跳过矩形
         if (self.editor_hwnd == null or !self.editor_shown) return null;
         return .{ self.editor_x, self.editor_y, self.editor_w, self.editor_h };
     }
@@ -1459,12 +1583,15 @@ pub const Plugin = struct {
     /// `present` 裁切用信息：窗口句柄 + 主窗 client 坐标下的位置/尺寸；未显示 → null。
     /// （present 会用 `GetWindowRgn` 取子窗口**当前可见区域**——已含遮挡裁切）
     pub fn editorPresentInfo(self: *const Plugin) ?EditorPresentInfo {
+        if (comptime builtin.os.tag != .windows) return null; // X11：同上
         if (self.editor_hwnd == null or !self.editor_shown) return null;
         return .{ .hwnd = self.editor_hwnd.?, .x = self.editor_x, .y = self.editor_y, .w = self.editor_w, .h = self.editor_h };
     }
 
     /// 输入闸门（见字段注释）：模态/菜单期间禁用；变化才动作
     pub fn setEditorEnabled(self: *Plugin, enabled: bool) void {
+        // X11：暂不做输入闸门（X 服务器会把遮挡裁掉；模态输入由主循环拦）
+        if (comptime builtin.os.tag != .windows) return;
         if (self.editor_enabled == enabled) return;
         const hwnd = self.editor_hwnd orelse return;
         self.editor_enabled = enabled;
@@ -1477,6 +1604,8 @@ pub const Plugin = struct {
     /// 且被裁区域的鼠标点击会自动穿透到下层（区域同时作用于命中测试）。
     /// 变化检测：覆盖集合/位置/尺寸不变则跳过（RGN 只重建于变化时）。
     pub fn setEditorClip(self: *Plugin, covers: []const EditClipRect) void {
+        // X11 已改为"插件 UI 独立顶层窗口"，不需要任何裁切/镜像；这里只剩 Windows 的 RGN 路径。
+        if (comptime builtin.os.tag != .windows) return;
         const hwnd = self.editor_hwnd orelse return;
         var hsh = std.hash.Wyhash.init(0x9e3779b97f4a7c15);
         hsh.update(std.mem.asBytes(&self.editor_x));
@@ -1502,6 +1631,14 @@ pub const Plugin = struct {
 
     /// 关闭插件编辑器（UI 线程；幂等）
     pub fn closeEditor(self: *Plugin) void {
+        // **Linux：只隐藏，不销毁**。实测 Vital：`removed()+release()` 会让它的 GL/后台线程
+        // 崩在已释放的对象上；窗口销毁同理。所以插件对象与窗口都留着，
+        // 下次打开面板直接重新 map（也更快）。进程退出时由系统回收。
+        if (comptime builtin.os.tag != .windows) {
+            if (self.editor_hwnd) |h| editor_x11.hide(h);
+            self.editor_shown = false;
+            return;
+        }
         if (self.view) |v| {
             _ = v.vtable.removed(v);
             _ = v.vtable.setFrame(v, null);
@@ -1514,7 +1651,11 @@ pub const Plugin = struct {
         }
         if (self.editor_hwnd) |h| {
             self.editor_hwnd = null;
-            _ = DestroyWindow(h);
+            if (comptime builtin.os.tag == .windows) {
+                _ = DestroyWindow(h);
+            } else {
+                editor_x11.destroy(h);
+            }
         }
         self.clip_valid = false;
         self.editor_shown = false;

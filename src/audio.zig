@@ -31,7 +31,12 @@ const fx = @import("effects.zig");
 const vst_host = @import("vst_host.zig");
 const ivstevents = @import("zig_vst3").pluginterfaces.vst.ivstevents;
 // 0.17：`@cImport` 已移除——改用 `zig translate-c` 预生成的绑定（免网络、免构建期翻译）
-const ma = @import("c/miniaudio.zig");
+// miniaudio 绑定：**按平台选择**。结构体布局随编译期启用的后端变化
+// （Linux 的 ma_device/ma_context 内嵌 pulse/alsa/jack 状态 → sizeof 比 Windows 大 464 字节），
+// 所以用同一份绑定会在跨平台时**越界写**。两份都由 `zig translate-c` 生成并入库。
+const builtin = @import("builtin");
+const ma = if (builtin.os.tag == .windows) @import("c/miniaudio_win.zig") else @import("c/miniaudio_linux.zig");
+const audio_pref = @import("audio_pref.zig");
 
 /// 每乐器每个分段发送给 VSTi 的事件上限（超出的丢弃；宁可丢事件也不分配）
 pub const vsti_batch_max = 256;
@@ -477,6 +482,9 @@ fn setDefaultEqBands(r: []eq.BandParams) void {
 
 pub const Engine = struct {
     device: ma.ma_device = undefined,
+    /// 显式选后端时用（`.auto` 走 `ma_device_init(null, …)`，不用它）
+    ctx: ma.ma_context = undefined,
+    ctx_ok: bool = false,
     params: *Params,
     allocator: std.mem.Allocator = undefined,
     sample_rate: u32 = 0,
@@ -567,7 +575,18 @@ pub const Engine = struct {
         config.dataCallback = dataCallback;
         config.pUserData = self; // 引擎实例（回调里取 params + synths）
 
-        if (ma.ma_device_init(null, &config, &self.device) != ma.MA_SUCCESS) {
+        // 后端：显式选中时建 context（失败自动回退默认）；`.auto` 走 null 让 miniaudio 自己挑
+        var ctx_ptr: ?*ma.ma_context = null;
+        if (audio_pref.maBackend(audio_pref.current)) |mb| {
+            var backends = [_]c_uint{mb};
+            if (ma.ma_context_init(&backends, 1, null, &self.ctx) == ma.MA_SUCCESS) {
+                self.ctx_ok = true;
+                ctx_ptr = &self.ctx;
+            } else {
+                std.debug.print("[audio] 后端 {s} 不可用 → 回退自动\n", .{audio_pref.label(audio_pref.current)});
+            }
+        }
+        if (ma.ma_device_init(ctx_ptr, &config, &self.device) != ma.MA_SUCCESS) {
             return error.AudioInitFailed;
         }
         self.sample_rate = self.device.sampleRate;
@@ -596,6 +615,10 @@ pub const Engine = struct {
             _ = ma.ma_device_stop(&self.device);
             ma.ma_device_uninit(&self.device);
             self.initialized = false;
+        }
+        if (self.ctx_ok) {
+            _ = ma.ma_context_uninit(&self.ctx);
+            self.ctx_ok = false;
         }
         self.freeStorage();
     }
@@ -2732,7 +2755,7 @@ test "audio: VSTi 声像平衡——等功率（0.5 原样、两端满偏单侧�
 
 test "audio: VSTi 声像——插件输出按平衡叠加（全左/全右/居中能量分配）" {
     const alloc = std.testing.allocator;
-    const dll_z = alloc.dupeSentinel(u8, "libs/zig-vst3/zig-out/bin/zig_vst3_sine_synth.dll", 0) catch return;
+    const dll_z = alloc.dupeSentinel(u8, "zig-out/bin/zig_vst3_sine_synth.dll", 0) catch return;
     defer alloc.free(dll_z);
 
     const measure = struct {

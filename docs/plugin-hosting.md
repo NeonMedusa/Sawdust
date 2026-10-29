@@ -230,3 +230,50 @@
 - zig-vst3（Zig 绑定，MIT，Zig 0.16）：https://github.com/joshburgess/zig-vst3
 - IPlugView 头（GUI 挂载）：https://github.com/steinbergmedia/vst3_pluginterfaces/blob/master/gui/iplugview.h
 - 最小宿主参考：https://stackoverflow.com/questions/55640822/how-to-instantiate-a-vst3-plugin-in-code-for-a-vst3-host-app
+
+## 插件路径自愈（跨平台工程的关键）
+
+工程里存的是**插件路径 + 类 CID**。把 Windows 上做的工程拿到 Linux 打开时，路径（`C:\Program Files\Common Files\VST3\X.vst3`）
+在 Linux 上必然不存在 → 槽位进入 `load_failed`（界面上"插件加载失败——将自动重试；文件恢复后自动加载"）。
+
+`App.reboundFailedPluginSlots()` 负责把它们**重绑到本机同款插件**，触发时机：
+- 插件扫描完成后；
+- 每 240 帧的后台巡检（`main` 里）。
+
+匹配规则（**从精确到兜底**）：
+1. **CID 匹配**：`findLiveEntryFor()` —— 缓存里找 class CID 相同、角色匹配（乐器/效果）、且 `dll` 真存在的条目；
+2. **包名兜底**：`findEntryByBundleName()` —— 取失败槽路径的**文件名**（`Vital.vst3`），
+   在缓存里找同名、角色匹配、文件存在的条目。**只在唯一命中时生效**（同名多份就不猜）。
+
+覆盖范围（三处都要扫，之前缺了第三处）：
+- 混音通道的效果槽；
+- 乐器槽；
+- **鼓组 VST3 层**（`instrument.kit.pads[].layers[]`）。
+
+> 教训：只做 CID 匹配不够——老工程可能没存 CID（`plugin_cid` 为空），跨平台工程还多一层
+> "路径完全不同"的问题。**包名兜底是必要的第二条腿**。
+### 自愈的两个坑（2026-10 实测）
+
+1. **扫描缓存的 `path` 曾经是"模块文件"而不是"包根"**
+   `startPluginScan` 把候选的 `dll`（`…/Vital.vst3/Contents/x86_64-linux/Vital.so`）当根传给 worker，
+   worker 再 `discover(该文件)` → 缓存里的 `path` 就变成了 `.so` 文件。
+   → 自愈的"包名兜底"拿 `Vital.so` 去比工程的 `Vital.vst3`，**永远不匹配**。
+   修法：扫描队列改存 **`c.path`（包根）**；兜底比较改成比 **名字主干**（`Vital`），
+   这样包根/模块两种形态都能对上，旧缓存也兼容。
+2. **老工程可能没有 CID**
+   现版本保存**会**写 `plugin_cid`（乐器/鼓组层/效果槽三处，见 `app.zig` 的 `plugin_cid = …`），
+   但更早版本没写 → 这类工程只能靠"包名兜底"。所以**两级匹配（CID → 包名）缺一不可**。
+### 按包名兜底的重定位：**静默应用**（确认窗已移除）
+
+- **为什么不再弹窗**：确认窗的前提是“已经有扫描结果”。但真实场景里，用户打开工程时往往**还没扫过插件**，
+  此时候选集为空 → 弹窗永远不会出现；等用户自己扫完，包名兜底已经能直接命中 → 弹窗又已经错过了时机。
+  一个永远不会在该出现时出现的确认窗，就是纯粹的代码负担。
+- **现在的行为**：后台巡检（约每 2 秒）与扫描完成时，
+  `reboundFailedPluginSlots(io)` 按 **CID 精确 → 包名兜底** 依次尝试，命中就静默改路径并弹 toast
+  「已自动重新定位 N 个插件」；都没命中就保持失败态，用户可在插件管理器里手动定位。
+- **为何安全**：
+  1. 只在“原路径真的消失”且“候选文件真的在磁盘上”时才改（存在性门槛，防两个坏文件来回跳）；
+  2. **保留原 CID**：换路径后再失败仍能继续按身份匹配；
+  3. 改动计入撤销历史（`commitHistory("重新定位插件")`）。
+- 已删除：`ModalKind.heal_plugin_guess`、`App.heal_guess_count`、`backupProjectFile()`、`drawHealGuess()`、
+  `reboundFailedPluginSlotsEx(io, apply)` 的“只统计不改动”分支。
