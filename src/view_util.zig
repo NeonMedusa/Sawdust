@@ -633,9 +633,9 @@ pub fn snapSelectorMenu(ui: *Ui, btn_x: i32, below_y: i32, snap: *i32, open: *bo
     return titleSelectorMenu(ui, btn_x, below_y, &items, snap, open, skip_close, 96);
 }
 
-/// 滚轮增量 → 像素（24px/格）
+/// 滚轮增量 → 像素（30px/格；全局列表与时间轴共用同一速度）
 pub fn scrollDelta(ui: *Ui) i32 {
-    return ui.wheel * 24;
+    return ui.wheel * 30;
 }
 
 /// — 视角跟随（播放列表 / 钢琴卷帘共用）—

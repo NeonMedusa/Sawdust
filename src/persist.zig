@@ -658,12 +658,14 @@ fn binReadValue(comptime T: type, r: *BinReader, a: std.mem.Allocator) !T {
         .bool => return (try r.byte()) != 0,
         .int => |info| {
             const uv = try r.varint();
+            // 溢出 = 字节流已错位（通常为读写不对称或文件损坏）→ 友好报错，
+            // 不用 `@intCast`（那会 panic："integer does not fit in destination type"）
             if (info.signedness == .signed) {
                 const zz: i64 = @bitCast(uv);
                 const x: i64 = (zz >> 1) ^ -(zz & 1);
-                return @intCast(x);
+                return std.math.cast(T, x) orelse error.CorruptProject;
             }
-            return @intCast(uv);
+            return std.math.cast(T, uv) orelse error.CorruptProject;
         },
         .float => |f| {
             if (f.bits != 32) @compileError("bin: only f32 floats supported");
@@ -686,7 +688,7 @@ fn binReadValue(comptime T: type, r: *BinReader, a: std.mem.Allocator) !T {
             for (&out) |*e| e.* = try binReadValue(arr.child, r, a);
             return out;
         },
-        .@"enum" => return @fromBackingInt(@intCast(try r.varint())),
+        .@"enum" => return @fromBackingInt(std.math.cast(@typeInfo(T).@"enum".tag_type orelse u32, try r.varint()) orelse error.CorruptProject),
         .@"struct" => |s| {
             var out: T = undefined;
             inline for (s.field_names, s.field_types, s.field_attrs) |fname, FType, attrs| {
@@ -1488,4 +1490,39 @@ test "persist: v5 旧布局兼容读（v5 之后追加的字段取默认值）" 
     try std.testing.expectEqual(@as(i32, 0), parsed.value.clips[0].trim_start);
     try std.testing.expectEqual(@as(i32, -1), parsed.value.clips[1].audio_style);
     try std.testing.expectEqual(@as(usize, 0), parsed.value.audio_styles.len);
+}
+
+test "persist: 二进制往返——SavedDrumLayer 的 plugin_state（版本门控 + b64）" {
+    // 回归：写端在"版本门控分支"里走 b64、读端曾漏判 → 字节流错位 →
+    // 含 VST3 鼓组层的工程重开时 @intCast 崩溃（见 docs/pitfalls.md）。
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const layer = SavedDrumLayer{
+        .kind = 2,
+        .gain = 0.75,
+        .plugin_path = "C:/v/Vital.vst3",
+        .plugin_cid = "00112233445566778899aabbccddeeff",
+        .plugin_state = "AAECAwQFBgc=",
+        .plugin_state_ctrl = "",
+    };
+    var w = BinWriter{ .a = a };
+    defer w.buf.deinit(a);
+    try binWriteValue(SavedDrumLayer, &w, layer);
+
+    var r = BinReader{ .data = w.buf.items };
+    const got = try binReadValue(SavedDrumLayer, &r, a);
+    try std.testing.expectEqual(w.buf.items.len, r.pos); // 不多读、不少读
+    try std.testing.expectEqualStrings(layer.plugin_path, got.plugin_path);
+    try std.testing.expectEqualStrings(layer.plugin_cid, got.plugin_cid);
+    try std.testing.expectEqualStrings(layer.plugin_state, got.plugin_state);
+    try std.testing.expectEqualStrings(layer.plugin_state_ctrl, got.plugin_state_ctrl);
+    try std.testing.expectApproxEqAbs(layer.gain, got.gain, 1e-6);
+}
+
+test "persist: 整数溢出 → error.CorruptProject（不再 panic）" {
+    // 300 的 varint = 0xAC 0x02（能装进 u64，但装不进 u8）；旧代码 @intCast 会 panic
+    var r = BinReader{ .data = &[_]u8{ 0xAC, 0x02 } };
+    try std.testing.expectError(error.CorruptProject, binReadValue(u8, &r, std.testing.allocator));
 }

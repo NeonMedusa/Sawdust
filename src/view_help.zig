@@ -35,6 +35,7 @@ const rows = [_]Row{
     .{ .sec = false, .key = "Delete", .desc = "删除选中内容" },
     .{ .sec = false, .key = "Ctrl + B", .desc = "克隆选中内容" },
     .{ .sec = false, .key = "Ctrl + C / Ctrl + V", .desc = "复制 / 粘贴到鼠标位置" },
+    .{ .sec = false, .key = "Ctrl + X", .desc = "剪切选中内容" },
     .{ .sec = false, .key = "Ctrl + ↑ / ↓", .desc = "音符上 / 下移动八度" },
     .{ .sec = false, .key = "Shift + ↑ / ↓", .desc = "音符上 / 下移动半音" },
     .{ .sec = false, .key = "Ctrl / Shift + ← / →", .desc = "左 / 右移动一小节 / 网格" },
@@ -42,6 +43,7 @@ const rows = [_]Row{
     .{ .sec = true, .key = "视图", .desc = "" },
     .{ .sec = false, .key = "Ctrl + 滚轮", .desc = "横向缩放" },
     .{ .sec = false, .key = "Shift + 滚轮", .desc = "纵向缩放" },
+    .{ .sec = false, .key = "Ctrl + 单击横向滚动条", .desc = "跳转到点击位置" },
 
     .{ .sec = true, .key = "关于", .desc = "" },
     .{ .sec = false, .key = "开源许可", .desc = "免费开源（MIT）" },

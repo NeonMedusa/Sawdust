@@ -164,6 +164,8 @@ pub fn draw(
     }
 
     // 轨道头第二行：读数（拖动中优先 → 悬停 → “—”）；声像模式显示方向标签
+    // 悬停列（整列提亮用；与“改值按列”同一语义）
+    const hover_step: ?i32 = if (hover_idx) |idx| app.notes.items[idx].step else null;
     {
         var buf: [32]u8 = undefined;
         const text: []const u8 = blk: {
@@ -257,6 +259,11 @@ pub fn draw(
             const lo = @min(tip_y, baseline);
             const hi = @max(tip_y, baseline);
             ui.renderer.fillRect(bx, lo, bar_w, @max(1, hi - lo + 1), ui.theme.ghost_note);
+            // 幽灵音符也给一个末端方块（**与本乐器同尺寸**、颜色偏暗的灰）：
+            // 目的 = 能看出**其它乐器**的力度/声像，而不是一条条叠在一起的白条（用户要求）。
+            const gdot: i32 = @max(bar_w, @divTrunc(bar_w * 3, 2));
+            const gcol = r_mod.rgb(150, 150, 150);
+            ui.renderer.fillRect(bx + @divTrunc(bar_w - gdot, 2), tip_y - @divTrunc(gdot, 2), gdot, gdot, gcol);
         }
         // 收集可见柱条（当前样式 + 乐器；x 在视野内），按柱高降序排序
         const LaneBar = struct { idx: usize, len_px: i32, selected: bool };
@@ -278,13 +285,18 @@ pub fn draw(
             }
         }.less);
         const white = r_mod.rgb(240, 250, 244);
+        // 末端方块边长：比柱宽大 1.5 倍（**以原方块中心为锚点**放大：横竖各偏移 (dot-bar_w)/2）
+        const dot: i32 = @max(bar_w, @divTrunc(bar_w * 3, 2));
         // ① 柱体：未选中组 → 选中组
         for ([_]bool{ false, true }) |want_selected| {
             for (bars[0..n]) |b| {
                 if (b.selected != want_selected) continue;
                 const nt = app.notes.items[b.idx];
                 const v = noteValue(nt, mode);
-                const col = if (nt.selected) ui.theme.note_selected else ui.theme.waveform;
+                // 悬停列**提亮**（比白描边简单：不做额外 pass、也不会盖住任何东西）
+                const hovered_col = hover_step != null and nt.step == hover_step.?;
+                const base = if (nt.selected) ui.theme.note_selected else ui.theme.waveform;
+                const col = if (hovered_col) brighten(base) else base;
                 const bx = barX(nt.step, track_x, step_ws, scroll_s);
                 const tip_y: i32 = if (mode == .velocity)
                     top + avail - velBarH(v, avail)
@@ -308,7 +320,11 @@ pub fn draw(
                 top + avail - velBarH(v, avail)
             else
                 top + @divTrunc(avail, 2) - panBarH(v, avail);
-            ui.renderer.fillRect(bx, tip_y - @divTrunc(bar_w, 2), bar_w, bar_w, white);
+            // 选中的音符用**更深的橙黄**（同 `theme.note_selected` 色系），未选中仍近白
+            // 悬停列：方块也跟着提亮（与柱体同一套 `brighten`）
+            const dbase = if (b.selected) r_mod.rgb(228, 150, 40) else white;
+            const dcol = if (hover_step != null and nt.step == hover_step.?) brighten(dbase) else dbase;
+            ui.renderer.fillRect(bx + @divTrunc(bar_w - dot, 2), tip_y - @divTrunc(dot, 2), dot, dot, dcol);
         }
         // 窗外暗化（见顶部 `dim_x`）：内容之后盖 scrim；右缘分界线 1px
         if (dim_x) |dx| {
@@ -319,24 +335,6 @@ pub fn draw(
                 ui.renderer.fillRect(s0, y, track_x + track_w - s0, h, scrim);
             }
             if (dx[1] >= track_x and dx[1] <= track_x + track_w) ui.renderer.vline(dx[1], y, h, ui.theme.text_dim);
-        }
-        // 悬停：白描边（最后画；方块已在上层，描边只绕柱体轮廓）
-        if (hover_idx) |hi_idx| {
-            const nt = app.notes.items[hi_idx];
-            const v = noteValue(nt, mode);
-            const bx = barX(nt.step, track_x, step_ws, scroll_s);
-            const tip_y: i32 = if (mode == .velocity)
-                top + avail - velBarH(v, avail)
-            else
-                top + @divTrunc(avail, 2) - panBarH(v, avail);
-            const baseline: i32 = if (mode == .velocity)
-                top + avail
-            else
-                top + @divTrunc(avail, 2);
-            const lo = @min(tip_y, baseline);
-            const hi = @max(tip_y, baseline);
-            ui.renderer.strokeRect(bx, lo, bar_w, @max(1, hi - lo + 1), ui.theme.text);
-            ui.renderer.fillRect(bx, tip_y - @divTrunc(bar_w, 2), bar_w, bar_w, white);
         }
     }
 
@@ -458,6 +456,22 @@ fn barX(step: i32, lane_x: i32, step_ws: f32, scroll_s: f32) i32 {
 }
 
 /// 命中柱条：返回音符下标（按 x 覆盖范围 + y 在轨道内；优先最近的 x）
+/// 力度/声像编辑区的命中半宽（≈1.5cm @96dpi；**与缩放无关**）。
+/// 命中与画笔（`hitNoteIndex` / `paintAt`）必须用同一个值——否则会出现
+/// “hover 能选中、点击/拖动却改不到”的不一致（实测 bug）。
+const lane_hit_tol: i32 = 30;
+
+/// 颜色提亮（悬停用）：各通道向 255 靠拢 30%，保留色相
+fn brighten(c: r_mod.Color) r_mod.Color {
+    const r: u32 = (c & 0xFF) * 13 / 10;
+    const g: u32 = ((c >> 8) & 0xFF) * 13 / 10;
+    const b: u32 = ((c >> 16) & 0xFF) * 13 / 10;
+    const rc: u32 = @min(255, r);
+    const gc: u32 = @min(255, g);
+    const bc: u32 = @min(255, b);
+    return (c & 0xFF000000) | (bc << 16) | (gc << 8) | rc;
+}
+
 fn hitNoteIndex(
     app: *App,
     mouse_x: i32,
@@ -473,11 +487,12 @@ fn hitNoteIndex(
     if (mouse_y < y or mouse_y > y + h) return null;
     var best: ?usize = null;
     var best_dx: i32 = std.math.maxInt(i32);
+    // 命中半宽见 `lane_hit_tol`（≈1.5cm；与缩放无关）。
+    // 区间重叠时由下面的 `dx < best_dx` 取“离鼠标最近的那一列”。
     for (app.notes.items, 0..) |nt, i| {
         if (nt.pattern != pattern or nt.instrument != app.sel.instrument) continue;
         const bx = barX(nt.step, track_x, step_ws, scroll_s);
-        // 命中范围放宽 2px（柱条窄时好点中）
-        if (mouse_x >= bx - 2 and mouse_x < bx + bar_w + 2) {
+        if (mouse_x >= bx - lane_hit_tol and mouse_x < bx + bar_w + lane_hit_tol) {
             const dx: i32 = @intCast(@abs(mouse_x - (bx + @divTrunc(bar_w, 2))));
             var take = dx < best_dx;
             if (!take and dx == best_dx) {
@@ -530,16 +545,30 @@ fn paintAt(
     mode: NoteLaneMode,
     selected_only: bool,
 ) bool {
+    // ① 先找**离鼠标最近的那一列**（1cm 内可能有多列，一次只动一列）
+    var best_step: ?i32 = null;
+    var best_dx: i32 = std.math.maxInt(i32);
+    for (app.notes.items) |*nt| {
+        if (nt.pattern != pattern or nt.instrument != app.sel.instrument) continue;
+        if (selected_only and !nt.selected) continue;
+        const bx = barX(nt.step, track_x, step_ws, scroll_s);
+        if (mouse_x < bx - lane_hit_tol or mouse_x >= bx + bar_w + lane_hit_tol) continue;
+        const dx: i32 = @intCast(@abs(mouse_x - (bx + @divTrunc(bar_w, 2))));
+        if (dx < best_dx) {
+            best_dx = dx;
+            best_step = nt.step;
+        }
+    }
+    const step = best_step orelse return false;
+    // ② 该列上的**所有音符**（同 step，可能多个音高）都改成目标值（原设计：一列一起改）
     var changed = false;
     for (app.notes.items) |*nt| {
         if (nt.pattern != pattern or nt.instrument != app.sel.instrument) continue;
-        if (selected_only and !nt.selected) continue; // 只编辑选中的
-        const bx = barX(nt.step, track_x, step_ws, scroll_s);
-        if (mouse_x >= bx - 2 and mouse_x < bx + bar_w + 2) {
-            if (noteValue(nt.*, mode) == target) continue; // 已是目标值：跳过
-            setNoteValue(nt, mode, target);
-            changed = true;
-        }
+        if (selected_only and !nt.selected) continue;
+        if (nt.step != step) continue;
+        if (noteValue(nt.*, mode) == target) continue; // 已是目标值
+        setNoteValue(nt, mode, target);
+        changed = true;
     }
     return changed;
 }

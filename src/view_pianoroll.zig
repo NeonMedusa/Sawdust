@@ -150,6 +150,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 nmini += 1;
             }
         }
+        // 防误触：滑块外单击 / 滚动条上滚轮 = 移动"一个当前网格"（Ctrl+单击才是直接定位）
+        ui.scrollbar_nudge = model.snapSteps(app.piano.snap) * util.piano_step_w;
+        ui.scrollbar_target = &app.piano.scroll_x_target; // 步进走补间（拖动仍直接写 scroll_x）
         _ = ui.scrollbarTimelineEx(10, x + 1, hsb_y, w - 2, ruler_h, &app.piano.scroll_x, min_content, &app.piano.zoom, view_w, dyn_zoom_min, 8.0, bars_right < util.overhang_map_limit, mini_buf[0..nmini]);
     }
     ui.renderer.hline(x + 1, ruler_y, w - 2, ui.theme.panel_border);
@@ -755,7 +758,16 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 判定：本帧在音符区按下 + Ctrl（不要求命中音符——命中音符时也优先框选，
     // 否则“从音符上开始拖框”会变成拖动该音符）
     // **按行框选**：起点在**琴键列**时切换成“整行选择”（垂直拖选音高行、水平不限）
-    if (ui.mods_ctrl and ui.mouse_pressed and ui.active_id == 0) {
+    // Ctrl+Shift+**单击音符** = 切换选中（未选中 → 加入；已选中 → 剔除）——
+    // 本次按下不再启动框选（否则“想剔除一个音符”会变成拉一个空框）。
+    var toggle_consumed = false;
+    if (ui.mods_ctrl and ui.mods_shift and ui.mouse_pressed and ui.active_id == 0 and in_lane) {
+        if (model.topmostNoteAt(app.notes.items, pattern, app.sel.instrument, pitch_i, step_i)) |ni| {
+            app.notes.items[ni].selected = !app.notes.items[ni].selected;
+            toggle_consumed = true;
+        }
+    }
+    if (ui.mods_ctrl and ui.mouse_pressed and ui.active_id == 0 and !toggle_consumed) {
         const in_keys = ui.hitRect(keys_x, lane_y, util.piano_header_w, lane_h);
         if (in_lane or in_keys) {
             app.piano.marquee_active = true;
@@ -765,13 +777,22 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             app.piano.row_marquee = in_keys;
             app.piano.row_marquee_pitch0 = pitch_i;
             ui.active_id = 7300; // 框选手势（归本视图）
-            if (!app.piano.marquee_add) app.clearNoteSelection();
+            if (!app.piano.marquee_add) {
+                app.clearNoteSelection();
+            } else {
+                // 追加模式：拍快照（每帧用“快照 ∪ 框内”重建 → 框缩回时自动回退）
+                app.allocator.free(app.piano.marquee_snap);
+                app.piano.marquee_snap = app.allocator.alloc(bool, app.notes.items.len) catch &.{};
+                for (app.notes.items, 0..) |nn, kk| {
+                    if (kk < app.piano.marquee_snap.len) app.piano.marquee_snap[kk] = nn.selected;
+                }
+            }
         }
     }
+    var marquee_release = false;
     if (ui.active_id == 7300 and !ui.mouse_down) {
         ui.active_id = 0;
-        app.piano.marquee_active = false;
-        app.piano.row_marquee = false;
+        marquee_release = true; // 松手这一帧还要再应用一次（追加模式只在此刻生效）
     }
     if (app.piano.marquee_active) {
         // 实时更新选区（每帧重算：框内 = 选中）
@@ -779,8 +800,13 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         const mx1 = @max(app.piano.marquee_x0, ui.mouse_x);
         const my0 = @min(app.piano.marquee_y0, ui.mouse_y);
         const my1 = @max(app.piano.marquee_y0, ui.mouse_y);
-        if (!app.piano.marquee_add) app.clearNoteSelection();
-        for (app.notes.items) |*n| {
+        // 每帧重建选区：追加模式 = 快照 ∪ 框内（框缩回时自动回退）；否则 = 框内
+        for (app.notes.items, 0..) |*n, ni| {
+            if (app.piano.marquee_add) {
+                n.selected = if (ni < app.piano.marquee_snap.len) app.piano.marquee_snap[ni] else false;
+            } else {
+                n.selected = false; // 替换模式：每帧清空后按框内重新置位
+            }
             if (n.pattern != pattern or n.instrument != app.sel.instrument) continue;
             if (app.piano.row_marquee) {
                 // 按行：音高在起始/当前行之间 → 选中（**水平不限**）
@@ -797,6 +823,13 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 n.selected = true;
             }
         }
+    }
+    // 松手：应用完这一帧后再清手势状态（追加模式靠这一帧生效）
+    if (marquee_release) {
+        app.piano.marquee_active = false;
+        app.piano.row_marquee = false;
+        app.allocator.free(app.piano.marquee_snap);
+        app.piano.marquee_snap = &.{};
     }
 
     // 命中音符（下标 + 命中模式：中部 / 左缘 / 右缘，边缘区 8px）
@@ -843,7 +876,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // （按住即发声，松开琴键/点击后自然释音）
 
     // 右键：删除音符（按下或拖动划过）
+    // **点在空白处**（没命中音符）→ 取消选区（与左键点空白的语义一致）
     if (!menu_click and ui.mouse_right_pressed and ui.hitRect(main_x, lane_y, main_w, lane_h)) {
+        if (note_hit == null) app.clearNoteSelection();
         app.playlist.erase_drag = true;
     }
     if (app.playlist.erase_drag) {
@@ -1088,7 +1123,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     }
     // 中键拖动中：屏蔽滚轮（含 Ctrl/Shift 缩放）——缩放会让锚定比例失准、
     // 拖动跟随抽动（用户约定：拖动期间只平移，不缩放）
-    if (!app.piano.nav_active and !ui.wheel_alt and ui.hitRect(main_x, lane_y, main_w, lane_h + splitter_h + editor_h)) {
+    // 网格区**和**纵向滚动条上都响应滚轮（鼠标停在滚动条上滚不动不符合直觉）
+    if (!app.piano.nav_active and !ui.wheel_alt and (ui.hitRect(main_x, lane_y, main_w, lane_h + splitter_h + editor_h) or ui.hitRect(sb_x, lane_y, ruler_h, lane_h))) {
         if (ui.wheel_ctrl) {
             // Ctrl+滚轮：横向缩放——**只更新补间目标**（滚轮离散，逐帧平滑逼近；
             // 补间块在本段之后；锚定用事件时的鼠标偏移，补间每一步都锚定）
@@ -1131,11 +1167,24 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             if (z_new > 0 and z_new != p.zoom) {
                 const vcw_now: i32 = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(view_w)) / p.zoom)));
                 const over: i32 = @max(0, p.scroll_x - @max(0, content_span - vcw_now)); // 悬空量保留
-                p.scroll_x = Ui.zoomAnchoredScrollX(p.scroll_x, view_w, p.zoom_anchor_off, p.zoom, z_new, content_span, content_span) + over;
+                p.scroll_x = Ui.zoomAnchoredScrollX(p.scroll_x, view_w, p.zoom_anchor_off, p.zoom, z_new, content_span, content_span, over);
                 p.zoom = z_new;
             }
         }
         p.zoom_anim_last = p.zoom;
+    }
+
+    // ── 横向滚动补间（滚动条单击/滚轮只写目标；拖动/载入直接改实体 → 采纳为目标不补间）──
+    {
+        const p = &app.piano;
+        if (p.scroll_x_anim_last != p.scroll_x) p.scroll_x_target = p.scroll_x;
+        if (p.scroll_x != p.scroll_x_target) {
+            const cur: f32 = @floatFromInt(p.scroll_x);
+            const tgt: f32 = @floatFromInt(p.scroll_x_target);
+            const nx: i32 = if (@abs(tgt - cur) <= 1.0) p.scroll_x_target else @intFromFloat(util.glideF32(cur, tgt, app.frame_dt_ns, 0.06));
+            p.scroll_x = @max(0, nx);
+        }
+        p.scroll_x_anim_last = p.scroll_x;
     }
     // ── 纵向补间（Shift+滚轮 = 音高行高；裸滚轮 = 纵向滚动；τ=0.03 同横向）──
     {

@@ -583,7 +583,7 @@ pub const Engine = struct {
                 self.ctx_ok = true;
                 ctx_ptr = &self.ctx;
             } else {
-                std.debug.print("[audio] 后端 {s} 不可用 → 回退自动\n", .{audio_pref.label(audio_pref.current)});
+                std.debug.print("[audio] 后端 {s} 不可用 -> 回退自动\n", .{audio_pref.label(audio_pref.current)});
             }
         }
         if (ma.ma_device_init(ctx_ptr, &config, &self.device) != ma.MA_SUCCESS) {
@@ -1219,15 +1219,6 @@ fn vstiNoteOff(engine: *Engine, i: usize, pitch: u8) void {
     vstiPush(engine, i, noteOffEvent(pitch));
 }
 
-/// VSTi：**全 128 音高**无条件 note-off（panic）。
-/// 与 `vstiAllOff`（仅活跃位图）的区别：state 恢复可能唤醒“快照里仍在发声”的
-/// 幽灵声部（不在位图中）——只能地毯式清；顺带擦除位图（重新对齐真实状态）。
-/// 事件量 128 ≤ `vsti_batch_max`（已为“段内真实事件 + panic”预留翻倍容量）。
-fn vstiPanic(engine: *Engine, i: usize) void {
-    var p: u16 = 0;
-    while (p < 128) : (p += 1) vstiNoteOff(engine, i, @intCast(p));
-}
-
 // ── 鼓组 VST3 层（每层一份事件批 + 位图；同乐器级 VSTi 惯例）──
 
 /// 鼓组 VST3 层：置位/清除发声位图
@@ -1330,7 +1321,7 @@ fn schedLogOn() bool {
 }
 
 fn handleGenChange(engine: *Engine, params: *Params, gen: u32, was_playing: bool) void {
-    if (schedLogOn()) std.debug.print("[gen] {d} → {d} stash={d} was_playing={}\n", .{ engine.stash_gen, gen, engine.stash_n, was_playing });
+    if (schedLogOn()) std.debug.print("[sched] gen {d} -> {d} stash={d} was_playing={}\n", .{ engine.stash_gen, gen, engine.stash_n, was_playing });
     engine.stash_n = 0;
     engine.stash_gen = gen;
     if (was_playing) {
@@ -1614,7 +1605,7 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
                 // 同批的 off 会把它们立刻关掉 → 实测「小节头/游标处第一个音不响」。
                 var offs: [128]ivstevents.Event = undefined;
                 for (&offs, 0..) |*e, p| e.* = noteOffEvent(@intCast(p));
-                for (0..128) |p| vstiActiveSet(engine, i, @intCast(p), false); // 位图清零（同 vstiPanic）
+                for (0..128) |p| vstiActiveSet(engine, i, @intCast(p), false); // 位图清零（panic 语义）
                 var tiny: [2]f32 = .{ 0, 0 };
                 pl.processInstrument(&tiny, 1, &offs, host_time);
             }
@@ -2040,7 +2031,7 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
     while (done < frames and si < engine.stash_n) {
         const ev = engine.stash[si];
         if (schedEventObsolete(ev, gen, edit_gen, rescan_from)) {
-            if (schedLogOn()) std.debug.print("[drop] step={d} kind={d} ev.gen={d} gen={d} edit={d}/{d}\n", .{ ev.step, @backingInt(ev.kind), ev.gen, gen, ev.edit_gen, edit_gen });
+            if (schedLogOn()) std.debug.print("[sched-drop] step={d} kind={d} ev.gen={d} gen={d} edit={d}/{d}\n", .{ ev.step, @backingInt(ev.kind), ev.gen, gen, ev.edit_gen, edit_gen });
             si += 1; // 作废（旧传输代 / 已被重发替换的旧编辑代）：丢弃，**不**释放声部
             continue;
         }
@@ -2876,7 +2867,7 @@ test "audio: VSTi panic——全 128 音高 note-off + 位图清零（state 恢�
     try std.testing.expect(engine.vsti_active_lo[0] != 0);
     try std.testing.expect(engine.vsti_active_hi[0] != 0);
     const before = engine.vsti_event_n[0];
-    vstiPanic(engine, 0);
+    for (0..128) |p| vstiNoteOff(engine, 0, @intCast(p)); // panic 式：全 128 无条件 off
     try std.testing.expectEqual(@as(u64, 0), engine.vsti_active_lo[0]); // 位图清零
     try std.testing.expectEqual(@as(u64, 0), engine.vsti_active_hi[0]);
     try std.testing.expectEqual(before + 128, engine.vsti_event_n[0]); // 全 128 无条件 off

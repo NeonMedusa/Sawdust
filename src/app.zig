@@ -466,8 +466,12 @@ pub const PlaylistState = struct {
     zoom_anchor_off: i32 = 0,
     /// 上一帧末 `zoom` 快照（检测“他处改变 zoom”→ 采纳为补间目标；<0 = 未初始化）
     zoom_anim_last: f32 = -1,
+    /// 横向滚动的补间目标（滚动条单击/滚轮写它；拖动直接写 `scroll_x`）
+    scroll_x_target: i32 = 0,
+    /// 上一帧的 `scroll_x`（他处改值 → 直接采纳，不补间）
+    scroll_x_anim_last: i32 = 0,
     /// 量化/吸附网格档位（`model.snap_denoms` 下标；**与钢琴卷帘独立**）
-    snap: i32 = 3, // 默认 1/8（`snap_denoms` 下标 3）
+    snap: i32 = 4, // 默认 1/16（`snap_denoms` 下标 4；最常用）
     /// 吸附网格下拉选单：展开中
     snap_menu_open: bool = false,
     /// 叠放轮换：上一次按下命中的片段（双击打开用它——第一次按下的那个；
@@ -514,6 +518,8 @@ pub const PlaylistState = struct {
     marquee_y0: i32 = 0,
     /// 框选追加（Ctrl+Shift）：按下时不取消旧选区
     marquee_add: bool = false,
+    /// 追加框选的选中快照（每帧重建选区 = 快照 ∪ 框内 → 框缩回时能正确回退）
+    marquee_snap: []bool = &.{},
     /// 批量拖动选中片段（拖动中）
     drag_batch: bool = false,
     /// 批量拖动按下时的鼠标步 / 轨道（快照基准）
@@ -566,6 +572,10 @@ pub const PianoState = struct {
     zoom_anchor_off: i32 = 0,
     /// 上一帧末 `zoom` 快照（检测“他处改变 zoom”→ 采纳为补间目标；<0 = 未初始化）
     zoom_anim_last: f32 = -1,
+    /// 横向滚动的补间目标（滚动条单击/滚轮写它；拖动直接写 `scroll_x`）
+    scroll_x_target: i32 = 0,
+    /// 上一帧的 `scroll_x`（他处改值 → 直接采纳，不补间）
+    scroll_x_anim_last: i32 = 0,
 
     // ── 中键拖动平移视口（音符网格区；抓画布：内容跟手）──
     nav_active: bool = false,
@@ -593,7 +603,7 @@ pub const PianoState = struct {
     last_note_pan: ?i32 = null,
 
     /// 量化/吸附网格档位（`model.snap_denoms` 下标；控制音符移动/拉伸对齐）
-    snap: i32 = 3, // 默认 1/8（`snap_denoms` 下标 3）
+    snap: i32 = 4, // 默认 1/16（`snap_denoms` 下标 4；最常用）
     /// 吸附网格下拉选单：展开中
     snap_menu_open: bool = false,
     /// 乐器选择下拉选单：展开中（标题栏、网格选单右侧；与机架窗口的选单独立）
@@ -613,6 +623,8 @@ pub const PianoState = struct {
     marquee_y0: i32 = 0,
     /// 框选追加（Ctrl+Shift）：按下时不取消旧选区
     marquee_add: bool = false,
+    /// 追加框选的选中快照（每帧重建选区 = 快照 ∪ 框内 → 框缩回时能正确回退）
+    marquee_snap: []bool = &.{},
     /// 批量拖动选中音符（拖动中；`drag_note` 为 null 时看这个）
     drag_batch: bool = false,
     /// 批量拖动按下时的鼠标内容步 / 音高（快照基准）
@@ -1176,7 +1188,7 @@ pub const HelpWindow = struct {
     x: i32 = 420,
     y: i32 = 110,
     w: i32 = 500,
-    h: i32 = 510, // 刚好等于内容高度（17 行×21px + 4 节标题间距 + 边距；无滚动——冗余会让底部空一截）
+    h: i32 = 556, // 刚好等于内容高度（19 行×21px + 4 节标题间距 + 边距；无滚动——冗余会让底部空一截）
     /// Z 序（越大越靠上；点窗口即置顶）——见 `RackState.z` 注释
     z: i32 = 26,
     grab_dx: i32 = 0,

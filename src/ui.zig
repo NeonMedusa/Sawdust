@@ -128,6 +128,11 @@ pub const Ui = struct {
     mouse_middle_down: bool = false, // 中键按住
     mouse_double: bool = false, // 本帧双击（左键）
     wheel: i32 = 0,
+    /// 横向滚动条：“一格”对应的滚动量（像素；0 = 旧行为：单击直接定位）。
+    /// 由调用方每帧设置（= 当前网格的像素宽）；只影响**滑块外**的单击与滚轮。
+    scrollbar_nudge: i32 = 0,
+    /// 步进的目标指针（非 null → 单击/滚轮写它，由视图每帧补间逼近；拖动仍直接写实体）
+    scrollbar_target: ?*i32 = null,
     /// 本帧滚轮是否按着 Ctrl（横向缩放）
     wheel_ctrl: bool = false,
     /// 本帧滚轮是否按着 Shift（纵向缩放）
@@ -1023,7 +1028,7 @@ pub const Ui = struct {
     /// - `span`：**内容跨度**（最右内容 + 留白，0 = 不限制）——右边缘不超过
     ///   `span`（即视图不留在“内容右侧的空白区”里）；缩到极限时上界为 0 → 自动贴左。
     ///   否则：曾把时间轴往右拉过（content_w 被拉大）时，缩小后视图会留在右边看空白。
-    pub fn zoomAnchoredScrollX(scroll: i32, view_w: i32, mouse_off: i32, old_zoom: f32, new_zoom: f32, content_w: i32, span: i32) i32 {
+    pub fn zoomAnchoredScrollX(scroll: i32, view_w: i32, mouse_off: i32, old_zoom: f32, new_zoom: f32, content_w: i32, span: i32, over: i32) i32 {
         // 防零下限只防“零/负”——**不能用 0.01**：时间轴超 ~12 万像素（几百小节）后
         // 合法缩放会跌破 0.01，旧下限会让锚定公式用错 zoom → 滑块位置/长度跳变（实测）
         const oz = @max(1e-9, old_zoom);
@@ -1035,14 +1040,16 @@ pub const Ui = struct {
         var cw = @max(@as(f32, @floatFromInt(content_w)), view_cw_new);
         // 内容跨度限制：视图右边缘不越过 span（留白区只留 3 小节用量）
         if (span > 0) cw = @min(cw, @max(@as(f32, @floatFromInt(span)), view_cw_new));
-        const max_scroll = @max(0, cw - view_cw_new);
+        // 上界 = 内容末尾 − 视口，**再加上缩放前已有的悬空量**：否则悬空状态下锚定值被钳回内容末尾
+        // （表现为“以最右边的内容为锚点”，实测 bug）。
+        const max_scroll: f32 = @max(0, cw - view_cw_new) + @as(f32, @floatFromInt(@max(0, over)));
         return @intFromFloat(std.math.clamp(ns, 0, max_scroll));
     }
 
     test "ui: zoomAnchoredScrollX——深缩放（zoom<0.01）锚定精确（几百小节跳变回归）" {
         // 时间轴 30 万像素（≈1560 小节）时 dyn_zoom_min≈0.004：
         // 旧版 @max(0.01) 下限会让 0.02→0.008 的锚定算出 100000（错）——正确为 55000
-        const ns = Ui.zoomAnchoredScrollX(100000, 1200, 600, 0.02, 0.008, 300000, 300000);
+        const ns = Ui.zoomAnchoredScrollX(100000, 1200, 600, 0.02, 0.008, 300000, 300000, 0);
         try std.testing.expectEqual(@as(i32, 55000), ns);
     }
 
@@ -1083,13 +1090,13 @@ pub const Ui = struct {
     test "ui: zoomAnchoredScrollX——横向缩放锚定鼠标下的内容" {
         // 放大：鼠标处内容停在鼠标处
         // view=380, mouse_off=100, 1.0→2.0, scroll=0 → cx=100 → ns=100-50=50
-        try std.testing.expectEqual(@as(i32, 50), Ui.zoomAnchoredScrollX(0, 380, 100, 1.0, 2.0, 400, 0));
+        try std.testing.expectEqual(@as(i32, 50), Ui.zoomAnchoredScrollX(0, 380, 100, 1.0, 2.0, 400, 0, 0));
         // 缩小：1/2 → 鼠标处内容仍在鼠标处（scroll=50, cx=50+50=100 → ns=100-100=0）
-        try std.testing.expectEqual(@as(i32, 0), Ui.zoomAnchoredScrollX(50, 380, 100, 2.0, 1.0, 400, 0));
+        try std.testing.expectEqual(@as(i32, 0), Ui.zoomAnchoredScrollX(50, 380, 100, 2.0, 1.0, 400, 0, 0));
         // 缩小到负值 → 钳到 0
-        try std.testing.expectEqual(@as(i32, 0), Ui.zoomAnchoredScrollX(0, 380, 100, 1.0, 0.5, 400, 0));
+        try std.testing.expectEqual(@as(i32, 0), Ui.zoomAnchoredScrollX(0, 380, 100, 1.0, 0.5, 400, 0, 0));
         // 放大超出内容右端 → 钳到 max_scroll（content 400、view_cw_new=380/2=190 → 210）
-        try std.testing.expectEqual(@as(i32, 210), Ui.zoomAnchoredScrollX(210, 380, 300, 1.0, 2.0, 400, 0));
+        try std.testing.expectEqual(@as(i32, 210), Ui.zoomAnchoredScrollX(210, 380, 300, 1.0, 2.0, 400, 0, 0));
     }
 
     test "ui: zoomAnchoredScrollX——span 限制（缩小后不留在内容右侧空白）" {
@@ -1097,13 +1104,13 @@ pub const Ui = struct {
         // 缩小（1.0 → 0.1）：view_cw_new = 3800
         // 无 span 限制：cw = max(5000, 3800) = 5000 → 仍可停在右侧
         // 有 span=600：cw = min(5000, max(600, 3800)) = 3800 → max_scroll = 0（拉回左侧）
-        const no_span = Ui.zoomAnchoredScrollX(3000, 380, 0, 1.0, 0.1, 5000, 0);
+        const no_span = Ui.zoomAnchoredScrollX(3000, 380, 0, 1.0, 0.1, 5000, 0, 0);
         try std.testing.expect(no_span > 0);
-        const with_span = Ui.zoomAnchoredScrollX(3000, 380, 0, 1.0, 0.1, 5000, 600);
+        const with_span = Ui.zoomAnchoredScrollX(3000, 380, 0, 1.0, 0.1, 5000, 600, 0);
         try std.testing.expectEqual(@as(i32, 0), with_span);
 
         // span 很大（内容确实超一屏）→ 限制不生效（可正常右滚）
-        const wide = Ui.zoomAnchoredScrollX(3000, 380, 0, 1.0, 1.0, 5000, 4800);
+        const wide = Ui.zoomAnchoredScrollX(3000, 380, 0, 1.0, 1.0, 5000, 4800, 0);
         try std.testing.expectEqual(@as(i32, 3000), wide);
     }
 
@@ -1424,6 +1431,21 @@ pub const Ui = struct {
 
         var changed = false;
         const hovered = self.hit(x, y, w, h);
+        // 滚轮：上滚 = 左移一格，下滚 = 右移一格（`scrollbar_nudge` = 当前网格像素宽）
+        if (hovered and self.wheel != 0 and self.scrollbar_nudge > 0) {
+            const wtgt = self.scrollbar_target orelse scroll;
+            const wdir: i32 = if (self.wheel > 0) -1 else 1;
+            const wns: i32 = @intCast(std.math.clamp(
+                @as(i64, wtgt.*) + @as(i64, wdir) * @as(i64, self.scrollbar_nudge),
+                0,
+                @as(i64, cap),
+            ));
+            if (wns != wtgt.*) {
+                wtgt.* = wns;
+                changed = true;
+            }
+            self.wheel = 0; // 消费，避免主区再纵向滚动
+        }
         // 按下只在滑块的**可见部分**上生效（完全悬空 → 不可见 → 不响应）
         const in_thumb = hovered and vis_r > vis_l and self.mouse_x >= vis_l and self.mouse_x < vis_r;
         const on_left = in_thumb and self.mouse_x < vis_l + edge_zone;
@@ -1529,23 +1551,39 @@ pub const Ui = struct {
             }
             self.drag_mx0 = self.mouse_x; // 位移式基准（零位移恒等）
         } else if (hovered and self.mouse_pressed) {
-            // **点击小地图（滑块外）→ 点击的内容置于视口正中**（可以产生悬空；
-            // 唯一例外 = 左端：不允许左悬空 → 硬钳 0）。按住继续拖 = 滑块跟手。
-            const target_left = self.mouse_x - x;
-            const clicked = @divTrunc(@as(i64, target_left) * @max(1, cw_eff), w64); // 点击处的内容坐标
-            const ns64 = clicked - @divTrunc(@as(i64, view_cw), 2); // 视口中心对准点击处
-            const cap_eff: i64 = if (allow_overhang) cap else @max(0, cw_eff - view_cw); // 巨图模式不出图
-            const ns: i32 = @intCast(std.math.clamp(ns64, 0, cap_eff));
-            if (ns != scroll.*) {
-                scroll.* = ns;
-                changed = true;
+            // 防误触：**滑块外**的普通单击 = 朝鼠标方向移一格（防“想点空白却跳到远处”）；
+            // Ctrl+单击 = 旧行为（点击处对准视口中心，并可继续拖动）。
+            if (!self.mods_ctrl and self.scrollbar_nudge > 0) {
+                const ntgt = self.scrollbar_target orelse scroll;
+                const ndir: i32 = if (self.mouse_x < vis_l) -1 else 1;
+                const nns: i32 = @intCast(std.math.clamp(
+                    @as(i64, ntgt.*) + @as(i64, ndir) * @as(i64, self.scrollbar_nudge),
+                    0,
+                    @as(i64, cap),
+                ));
+                if (nns != ntgt.*) {
+                    ntgt.* = nns;
+                    changed = true;
+                }
+            } else {
+                // **点击小地图（滑块外）→ 点击的内容置于视口正中**（可以产生悬空；
+                // 唯一例外 = 左端：不允许左悬空 → 硬钳 0）。按住继续拖 = 滑块跟手。
+                const target_left = self.mouse_x - x;
+                const clicked = @divTrunc(@as(i64, target_left) * @max(1, cw_eff), w64); // 点击处的内容坐标
+                const ns64 = clicked - @divTrunc(@as(i64, view_cw), 2); // 视口中心对准点击处
+                const cap_eff: i64 = if (allow_overhang) cap else @max(0, cw_eff - view_cw); // 巨图模式不出图
+                const ns: i32 = @intCast(std.math.clamp(ns64, 0, cap_eff));
+                if (ns != scroll.*) {
+                    scroll.* = ns;
+                    changed = true;
+                }
+                self.active_id = id;
+                self.drag_content0 = cw_eff;
+                self.drag_scroll0 = scroll.*;
+                self.drag_view_cw0 = view_cw;
+                self.drag_mode_h = .body;
+                self.drag_mx0 = self.mouse_x; // 位移式基准（后续拖动零位移恒等）
             }
-            self.active_id = id;
-            self.drag_content0 = cw_eff;
-            self.drag_scroll0 = scroll.*;
-            self.drag_view_cw0 = view_cw;
-            self.drag_mode_h = .body;
-            self.drag_mx0 = self.mouse_x; // 位移式基准（后续拖动零位移恒等）
         }
 
         // 绘制滑块（用**本帧最终状态**重投影，**裁剪**到轨道；悬空部分裁掉；完全出界不画）

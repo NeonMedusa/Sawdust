@@ -220,6 +220,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             };
             nmini += 1;
         }
+        // 防误触：滑块外的单击 / 滚动条上的滚轮 = 移动"一个当前网格"（Ctrl+单击才是直接定位）
+        ui.scrollbar_nudge = model.snapSteps(app.playlist.snap) * util.piano_step_w;
+        ui.scrollbar_target = &app.playlist.scroll_x_target; // 步进走补间（拖动仍直接写 scroll_x）
         _ = ui.scrollbarTimelineEx(8, x + 1, hsb_y, w - 2, ruler_h, &app.playlist.scroll_x, min_content, &app.playlist.zoom, view_w, dyn_zoom_min, 8.0, bars_right < util.overhang_map_limit, mini_buf[0..nmini]);
     }
     ui.renderer.hline(x + 1, ruler_y, w - 2, ui.theme.panel_border);
@@ -719,7 +722,16 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
 
     // ── 框选（Ctrl+左键拖；Ctrl+Shift = 追加）——片段──
     // **按行框选**：起点在**轨道名列**时切换成“整行选择”（垂直拖选轨道行、水平不限）
-    if (ui.mods_ctrl and ui.mouse_pressed and ui.active_id == 0) {
+    // Ctrl+Shift+**单击片段** = 切换选中（未选中 → 加入；已选中 → 剔除）——
+    // 本次按下不再启动框选（与钢琴卷帘同语义）。
+    var toggle_consumed = false;
+    if (ui.mods_ctrl and ui.mods_shift and ui.mouse_pressed and ui.active_id == 0 and in_lane and valid_track) {
+        if (model.topmostClipAt(app.clips.items, track_i, step_i)) |ci| {
+            app.clips.items[ci].selected = !app.clips.items[ci].selected;
+            toggle_consumed = true;
+        }
+    }
+    if (ui.mods_ctrl and ui.mouse_pressed and ui.active_id == 0 and !toggle_consumed) {
         const in_header = ui.hitRect(main_x, tracks_y, header_w, tracks_h);
         if (in_lane or in_header) {
             app.playlist.marquee_active = true;
@@ -729,21 +741,37 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             app.playlist.row_marquee = in_header;
             app.playlist.row_marquee_track0 = track_i;
             ui.active_id = 7400; // 片段框选手势
-            if (!app.playlist.marquee_add) app.clearClipSelection();
+            if (!app.playlist.marquee_add) {
+                app.clearClipSelection();
+            } else {
+                // 追加模式：拍快照（每帧用“快照 ∪ 框内”重建 → 框缩回时自动回退）
+                app.allocator.free(app.playlist.marquee_snap);
+                app.playlist.marquee_snap = app.allocator.alloc(bool, app.clips.items.len) catch &.{};
+                for (app.clips.items, 0..) |cc, kk| {
+                    if (kk < app.playlist.marquee_snap.len) app.playlist.marquee_snap[kk] = cc.selected;
+                }
+            }
         }
     }
     if (ui.active_id == 7400 and !ui.mouse_down) {
         ui.active_id = 0;
         app.playlist.marquee_active = false;
         app.playlist.row_marquee = false;
+        app.allocator.free(app.playlist.marquee_snap);
+        app.playlist.marquee_snap = &.{};
     }
     if (app.playlist.marquee_active) {
         const mx0 = @min(app.playlist.marquee_x0, ui.mouse_x);
         const mx1 = @max(app.playlist.marquee_x0, ui.mouse_x);
         const my0 = @min(app.playlist.marquee_y0, ui.mouse_y);
         const my1 = @max(app.playlist.marquee_y0, ui.mouse_y);
-        if (!app.playlist.marquee_add) app.clearClipSelection();
-        for (app.clips.items) |*c| {
+        // 每帧重建选区：追加模式 = 快照 ∪ 框内（框缩回时自动回退）；否则 = 框内
+        for (app.clips.items, 0..) |*c, ci| {
+            if (app.playlist.marquee_add) {
+                c.selected = if (ci < app.playlist.marquee_snap.len) app.playlist.marquee_snap[ci] else false;
+            } else {
+                c.selected = false;
+            }
             if (app.playlist.row_marquee) {
                 // 按行：轨道在起始/当前行之间 → 选中（**水平不限**）
                 const t0 = @min(app.playlist.row_marquee_track0, track_i);
@@ -817,7 +845,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     }
 
     // 右键：按下处删除；按住拖动 = 擦除（划过即删；起点需在播放列表内）
+    // **点在空白处**（没命中片段）→ 取消选区（与左键点空白的语义一致）
     if (ui.mouse_right_pressed and ui.hitRect(main_x, tracks_y, main_w, tracks_h)) {
+        if (clip_hit == null) app.clearClipSelection();
         app.playlist.erase_drag = true;
     }
     if (app.playlist.erase_drag) {
@@ -1033,7 +1063,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 纵向滚动：滚轮（主区）+ 右侧纵向滚动条
     // 中键拖动中：屏蔽滚轮（含 Ctrl/Shift 缩放）——缩放会让锚定比例失准、
     // 拖动跟随抽动（用户约定：拖动期间只平移，不缩放）
-    if (!app.playlist.nav_active and ui.hitRect(main_x, tracks_y, main_w, tracks_h)) {
+    // 网格区**和**纵向滚动条上都响应滚轮（鼠标停在滚动条上滚不动不符合直觉）
+    if (!app.playlist.nav_active and (ui.hitRect(main_x, tracks_y, main_w, tracks_h) or ui.hitRect(sb_x, tracks_y, ruler_h, tracks_h))) {
         if (ui.wheel_ctrl) {
             // Ctrl+滚轮：横向缩放——**只更新补间目标**（滚轮离散，逐帧平滑逼近；
             // 补间块在本段之后；锚定用事件时的鼠标偏移，补间每一步都锚定）
@@ -1079,11 +1110,24 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             if (z_new > 0 and z_new != pl.zoom) {
                 const vcw_now: i32 = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(view_w)) / pl.zoom)));
                 const over: i32 = @max(0, pl.scroll_x - @max(0, content_span - vcw_now)); // 悬空量保留
-                pl.scroll_x = Ui.zoomAnchoredScrollX(pl.scroll_x, view_w, pl.zoom_anchor_off, pl.zoom, z_new, content_span, content_span) + over;
+                pl.scroll_x = Ui.zoomAnchoredScrollX(pl.scroll_x, view_w, pl.zoom_anchor_off, pl.zoom, z_new, content_span, content_span, over);
                 pl.zoom = z_new;
             }
         }
         pl.zoom_anim_last = pl.zoom;
+    }
+
+    // ── 横向滚动补间（滚动条单击/滚轮只写目标；拖动/载入直接改实体 → 采纳为目标不补间）──
+    {
+        const pl = &app.playlist;
+        if (pl.scroll_x_anim_last != pl.scroll_x) pl.scroll_x_target = pl.scroll_x;
+        if (pl.scroll_x != pl.scroll_x_target) {
+            const cur: f32 = @floatFromInt(pl.scroll_x);
+            const tgt: f32 = @floatFromInt(pl.scroll_x_target);
+            const nx: i32 = if (@abs(tgt - cur) <= 1.0) pl.scroll_x_target else @intFromFloat(util.glideF32(cur, tgt, app.frame_dt_ns, 0.06));
+            pl.scroll_x = @max(0, nx);
+        }
+        pl.scroll_x_anim_last = pl.scroll_x;
     }
 
     // ── 纵向补间（Shift+滚轮 = 轨道行高；裸滚轮 = 纵向滚动；τ=0.03 同横向）──
