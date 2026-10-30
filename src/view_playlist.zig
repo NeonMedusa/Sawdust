@@ -1223,6 +1223,15 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 const n = app.copySelectedClips();
                 if (n > 0) app.setToastWith("已复制 {d} 个片段", .{n});
             },
+            .cut => {
+                // 剪切 = 先复制到剪贴板，再删除选区
+                const n = app.copySelectedClips();
+                if (n > 0) {
+                    _ = app.deleteSelectedClips();
+                    app.setToastWith("已剪切 {d} 个片段", .{n});
+                    app.commitHistory("剪切片段");
+                }
+            },
             .paste => {
                 // 粘贴到**鼠标位置**（步吸附网格；**轨道不变**——回原轨道）
                 const n = app.pasteClips(snap_step, rows_draw);

@@ -1254,6 +1254,15 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 const n = app.copySelectedNotes();
                 if (n > 0) app.setToastWith("已复制 {d} 个音符", .{n});
             },
+            .cut => {
+                // 剪切 = 先复制到剪贴板，再删除选区（两件事一次完成）
+                const n = app.copySelectedNotes();
+                if (n > 0) {
+                    _ = app.deleteSelectedNotes();
+                    app.setToastWith("已剪切 {d} 个音符", .{n});
+                    app.commitHistory("剪切音符");
+                }
+            },
             .paste => {
                 // 粘贴到**鼠标位置**（音高不变；step = 鼠标所在步）
                 const anchor = @max(0, snap_step);

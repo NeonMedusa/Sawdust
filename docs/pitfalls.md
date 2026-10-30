@@ -1453,3 +1453,35 @@ const names = if (total == 1) first.? else
   再 `dirname`。（注意 Zig 0.17 没有 `std.posix.readlink`，要用 `Io.Dir.readLinkAbsolute`。）
 - **连带**：字体解析顺序重写为「`data/font.txt` → fontconfig → 系统已装字体（按名字逐个试）→ `<exe>/data/fonts/`
   → 任意一种系统字体 → 报错并给安装命令」，`<cwd>/fonts` **取消**。
+### VSTi 的 panic（全 128 音高 note-off）**不得与本段真实事件同批**
+
+- **现象**：循环回跳 / 播放中把游标点到 VST 音符开头 → 那个音符**不响**（内置合成器同场景正常，所以一开始误判成调度问题）。
+- **诊断线索**：`SAWDUST_SCHED_LOG=1` 时跳转那一下打印 `[vsti-batch] n=129 on=1 off=128` —— note-on 和 panic 的 128 条 off 挤在同一批、同一 `sampleOffset=0`，插件（Vital）会把刚起音的音符立刻关掉。
+- **修法**：panic **不塞事件批**，改由渲染路径用**本地数组 + 一次 1 帧的独立 `processInstrument` 调用**冲掉；乐器级与鼓组 VST3 层都要这么做。
+  对应地把 `releaseAllVoices` 里的 VSTi 分支改成**置 `instrument_panic` / `kit_layer_panic` 旗标**。
+- **注意**：第一版修法"暂存真实事件 → 清批 → panic → 冲 → 恢复"看似正确，实际因为 panic 会**追加**到已有批，把真实事件一起消费掉了（表现为 on 彻底消失）。本地数组方案没有这个陷阱。
+
+### 惰性分配的状态容器：**所有入口都必须走同一个 ensure**
+
+- **现象**：含 VST3 鼓组层的工程，保存后重开 → 该鼓组**完全没有声音**（插件 UI 能开、点钢琴键也没声）；在同一个鼓组里**新加一层 VST** 后，新旧两层立刻都有声。
+- **根因**：`engine.kit_vsti[i]` 只在 `App.kitLayerAddVst3()` 里分配（`ensureKitVsti`），
+  而**打开工程**的路径只调了 `ensureKitPool` / `ensureKitSampler` → `kitVstiState() orelse continue` 把整层跳过。
+- **修法**：把 `ensureKitVsti` 放进**每帧的鼓组同步块**（与另两个 ensure 同处 = 设备暂停窗口），并用"是否含 VST3 层"做守卫避免纯合成器鼓组白占内存。
+- **纪律**：这类"惰性分配的运行时状态"（池 / VST 状态 / 采样器）必须**新建、加载、自愈三条路径共用同一个 ensure**；漏一条就会出现"新建能用、重开就哑"。
+
+### 二进制存档：**版本门控字段与 b64 字段的判定，读写两端必须同序**
+
+- **现象**：含 VST3 鼓组层的工程，保存后重开崩溃：`persist.zig: binReadValue → @intCast` "integer does not fit in destination type"。
+- **根因**：写端在"版本门控分支"里**也**判了 `isB64TextField`（`plugin_state`/`plugin_state_ctrl` 走 base64），
+  读端的同一分支**没有** → 把 b64 当普通字符串读 → 从该字段起整条字节流错位 → 某处 `@intCast` 溢出。
+  普通 VST 乐器/效果器的 `plugin_state` 没被版本门控，所以以前从没暴露。
+- **修法**：读端的版本门控分支补上 b64 判定（与写端镜像）。
+- **纪律**：`binWriteValue` 与 `binReadValue` 的**分支顺序必须逐条对应**；新增"特殊编码字段"时两边一起改。
+  另建议：这类不对称靠**往返单测**（`toBinary` → `fromBinary`）兜底，目前该路径无测试覆盖。
+
+### 保存后不要再用 `path`（use-after-free）
+
+- **现象**：`Ctrl+S` 保存已有工程 → 偶发崩溃在 `setToastWith` 的 `bufPrint`（`memcpy` 读到野地址）。
+- **根因**：`saveProjectToPath` 里 `app.setProjectPath(path)` 会 **free 旧 `project_path`**，
+  而普通保存时 `path` 正指向它；之后 `setToastWith("已保存：{s}", .{path})` 就是读已释放内存。
+- **修法**：改用 `app.project_path.?`（app 自己 dupe 的副本）拼提示。

@@ -694,6 +694,11 @@ fn binReadValue(comptime T: type, r: *BinReader, a: std.mem.Allocator) !T {
                     if (legacySkip(r.version, T, fname)) {
                         // 旧版本没有该字段 → 用声明默认值（0.17：默认值挂在 field_attrs 上）
                         @field(out, fname) = attrs.defaultValue(FType) orelse @compileError("legacy v5 跳过字段必须有默认值：" ++ fname);
+                    } else if (comptime isB64TextField(fname, FType)) {
+                        // **必须和写入端一致**：版本门控字段里也有 plugin_state/plugin_state_ctrl，
+                        // 写端走 b64、读端若当普通字符串 → 整条流错位（实测：含 VST3 鼓组层的工程打不开，
+                        // 报 “integer does not fit in destination type”）。
+                        @field(out, fname) = try binReadB64Field(r, a);
                     } else {
                         @field(out, fname) = try binReadValue(FType, r, a);
                     }

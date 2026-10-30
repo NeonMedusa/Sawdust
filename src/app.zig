@@ -62,7 +62,7 @@ pub const Layout = struct {
 pub const FileAction = enum { new, open, save, save_as, import_midi, export_midi, export_wav, import_json, export_json };
 
 /// 编辑操作（框选/批量操作快捷键 → 由**当前视图**在帧内按上下文执行）
-pub const EditOp = enum { delete_selected, clone_right, copy, paste, select_all };
+pub const EditOp = enum { delete_selected, clone_right, copy, cut, paste, select_all };
 
 /// 键盘移动选中音符的请求（Shift/Ctrl+方向键；main 登记、音符视图消费）
 pub const MoveReq = struct {

@@ -1144,15 +1144,18 @@ fn releaseAllVoices(engine: *Engine) void {
     // （如恢复唤醒的幽灵声部/批满丢事件），按位图补 off 会漏 → 用不掉挂的版本
     const params = engine.params;
     for (0..engine.synths.len) |i| {
-        if (params.instrument_kind[i].load(.monotonic) == 2) vstiPanic(engine, i);
+        // **不在这里塞批**：128 条 off 与随后的新 on 同批时，插件会把新音立刻关掉
+        // （实测：循环回跳 / 播放中点游标到 VST 音符开头 → 该音不响）。改由渲染路径单独冲掉。
+        if (params.instrument_kind[i].load(.monotonic) == 2) params.instrument_panic[i].store(true, .release);
     }
     // 鼓组 VST3 层：同样 panic 式全体释音（仅在有实例的层；位图可能失同步）
+    // **同样不塞批**：置旗标，由渲染路径单独冲（否则跳转点的 note-on 被同批 off 关掉）
     for (0..engine.kit_vsti.len) |i| {
         const n_layers = @min(params.kit_layer_count[i].load(.monotonic), kit_max_layers);
         for (0..n_layers) |l| {
             if (params.kit_layer_kind[i][l].load(.monotonic) != 2) continue;
             if (params.kit_layer_plugin[i][l].load(.acquire) == null) continue;
-            kitLayerVstiPanic(engine, i, l);
+            params.kit_layer_panic[i][l].store(true, .release);
         }
     }
     // 鼓组采样器层：声部全清零（一次性无 off 可依——暂停/全体释音必须硬清）
@@ -1162,7 +1165,11 @@ fn releaseAllVoices(engine: *Engine) void {
 /// VSTi：把事件追加到该乐器的待发送批（满则丢弃——宁可丢事件不分配）
 fn vstiPush(engine: *Engine, i: usize, ev: ivstevents.Event) void {
     const n = engine.vsti_event_n[i];
-    if (n >= engine.vsti_events[i].len) return;
+    if (n >= engine.vsti_events[i].len) {
+        // 诊断：批满丢事件（实测线索：VSTi 在循环回跳后第一个音不响，内部合成器正常）
+        if (schedLogOn()) std.debug.print("[vsti-full] inst={d} cap={d} drop kind={d}\n", .{ i, engine.vsti_events[i].len, ev.type });
+        return;
+    }
     engine.vsti_events[i][n] = ev;
     engine.vsti_event_n[i] = n + 1;
 }
@@ -1193,9 +1200,9 @@ fn vstiNoteOn(engine: *Engine, i: usize, pitch: u8, velocity: u8) void {
     });
 }
 
-fn vstiNoteOff(engine: *Engine, i: usize, pitch: u8) void {
-    vstiActiveSet(engine, i, pitch, false);
-    vstiPush(engine, i, .{
+/// VST3 事件：构造一条 note-off（panic 与普通 off 共用）
+fn noteOffEvent(pitch: u8) ivstevents.Event {
+    return .{
         .sampleOffset = 0,
         .type = @backingInt(ivstevents.Event.EventTypes.kNoteOffEvent),
         .data = .{ .noteOff = .{
@@ -1204,7 +1211,12 @@ fn vstiNoteOff(engine: *Engine, i: usize, pitch: u8) void {
             .velocity = 0,
             .noteId = -1,
         } },
-    });
+    };
+}
+
+fn vstiNoteOff(engine: *Engine, i: usize, pitch: u8) void {
+    vstiActiveSet(engine, i, pitch, false);
+    vstiPush(engine, i, noteOffEvent(pitch));
 }
 
 /// VSTi：**全 128 音高**无条件 note-off（panic）。
@@ -1268,12 +1280,6 @@ fn kitLayerVstiNoteOff(engine: *Engine, i: usize, l: usize, pitch: u8) void {
     });
 }
 
-/// 鼓组 VST3 层：全 128 音高补 off（panic 式——位图可能失同步）
-fn kitLayerVstiPanic(engine: *Engine, i: usize, l: usize) void {
-    var p: u16 = 0;
-    while (p < 128) : (p += 1) kitLayerVstiNoteOff(engine, i, l, @intCast(p));
-}
-
 /// VSTi：按位图补发全部 note-off（暂停/跳转/切类型/全体释音共用）
 fn vstiAllOff(engine: *Engine, i: usize) void {
     var lo = engine.vsti_active_lo[i];
@@ -1314,7 +1320,17 @@ pub fn transportEdge(engine: *Engine, playing: bool) void {
 /// UI 推事件与 gen 存储之间有窗口（中间还有 reset 的 gather）——音频线程
 /// 可能先消费 all_off、再按**新传输参数**误触发旧 gen 的事件（新声部，
 /// 其 off 随后被作废 → 又悬挂）。这里与事件触发同线程，无窗口。
+/// 诊断开关（`SAWDUST_SCHED_LOG=1`）：打印传输代变化与事件丢弃（仅排障用）
+var sched_log: ?bool = null;
+fn schedLogOn() bool {
+    if (sched_log) |v| return v;
+    const v = std.c.getenv("SAWDUST_SCHED_LOG") != null;
+    sched_log = v;
+    return v;
+}
+
 fn handleGenChange(engine: *Engine, params: *Params, gen: u32, was_playing: bool) void {
+    if (schedLogOn()) std.debug.print("[gen] {d} → {d} stash={d} was_playing={}\n", .{ engine.stash_gen, gen, engine.stash_n, was_playing });
     engine.stash_n = 0;
     engine.stash_gen = gen;
     if (was_playing) {
@@ -1592,7 +1608,16 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
             if (engine.vsti_scratch.len < n) continue; // 中转缓冲未初始化（测试环境）：未加载即跳过
             // state 恢复防挂音（UI 置旗标）：本段先对全 128 音高补 off——
             // 恢复可能唤醒“快照里仍在发声”的幽灵声部（不在活跃位图）
-            if (params.instrument_panic[i].swap(false, .acq_rel)) vstiPanic(engine, i);
+            if (params.instrument_panic[i].swap(false, .acq_rel)) {
+                // panic **不碰本段事件批**：本地造 128 条 off 单独送插件。
+                // 为什么不能塞进批：跳转时批里已经有本段的真实事件（如回跳点的 note-on），
+                // 同批的 off 会把它们立刻关掉 → 实测「小节头/游标处第一个音不响」。
+                var offs: [128]ivstevents.Event = undefined;
+                for (&offs, 0..) |*e, p| e.* = noteOffEvent(@intCast(p));
+                for (0..128) |p| vstiActiveSet(engine, i, @intCast(p), false); // 位图清零（同 vstiPanic）
+                var tiny: [2]f32 = .{ 0, 0 };
+                pl.processInstrument(&tiny, 1, &offs, host_time);
+            }
             const sc = engine.vsti_scratch[0..n];
             @memset(sc, 0);
             // 本段事件（段边界 = 事件时刻 → offset 全 0）；消费后清零
@@ -1618,8 +1643,17 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
                     const pl = params.kit_layer_plugin[i][l].load(.acquire) orelse continue;
                     const st = kitVstiState(engine, i) orelse continue;
                     if (engine.vsti_scratch.len < n) continue;
-                    // state 恢复防挂音（UI 置旗标）：本段先全 128 补 off
-                    if (params.kit_layer_panic[i][l].swap(false, .acq_rel)) kitLayerVstiPanic(engine, i, l);
+                    // state 恢复防挂音（UI 置旗标）：本段先全 128 补 off——
+                    // **不塞进本层事件批**：同批的 off 会把跳转点的 note-on 立刻关掉
+                    // （实测：鼓组 VST3 层同乐器级 VSTi 一样会“小节头/游标处第一个音不响”）。
+                    if (params.kit_layer_panic[i][l].swap(false, .acq_rel)) {
+                        var offs: [128]ivstevents.Event = undefined;
+                        for (&offs, 0..) |*e, p| e.* = noteOffEvent(@intCast(p));
+                        st.active_lo[l] = 0;
+                        st.active_hi[l] = 0; // 位图清零（与乐器级 panic 同语义）
+                        var tiny: [2]f32 = .{ 0, 0 };
+                        pl.processInstrument(&tiny, 1, &offs, host_time);
+                    }
                     const sc = engine.vsti_scratch[0..n];
                     @memset(sc, 0);
                     pl.processInstrument(sc, frames, st.evts[l].events[0..st.evts[l].n], host_time);
@@ -2006,6 +2040,7 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
     while (done < frames and si < engine.stash_n) {
         const ev = engine.stash[si];
         if (schedEventObsolete(ev, gen, edit_gen, rescan_from)) {
+            if (schedLogOn()) std.debug.print("[drop] step={d} kind={d} ev.gen={d} gen={d} edit={d}/{d}\n", .{ ev.step, @backingInt(ev.kind), ev.gen, gen, ev.edit_gen, edit_gen });
             si += 1; // 作废（旧传输代 / 已被重发替换的旧编辑代）：丢弃，**不**释放声部
             continue;
         }

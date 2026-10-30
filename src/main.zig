@@ -630,6 +630,7 @@ pub fn main(init: std.process.Init) !u8 {
                     }
                     if (k.ctrl and (k.code == 'B' or k.code == 'b')) app.pending_edit_op = .clone_right;
                     if (k.ctrl and (k.code == 'C' or k.code == 'c')) app.pending_edit_op = .copy;
+                    if (k.ctrl and (k.code == 'X' or k.code == 'x')) app.pending_edit_op = .cut;
                     if (k.ctrl and (k.code == 'V' or k.code == 'v')) app.pending_edit_op = .paste;
                     if (k.ctrl and (k.code == 'A' or k.code == 'a')) app.pending_edit_op = .select_all;
                     // ── 撤销/重做 ──
@@ -716,6 +717,20 @@ pub fn main(init: std.process.Init) !u8 {
                 if (it.kit != null) {
                     app.ensureKitPool(i);
                     app.ensureKitSampler(i);
+                    // 含 VST3 层才分配（纯合成器鼓组不白占内存）——
+                    // **加载路径必须也调**：只在 `kitLayerAddVst3` 里调的话，
+                    // 从工程打开后 `engine.kit_vsti[i]` 为 null → 音频侧整层跳过 → 完全无声（实测 bug）。
+                    var has_vst3 = false;
+                    for (it.kit.?.pads.items) |*pad| {
+                        for (pad.layers.items) |*ly| {
+                            if (ly.kind == .vst3) {
+                                has_vst3 = true;
+                                break;
+                            }
+                        }
+                        if (has_vst3) break;
+                    }
+                    if (has_vst3) app.ensureKitVsti(i);
                 } else if (app.engine.kit_chunks.len > i and app.engine.kit_chunks[i].load(.monotonic) != null) {
                     app.kit_gc_pending = true; // 不再是鼓组 → 帧末释放其池
                 }
@@ -2856,7 +2871,9 @@ fn saveProjectToPath(app: *App, io: std.Io, path: []const u8) void {
     // 普通保存时 path 正指向旧的 project_path，先 free 再读会 use-after-free
     app.setProjectPath(path);
     app.markSaved();
-    app.setToastWith("已保存：{s}", .{path});
+    // **不要再用 `path`**：普通保存时它正指向 `project_path` 的旧内存，
+    // `setProjectPath` 已把它 free 掉 → 在这里解引用就是 use-after-free（实测崩在 toast 格式化）。
+    if (app.project_path) |saved| app.setToastWith("已保存：{s}", .{saved});
 }
 
 /// 弹对话框选文件并加载（替换当前工程）。取消/失败不影响当前工程。
