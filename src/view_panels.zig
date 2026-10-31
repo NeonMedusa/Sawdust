@@ -292,7 +292,7 @@ pub fn drawPatternCtxMenu(ui: *Ui, app: *App) void {
         app.panels.ctx_pattern = null; // 目标已不存在（撤销/删除）→ 关闭
         return;
     }
-    const items = [_][]const u8{ "重命名", "删除样式" };
+    const items = [_][]const u8{ "克隆", "重命名", "删除样式" };
     const menu_w: i32 = 130;
     const menu_h: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
     const mx = app.panels.ctx_pat_x;
@@ -316,11 +316,22 @@ pub fn drawPatternCtxMenu(ui: *Ui, app: *App) void {
     if (clicked) |ci| {
         switch (ci) {
             0 => {
+                // 克隆：复制样式及其音符（**不自动切换**；可 Ctrl+Z 撤销）
+                const ni = app.clonePattern(idx);
+                if (ni >= 0) {
+                    app.commitHistory("克隆样式");
+                    app.setToastWith("已克隆样式 → {s}", .{app.pattern_items.items[@intCast(ni)]});
+                } else {
+                    app.setToast("克隆样式失败（数量上限）");
+                }
+                app.panels.ctx_pattern = null;
+            },
+            1 => {
                 // 重命名：输入框弹在菜单位置（复用文本输入基建——支持中文 IME）
                 app.beginRenamePattern(idx, mx + 6, my + 4);
                 app.panels.ctx_pattern = null;
             },
-            1 => {
+            2 => {
                 if (app.pattern_items.items.len <= 1) {
                     app.setToast("至少保留一个样式");
                 } else if (app.patternUsage(idx).notes == 0 and app.patternUsage(idx).clips == 0) {

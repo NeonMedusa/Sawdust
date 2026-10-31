@@ -890,8 +890,6 @@ pub const DrumKitWindow = struct {
     layer_scroll: i32 = 0,
     /// 试听按住中的音高（松开 → 释音）
     audition_pitch: ?i32 = null,
-    /// 左音高列表点击试听（与上者分开：列表是“点一下整行”，按钮是“按住”）
-    list_audition: ?i32 = null,
 };
 
 /// 调音台通道数：**默认 2**（主通道 + 通道#1），可添加；上限见 `max_mixer_channels`
@@ -6870,6 +6868,59 @@ pub const App = struct {
         };
         self.dirty = true;
         return @intCast(self.pattern_items.items.len - 1);
+    }
+
+    /// 克隆样式（**连同其音符**；片段不复制）——返回新样式序号，失败 -1。
+    /// 名字取“<原名> 副本”，已被占用则加序号（副本2、副本3…）。
+    pub fn clonePattern(self: *App, idx: usize) i32 {
+        if (idx >= self.pattern_items.items.len) return -1;
+        const src_name = self.pattern_items.items[idx];
+        const new_idx = self.addPattern();
+        if (new_idx < 0) return -1;
+
+        // 名字：<原名> 副本（重名则追加序号）
+        var nb: [128]u8 = undefined;
+        var k: i32 = 0;
+        var picked: []const u8 = "";
+        while (k < 1000) : (k += 1) {
+            const cand = if (k == 0)
+                std.fmt.bufPrint(&nb, "{s} 副本", .{src_name}) catch break
+            else
+                std.fmt.bufPrint(&nb, "{s} 副本{d}", .{ src_name, k + 1 }) catch break;
+            var taken = false;
+            for (self.pattern_items.items, 0..) |existing, ei| {
+                if (ei == @as(usize, @intCast(new_idx))) continue; // 自己不算
+                if (std.mem.eql(u8, existing, cand)) {
+                    taken = true;
+                    break;
+                }
+            }
+            if (!taken) {
+                picked = cand;
+                break;
+            }
+        }
+        if (picked.len > 0) {
+            if (self.allocator.dupe(u8, picked)) |nm| {
+                self.allocator.free(self.pattern_items.items[@intCast(new_idx)]);
+                self.pattern_items.items[@intCast(new_idx)] = nm;
+            } else |_| {}
+        }
+
+        // 音符：同 pattern 的逐个复制到新样式（片段不复制）
+        const src_pat: i32 = @intCast(idx);
+        var i: usize = 0;
+        const count = self.notes.items.len;
+        while (i < count) : (i += 1) {
+            const nt = self.notes.items[i];
+            if (nt.pattern != src_pat) continue;
+            var copy = nt;
+            copy.pattern = new_idx;
+            copy.selected = false;
+            self.notes.append(self.allocator, copy) catch {};
+        }
+        self.dirty = true;
+        return new_idx;
     }
 
     /// 删除样式（**连同其音符/片段**；其余样式序号前移）。
