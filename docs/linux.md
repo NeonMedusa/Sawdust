@@ -73,6 +73,15 @@ zig build -Dcpu=baseline -Doptimize=ReleaseFast # 日常用这个：明显更流
 | 2 | **中文输入（XIM）** 主界面与插件 UI 都没有 | 重命名、插件内输入只能用 ASCII | §5 待办 #1 |
 | 3 | **WSLg 无硬件 GL**（DRI3 警告），音频/输入延迟偏高 | 手感不如 Windows | 环境限制；ReleaseFast 构建可显著缓解 |
 | 4 | **MIT-SHM 在 WSLg 不可用**（Xwayland 在另一个 IPC 命名空间，SysV 共享段看不见） | 每帧 3.9 MB 走 socket | 自动回退，功能正常；**真 Linux 自动启用** |
+### MIT-SHM 的一个**生命周期**陷阱（2026-11 修）
+
+`XShmCreateImage(..., shminfo, ...)` 会把传入的 `shminfo` 指针**存进返回的 `XImage.obdata`**，
+之后 `XShmPutImage` 还要靠它取 `shmseg`。所以 `XShmSegmentInfo` **必须**活得比 image 久：
+
+- ✗ 早先实现用 `shmInit` 的**局部变量** → 函数返回即销毁 → `obdata` 变悬垂指针 →
+  真 Linux（SHM 可用）上 `XShmPutImage` 读到垃圾段号 → **完全没画面**（WSLg 因回退 `XPutImage` 反而复现不了）；
+- ✓ 现在 `ShmSegmentInfo` 是 **`X11Window` 的成员**（`self.shm` + `shm_active` 标志），
+  地址在窗口生命周期内稳定；`shmTeardown` 也用同一个成员做 `XShmDetach`。
 | 5 | CLI 冒烟（`--vst-scan --run`）**退出前**偶发插件线程 segfault | GUI 长跑不受影响 | 已知，低优先级 |
 | 6 | WSLg **没有窗口管理器**：无人发 `WM_TAKE_FOCUS`/`_NET_ACTIVE_WINDOW` | 插件独立窗口焦点需用户自己点 | 真桌面无此问题 |
 | 7 | 远程 X（`ssh -X`）下 SHM 不可用、延迟高 | 能用，但不适合实时音频 | 预期行为 |

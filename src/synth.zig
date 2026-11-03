@@ -28,14 +28,18 @@ pub const max_instruments: usize = 32;
 /// 立即事件队列容量（UI 每秒推入的事件数远小于此值）
 const queue_size: usize = 1024;
 
-/// 调度事件队列容量（UI 按 lookahead 提前调度；数秒的余量）
-const sched_capacity: usize = 4096;
+/// 调度事件队列容量（UI 按 lookahead 提前调度；数秒的余量）。
+/// **播放中重扫会一次推入整个 lookahead 窗口**（4 小节）的事件——
+/// 密集工程可达上千条，容量小了会静默丢弃（丢的往往是 off → 挂音，实测）。
+const sched_capacity: usize = 16384;
 
 /// 每块最多处理的立即事件数
 pub const drain_max = 64;
 
-/// 每块最多处理的调度事件数（块大小未知，取足够大避免初始调度积压）
-pub const sched_drain_max = 256;
+/// 每块最多处理的调度事件数（块大小未知，取足够大避免初始调度积压）。
+/// 同时是**音频侧 stash 容量**：播放中重扫一次推入整个窗口的事件，
+/// 超过它就会被 `stashInsert` 丢掉（丢 off = 挂音，实测：拖动后偶发长音不释）。
+pub const sched_drain_max = 2048;
 
 pub const Waveform = enum(u8) {
     sine = 0,
@@ -146,6 +150,10 @@ pub const NoteEvent = struct {
     kind: EventKind = .off,
     pitch: u8 = 0,
     instrument: u8 = 0,
+    /// 对应 on 的起点步（-1 = 未知：按音高 FIFO 释音）
+    on_step: i32 = -1,
+    /// 立即 on 事件也可以带“应该结束的步”（-1 = 未知）
+    end_step: i32 = -1,
     /// 力度（1-127；0 不允许）
     velocity: u8 = default_velocity,
     /// 声像（0-127；64 = 居中）
@@ -159,6 +167,12 @@ pub const SchedEvent = struct {
     instrument: u8 = 0,
     /// 事件生效的步位置（与 playback 的步坐标一致）
     step: i32 = 0,
+    /// 该音符**实例**的起点步（on = 自己的 step；off = 对应 on 的 step）。
+    /// 音频侧用它把 off 精确匹配到自己的声部（-1 = 未知，退回按音高 FIFO）。
+    on_step: i32 = -1,
+    /// 该音符**应该结束**的步（只有 on 事件带；off/未知 = -1）。
+    /// 诊断与"方案 B（本地到点释音）"共用。
+    end_step: i32 = -1,
     /// 调度 generation（transport 变化时递增；旧事件作废）
     gen: u32 = 0,
     /// 编辑代（播放中编辑提交时递增）：音频线程丢弃 `edit_gen` **小于**
@@ -184,16 +198,32 @@ pub fn schedEventLess(_: void, a: SchedEvent, b: SchedEvent) bool {
 pub fn Ring(comptime T: type, comptime capacity: usize) type {
     return struct {
         const Self = @This();
-        buf: [capacity]T = @splat(.{}),
+        /// 事件缓冲。**故意用 `undefined` 作为默认值**：写成 `@splat(.{})` 会让编译器
+        /// 把整块“全默认事件”的初值镜像塞进 `.rodata`（`SchedQueue` 16 384×28 B ≈ 448 KB！
+        /// 运行时真身本来就在 `.bss`，`.rodata` 那份纯粹是 memcpy 源、白占文件体积）。
+        /// 安全依据：`buf` 只在 `[read, write)` 区间内被读，而该区间内的每格都必然已被
+        /// `push` 完整写过。启动时 `zeroed()` 再清一遍，仅为可重复性。
+        buf: [capacity]T = undefined,
         /// 写位置（UI 线程）
         write: Atomic(usize) = Atomic(usize).init(0),
         /// 读位置（音频线程）
         read: Atomic(usize) = Atomic(usize).init(0),
+        /// 累计丢弃数（队列满；排查“丢事件 → 挂音”用）
+        dropped: Atomic(usize) = Atomic(usize).init(0),
+
+        /// 运行时清零事件缓冲（配合 `buf` 的 `undefined` 默认值；见其注释）
+        pub fn zeroed(self: *Self) void {
+            @memset(std.mem.sliceAsBytes(&self.buf), 0);
+        }
 
         pub fn push(self: *Self, ev: T) void {
             const w = self.write.load(.monotonic);
             const r = self.read.load(.acquire);
-            if (w -% r >= capacity) return; // 队列满：丢弃（宁可丢也不阻塞音频）
+            if (w -% r >= capacity) {
+                // 队列满：丢弃（宁可丢也不阻塞音频）——但要计数，否则“丢 off → 挂音”无从查起
+                _ = self.dropped.fetchAdd(1, .monotonic);
+                return;
+            }
             self.buf[w % capacity] = ev;
             self.write.store(w + 1, .release);
         }
@@ -234,6 +264,13 @@ pub const Voice = struct {
     release_from: f32 = 0,
     /// 分配序号（无空闲声部时偷取最旧）
     start_seq: u64 = 0,
+    /// 这个声部**应该在**哪一步结束（-1 = 未知）。仅用于自检/诊断：
+    /// 超过它 + 余量还在响 = 有 off 丢了（方案 B 落地后会用它来本地释音）。
+    end_step: i32 = -1,
+    /// 触发这个声部的音符**起点步**（-1 = 未知：立即事件/试听/panic 路径）。
+    /// note-off 用它**精确匹配自己的声部**——按音高 FIFO 会误切“同一音高的别的实例”
+    /// （实测：播放中拖动片段后，音符只响音头就被别的 off 掐掉）。
+    start_step: i32 = -1,
     /// 力度增益（= velocity / 127；默认 127/127 = 1.0）
     vel_gain: f32 = 1.0,
     /// 声像增益（等功率；居中 = 1.0/1.0——与调音台通道声像同一公式）
@@ -338,9 +375,23 @@ fn allocVoice(state: anytype) *Voice {
 /// 音符开（分配声部）——公开：音频回调按事件路由调用。
 /// `velocity`：1-127（钳制；0 按 1 处理——力度 0 = 静音是 MIDI 的 note-on
 /// 退化语义，本项目不做）；`pan`：0-127（64 = 居中）。
-pub fn noteOn(state: anytype, pitch: u8, velocity: u8, pan: u8) void {
+pub fn noteOn(state: anytype, pitch: u8, velocity: u8, pan: u8, at_step: i32, end_step: i32) bool {
+    // 同一音符实例的重触发（重扫重发同一个 on）：先放掉同 (音高, 起点) 的旧声部，
+    // 否则“双声部 + 只有一条 off”必然漏一个（实测：乱拖后出现两个实例同时响）。
+    var retrig = false;
+    if (at_step >= 0) {
+        for (&state.voices) |*prev| {
+            if (prev.pitch != pitch or prev.start_step != at_step) continue;
+            if (prev.env_stage == .idle or prev.env_stage == .release) continue;
+            prev.env_stage = .release;
+            prev.release_from = prev.env_level;
+            retrig = true;
+        }
+    }
     state.note_counter += 1;
     const v = allocVoice(state);
+    v.start_step = at_step;
+    v.end_step = end_step;
     v.pitch = pitch;
     v.freq = pitchHz(pitch);
     v.env_stage = .attack;
@@ -364,6 +415,7 @@ pub fn noteOn(state: anytype, pitch: u8, velocity: u8, pan: u8) void {
             v.phase[o][k] = (nextNoise(&v.rng) + 1.0) * 0.5;
         }
     }
+    return retrig;
 }
 
 /// 音符关（该音高的声部进入释音）——**FIFO**：只释放**最早分配**的声部。
@@ -371,17 +423,36 @@ pub fn noteOn(state: anytype, pitch: u8, velocity: u8, pan: u8) void {
 /// 动机（重叠音符支持）：同音高允许重叠（与 MIDI 一致）。若这里释放**所有**
 /// 同音高声部，第一个 note-off 会把后一个音也掉（实测：重叠时断音）。
 /// MIDI 接收端的标准语义：note-off 匹配最早的未释放 note-on。
-pub fn noteOff(state: anytype, pitch: u8) void {
+pub fn noteOff(state: anytype, pitch: u8, at_step: i32) bool {
     var best: ?usize = null;
     for (state.voices, 0..) |v, vi| {
         if (v.pitch != pitch or v.env_stage == .idle or v.env_stage == .release) continue;
+        // 精确匹配：只释放**这个音符实例**的声部；找不到就什么都不做
+        //（按音高兜底会切掉同音高的另一个实例——实测“只响音头”的元凶）
+        if (at_step >= 0 and v.start_step != at_step) continue;
         if (best == null or v.start_seq < state.voices[best.?].start_seq) best = vi;
+    }
+    // 兜底：起点步对不上（音符被拖走后映射变了 / 重扫时代差）时，
+    // 若该音高**只有一个**声部在响，那它必然就是要释放的那个 → 释放（防挂音）；
+    // 有两个以上就**不动**（无法判定，宁可留到它自己的 off，也绝不误切）。
+    if (best == null and at_step >= 0) {
+        var cnt: usize = 0;
+        var only: ?usize = null;
+        for (state.voices, 0..) |v, vi| {
+            if (v.pitch != pitch or v.env_stage == .idle or v.env_stage == .release) continue;
+            cnt += 1;
+            only = vi;
+            if (cnt > 1) break;
+        }
+        if (cnt == 1) best = only;
     }
     if (best) |bi| {
         const v = &state.voices[bi];
         v.env_stage = .release;
         v.release_from = v.env_level;
+        return true;
     }
+    return false; // 没有匹配的声部（诊断用：说明这条 off 是孤儿）
 }
 
 /// 全部释音
@@ -609,8 +680,8 @@ fn pump(p: *const SynthParams, st: *Synth, q: *EventQueue, buf: []f32, frames: u
     const n = q.drain(&evbuf);
     for (evbuf[0..n]) |ev| {
         switch (ev.kind) {
-            .on => noteOn(st, ev.pitch, ev.velocity, ev.pan),
-            .off => noteOff(st, ev.pitch),
+            .on => _ = noteOn(st, ev.pitch, ev.velocity, ev.pan, ev.on_step, ev.end_step),
+            .off => _ = noteOff(st, ev.pitch, ev.on_step),
             .all_off => allOff(st),
         }
     }
@@ -652,7 +723,7 @@ test "synth: 合奏——立体声展开与响度量级（增益补偿）" {
 
     // ① 单副本（unison = 0）：居中声像 → L == R（与旧单声道实现一致）
     var st0 = Synth{};
-    noteOn(&st0, 60, 127, 64);
+    _ = noteOn(&st0, 60, 127, 64, -1, -1);
     var buf0: [F * 2]f32 = undefined;
     render(&p, &st0, &buf0, F, 48000, 1.0, false);
     var e0: f64 = 0;
@@ -667,7 +738,7 @@ test "synth: 合奏——立体声展开与响度量级（增益补偿）" {
     // ② 合奏 8 副本：副本失谐 + 立体声展开 → L/R 不同；1/√copies 补偿保量级
     p.osc[0].unison.store(8, .monotonic);
     var st1 = Synth{};
-    noteOn(&st1, 60, 127, 64);
+    _ = noteOn(&st1, 60, 127, 64, -1, -1);
     var buf1: [F * 2]f32 = undefined;
     render(&p, &st1, &buf1, F, 48000, 1.0, false);
     var e1: f64 = 0;
@@ -708,7 +779,7 @@ test "synth: 合奏散布——0% 无拍频（每窗电平恒定）、50% 明显
     for ([_]f32{ 0.0, 0.5 }, 0..) |det, di| {
         p.osc[0].unison_detune.store(det, .monotonic);
         var st = Synth{};
-        noteOn(&st, 45, 127, 64); // A2（110Hz）：±25c 的最外对拍频 ≈3Hz——窗内可见
+        _ = noteOn(&st, 45, 127, 64, -1, -1); // A2（110Hz）：±25c 的最外对拍频 ≈3Hz——窗内可见
         var buf: [W * 2]f32 = undefined;
         var mn: f64 = std.math.inf(f64);
         var mx: f64 = 0;
@@ -761,7 +832,7 @@ test "synth: 散布功率——参数参与渲染（输出与线性不同）" {
     for (powers, 0..) |pwr, bi| {
         p.osc[0].detune_power.store(pwr, .monotonic);
         var st = Synth{};
-        noteOn(&st, 45, 127, 64);
+        _ = noteOn(&st, 45, 127, 64, -1, -1);
         render(&p, &st, &bufs[bi], F, 48000, 1.0, false);
     }
     // 聚拢 vs 线性：波形明显不同（内圈副本位置变了）
@@ -842,6 +913,50 @@ test "synth: 同音高重叠——note-off FIFO（只释放最早分配的声部
     try std.testing.expectEqual(@as(usize, 0), activeCount(&st));
 }
 
+test "synth: note-off 按起点步精确匹配（不误切同音高的别的实例）" {
+    var p = SynthParams{};
+    p.attack.store(0.0, .monotonic);
+    p.sustain.store(1.0, .monotonic);
+    p.release.store(0.0, .monotonic);
+
+    var st = Synth{};
+    var q = EventQueue{};
+    var buf: [4800 * 2]f32 = undefined;
+
+    // 同音高、不同起点步 = 两个**不同实例**（典型：同一样式放在两条轨 / 拖动后新旧位置）
+    q.push(.{ .kind = .on, .pitch = 60, .on_step = 5 });
+    pump(&p, &st, &q, &buf, 4, test_sr, 1.0);
+    q.push(.{ .kind = .on, .pitch = 60, .on_step = 9 });
+    pump(&p, &st, &q, &buf, 4, test_sr, 1.0);
+    try std.testing.expectEqual(@as(usize, 2), activeCount(&st));
+
+    // off 带着**不存在的**起点步 → 一个声部都不该被切（这是“只响音头”的旧 bug 根源）
+    q.push(.{ .kind = .off, .pitch = 60, .on_step = 7 });
+    pump(&p, &st, &q, &buf, 4800, test_sr, 1.0);
+    try std.testing.expectEqual(@as(usize, 2), activeCount(&st));
+
+    // off 带 9 → 只释放步 9 那个实例
+    q.push(.{ .kind = .off, .pitch = 60, .on_step = 9 });
+    pump(&p, &st, &q, &buf, 4800, test_sr, 1.0);
+    try std.testing.expectEqual(@as(usize, 1), activeCount(&st));
+
+    // 同一实例重触发（重扫重发同一个 on）：先放旧的再起新的 → 始终只有一个声部
+    q.push(.{ .kind = .on, .pitch = 60, .on_step = 5 });
+    pump(&p, &st, &q, &buf, 4800, test_sr, 1.0);
+    try std.testing.expectEqual(@as(usize, 1), activeCount(&st));
+
+    // 唯一声部兜底：起点步对不上但该音高只有一个声部在响 → 释放它（防挂音）
+    q.push(.{ .kind = .off, .pitch = 60, .on_step = 999 });
+    pump(&p, &st, &q, &buf, 4800, test_sr, 1.0);
+    try std.testing.expectEqual(@as(usize, 0), activeCount(&st));
+
+    // on_step = -1（试听/立即事件）→ 退回按音高 FIFO
+    q.push(.{ .kind = .on, .pitch = 60, .on_step = 5 });
+    pump(&p, &st, &q, &buf, 4, test_sr, 1.0);
+    q.push(.{ .kind = .off, .pitch = 60 });
+    pump(&p, &st, &q, &buf, 4800, test_sr, 1.0);
+    try std.testing.expectEqual(@as(usize, 0), activeCount(&st));
+}
 test "synth: 快速连点 = 新声部重触发（不吞音）" {
     var p = SynthParams{};
     p.attack.store(0.5, .monotonic); // 慢起音（可观察每下从低位重起）
@@ -967,7 +1082,7 @@ test "synth: render(add=true) 叠加而不覆盖" {
 
     // 第二个声部池（同相位）叠加渲染 → 能量应约翻倍（验证 add 而非覆盖）
     var st2 = Synth{};
-    noteOn(&st2, 60, default_velocity, default_pan);
+    _ = noteOn(&st2, 60, default_velocity, default_pan, -1, -1);
     render(&p, &st2, &buf, 64, test_sr, 1.0, true);
     var e2: f32 = 0;
     for (buf) |s| e2 += @abs(s);

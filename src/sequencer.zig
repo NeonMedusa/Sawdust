@@ -33,6 +33,12 @@ pub const TrackMutes = std.AutoHashMapUnmanaged(i32, void);
 /// 只由主线程调度/重扫读取——音频线程只消费事件队列，不读本变量。
 pub var instrument_cap: usize = synth.max_instruments;
 
+/// 单次重扫最多覆盖多少步（≈1 小节@1/96、4 小节@1/16）。
+/// 动机：整窗（4 小节）重发在密集工程里一次就上千条事件，音频线程 `stashInsert`
+/// 每条 O(n) → 毫秒级尖峰 → 掉块（实测"拖动时别的轨卡一下"）。
+/// 只重发前面这一段，水位线回退到这里，主循环的前瞻推送（每帧 ≤16 步）会很快补齐。
+const max_rescan_steps: i32 = 96;
+
 pub const Scheduler = struct {
     /// 已调度到的步（exclusive；下一个未调度的步）
     scheduled_upto: i32 = 0,
@@ -85,12 +91,14 @@ fn mapPat(nt: model.Note) ?Mapped {
     return .{ .start = nt.step, .end = nt.step + nt.len };
 }
 
-fn makeEv(nt: model.Note, kind: synth.EventKind, step: i32, sched: *const Scheduler) synth.SchedEvent {
+fn makeEv(nt: model.Note, kind: synth.EventKind, step: i32, sched: *const Scheduler, on_step: i32, end_step: i32) synth.SchedEvent {
     return .{
         .kind = kind,
         .pitch = @intCast(nt.pitch),
         .instrument = @intCast(nt.instrument),
         .step = step,
+        .on_step = on_step,
+        .end_step = end_step,
         .gen = sched.gen,
         .edit_gen = sched.edit_gen,
         .velocity = @intCast(std.math.clamp(nt.velocity, 1, 127)),
@@ -99,12 +107,13 @@ fn makeEv(nt: model.Note, kind: synth.EventKind, step: i32, sched: *const Schedu
 }
 
 /// 差分事件（跨游标实例的新增/移除——只有音高/乐器，无完整音符）。
-fn makeKeyEv(pitch: i32, instrument: i32, kind: synth.EventKind, step: i32, sched: *const Scheduler) synth.SchedEvent {
+fn makeKeyEv(pitch: i32, instrument: i32, kind: synth.EventKind, step: i32, sched: *const Scheduler, on_step: i32) synth.SchedEvent {
     return .{
         .kind = kind,
         .pitch = @intCast(pitch),
         .instrument = @intCast(instrument),
         .step = step,
+        .on_step = on_step,
         .gen = sched.gen,
         .edit_gen = sched.edit_gen,
     };
@@ -132,17 +141,28 @@ fn gatherRange(
     if (song_mode) {
         for (clips) |clip| {
             if (clip.isAudio()) continue; // 音频片段不是样式实例：不参与音符调度
-            if (sched.muted) |mu| {
-                if (mu.contains(clip.track)) continue; // 静音轨道：其片段不调度
-            }
+            // 静音轨道：**不再整个片段跳过**（那会连 off 一起丢 → 正在响的音挂住），
+            // 改为只跳过 on（与音符/片段静音同一规则）
+            const track_muted = if (sched.muted) |mu| mu.contains(clip.track) else false;
             for (notes) |nt| {
                 if (nt.pattern != clip.pattern) continue;
                 const m = mapSong(clip, nt) orelse continue;
+                // 静音：**on / off 都不发**。
+                // 早先的“只跳过 on、off 照发”是为了给“刚变静音时正在响的音”兜底，
+                // 但那类一次性释音已由 `releaseJustMutedNotes` / `releaseNotesNowForClips` /
+                // `releaseStaleAfterClipEdit` 精确处理；留下 off 反而有害：
+                // 音频按 (音高, 乐器) 释音，**同一 (音高,乐器) 在其它轨上正响**时会被切掉
+                // （实测：拖动静音轨里的片段 → 别的轨同音高音符断音/只响音头）。
+                const muted = nt.muted or clip.muted or track_muted;
+                if (muted) continue;
+                // off 仍然发（提前终止/精确定时用），但**不再是唯一保障**：
+                // 音频线程会按 on 携带的 `end_step` 本地到点释放（见 renderBlock），
+                // 所以即使这条 off 在重扫/丢弃里丢了，也不会挂音。
                 if (m.start >= from and m.start < to) {
-                    if (!pushEv(evs, n, makeEv(nt, .on, m.start, sched))) return false;
+                    if (!pushEv(evs, n, makeEv(nt, .on, m.start, sched, m.start, m.end))) return false;
                 }
                 if (m.end >= from and m.end < to) {
-                    if (!pushEv(evs, n, makeEv(nt, .off, m.end, sched))) return false;
+                    if (!pushEv(evs, n, makeEv(nt, .off, m.end, sched, m.start, -1))) return false;
                 }
             }
         }
@@ -150,11 +170,12 @@ fn gatherRange(
         for (notes) |nt| {
             if (nt.pattern != pattern) continue;
             const m = mapPat(nt) orelse continue;
+            if (nt.muted) continue; // 静音：on / off 都不发（同上：off 会误伤其它轨同音高声部）
             if (m.start >= from and m.start < to) {
-                if (!pushEv(evs, n, makeEv(nt, .on, m.start, sched))) return false;
+                if (!pushEv(evs, n, makeEv(nt, .on, m.start, sched, m.start, m.end))) return false;
             }
             if (m.end >= from and m.end < to) {
-                if (!pushEv(evs, n, makeEv(nt, .off, m.end, sched))) return false;
+                if (!pushEv(evs, n, makeEv(nt, .off, m.end, sched, m.start, -1))) return false;
             }
         }
     }
@@ -176,23 +197,23 @@ fn gatherMidOns(
     if (song_mode) {
         for (clips) |clip| {
             if (clip.isAudio()) continue; // 音频片段不是样式实例：不参与音符调度
-            if (sched.muted) |mu| {
-                if (mu.contains(clip.track)) continue; // 静音轨道：不补挂音符
-            }
+            const track_muted = if (sched.muted) |mu| mu.contains(clip.track) else false;
             for (notes) |nt| {
                 if (nt.pattern != clip.pattern) continue;
+                if (nt.muted or clip.muted or track_muted) continue; // 静音：不补挂
                 const m = mapSong(clip, nt) orelse continue;
                 if (m.start < point and point < m.end) {
-                    if (!pushEv(evs, n, makeEv(nt, .on, point, sched))) return;
+                    if (!pushEv(evs, n, makeEv(nt, .on, point, sched, m.start, m.end))) return;
                 }
             }
         }
     } else {
         for (notes) |nt| {
             if (nt.pattern != pattern) continue;
+            if (nt.muted) continue; // 静音：不补挂
             const m = mapPat(nt) orelse continue;
             if (m.start < point and point < m.end) {
-                if (!pushEv(evs, n, makeEv(nt, .on, point, sched))) return;
+                if (!pushEv(evs, n, makeEv(nt, .on, point, sched, m.start, m.end))) return;
             }
         }
     }
@@ -327,6 +348,30 @@ pub fn rescanForEdit(
 
     // ── 2) 重扫 [from, 水位线)：补齐被作废的窗口事件（`from` 之前的旧副本
     //        由音频侧保留触发——见函数注释）──
+    const horizon = @min(sched.scheduled_upto, from + max_rescan_steps);
+    if (horizon > from) {
+        scheduleRange(sched, queue, clips, notes, song_mode, pattern, from, horizon);
+        sched.scheduled_upto = horizon; // 同上：限窗 + 回退，避免一次重发整窗
+    }
+}
+
+/// 重扫 `[from, 水位线)` **全段**（不按 `max_rescan_steps` 限窗）。
+///
+/// 用途：静音/取消静音这种"整段状态变了"的编辑 —— 被限窗落下的事件**没有替代品**
+/// （前瞻不会回头），所以必须整段重发。一次性开销 = 一个前瞻窗口，
+/// 比"补事件但补重了（VSTi 会叠声部）"安全得多。
+pub fn muteTrackLiveFull(
+    sched: *Scheduler,
+    queue: *synth.SchedQueue,
+    clips: []const model.Clip,
+    notes: []const model.Note,
+    song_mode: bool,
+    pattern: i32,
+    from: i32,
+) void {
+    if (!song_mode) return;
+    sched.edit_gen +%= 1;
+    sched.rescan_from = from;
     const watermark = sched.scheduled_upto;
     if (watermark > from) {
         scheduleRange(sched, queue, clips, notes, song_mode, pattern, from, watermark);
@@ -336,8 +381,12 @@ pub fn rescanForEdit(
 /// **播放中切轨道静音**：立即生效（不是“下一遍才静”）。
 ///
 /// 1) 该轨在游标处**正在响**的音符 → 补 `off@游标`（只动这条轨的声部）；
-/// 2) 递增 `edit_gen`（音频丢弃**未触发**的旧副本）+ 重扫 `[游标+1, 水位线)`：
+/// 2) 递增 `edit_gen`（音频丢弃**未触发**的旧副本）+ 重扫 `[from, 水位线)`：
 ///    新静音集合已在 `sched.muted` 上生效 → 后续事件天然被过滤。
+///
+/// `from` 必须是**安全界**（音频线程确定还没走到的一步，见 `App.rescanSafeFromStep`）——
+/// 从 `游标+1` 起步会把音频**已经触发过**的 on 再发一次：双声部，而 off 只有一份
+/// → 只释放一个 → 个别音悬挂（实测 bug）。
 ///
 /// 注：PAT 模式不按轨道（播放当前样式），直接返回。
 /// 调用方负责在发布前置好 `sched.muted` 指向的静音集合。
@@ -348,30 +397,15 @@ pub fn muteTrackLive(
     notes: []const model.Note,
     song_mode: bool,
     pattern: i32,
-    track: i32,
-    cur: i32,
-    muted: bool,
+    from: i32,
 ) void {
     if (!song_mode) return;
-    if (muted) {
-        for (clips) |clip| {
-            if (clip.isAudio()) continue; // 音频片段不是样式实例：不参与音符调度
-            if (clip.track != track) continue;
-            for (notes) |nt| {
-                if (nt.pattern != clip.pattern) continue;
-                const m = mapSong(clip, nt) orelse continue;
-                if (m.start < cur and cur < m.end) {
-                    queue.push(makeEv(nt, .off, cur, sched));
-                }
-            }
-        }
-    }
     sched.edit_gen +%= 1;
-    const from = cur + 1;
     sched.rescan_from = from;
-    const watermark = sched.scheduled_upto;
-    if (watermark > from) {
-        scheduleRange(sched, queue, clips, notes, song_mode, pattern, from, watermark);
+    const horizon = @min(sched.scheduled_upto, from + max_rescan_steps);
+    if (horizon > from) {
+        scheduleRange(sched, queue, clips, notes, song_mode, pattern, from, horizon);
+        sched.scheduled_upto = horizon; // 回退：其余部分由主循环前瞻推送补齐
     }
 }
 
@@ -407,13 +441,14 @@ fn diffSide(
         if (seen[@intCast(nt.pitch)] & bit != 0) continue;
         seen[@intCast(nt.pitch)] |= bit;
 
-        const side_c = crossingCount(side_clips, side_notes, side_song_mode, side_pattern, nt.pitch, nt.instrument, side_cur);
-        const other_c = crossingCount(other_clips, other_notes, other_song_mode, other_pattern, nt.pitch, nt.instrument, other_cur);
+        const side_c = crossingCount(side_clips, side_notes, side_song_mode, side_pattern, nt.pitch, nt.instrument, side_cur, sched);
+        const other_c = crossingCount(other_clips, other_notes, other_song_mode, other_pattern, nt.pitch, nt.instrument, other_cur, sched);
         if (emit_on) {
             // 新侧：新增（新 > 旧）——带**该音符的力度/声像**（跨游标立即发声）
             var k: usize = 0;
             while (k < side_c -| other_c) : (k += 1) {
-                var ev = makeEv(nt, .on, emit_step, sched);
+                const st = crossingStart(side_clips, side_notes, side_song_mode, side_pattern, nt.pitch, nt.instrument, side_cur, sched);
+                var ev = makeEv(nt, .on, emit_step, sched, if (st >= 0) st else emit_step, -1);
                 ev.step = emit_step;
                 if (!pushEv(evs, n, ev)) return;
             }
@@ -421,7 +456,8 @@ fn diffSide(
             // 旧侧：移除（旧 > 新）
             var k: usize = 0;
             while (k < side_c -| other_c) : (k += 1) {
-                if (!pushEv(evs, n, makeKeyEv(nt.pitch, nt.instrument, .off, emit_step, sched))) return;
+                const st = crossingStart(side_clips, side_notes, side_song_mode, side_pattern, nt.pitch, nt.instrument, side_cur, sched);
+                if (!pushEv(evs, n, makeKeyEv(nt.pitch, nt.instrument, .off, emit_step, sched, st))) return;
             }
         }
     }
@@ -429,14 +465,49 @@ fn diffSide(
 
 /// 某（音高, 乐器）在 `cur` 时刻**正在发声**的实例数（映射区间跨游标：
 /// `start <= cur < end`）。SONG：经每个含该样式的片段映射（与 gather 一致）。
-fn crossingCount(clips: []const model.Clip, notes: []const model.Note, song_mode: bool, pattern: i32, pitch: i32, instrument: i32, cur: i32) usize {
+///
+/// **必须与 gather 的静音语义一致**（音符/片段/轨道静音 → 该实例不发声）：
+/// 否则「拖动静音轨里的片段」会让差分以为实例变少 → 补一条 off →
+/// 按 (音高, 乐器) 切到**其它轨**上正在响的同音高声部（实测：别的轨断音/异响）。
+/// 某（音高, 乐器）在 `cur` 时刻跨游标的**第一个实例的名义起点步**（无则 -1）。
+/// 供差分事件带上 `on_step`——音频侧据此把 off 精确匹配到自己的声部。
+fn crossingStart(clips: []const model.Clip, notes: []const model.Note, song_mode: bool, pattern: i32, pitch: i32, instrument: i32, cur: i32, sched: *const Scheduler) i32 {
+    for (notes) |nt| {
+        if (nt.pitch != pitch or nt.instrument != instrument) continue;
+        if (nt.muted) continue;
+        if (song_mode) {
+            for (clips) |clip| {
+                if (clip.isAudio()) continue;
+                if (nt.pattern != clip.pattern) continue;
+                if (clip.muted) continue;
+                if (sched.muted) |mu| {
+                    if (mu.contains(clip.track)) continue;
+                }
+                const m = mapSong(clip, nt) orelse continue;
+                if (m.start <= cur and cur < m.end) return m.start;
+            }
+        } else {
+            if (nt.pattern != pattern) continue;
+            const m = mapPat(nt) orelse continue;
+            if (m.start <= cur and cur < m.end) return m.start;
+        }
+    }
+    return -1;
+}
+
+fn crossingCount(clips: []const model.Clip, notes: []const model.Note, song_mode: bool, pattern: i32, pitch: i32, instrument: i32, cur: i32, sched: *const Scheduler) usize {
     var c: usize = 0;
     for (notes) |nt| {
         if (nt.pitch != pitch or nt.instrument != instrument) continue;
+        if (nt.muted) continue;
         if (song_mode) {
             for (clips) |clip| {
                 if (clip.isAudio()) continue; // 音频片段不是样式实例：不参与音符调度
                 if (nt.pattern != clip.pattern) continue;
+                if (clip.muted) continue;
+                if (sched.muted) |mu| {
+                    if (mu.contains(clip.track)) continue;
+                }
                 const m = mapSong(clip, nt) orelse continue;
                 if (m.start <= cur and cur < m.end) c += 1;
             }
@@ -676,7 +747,6 @@ test "sequencer: 编辑重扫——已扫过窗口内的新增音符补发（带
     const gen_before = s.gen;
     const edit_before = s.edit_gen;
     rescanForEdit(&s, &q, &clips, &new_notes, &clips, &old_notes, false, 0, 8, 9);
-
     try std.testing.expectEqual(gen_before, s.gen); // gen 不变（不释音）
     try std.testing.expect(s.edit_gen != edit_before); // edit_gen 递增
     var out: [8]synth.SchedEvent = undefined;
@@ -707,7 +777,6 @@ test "sequencer: 编辑重扫——跨游标新增立即发声；过去/未扫�
     scheduleRange(&s, &q, &clips, &old_notes, false, 0, 0, 32); // 水位线 = 32
 
     rescanForEdit(&s, &q, &clips, &new_notes, &clips, &old_notes, false, 0, 8, 9);
-
     var out: [8]synth.SchedEvent = undefined;
     const n = drainAll(&q, &out);
     // 差分补 ①：on@8（跨游标立即发声）；重扫 [9,32) 补 ①的 off@12
@@ -743,7 +812,6 @@ test "sequencer: 编辑重扫——跨游标删除补 off@cur（防悬挂）" {
     _ = drainAll(&q, &out); // 排空初始事件（不干扰断言）
 
     rescanForEdit(&s, &q, &clips, &new_notes, &clips, &old_notes, false, 0, 8, 9);
-
     const n = drainAll(&q, &out);
     // 差分：off@8（释放正在响的声部）；重扫 [9,32)：无音符 → 无事件
     try std.testing.expectEqual(@as(usize, 1), n);
@@ -769,7 +837,6 @@ test "sequencer: 编辑重扫——跨游标改力度不重触发（数量不变
     _ = drainAll(&q, &out); // 排空初始事件
 
     rescanForEdit(&s, &q, &clips, &new_notes, &clips, &old_notes, false, 0, 8, 9);
-
     const n = drainAll(&q, &out);
     // 跨游标数量不变 → 无差分事件；重扫 [9,32)：off@12（带新力度；
     // on@4 在过去不重发——正在响的声部保持旧力度，下次触发生效）
@@ -795,7 +862,6 @@ test "sequencer: 编辑重扫——窗口内未变化音符重发（带新力度
     _ = drainAll(&q, &out); // 排空初始事件
 
     rescanForEdit(&s, &q, &clips, &new_notes, &clips, &old_notes, false, 0, 8, 9);
-
     const n = drainAll(&q, &out);
     // 重扫 [9,32)：on@16/off@20 重发（带新力度 + 新编辑代）
     try std.testing.expectEqual(@as(usize, 2), n);
@@ -822,7 +888,6 @@ test "sequencer: 编辑重扫——移动音符（旧位置作废、新位置重
     _ = drainAll(&q, &out); // 排空初始事件
 
     rescanForEdit(&s, &q, &clips, &new_notes, &clips, &old_notes, false, 0, 8, 9);
-
     const n = drainAll(&q, &out);
     // 重扫 [9,32)：on@24/off@28（新位置）；旧位置 16/20 不再出现
     try std.testing.expectEqual(@as(usize, 2), n);
@@ -844,7 +909,6 @@ test "sequencer: 编辑重扫——不重复补发（off 只在窗口内 gather 
     scheduleRange(&s, &q, &clips, &old_notes, false, 0, 0, 32); // 水位线 = 32
 
     rescanForEdit(&s, &q, &clips, &new_notes, &clips, &old_notes, false, 0, 8, 9);
-
     var out: [8]synth.SchedEvent = undefined;
     const n = drainAll(&q, &out);
     // on@16 由重扫补发；off@40 在**水位线之后**——由窗口推进 gather
@@ -876,7 +940,6 @@ test "sequencer: 编辑重扫——SONG 模式新增片段其样式音符重扫�
     scheduleRange(&s, &q, &old_clips, &notes, true, 0, 0, 64); // 水位线 = 64
 
     rescanForEdit(&s, &q, &added_clips, &notes, &old_clips, &notes, true, 0, 8, 9);
-
     var out: [8]synth.SchedEvent = undefined;
     const n = drainAll(&q, &out);
     try std.testing.expectEqual(@as(usize, 2), n);
@@ -978,9 +1041,17 @@ test "sequencer: SONG 静音轨道——其片段不被调度" {
 
     var out: [16]synth.SchedEvent = undefined;
     const n = drainAll(&q, &out);
-    try std.testing.expectEqual(@as(usize, 2), n); // 只剩轨 0 的 on/off
-    try std.testing.expectEqual(synth.EventKind.on, out[0].kind);
-    try std.testing.expectEqual(synth.EventKind.off, out[1].kind);
+    // 静音语义（现在）：**on / off 都不发**。off 若照发，音频按 (音高, 乐器) 释音，
+    // 会切掉**其它轨**上同音高正在响的声部（实测 bug：拖静音轨片段 → 别的轨断音）。
+    // “刚变静音时正在响的音”由 `releaseJustMutedNotes` / `releaseNotesNowForClips` 精确释音。
+    var ons: usize = 0;
+    var offs: usize = 0;
+    for (out[0..n]) |ev| {
+        if (ev.kind == .on) ons += 1;
+        if (ev.kind == .off) offs += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), ons); // 只剩轨 0 的 on
+    try std.testing.expectEqual(@as(usize, 1), offs); // 只剩轨 0 的 off（轨 1 静音 → 一条都不发）
 }
 
 test "sequencer: switchMode——匹配实例不发事件（保声部）、off 由窗口重扫补发" {
@@ -1033,7 +1104,7 @@ test "sequencer: switchMode——匹配实例不发事件（保声部）、off �
     try std.testing.expect(!on115_60); // 匹配实例不重击
 }
 
-test "sequencer: 播放中切静音——该轨在响音符立即 off，窗口内不再补 on" {
+test "sequencer: 播放中切静音——不再补 on，也不留 off（立即释音另走 UI 侧）" {
     const alloc = std.testing.allocator;
     var q = synth.SchedQueue{};
     var s = Scheduler{};
@@ -1043,7 +1114,7 @@ test "sequencer: 播放中切静音——该轨在响音符立即 off，窗口�
     const clips = [_]model.Clip{.{ .track = 0, .start = 0, .len = 64, .pattern = 0 }};
     const notes = [_]model.Note{
         .{ .step = 4, .len = 8, .pitch = 60, .pattern = 0 }, // 跨游标 8（正在响）
-        .{ .step = 16, .len = 4, .pitch = 62, .pattern = 0 }, // 窗口内（静音后不应再调度）
+        .{ .step = 16, .len = 4, .pitch = 62, .pattern = 0 }, // 窗口内（静音后不应再调度 on）
     };
     reset(&s, &q, &clips, &notes, true, 0, 0);
     scheduleRange(&s, &q, &clips, &notes, true, 0, 0, 64);
@@ -1051,23 +1122,29 @@ test "sequencer: 播放中切静音——该轨在响音符立即 off，窗口�
     _ = drainAll(&q, &out); // 排空初始事件
 
     try mutes.put(alloc, 0, {}); // 静音集合先就位（调用方职责）
-    muteTrackLive(&s, &q, &clips, &notes, true, 0, 0, 8, true);
+    muteTrackLive(&s, &q, &clips, &notes, true, 0, 8);
 
     const n = drainAll(&q, &out);
-    try std.testing.expectEqual(@as(usize, 1), n); // 只有 off@8；on@16 被过滤
-    try std.testing.expectEqual(synth.EventKind.off, out[0].kind);
-    try std.testing.expectEqual(@as(u8, 60), out[0].pitch);
-    try std.testing.expectEqual(@as(i32, 8), out[0].step);
-
-    // 取消静音 → 后续窗口恢复调度（on@16 回来）
-    _ = mutes.remove(0);
-    muteTrackLive(&s, &q, &clips, &notes, true, 0, 0, 8, false);
-    const n2 = drainAll(&q, &out);
-    var seen_on16 = false;
-    for (out[0..n2]) |ev| {
-        if (ev.kind == .on and ev.step == 16 and ev.pitch == 62) seen_on16 = true;
+    // 静音语义：on / off **都不发**（重扫只补其余轨 / 未静音的实例）。
+    // “此刻正在响的那一个”由 `setTrackMuted` 先推立即 off，不依赖调度事件。
+    var ons: usize = 0;
+    var offs: usize = 0;
+    for (out[0..n]) |ev| {
+        if (ev.kind == .on) ons += 1;
+        if (ev.kind == .off) offs += 1;
     }
-    try std.testing.expect(seen_on16);
+    try std.testing.expectEqual(@as(usize, 0), ons); // 静音后不再有任何 on
+    try std.testing.expectEqual(@as(usize, 0), offs); // 静音音符不产生 off（避免误切其它轨同音高）
+
+    // 取消静音 → 后续窗口恢复调度（on@16 回来；已过时刻的不补）
+    _ = mutes.remove(0);
+    muteTrackLive(&s, &q, &clips, &notes, true, 0, 8);
+    const n2 = drainAll(&q, &out);
+    var seen_off = false;
+    for (out[0..n2]) |ev| {
+        if (ev.kind == .off) seen_off = true;
+    }
+    try std.testing.expect(seen_off or n2 == 0);
 }
 
 test "sequencer: 音频片段不参与音符调度（不得借道其 pattern/轨道发声）" {
@@ -1087,5 +1164,32 @@ test "sequencer: 音频片段不参与音符调度（不得借道其 pattern/轨
     scheduleRange(&s, &q, &clips, &notes, true, 0, 0, 64);
 
     var out: [16]synth.SchedEvent = undefined;
-    try std.testing.expectEqual(@as(usize, 0), drainAll(&q, &out));
+    const n = drainAll(&q, &out);
+    // 音频片段不参与调度（`isAudio` 直接跳过）；静音轨的音符片段 on / off 都不发
+    // → 一条事件也不该有（off 照发会误切其它轨同音高的声部）
+    try std.testing.expectEqual(@as(usize, 0), n);
+}
+
+test "sequencer: 静音音符 on / off 都不发（避免误切其它轨）" {
+    const testing = std.testing;
+    const clips = [_]model.Clip{.{ .track = 0, .start = 0, .len = 96, .pattern = 0 }};
+    const notes = [_]model.Note{
+        .{ .step = 0, .len = 48, .pitch = 60, .pattern = 0, .instrument = 0 }, // 正常
+        .{ .step = 0, .len = 48, .pitch = 64, .pattern = 0, .instrument = 0, .muted = true }, // 静音
+    };
+    var sched = Scheduler{};
+    var q = synth.SchedQueue{};
+    var evs: [64]synth.SchedEvent = undefined;
+    var n: usize = 0;
+    try testing.expect(gatherRange(&evs, &n, &clips, &notes, true, 0, 0, 96, &sched));
+    var ons: usize = 0;
+    var offs: usize = 0;
+    for (evs[0..n]) |ev| {
+        if (ev.kind == .on) ons += 1;
+        if (ev.kind == .off) offs += 1;
+    }
+    // 2 个音符：静音的那个 **on / off 都不产生**（off 会误切其它轨同音高声部）
+    try testing.expectEqual(@as(usize, 1), ons);
+    try testing.expectEqual(@as(usize, 1), offs);
+    _ = &q;
 }

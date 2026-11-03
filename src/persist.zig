@@ -49,6 +49,8 @@ pub const SavedClip = struct {
     trim_start: i32 = 0,
     /// 音频片段：采样内长度（帧；<= 0 = 到素材末尾）
     trim_len: i32 = 0,
+    /// 片段静音（v8；旧档缺失 → false）
+    muted: bool = false,
     // ── v1 兼容字段（**仅用于迁移**；v2 存档不写）──
     /// v1：起始小节（1 起）。加载 v1 时据此重建 `start`。
     bar: ?i32 = null,
@@ -99,6 +101,8 @@ pub const SavedNote = struct {
     velocity: i32 = note_default_velocity,
     /// 声像（0-127；64 = 居中；缺省 =`note_default_pan`）
     pan: i32 = note_default_pan,
+    /// 音符静音（v8；旧档缺失 → false）
+    muted: bool = false,
 
     /// 序列化省默认：格式/力度/声像/乐器为默认值时省略（占盘大头；见 docs/save-format.md）
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -311,6 +315,9 @@ pub const Project = struct {
     /// 音频样式（引用文件按相对工程目录的路径；片段经 `SavedClip.audio_style` 引用）
     audio_styles: []SavedAudioStyle = &.{},
     instruments: []SavedInstrument = &.{},
+    /// 乐器**显示顺序**（显示第 i 行 → 物理槽位 `order[i]`；空/缺失 = 按 0..n 顺序）。
+    /// 物理槽位是音符引用与音频同步的身份，上下移只改本数组（不动音符）。
+    instrument_order: []u32 = &.{},
     /// 调音台通道（旧存档缺失 → 全默认 8 通道；加载时长度不匹配则重置）
     mixer: []SavedMixerChannel = &.{},
 };
@@ -465,9 +472,12 @@ pub const binary_magic = "SAWD";
 /// **不变量**：任何 `Saved*`/`Project` 字段增删/调序**必须**递增它（v5 首版曾被
 /// 多次改布局未递增，导致旧工程加载错位 → `integer does not fit…` 崩溃，实测）。
 /// v5 旧档保留专门的兼容读（见 `introducedVersion`/`legacySkip`）。
-pub const binary_version: u8 = 6;
+pub const binary_version: u8 = 8; // v8：音符/片段静音（`muted`）
 /// v5（首版二进制，f4a7960）——兼容读取用
 const binary_version_legacy: u8 = 5;
+/// v6（鼓组 VST3 层 / 音频片段 / 音频样式字段）——这些字段的引入版本**钉死为 6**，
+/// 不随 `binary_version` 上调而漂移（否则 v6 存档会被误判为“缺字段”而错位）。
+const binary_version_v6: u8 = 6;
 
 /// 某字段**首次出现的存档版本**（未登记 = 从首版就有 → null）。
 ///
@@ -481,21 +491,27 @@ fn introducedVersion(comptime T: type, comptime name: []const u8) ?u8 {
     if (comptime std.mem.endsWith(u8, tn, "SavedDrumLayer")) {
         // 85f9bad（层 VST3）+ 音频 P1（采样器层字段）——均为 v6
         inline for (.{ "plugin_path", "plugin_cid", "plugin_state", "plugin_state_ctrl", "asset_path", "trim_start", "trim_len", "speed" }) |fn_name| {
-            if (comptime std.mem.eql(u8, name, fn_name)) return binary_version;
+            if (comptime std.mem.eql(u8, name, fn_name)) return binary_version_v6;
         }
         return null;
     }
     if (comptime std.mem.endsWith(u8, tn, "SavedClip")) {
-        // 音频片段字段——v6
+        // 音频片段字段——v6；静音——v8
         inline for (.{ "audio_style", "trim_start", "trim_len" }) |fn_name| {
-            if (comptime std.mem.eql(u8, name, fn_name)) return binary_version;
+            if (comptime std.mem.eql(u8, name, fn_name)) return binary_version_v6;
         }
+        if (comptime std.mem.eql(u8, name, "muted")) return binary_version;
+        return null;
+    }
+    if (comptime std.mem.endsWith(u8, tn, "SavedNote")) {
+        // 静音——v8（旧档缺失 → false）
+        if (comptime std.mem.eql(u8, name, "muted")) return binary_version;
         return null;
     }
     if (comptime std.mem.endsWith(u8, tn, "Project")) {
-        inline for (.{"audio_styles"}) |fn_name| {
-            if (comptime std.mem.eql(u8, name, fn_name)) return binary_version;
-        }
+        // 音频样式：v6；乐器显示顺序：v7（旧档缺失 → 默认空 = 按槽位顺序）
+        if (comptime std.mem.eql(u8, name, "audio_styles")) return binary_version_v6;
+        if (comptime std.mem.eql(u8, name, "instrument_order")) return 7;
         return null;
     }
     return null;
@@ -748,9 +764,9 @@ pub fn fromBinary(allocator: std.mem.Allocator, data: []const u8) !std.json.Pars
     const magic = try r.take(binary_magic.len);
     if (!std.mem.eql(u8, magic, binary_magic)) return error.NotBinaryProject;
     const ver = try r.byte();
-    if (ver == binary_version_legacy) {
-        r.version = ver; // 旧档：`legacySkip` 据此跳过旧版本没有的字段（保留默认值）
-    } else if (ver != binary_version) return error.UnsupportedBinaryVersion;
+    if (ver >= binary_version_legacy and ver <= binary_version) {
+        r.version = ver; // 按存档版本决定哪些字段需要跳过（`legacySkip`）
+    } else return error.UnsupportedBinaryVersion;
     const value = try binReadValue(Project, &r, arena.allocator());
     if (r.pos != data.len) return error.TrailingBinaryData;
     return .{ .arena = arena, .value = value };
@@ -1525,4 +1541,22 @@ test "persist: 整数溢出 → error.CorruptProject（不再 panic）" {
     // 300 的 varint = 0xAC 0x02（能装进 u64，但装不进 u8）；旧代码 @intCast 会 panic
     var r = BinReader{ .data = &[_]u8{ 0xAC, 0x02 } };
     try std.testing.expectError(error.CorruptProject, binReadValue(u8, &r, std.testing.allocator));
+}
+
+test "persist: v6 旧档（无 instrument_order）能正确读取——版本门控回归" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const proj = Project{ .bpm = 133, .instrument_order = &.{} };
+    var w = BinWriter{ .a = a, .version = binary_version_v6 };
+    defer w.buf.deinit(a);
+    try w.put(binary_magic);
+    try w.putByte(binary_version_v6);
+    try binWriteValue(Project, &w, proj);
+
+    var parsed = try fromBinary(std.testing.allocator, w.buf.items);
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i32, 133), parsed.value.bpm);
+    try std.testing.expectEqual(@as(usize, 0), parsed.value.instrument_order.len); // 旧档 → 空 = 按槽位顺序
 }

@@ -292,8 +292,8 @@ pub fn drawPatternCtxMenu(ui: *Ui, app: *App) void {
         app.panels.ctx_pattern = null; // 目标已不存在（撤销/删除）→ 关闭
         return;
     }
-    const items = [_][]const u8{ "克隆", "重命名", "删除样式" };
-    const menu_w: i32 = 130;
+    const items = [_][]const u8{ "克隆", "导出 MIDI…", "重命名", "删除样式" };
+    const menu_w: i32 = 150;
     const menu_h: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
     const mx = app.panels.ctx_pat_x;
     const my = app.panels.ctx_pat_y;
@@ -327,11 +327,36 @@ pub fn drawPatternCtxMenu(ui: *Ui, app: *App) void {
                 app.panels.ctx_pattern = null;
             },
             1 => {
+                // 导出该样式的 MIDI（只导出本样式的音符；同样过滤空乐器）
+                // 文件名：`<工程名> - <样式名>.mid`（未保存的工程用 `song`）
+                const S = struct {
+                    var buf: [300]u8 = undefined;
+                };
+                const pname = app.pattern_items.items[idx];
+                const stem: []const u8 = blk: {
+                    if (app.project_path) |p| {
+                        const base = std.fs.path.basename(p);
+                        const s = if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot| base[0..dot] else base;
+                        if (s.len > 0) break :blk s[0..@min(s.len, 180)];
+                    }
+                    break :blk "song";
+                };
+                const dflt = std.fmt.bufPrint(&S.buf, "{s} - {s}.mid", .{ stem, pname[0..@min(pname.len, 100)] }) catch "song.mid";
+                app.requestPick(.{
+                    .kind = .save,
+                    .use_ = .{ .export_midi = .{ .pattern = @intCast(idx) } },
+                    .title = "导出样式 MIDI",
+                    .filter = "MIDI 文件 (*.mid;*.midi)\x00*.mid;*.midi\x00所有文件 (*.*)\x00*.*\x00",
+                    .default_name = dflt,
+                });
+                app.panels.ctx_pattern = null;
+            },
+            2 => {
                 // 重命名：输入框弹在菜单位置（复用文本输入基建——支持中文 IME）
                 app.beginRenamePattern(idx, mx + 6, my + 4);
                 app.panels.ctx_pattern = null;
             },
-            2 => {
+            3 => {
                 if (app.pattern_items.items.len <= 1) {
                     app.setToast("至少保留一个样式");
                 } else if (app.patternUsage(idx).notes == 0 and app.patternUsage(idx).clips == 0) {

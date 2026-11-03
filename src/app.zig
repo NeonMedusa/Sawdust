@@ -62,7 +62,7 @@ pub const Layout = struct {
 pub const FileAction = enum { new, open, save, save_as, import_midi, export_midi, export_wav, import_json, export_json };
 
 /// 编辑操作（框选/批量操作快捷键 → 由**当前视图**在帧内按上下文执行）
-pub const EditOp = enum { delete_selected, clone_right, copy, cut, paste, select_all };
+pub const EditOp = enum { delete_selected, clone_right, copy, cut, paste, select_all, toggle_mute };
 
 /// 键盘移动选中音符的请求（Shift/Ctrl+方向键；main 登记、音符视图消费）
 pub const MoveReq = struct {
@@ -195,6 +195,8 @@ pub const HistoryState = struct {
     track_names: [][]u8,
     /// 静音轨道快照（排序行号列表；静态释放）——静音切换也要能撤销
     track_muted: []i32,
+    /// 乐器**显示顺序**快照（行 → 物理槽位）——上移/下移乐器也要能撤销/标脏
+    instrument_order: []u32 = &.{},
     bpm: i32 = 120,
     time_num: i32 = 4,
     time_den: i32 = 4,
@@ -430,6 +432,9 @@ pub const Selection = struct {
 };
 
 /// 播放列表视图状态
+/// 拖动/拉伸的起点快照（用于播放中“旧窗口 → 新窗口”的释音对比）
+pub const ClipDragSnap = struct { idx: usize, clip: model.Clip };
+
 pub const PlaylistState = struct {
     /// 轨道行高（像素；□ 缺口缩放）
     track_h: i32 = 44,
@@ -490,6 +495,18 @@ pub const PlaylistState = struct {
     /// 片段拖动状态（下标 + 抓取点在小节内的偏移）
     drag_clip: ?usize = null,
     drag_grab: i32 = 0,
+    /// 拖动/拉伸开始时的片段快照（播放中改了时间 → 释放旧窗口里正在响的实例）。
+    /// 批量拖动/拉伸时记录**所有被移动的片段**。
+    drag_snaps: std.ArrayListUnmanaged(ClipDragSnap) = .empty,
+    /// 拖动/拉伸的**预览**（松手才真正应用）：作用于哪个片段 + 预览值。
+    /// 拖动期间模型不变 → 调度器看到的一直是旧位置，音频完全不受干扰。
+    preview_idx: ?usize = null,
+    preview_clip: ?model.Clip = null,
+    /// 批量拖动预览（相对快照的偏移，松手一次应用）
+    preview_batch_step: i32 = 0,
+    preview_batch_track: i32 = 0,
+    /// 预览时的轨道行数（上界 clamp 用）
+    preview_rows: i32 = 0,
     /// 片段拉伸状态（下标）
     resize_clip: ?usize = null,
     /// 拉伸的是左缘（true，折叠/展开）还是右缘（false，改长度）
@@ -1101,7 +1118,8 @@ pub const PickUse = union(enum) {
     import_midi,
     import_json,
     export_json,
-    export_midi,
+    /// MIDI 导出：`pattern` < 0 = 全部样式；否则只导出该样式
+    export_midi: struct { pattern: i32 = -1 },
     export_wav,
     /// 插件管理：添加扫描文件夹 / 单文件
     plugin_folder,
@@ -1186,7 +1204,7 @@ pub const HelpWindow = struct {
     x: i32 = 420,
     y: i32 = 110,
     w: i32 = 500,
-    h: i32 = 556, // 刚好等于内容高度（19 行×21px + 4 节标题间距 + 边距；无滚动——冗余会让底部空一截）
+    h: i32 = 572, // 刚好等于内容高度（20 行×21px + 4 节标题间距 + 边距；无滚动——冗余会让底部空一截）
     /// Z 序（越大越靠上；点窗口即置顶）——见 `RackState.z` 注释
     z: i32 = 26,
     grab_dx: i32 = 0,
@@ -1337,6 +1355,10 @@ pub const App = struct {
     notes: std.ArrayListUnmanaged(Note) = .empty,
     /// 乐器列表（槽位；可多个同名）
     instruments: std.ArrayListUnmanaged(Instrument) = .empty,
+    /// 乐器**显示顺序**（显示第 i 行 → 物理槽位 `order[i]`）。
+    /// 物理槽位（`instruments` 下标）是音符引用与音频同步的身份，**不随上下移改变**；
+    /// 上下移只交换本数组元素，不动音符、不释放声部（无卡顿/挂音）。
+    order: std.ArrayListUnmanaged(u32) = .empty,
     /// 已删除乐器的合成器参数（**延迟释放**）：音频线程可能仍持有指针，
     /// 立即 destroy 会造成 use-after-free。进程退出时才真正释放。
     retired_synths: std.ArrayListUnmanaged(*synth.SynthParams) = .empty,
@@ -1369,6 +1391,12 @@ pub const App = struct {
     /// 待提交的操作名（**拖动类操作**在拖动中每帧设置，帧末鼠标松开后才真正提交——
     /// 实现 coalesce：一次拖动 = 一条历史，而不是每帧一条）
     history_pending: ?[]const u8 = null,
+    /// 拖动提交时已经**全窗口重扫**过一遍了 → 同帧 `commitHistory` 的编辑重扫纯属重复
+    /// （它会把刚发的一整窗事件再作废一次：实测一次拖动作废 2000+ 条，全是无用功）。
+    skip_next_edit_rescan: bool = false,
+    /// 待写入日志文件的诊断行（`--sched-log` 时 App 侧追加，`schedLogTick` 落盘）
+    sched_log_pending: std.ArrayListUnmanaged(u8) = .empty,
+
     /// 进行中的“起手提交 + 静置钉值”手势（滚轮 / 插件侧改动：无明确终点事件）。
     /// 起手即提交临时条目；静置 1s / 新操作起手 / 编辑器关闭 / 保存 → 钉住最终值。
     gesture: ?Gesture = null,
@@ -2689,6 +2717,45 @@ pub const App = struct {
 
     /// 添加乐器（自动分配名字与合成器参数）；返回新槽位序号（失败 -1）
     /// `base_name`：基础名（如 "减法合成器"）；同名自动追加 #2、#3…
+    /// 保证 `order` 与 `instruments` 长度一致（加载工程 / 任何漂移时重建为 0..n）
+    pub fn ensureOrder(self: *App) void {
+        const n = self.instruments.items.len;
+        if (self.order.items.len == n) return;
+        self.order.clearRetainingCapacity();
+        var i: usize = 0;
+        while (i < n) : (i += 1) self.order.append(self.allocator, @intCast(i)) catch return;
+    }
+
+    /// 校验"行→槽位"是不是 `0..n` 的一个排列（存档/历史快照导入用）。
+    /// 不是排列 → 调用方应重建 `0..n-1`，否则会出现重复/漏音轨。
+    pub fn validInstrumentOrder(order: []const u32, n: usize) bool {
+        if (order.len != n) return false;
+        var seen: [64]bool = @splat(false);
+        if (n > seen.len) return false;
+        for (order) |s| {
+            if (s >= n) return false;
+            if (seen[s]) return false;
+            seen[s] = true;
+        }
+        return true;
+    }
+
+    /// 显示第 `row` 行 → 物理槽位（越界 → null）
+    pub fn slotAt(self: *const App, row: usize) ?usize {
+        if (row >= self.order.items.len) return null;
+        const s = self.order.items[row];
+        if (s >= self.instruments.items.len) return null;
+        return s;
+    }
+
+    /// 物理槽位 → 显示行号（找不到 → null）
+    pub fn rowOf(self: *const App, slot: usize) ?usize {
+        for (self.order.items, 0..) |s, r| {
+            if (s == slot) return r;
+        }
+        return null;
+    }
+
     pub fn addInstrument(self: *App, base_name: []const u8) i32 {
         self.ensureAudioCapacity(self.instruments.items.len + 1, 0, 0);
         // 1) 生成不重复的名字：统计已有同名（忽略 #N 后缀）数量
@@ -2725,6 +2792,8 @@ pub const App = struct {
             self.allocator.destroy(sp);
             return -1;
         };
+        self.ensureOrder();
+        self.order.append(self.allocator, @intCast(self.instruments.items.len - 1)) catch {};
         self.dirty = true;
         return @intCast(self.instruments.items.len - 1);
     }
@@ -3323,6 +3392,13 @@ pub const App = struct {
     /// 历史的脏标复用曾经漏置/提前消费，导致“拖入后首次不响、动一下片段或切
     /// PAT/SONG 才响”（实测 bug）。行数很少，逐帧比对成本可忽略；顺带能捕捉
     /// **资产列表扩容后指针失效**（指针变了 → 重发）。
+    /// 音频片段在这一行播放表上的增益：**片段静音 / 轨道静音 → 0**。
+    /// （音频片段不走音符调度，静音必须体现在播放表上。）
+    fn audioRowGain(self: *const App, c: model.Clip, style_gain: f32) f32 {
+        if (c.muted or self.isTrackMuted(c.track)) return 0;
+        return style_gain;
+    }
+
     pub fn rebuildAudioTable(self: *App) void {
         const a = self.allocator;
         self.reapRetiredAudioTables();
@@ -3343,7 +3419,9 @@ pub const App = struct {
                     .trim_start = c.trim_start,
                     .trim_len = c.trim_len,
                     .channel = @intCast(std.math.clamp(st.channel, 0, 65535)),
-                    .gain = st.gain,
+                    // **片段静音 / 轨道静音** → 增益 0（音频片段不走音符调度，
+                    // 所以静音必须在播放表上体现；音频侧按行增益做淡入淡出，不会咔哒）
+                    .gain = self.audioRowGain(c, st.gain),
                     .speed = st.speed,
                 }) catch return; // OOM：保留旧表，下帧重试
             }
@@ -3688,6 +3766,11 @@ pub const App = struct {
         self.retireSynth(inst.synth);
         if (inst.kit) |kit| self.deinitDrumKit(kit); // 鼓组内容同样退役层参数
         _ = self.instruments.orderedRemove(idx);
+        // 显示顺序：删掉该槽位项，后续槽位下标前移
+        if (self.rowOf(idx)) |r| _ = self.order.orderedRemove(r);
+        for (self.order.items) |*s| {
+            if (s.* > idx) s.* -= 1;
+        }
         var i: usize = 0;
         while (i < self.notes.items.len) {
             const n = &self.notes.items[i];
@@ -3716,6 +3799,51 @@ pub const App = struct {
         self.shrink_pending = true; // 帧末尝试回收容量
     }
 
+    /// 上下移动乐器：**只改显示顺序**（`order`），不动音符、不释放声部——
+    /// 物理槽位是音符引用与音频同步的身份，所以播放中移动也不会卡顿/挂音。
+    pub fn moveInstrument(self: *App, slot: usize, up: bool) bool {
+        self.ensureOrder();
+        const row = self.rowOf(slot) orelse return false;
+        if (up and row == 0) return false;
+        const target: usize = if (up) row - 1 else row + 1;
+        if (target >= self.order.items.len) return false;
+        std.mem.swap(u32, &self.order.items[row], &self.order.items[target]);
+        self.renumberAutoInstruments(); // 自动命名（“乐器 #N”）按显示顺序重编；自定义名不动
+        self.dirty = true;
+        return true;
+    }
+
+    /// 自动命名的乐器（`乐器` / `乐器 #N`）按**显示顺序**重新编号；
+    /// 用户改过名的乐器一律不动（名字是身份，不是序号）。
+    fn renumberAutoInstruments(self: *App) void {
+        const base = "乐器";
+        var next: i32 = 1;
+        for (self.order.items) |s| {
+            if (s >= self.instruments.items.len) continue;
+            const inst = &self.instruments.items[s];
+            const is_auto = std.mem.eql(u8, inst.name, base) or auto: {
+                if (!std.mem.startsWith(u8, inst.name, base ++ " #")) break :auto false;
+                const tail = inst.name[base.len + 2 ..];
+                if (tail.len == 0) break :auto false;
+                for (tail) |ch| {
+                    if (!std.ascii.isDigit(ch)) break :auto false;
+                }
+                break :auto true;
+            };
+            if (!is_auto) continue;
+            var buf: [64]u8 = undefined;
+            const want = if (next == 1)
+                std.fmt.bufPrint(&buf, "{s}", .{base}) catch continue
+            else
+                std.fmt.bufPrint(&buf, "{s} #{d}", .{ base, next }) catch continue;
+            next += 1;
+            if (std.mem.eql(u8, inst.name, want)) continue;
+            const dup = self.allocator.dupe(u8, want) catch continue;
+            self.allocator.free(inst.name);
+            inst.name = dup;
+        }
+    }
+
     /// 清除待打开工程的路径（取消流程时）
     pub fn clearPendingOpen(self: *App) void {
         if (self.pending_open_path) |p| self.allocator.free(p);
@@ -3742,6 +3870,8 @@ pub const App = struct {
 
     /// 释放全部乐器（名字 + 合成器参数，含退役的）+ 保存相关字段——进程退出时调用
     pub fn deinitAll(self: *App) void {
+        self.sched_log_pending.deinit(self.allocator); // 诊断缓冲（--sched-log 用）
+        self.order.deinit(self.allocator); // 显示顺序表（无其它持有者）
         // 异步导入：先停 worker（join）——之后才能安全释放缓冲/资产
         self.import_mgr.deinit();
         self.clearGesture(); // 手势增量列表（无引擎依赖）先释放
@@ -4877,7 +5007,9 @@ pub const App = struct {
             // Alt+滚轮改力度“不及时生效”：续接分支只续手势、不重扫，
             // 而钉值（静置 1s）也不重扫——只有第一滚生效）。
             // 非音符改动（EQ 旋钮等）不重扫（判据同 `commitHistory`）。
-            if (!self.notesClipsUnchanged()) self.rescanForPlaybackEdit();
+            const win_same = self.scheduleWindowUnchanged();
+            if (audio.schedLogOn()) self.logLine("[hist] label={s} windowUnchanged={}\n", .{ label, win_same });
+            if (!win_same) self.rescanForPlaybackEdit();
             return;
         }
         const before = self.history.items.len;
@@ -5126,6 +5258,13 @@ pub const App = struct {
         // 会把数组泄漏掉（实测：undo → importMixerChannels → 重建通道后泄漏）
         self.mixer_channels_state.deinit(self.allocator);
         self.mixer_channels_state = .empty;
+    }
+
+    /// 队列缓冲运行时清零（`Ring.buf` 故意用 `undefined` 默认值，省掉 `.rodata`
+    /// 里 ~450 KB 的初值镜像；启动时清一次只为可重复性）——`initAudioCapacity` 前调用
+    pub fn initQueues(self: *App) void {
+        self.events.zeroed();
+        self.sched_events.zeroed();
     }
 
     /// 初始化音频容量（启动第一个编辑动作/测试建立；幂等）
@@ -5989,6 +6128,7 @@ pub const App = struct {
         self.allocator.free(st.label);
         self.allocator.free(st.notes);
         self.allocator.free(st.clips);
+        self.allocator.free(st.instrument_order);
         // 注：**不要**加 `if (len > 0)`——`alloc(T, 0)` 也必须配对 `free`
         // （测试分配器会把 0 长度分配记为泄漏）
         self.freeSavedMixerChannels(st.mixer, true);
@@ -6352,6 +6492,8 @@ pub const App = struct {
             self.freeSavedMixerChannels(mixer, true);
             self.allocator.free(mixer);
         }
+        const order_snap = try self.allocator.dupe(u32, self.order.items);
+        errdefer self.allocator.free(order_snap);
         const pat_names = try self.allocator.alloc([]u8, self.pattern_items.items.len);
         var pn: usize = 0;
         errdefer {
@@ -6403,6 +6545,7 @@ pub const App = struct {
             .pattern_names = pat_names,
             .track_names = trk_names,
             .track_muted = muted_list,
+            .instrument_order = order_snap, // 显示顺序（上移/下移乐器也要能撤销）
             .param_edits = recs0,
             .bpm = self.bpm,
             .time_num = self.time_num,
@@ -6429,6 +6572,11 @@ pub const App = struct {
                 a.pattern != b.pattern or a.offset != b.offset) return false;
             // 音频片段字段（样式引用/trim）也要比较——否则粗剪/换源被判“无变化”
             if (a.audio_style != b.audio_style or a.trim_start != b.trim_start or a.trim_len != b.trim_len) return false;
+        }
+        // **乐器显示顺序**——否则"上移/下移乐器"会被判成"无变化"而不进历史、不标脏
+        if (st.instrument_order.len != self.order.items.len) return false;
+        for (st.instrument_order, self.order.items) |a, b| {
+            if (a != b) return false;
         }
         // 音频样式（名称/路径/通道/增益）——否则调样式推子会被判“无变化”丢历史
         if (st.audio_styles.len != self.audio_styles.items.len) return false;
@@ -6542,7 +6690,9 @@ pub const App = struct {
         // 乐器），重扫纯属浪费且有害——它会重发游标附近的事件，音频对
         // “已过时”事件立即触发 → 重发已在响的 on = 双声部（单个 off 只
         // 释放一个）→ 个别音悬挂（实测 bug：播放中调 EQ 概率悬挂）。
-        if (!self.notesClipsUnchanged()) self.rescanForPlaybackEdit();
+        const win_same = self.scheduleWindowUnchanged();
+        if (audio.schedLogOn()) self.logLine("[hist] label={s} windowUnchanged={}\n", .{ label, win_same });
+        if (!win_same) self.rescanForPlaybackEdit();
         // 截断 redo 尾巴（新操作发生在撤销之后）
         while (self.history.items.len > self.history_current + 1) {
             var st = self.history.pop().?;
@@ -6568,21 +6718,79 @@ pub const App = struct {
     }
 
     /// 当前 notes/clips 与所在快照是否**内容等价**（忽略 `selected` 瞬态字段）。
-    /// 供 `commitHistory` 判断是否需要重扫调度——只关心会改变事件的内容。
-    fn notesClipsUnchanged(self: *const App) bool {
-        if (self.history.items.len == 0) return false; // 无基准：保守重扫
+    /// 诊断行：打 stderr（看控制台）+ 攒进缓冲（由 `schedLogTick` 写进日志文件，
+    /// 这样复盘时不需要用户手动复制控制台）。
+    fn logLine(self: *App, comptime fmt: []const u8, args: anytype) void {
+        std.debug.print(fmt, args);
+        var buf: [256]u8 = undefined;
+        const s = std.fmt.bufPrint(&buf, fmt, args) catch return;
+        self.sched_log_pending.appendSlice(self.allocator, s) catch {};
+    }
+
+    /// 音符在该片段里**实际被调度**的歌曲区间（已按片段的 trim 窗口 `[offset, offset+len)` 裁剪）。
+    /// 不在窗口内 → null（**片段被左右端点裁短后，窗外的音符根本不会被调度**）。
+    /// 规则与 `sequencer.mapSong` 完全一致 —— 所有"要不要重扫 / 谁在响"的判断都必须走这里，
+    /// 否则会把**已被裁掉**的音符当成"窗口内有事件"，白白触发整窗重发（实测卡顿来源）。
+    fn clipNoteSpan(c: model.Clip, n: model.Note) ?struct { start: i32, end: i32 } {
+        if (n.pitch < 0 or n.pitch > 127 or n.instrument < 0 or n.len <= 0) return null;
+        const clip_end = c.start + c.len;
+        const gs = c.start + (n.step - c.offset);
+        const ge = gs + n.len;
+        if (ge <= c.start or gs >= clip_end) return null;
+        return .{ .start = @max(gs, c.start), .end = @min(ge, clip_end) };
+    }
+
+    /// 把一个 on 事件混进指纹（数量 + 顺序无关哈希）。
+    fn mixOn(n: *u64, h: *u64, step: i32, pitch: i32, instrument: i32, velocity: i32, pan: i32) void {
+        var k: u64 = @as(u64, @intCast(@as(u32, @bitCast(step))));
+        k = k *% 0x9E3779B97F4A7C15 +% @as(u64, @intCast(@max(0, pitch)));
+        k = k *% 0x9E3779B97F4A7C15 +% @as(u64, @intCast(@max(0, instrument)));
+        k = k *% 0x9E3779B97F4A7C15 +% @as(u64, @intCast(@max(0, velocity)));
+        k = k *% 0x9E3779B97F4A7C15 +% @as(u64, @intCast(@max(0, pan)));
+        h.* +%= k ^ (k >> 29);
+        n.* += 1;
+    }
+
+    /// 把 `[from,to)` 窗口内**所有可闻的 on 事件**算成一个指纹（顺序无关）。
+    /// 用来判断"这次编辑到底有没有改变已排程窗口里的内容"——
+    /// 比"逐个字段比较片段数组"更准：增删片段、拖到远处、换到静音轨，
+    /// 只要窗口里没事件变化，就**不需要重扫**（避免音频线程被无谓的重发挤爆）。
+    fn windowOnsFingerprint(self: *const App, clips: []const model.Clip, notes: []const model.Note, from: i32, to: i32) struct { n: u64, h: u64 } {
+        var n: u64 = 0;
+        var h: u64 = 0;
+        if (!self.sel.song_mode) {
+            // PAT 模式：没有片段，音符步号即时间
+            for (notes) |nt| {
+                if (nt.pattern != self.sel.pattern or nt.muted) continue;
+                if (nt.step < from or nt.step >= to) continue;
+                mixOn(&n, &h, nt.step, nt.pitch, nt.instrument, nt.velocity, nt.pan);
+            }
+            return .{ .n = n, .h = h };
+        }
+        for (clips) |c| {
+            if (c.isAudio() or c.muted) continue;
+            if (self.isTrackMuted(c.track)) continue;
+            for (notes) |nt| {
+                if (nt.pattern != c.pattern or nt.muted) continue;
+                const sp = clipNoteSpan(c, nt) orelse continue; // 与 mapSong 同规则：裁掉的音符不排程
+                if (sp.start < from or sp.start >= to) continue;
+                mixOn(&n, &h, sp.start, nt.pitch, nt.instrument, nt.velocity, nt.pan);
+            }
+        }
+        return .{ .n = n, .h = h };
+    }
+
+    /// 已排程窗口 `[cur, 水位线)` 里的**可闻 on 事件**是否和上一快照一致。
+    fn scheduleWindowUnchanged(self: *const App) bool {
+        if (!self.playing) return true; // 不播放：没有窗口可谈
+        if (self.history.items.len == 0) return false;
+        const cur = self.playback.cursorStep(self.sel.song_mode);
+        const to = self.scheduler.scheduled_upto;
+        if (to <= cur) return false;
         const old = &self.history.items[self.history_current];
-        if (old.notes.len != self.notes.items.len or old.clips.len != self.clips.items.len) return false;
-        for (old.notes, self.notes.items) |a, b| {
-            if (a.step != b.step or a.len != b.len or a.pitch != b.pitch or
-                a.pattern != b.pattern or a.instrument != b.instrument or
-                a.velocity != b.velocity or a.pan != b.pan) return false;
-        }
-        for (old.clips, self.clips.items) |a, b| {
-            if (a.track != b.track or a.start != b.start or a.len != b.len or
-                a.pattern != b.pattern or a.offset != b.offset) return false;
-        }
-        return true;
+        const a = self.windowOnsFingerprint(old.clips, old.notes, cur, to);
+        const b = self.windowOnsFingerprint(self.clips.items, self.notes.items, cur, to);
+        return a.n == b.n and a.h == b.h; // 数量+哈希：碰撞概率可忽略
     }
 
     /// 播放中编辑提交后：按新旧快照重扫调度（见 `sequencer.rescanForEdit`）。
@@ -6597,6 +6805,10 @@ pub const App = struct {
     /// 声部无法改值、下次触发生效）。
     fn rescanForPlaybackEdit(self: *App) void {
         if (!self.playing) return;
+        if (self.skip_next_edit_rescan) {
+            self.skip_next_edit_rescan = false; // 刚刚已经全窗扫过（数据一致）→ 不再重复
+            return;
+        }
         if (self.history.items.len == 0) return;
         const old = &self.history.items[self.history_current];
         const cur = self.playback.cursorStep(self.sel.song_mode);
@@ -6613,6 +6825,7 @@ pub const App = struct {
             cur,
             rescan_from,
         );
+        if (audio.schedLogOn()) self.logLine("[rescan] EDIT from={d} upto={d} gen={d}\n", .{ rescan_from, self.scheduler.scheduled_upto, self.scheduler.edit_gen });
         // 发布顺序：**先安全界、后编辑代**——音频读到新代时安全界必然
         // 已就位（反过来“新代 + 旧界”会丢弃还没重发的旧事件 → 漏 off → 悬挂）
         self.params.sched_rescan_from.store(self.scheduler.rescan_from, .monotonic);
@@ -6656,15 +6869,33 @@ pub const App = struct {
     /// `(游标, 安全界)` 区间的旧副本由音频侧保留触发（不漏），代价是该
     /// 区间内**新增**的音符首次不响（下一遍会响）。
     fn rescanSafeFromStep(self: *const App, cur: i32) i32 {
+        const step_frames = self.stepFramesNow();
+        const margin: i32 = @intCast(@max(2, @divTrunc(1536 + step_frames - 1, step_frames)));
+        return @max(cur + 1, self.audioStepNow() + 1 + margin);
+    }
+
+    /// 每步多少帧（与音频线程同一公式；变拍号/变速时同步变化）
+    fn stepFramesNow(self: *const App) u64 {
         const sr: u64 = @max(1, self.params.sample_rate);
         const bpm: u64 = @intCast(std.math.clamp(self.bpm, 20, 999));
         const beat: u64 = @intCast(@max(1, model.stepsPerBeat(self.time_den)));
-        const step_frames: u64 = @max(1, sr * 60 / (bpm * beat));
+        return @max(1, sr * 60 / (bpm * beat));
+    }
+
+    /// 判定“此刻是否正在响”用的步号：UI 游标与音频线程时刻取**较大者**
+    /// （UI 落后时以音频为准，避免误切刚结束的音符；不落后时行为不变）
+    fn releaseJudgeStep(self: *const App) i32 {
+        const ui = self.playback.cursorStep(self.sel.song_mode);
+        if (!self.sel.song_mode) return ui;
+        return @max(ui, self.audioStepNow());
+    }
+
+    /// **音频线程此刻**所在的步（新鲜读 `frames_played`；UI 的 `cursorStep` 来自帧首快照、
+    /// 可能落后几十毫秒——判断“此刻是否正在响”要用这个，否则会误切已经结束的音符）
+    fn audioStepNow(self: *const App) i32 {
         const frames_now = self.params.frames_played.load(.monotonic);
         const el: u64 = frames_now -| self.playback.start_frame;
-        const bound: i32 = self.playback.start_step + @as(i32, @intCast(el / step_frames));
-        const margin: i32 = @intCast(@max(2, @divTrunc(1536 + step_frames - 1, step_frames)));
-        return @max(cur + 1, bound + 1 + margin);
+        return self.playback.start_step + @as(i32, @intCast(el / self.stepFramesNow()));
     }
 
     /// 应用历史快照（恢复 = 整块回写；顺带钳制选择/乐器索引）
@@ -6748,6 +6979,13 @@ pub const App = struct {
         }
         self.setTrackNames(st.track_names); // 空快照 → 全部回到合成默认名（行跨度自动推导）
         self.setTrackMutes(st.track_muted); // 静音集合同理（空快照 → 全未静音）
+        // 乐器**显示顺序**：快照长度必须与乐器数一致才采用（否则回落 0..n-1，防越界/错位）
+        self.order.clearRetainingCapacity();
+        if (st.instrument_order.len == self.instruments.items.len and validInstrumentOrder(st.instrument_order, self.instruments.items.len)) {
+            self.order.appendSlice(self.allocator, st.instrument_order) catch {};
+        } else {
+            self.ensureOrder();
+        }
         self.bpm = st.bpm;
         self.time_num = st.time_num;
         self.time_den = st.time_den;
@@ -7149,25 +7387,455 @@ pub const App = struct {
         self.dirty = true;
         if (self.scheduler.muted == null) self.scheduler.muted = &self.track_muted;
         self.setToast(if (muted) "轨道已静音" else "已取消静音");
-        // **播放中立即生效**（实测 bug：播放中点静音，该轨音符仍在响）——
-        // 补 off@游标（只动这条轨）+ 编辑代递增作废未触发副本 + 重扫窗口（带新静音集）
-        if (self.playing) {
-            const cur = self.playback.cursorStep(self.sel.song_mode);
-            sequencer.muteTrackLive(
-                &self.scheduler,
-                &self.sched_events,
-                self.clips.items,
-                self.notes.items,
-                self.sel.song_mode,
-                self.sel.pattern,
-                key,
-                cur,
-                muted,
-            );
-            // 发布序：先安全界、后编辑代（同 rescanForPlaybackEdit）
-            self.params.sched_rescan_from.store(self.scheduler.rescan_from, .monotonic);
-            self.params.sched_edit_gen.store(self.scheduler.edit_gen, .monotonic);
+        // 播放中：① 后终不再触发（作废 + 重扫）；② **正在响的立即释音**（按音高精确 off）
+        if (self.playing and muted) {
+            // 按**片段实例**收集（同一样式若也在别的可闻轨上，不会被误杀）
+            var scope = std.ArrayListUnmanaged(usize).empty;
+            defer scope.deinit(self.allocator);
+            for (self.clips.items, 0..) |clip, i| {
+                if (clip.isAudio() or clip.track != key) continue;
+                scope.append(self.allocator, i) catch {};
+            }
+            self.releaseNotesNowForClips(scope.items);
+            // 只有当该轨的内容**在已排程窗口里**时，才需要作废旧事件重扫；
+            // 否则（例如片段放在游标很远之后）纯属浪费——重发上千条事件会让音频线程掉块。
+            const need_on = self.muteNeedsRescanForClips(scope.items, .track);
+            if (audio.schedLogOn()) {
+                const cur = self.playback.cursorStep(true);
+                self.logLine("[mute] track idx={d} ON cur={d} upto={d} scope={d} rescan={}\n", .{ idx, cur, self.scheduler.scheduled_upto, scope.items.len, need_on });
+            }
+            if (need_on) self.rescanSchedulingLive();
+            return;
         }
+        if (self.playing) {
+            var scope = std.ArrayListUnmanaged(usize).empty;
+            defer scope.deinit(self.allocator);
+            for (self.clips.items, 0..) |clip, i| {
+                if (clip.isAudio() or clip.track != key) continue;
+                scope.append(self.allocator, i) catch {};
+            }
+            const need_off = self.muteNeedsRescanForClips(scope.items, .track);
+            if (audio.schedLogOn()) {
+                const cur = self.playback.cursorStep(true);
+                self.logLine("[mute] track idx={d} OFF cur={d} upto={d} scope={d} rescan={}\n", .{ idx, cur, self.scheduler.scheduled_upto, scope.items.len, need_off });
+            }
+            if (need_off) self.rescanSchedulingLive();
+        }
+    }
+
+    /// 静音状态刚变化：把**刚变成不可闻**的、此刻正在响的音符**立即释音**。
+    /// 粒度 = **(音高, 乐器)**（`synth.noteOff` 只释放该音高最早的一个声部）——
+    /// 因此不会像曾经的 `all_off_inst` 那样误伤其它轨。
+    /// `scope` = 受影响的音符下标（只对“现在静音”的那些调用）。
+    pub fn releaseJustMutedNotes(self: *App, scope: []const usize) void {
+        if (!self.playing) return;
+        const cur = self.releaseJudgeStep();
+        for (scope) |i| {
+            if (i >= self.notes.items.len) continue;
+            const n = self.notes.items[i];
+            if (n.instrument < 0 or n.pitch < 0 or n.pitch > 127 or n.len <= 0) continue;
+            // 逐个**实例**释音（带起点步 → 只释放这一个实例的声部，绝不误伤别的轨）
+            // **不看静音状态**：调用时标志已经改过了，这里要算的是“没静音时它是否在响”
+            const pitch: u8 = @intCast(n.pitch);
+            const inst: u8 = @intCast(@min(n.instrument, 255));
+            if (self.sel.song_mode) {
+                for (self.clips.items) |clip| {
+                    if (clip.isAudio()) continue;
+                    if (n.pattern != clip.pattern) continue;
+                    if (clip.muted) continue;
+                    if (self.isTrackMuted(clip.track)) continue;
+                    const sp = clipNoteSpan(clip, n) orelse continue;
+                    if (sp.start <= cur and cur < sp.end) {
+                        self.events.push(.{ .kind = .off, .pitch = pitch, .instrument = inst, .on_step = sp.start });
+                    }
+                }
+            } else if (n.pattern == self.sel.pattern and n.step <= cur and cur < n.step + n.len) {
+                self.events.push(.{ .kind = .off, .pitch = pitch, .instrument = inst, .on_step = n.step });
+            }
+        }
+    }
+
+    /// 静音**片段/轨道**时：把「这些片段里、此刻正在响」的音符立即释音（按音高精确 off）。
+    /// 与 `releaseJustMutedNotes` 的区别：这里按**片段实例**计数——同一样式若也放在
+    /// 别的可闻轨上，那些实例**不会被误杀**。
+    pub fn releaseNotesNowForClips(self: *App, clip_indices: []const usize) void {
+        if (!self.playing) return;
+        const cur = self.releaseJudgeStep();
+        for (clip_indices) |ci| {
+            if (ci >= self.clips.items.len) continue;
+            const clip = self.clips.items[ci];
+            if (clip.isAudio()) continue;
+            for (self.notes.items) |n| {
+                if (n.pattern != clip.pattern) continue;
+                if (n.instrument < 0 or n.pitch < 0 or n.pitch > 127 or n.len <= 0) continue;
+                const on_step = if (self.sel.song_mode) blk: {
+                    const sp = clipNoteSpan(clip, n) orelse break :blk -1; // 被裁掉的不算
+                    if (!(sp.start <= cur and cur < sp.end)) break :blk -1;
+                    break :blk sp.start;
+                } else if (n.pattern == self.sel.pattern and n.step <= cur and cur < n.step + n.len)
+                    n.step
+                else
+                    -1;
+                if (on_step < 0) continue; // 不在响
+                self.events.push(.{
+                    .kind = .off,
+                    .pitch = @intCast(n.pitch),
+                    .instrument = @intCast(@min(n.instrument, 255)),
+                    .on_step = on_step,
+                });
+            }
+        }
+    }
+
+    /// 片段 `ci` 的**有效位置**（拖动/拉伸预览优先）——绘制用。
+    /// 返回 null 表示无预览，调用方用自己的那份数据。
+    pub fn previewClipAt(self: *const App, ci: usize) ?model.Clip {
+        if (ci >= self.clips.items.len) return null;
+        if (self.playlist.preview_idx) |pi| {
+            if (pi == ci) {
+                if (self.playlist.preview_clip) |pc| return pc;
+            }
+        }
+        if (self.playlist.preview_batch_step != 0 or self.playlist.preview_batch_track != 0) {
+            const c = self.clips.items[ci];
+            if (c.selected) {
+                var pc = c;
+                pc.start = @max(0, c.start + self.playlist.preview_batch_step);
+                pc.track += self.playlist.preview_batch_track;
+                return pc;
+            }
+        }
+        return null;
+    }
+
+    /// 松手时提交拖动/拉伸预览：写回模型（**播放中唯一的改动点**），然后
+    /// ① 进/出静音轨 → 该实例立刻释音；② 释放旧窗口里正在响、新窗口里不响的实例；
+    /// ③ 作废旧事件 + 按新数据重扫。
+    pub fn commitDragPreview(self: *App) void {
+        if (self.playlist.preview_idx) |pi| {
+            if (pi < self.clips.items.len) {
+                if (self.playlist.preview_clip) |pc| {
+                    const old = self.clips.items[pi];
+                    const move_pos = pc.start != old.start or pc.len != old.len or
+                        pc.offset != old.offset or pc.trim_start != old.trim_start;
+                    const move_track = pc.track != old.track;
+                    if (move_pos or move_track) {
+                        self.clips.items[pi] = pc;
+                        self.dirty = true;
+                        if (self.playing and self.sel.song_mode) {
+                            if (move_track and self.isTrackMuted(pc.track)) {
+                                var one = [_]usize{pi};
+                                self.releaseNotesNowForClips(&one); // 拖进静音轨：立刻停
+                            }
+                            const snapped_rescan = move_pos and self.syncDragSnaps();
+                            if (snapped_rescan) self.skip_next_edit_rescan = true; // 位置变了：旧实例释音 + 重扫
+                            // 换轨（进出静音轨）：只有窗口里确实排过/该排事件时才重扫
+                            if (move_track and !snapped_rescan and self.muteNeedsRescanForClipMove(pi, old)) {
+                                self.rescanSchedulingLive();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (self.playlist.preview_batch_step != 0 or self.playlist.preview_batch_track != 0) {
+            const rows = if (self.playlist.preview_rows > 0) self.playlist.preview_rows else @as(i32, @intCast(@min(self.clips.items.len, 256)));
+            _ = self.moveSelectedClips(self.playlist.preview_batch_step, self.playlist.preview_batch_track, rows);
+            self.dirty = true;
+            if (self.syncDragSnaps()) self.skip_next_edit_rescan = true; // 旧实例释音 + 重扫
+        }
+        self.playlist.preview_batch_step = 0;
+        self.playlist.preview_batch_track = 0;
+        self.playlist.preview_idx = null;
+        self.playlist.preview_clip = null;
+        // 批量拉伸仍是实时应用 → 松手补一次收尾
+        if (self.syncDragSnaps()) self.skip_next_edit_rescan = true;
+    }
+    /// 拖动/拉伸开始：记下将被改动的片段快照（单个 = 拖到的那个；批量 = 全部选中）。
+    pub fn beginDragSnaps(self: *App, only: ?usize) void {
+        self.playlist.drag_snaps.clearRetainingCapacity();
+        if (!self.playing or !self.sel.song_mode) return;
+        if (only) |ci| {
+            if (ci < self.clips.items.len) {
+                self.playlist.drag_snaps.append(self.allocator, .{ .idx = ci, .clip = self.clips.items[ci] }) catch {};
+            }
+        } else {
+            for (self.clips.items, 0..) |c, ci| {
+                if (!c.selected) continue;
+                self.playlist.drag_snaps.append(self.allocator, .{ .idx = ci, .clip = c }) catch {};
+            }
+        }
+    }
+
+    /// 每帧调用（拖动中 + 松手那一帧）：改了时间参数的片段 →
+    /// ① 旧窗口里正在响、新窗口里不响的实例**立即 off**；② 作废旧事件 + 按新数据重扫（只做一次）。
+    pub fn syncDragSnaps(self: *App) bool {
+        if (!self.playing or !self.sel.song_mode) return false;
+        if (self.playlist.drag_snaps.items.len == 0) return false;
+        // **边界只算一次**：释音判定的“安全界”必须和紧接着的重扫用同一个界，
+        // 否则两次 `frames_played` 读取之间音频又往前走了 → 恰好落在这段缝隙里的
+        // 旧 on 会被保留触发、off 却被作废 → 偶发长音不释（实测）。
+        const cur = self.playback.cursorStep(true);
+        const safe_from = self.rescanSafeFromStep(cur);
+        var changed = false;
+        for (self.playlist.drag_snaps.items) |*snap| {
+            if (snap.idx >= self.clips.items.len) continue;
+            const nowc = self.clips.items[snap.idx];
+            if (nowc.start == snap.clip.start and nowc.len == snap.clip.len and nowc.offset == snap.clip.offset) continue;
+            self.releaseStaleAfterClipEdit(snap.idx, snap.clip);
+            // 只有"旧/新位置在已排程窗口里真有 on（且可闻）"才需要重扫。
+            // 拖到远处、拖进静音轨、拖不可闻片段 —— 窗口里没事件变化 → 一次都不扫
+            //（否则作废整窗旧事件重发上千条 → 音频线程掉块，别的轨"卡一下"）。
+            if (self.muteNeedsRescanForClipMove(snap.idx, snap.clip)) changed = true;
+            snap.clip = nowc;
+        }
+        if (changed) self.rescanSchedulingFrom(safe_from);
+        return changed;
+    }
+
+    /// 拖动/拉伸结束：丢掉快照。
+    pub fn endDragSnaps(self: *App) void {
+        self.playlist.drag_snaps.deinit(self.allocator);
+        self.playlist.drag_snaps = .empty;
+    }
+    /// 播放中**拖动/拉伸片段改了时间参数**（start / len / offset）：
+    /// 该片段里此刻**正在响**的音符全部立即 off（按旧窗口判定）。
+    /// 不试图“追进度”：让旧声部继续响到新位置的自然尾 → 拖动距离大时听起来像挂了长音。
+    pub fn releaseStaleAfterClipEdit(self: *App, clip_idx: usize, old_clip: model.Clip) void {
+        if (!self.playing) return;
+        if (!self.sel.song_mode) return;
+        if (clip_idx >= self.clips.items.len) return;
+        const clip = self.clips.items[clip_idx];
+        if (clip.isAudio() or old_clip.isAudio()) return; // 音频片段不走音符调度
+        // 旧位置本来就**不可闻**（片段静音 / 静音轨）→ 一个声部都没有，别去推 off：
+        // 按 (音高, 乐器) 的 off 会切掉**其它轨**上同音高的声部（实测：拖静音轨的片段 → 别的轨断音）
+        if (!self.clipAudible(old_clip)) return;
+        const cur = self.releaseJudgeStep();
+        const safe_from = self.rescanSafeFromStep(self.playback.cursorStep(true));
+        for (self.notes.items) |n| {
+            if (n.pattern != clip.pattern) continue;
+            if (n.muted) continue; // 静音音符从来没有 on → 它的 off 只会误伤别的轨
+            if (n.instrument < 0 or n.pitch < 0 or n.pitch > 127 or n.len <= 0) continue;
+            const pitch: u8 = @intCast(n.pitch);
+            const inst: u8 = @intCast(@min(n.instrument, 255));
+            const sp_old = clipNoteSpan(old_clip, n) orelse continue;
+            const s_old = sp_old.start;
+            if (s_old < cur and cur < sp_old.end) {
+                // ① 旧 on 早已触发（严格早于音频当前位置）→ 立即切（按起点步精确匹配声部）
+                self.events.push(.{ .kind = .off, .pitch = pitch, .instrument = inst, .on_step = s_old });
+            }
+            // 注：`[游标, 安全界)` 缝隙里的旧 on 现在由**音频侧一律作废**
+            //（见 `audio.schedEventObsolete`），不会变成孤儿声部，
+            // 所以这里不需要补“收尾 off”（补了反而会按 (音高,乐器) 误切别的声部）。
+            _ = safe_from;
+        }
+    }
+
+    /// 切换**片段**静音（视图只负责收集选中下标）。
+    /// ① 刚变成静音的 → 立即释音（按片段实例）；
+    /// ② 是否重扫用**全部被切换的**片段来判定 —— **两个方向都要**：
+    ///    响→静音要作废窗口里的 on；静音→响要把窗口里的 on 补回来。
+    ///    （曾经的 bug：只拿"刚静音的"去问门控 → 取消静音永远不重扫 → 扫过这些音符时哑掉）
+    pub fn toggleClipMute(self: *App, idxs: []const usize) usize {
+        if (idxs.len == 0) return 0;
+        var newly = std.ArrayListUnmanaged(usize).empty;
+        defer newly.deinit(self.allocator);
+        var n: usize = 0;
+        for (idxs) |ci| {
+            if (ci >= self.clips.items.len) continue;
+            const c = &self.clips.items[ci];
+            c.muted = !c.muted;
+            if (c.muted) newly.append(self.allocator, ci) catch {};
+            n += 1;
+        }
+        if (n == 0) return 0;
+        self.releaseNotesNowForClips(newly.items); // 刚静音的：正在响的立即停
+        // 两个方向都**全段重扫**（不作"补事件"——补重了 VSTi 会叠声部，实测音量越切越高）。
+        if (audio.schedLogOn()) {
+            const cur = self.playback.cursorStep(self.sel.song_mode);
+            self.logLine("[mute] clips n={d} muted_now={d} cur={d} upto={d}\n", .{ n, newly.items.len, cur, self.scheduler.scheduled_upto });
+        }
+        const need_clip = self.muteNeedsRescanForClips(idxs, .clip);
+        if (audio.schedLogOn()) self.logLine("[mute] clips scope={d} rescan={}\n", .{ idxs.len, need_clip });
+        if (need_clip) {
+            self.rescanSchedulingFull();
+            self.skip_next_edit_rescan = true; // commitHistory 的二次重扫纯属重复
+        }
+        return n;
+    }
+
+    /// 切换**音符**静音（同上：释音只看"刚静音的"，重扫门控看"全部切换的"）。
+    pub fn toggleNoteMute(self: *App, idxs: []const usize) usize {
+        if (idxs.len == 0) return 0;
+        var newly = std.ArrayListUnmanaged(usize).empty;
+        defer newly.deinit(self.allocator);
+        var n: usize = 0;
+        for (idxs) |i| {
+            if (i >= self.notes.items.len) continue;
+            const nt = &self.notes.items[i];
+            nt.muted = !nt.muted;
+            if (nt.muted) newly.append(self.allocator, i) catch {};
+            n += 1;
+        }
+        if (n == 0) return 0;
+        self.releaseJustMutedNotes(newly.items);
+        // 两个方向都**全段重扫**（见 `rescanSchedulingFull`：补事件的做法会让 VSTi 叠声部）
+        if (audio.schedLogOn()) {
+            const cur = self.playback.cursorStep(self.sel.song_mode);
+            self.logLine("[mute] notes n={d} muted_now={d} cur={d} upto={d}\n", .{ n, newly.items.len, cur, self.scheduler.scheduled_upto });
+        }
+        const need_note = self.muteNeedsRescanForNotes(idxs);
+        if (audio.schedLogOn()) self.logLine("[mute] notes scope={d} rescan={}\n", .{ idxs.len, need_note });
+        if (need_note) {
+            self.rescanSchedulingFull();
+            self.skip_next_edit_rescan = true;
+        }
+        return n;
+    }
+
+    /// 该片段在 `[from, to)` 里有没有 on 事件（按当前片段参数映射）。
+    fn clipHasOnsInRange(self: *const App, c: model.Clip, from: i32, to: i32) bool {
+        if (c.isAudio()) return false;
+        for (self.notes.items) |n| {
+            if (n.pattern != c.pattern) continue;
+            const sp = clipNoteSpan(c, n) orelse continue; // 被端点裁掉的音符不参与
+            if (sp.start >= from and sp.start < to) return true;
+        }
+        return false;
+    }
+
+    /// 片段**换轨/换位**（拖动提交）时是否需要重扫：
+    /// 旧位置或新位置的内容在已排程窗口里有 on（且该位置可闻）→ 需要。
+    /// 典型误伤场景：把**远期**片段拖进**静音轨**并落到游标下 —— 旧位置窗口内没事件、
+    /// 新位置又不可闻 → **一次重扫都不该有**（否则音频线程白丢/白插上千条事件 → 别的轨卡一下）。
+    pub fn muteNeedsRescanForClipMove(self: *const App, ci: usize, old_clip: model.Clip) bool {
+        if (!self.playing or !self.sel.song_mode) return true;
+        if (ci >= self.clips.items.len) return true;
+        const cur = self.playback.cursorStep(true);
+        const to = self.scheduler.scheduled_upto;
+        if (to <= cur) return true;
+        // 旧位置：只有当时可闻才在窗口里排过 on
+        if (!old_clip.muted and !self.isTrackMuted(old_clip.track)) {
+            if (self.clipHasOnsInRange(old_clip, cur, to)) return true;
+        }
+        // 新位置：只有现在可闻才会排 on
+        const nowc = self.clips.items[ci];
+        if (nowc.muted or self.isTrackMuted(nowc.track)) return false;
+        return self.clipHasOnsInRange(nowc, cur, to);
+    }
+
+    /// 受影响的**片段**里，是否有 on 落在已排程窗口 `[cur, scheduled_upto)`。
+    /// 没有 → 这次静音变化**不需要重扫**：窗口外的 on 还没生成，
+    /// 下一轮前瞻会按新静音状态自然生成（这就是"静音远期片段却让别的轨卡一下"的根因）。
+    /// 这次切换的是什么静音（决定"另一层"静音是否可以把该片段排除掉）。
+    pub const MuteToggle = enum { clip, track };
+
+    pub fn muteNeedsRescanForClips(self: *const App, clip_indices: []const usize, what: MuteToggle) bool {
+        if (!self.playing or !self.sel.song_mode) return true; // 保守
+        const cur = self.playback.cursorStep(true);
+        const to = self.scheduler.scheduled_upto;
+        if (to <= cur) return true;
+        for (clip_indices) |ci| {
+            if (ci >= self.clips.items.len) continue;
+            const c = self.clips.items[ci];
+            if (c.isAudio()) continue;
+            // 被切的那一层**不能**用来排除（它的状态正在变）；**另一层**已经静音的话，
+            // 该片段前后都不可闻 → 与调度无关，重扫纯属浪费（实测：切静音轨的开关、
+            // 而该轨里的片段早就自己静音了 → 其它轨"卡一下"）。
+            switch (what) {
+                .track => if (c.muted) continue, // 片段自己已静音：轨道开关不影响它
+                .clip => if (self.isTrackMuted(c.track)) continue, // 轨道已静音：片段开关不影响它
+            }
+            for (self.notes.items) |n| {
+                if (n.pattern != c.pattern) continue;
+                const sp = clipNoteSpan(c, n) orelse continue; // 被端点裁掉的音符不参与
+                if (sp.start >= cur and sp.start < to) return true;
+            }
+        }
+        return false;
+    }
+
+    /// 同上，但作用对象是**音符**（钢琴卷帘 Ctrl+M）。
+    pub fn muteNeedsRescanForNotes(self: *const App, note_indices: []const usize) bool {
+        if (!self.playing or !self.sel.song_mode) return true;
+        const cur = self.playback.cursorStep(true);
+        const to = self.scheduler.scheduled_upto;
+        if (to <= cur) return true;
+        for (self.clips.items) |c| {
+            if (c.isAudio() or c.muted) continue;
+            if (self.isTrackMuted(c.track)) continue;
+            for (note_indices) |ni| {
+                if (ni >= self.notes.items.len) continue;
+                const n = self.notes.items[ni];
+                if (n.pattern != c.pattern) continue;
+                const sp = clipNoteSpan(c, n) orelse continue;
+                if (sp.start >= cur and sp.start < to) return true;
+            }
+        }
+        return false;
+    }
+
+    /// 片段此刻是否**可能发声**（片段本身没静音 + 所在轨没静音）
+    pub fn clipAudible(self: *const App, c: model.Clip) bool {
+        if (c.muted) return false;
+        return !self.isTrackMuted(c.track);
+    }
+
+    /// 该轨道是否静音（供视图侧判断“拖入静音轨”等场景）
+    pub fn isTrackMuted(self: *const App, track: i32) bool {
+        return self.track_muted.contains(track);
+    }
+
+    /// 播放中**数据变了**（静音开关 / 片段拖动改时间）→ 作废已排队的旧事件 + 按当前数据重扫。
+    /// **不释音**：正在响的音符由重扫重新生成的 off 自然结束（需“立刻停”的场景另调
+    /// `releaseJustMutedNotes` / `releaseNotesNowForClips` / `releaseStaleAfterClipEdit`）。
+    ///
+    /// 起点用**安全界**（`rescanSafeFromStep`）而不是 `游标+1`：UI 游标落后音频线程，
+    /// 从游标起会重发音频**已经触发过**的 on → 双声部，而 off 只有一份 → 个别音悬挂
+    /// （实测：拖动松手后偶有长音不释）。
+    pub fn rescanSchedulingLive(self: *App) void {
+        if (!self.playing or !self.sel.song_mode) return;
+        self.rescanSchedulingFrom(self.rescanSafeFromStep(self.playback.cursorStep(true)));
+    }
+
+    pub fn rescanSchedulingFrom(self: *App, from: i32) void {
+        if (!self.playing or !self.sel.song_mode) return;
+        sequencer.muteTrackLive(
+            &self.scheduler,
+            &self.sched_events,
+            self.clips.items,
+            self.notes.items,
+            self.sel.song_mode,
+            self.sel.pattern,
+            from,
+        );
+        // 发布序：先安全界、后编辑代（同 rescanForPlaybackEdit）
+        self.params.sched_rescan_from.store(self.scheduler.rescan_from, .monotonic);
+        self.params.sched_edit_gen.store(self.scheduler.edit_gen, .monotonic);
+        if (audio.schedLogOn()) self.logLine("[rescan] from={d} upto={d} gen={d}\n", .{ from, self.scheduler.scheduled_upto, self.scheduler.edit_gen });
+    }
+
+    /// 某 (乐器, 音高) 在工程里**写出来的最长音符时长**（步）；没有该键的音符 → 0。
+    /// 用于“数据驱动”的挂音判定：响得比你自己写的最长音符还长 1 小节 = 肯定挂了。
+    pub fn maxNoteLenFor(self: *const App, inst: usize, pitch: u8) i32 {
+        var m: i32 = 0;
+        for (self.notes.items) |n| {
+            if (n.instrument < 0 or n.pitch < 0) continue;
+            if (@as(usize, @intCast(n.instrument)) != inst) continue;
+            if (@as(u8, @intCast(n.pitch)) != pitch) continue;
+            if (n.len > m) m = n.len;
+        }
+        return m;
+    }
+
+    /// 重扫 `[安全界, 水位线)` **全段**（不限窗）。静音切换用：被限窗落下的事件没有替代品。
+    pub fn rescanSchedulingFull(self: *App) void {
+        if (!self.playing or !self.sel.song_mode) return;
+        const from = self.rescanSafeFromStep(self.playback.cursorStep(true));
+        sequencer.muteTrackLiveFull(&self.scheduler, &self.sched_events, self.clips.items, self.notes.items, self.sel.song_mode, self.sel.pattern, from);
+        self.params.sched_rescan_from.store(self.scheduler.rescan_from, .monotonic);
+        self.params.sched_edit_gen.store(self.scheduler.edit_gen, .monotonic);
+        if (audio.schedLogOn()) self.logLine("[rescan] FULL from={d} upto={d} gen={d}\n", .{ from, self.scheduler.scheduled_upto, self.scheduler.edit_gen });
     }
 
     /// 以列表重建静音集合（历史/存档用；先清空）
@@ -7379,12 +8047,12 @@ pub const App = struct {
         const clips = try alloc.alloc(persist.SavedClip, self.clips.items.len);
         errdefer alloc.free(clips);
         for (self.clips.items, 0..) |c, i| {
-            clips[i] = .{ .track = c.track, .start = c.start, .len = c.len, .pattern = c.pattern, .offset = c.offset, .audio_style = c.audio_style, .trim_start = c.trim_start, .trim_len = c.trim_len };
+            clips[i] = .{ .track = c.track, .start = c.start, .len = c.len, .pattern = c.pattern, .offset = c.offset, .audio_style = c.audio_style, .trim_start = c.trim_start, .trim_len = c.trim_len, .muted = c.muted };
         }
         const notes = try alloc.alloc(persist.SavedNote, self.notes.items.len);
         errdefer alloc.free(notes);
         for (self.notes.items, 0..) |n, i| {
-            notes[i] = .{ .step = n.step, .len = n.len, .pitch = n.pitch, .pattern = n.pattern, .instrument = n.instrument, .velocity = n.velocity, .pan = n.pan };
+            notes[i] = .{ .step = n.step, .len = n.len, .pitch = n.pitch, .pattern = n.pattern, .instrument = n.instrument, .velocity = n.velocity, .pan = n.pan, .muted = n.muted };
         }
         const insts = try alloc.alloc(persist.SavedInstrument, self.instruments.items.len);
         var ni: usize = 0;
@@ -7468,6 +8136,7 @@ pub const App = struct {
             .clips = clips,
             .notes = notes,
             .instruments = insts,
+            .instrument_order = self.order.items, // 显示顺序（物理槽位不变）
             .mixer = mix,
             .audio_styles = astyles,
         };
@@ -7657,7 +8326,7 @@ pub const App = struct {
     /// 阶段 3：其余内宇（片段/音符/乐器/全局设置；毫秒级）
     fn importProjectBody(self: *App, p: persist.Project) void {
         for (p.clips) |c| {
-            self.addClip(.{ .track = c.track, .start = c.start, .len = c.len, .pattern = c.pattern, .offset = c.offset, .audio_style = c.audio_style, .trim_start = c.trim_start, .trim_len = c.trim_len });
+            self.addClip(.{ .track = c.track, .start = c.start, .len = c.len, .pattern = c.pattern, .offset = c.offset, .audio_style = c.audio_style, .trim_start = c.trim_start, .trim_len = c.trim_len, .muted = c.muted });
         }
         // 容错：片段引用了不存在的音频样式（手工改档/旧 bug）→ 丢弃，避免“隐形空片段”
         {
@@ -7676,13 +8345,24 @@ pub const App = struct {
             if (bad > 0) self.setToastWith("有 {d} 个音频片段引用了不存在的样式，已丢弃", .{bad});
         }
         for (p.notes) |n| {
-            self.addNote(.{ .step = n.step, .len = n.len, .pitch = n.pitch, .pattern = n.pattern, .instrument = n.instrument, .velocity = n.velocity, .pan = n.pan });
+            self.addNote(.{ .step = n.step, .len = n.len, .pitch = n.pitch, .pattern = n.pattern, .instrument = n.instrument, .velocity = n.velocity, .pan = n.pan, .muted = n.muted });
         }
         for (p.instruments) |*inst| {
             const idx = self.addInstrument(inst.name);
             if (idx < 0) continue;
             const target = &self.instruments.items[@intCast(idx)];
             self.applySavedInstrument(inst, target, .full, 0, 0);
+        }
+        // 显示顺序：存档里有且是 0..n 的**合法排列** → 采纳；否则按槽位顺序（旧存档兼容）
+        self.order.clearRetainingCapacity();
+        {
+            const n = self.instruments.items.len;
+            // 与历史快照恢复共用同一个校验（`validInstrumentOrder`）——避免两处判据漂移
+            const ok = validInstrumentOrder(p.instrument_order, n);
+            if (ok) {
+                for (p.instrument_order) |s| self.order.append(self.allocator, s) catch {};
+            }
+            self.ensureOrder(); // 非法/缺失 → 重建为 0..n
         }
 
         // 全局设置
@@ -7851,64 +8531,112 @@ pub const App = struct {
         return .{ .pattern = new_pat, .notes = imported, .instruments = inst_count, .skipped = skipped };
     }
 
-    /// 导出用：每 MIDI 通道声像（0-127；= 该通道**首个**乐器的声像）。
-    /// 通道规则与 `exportMidiNotes` 一致（优先来源通道 `midi_channel`，否则号 mod 16）；
-    /// 音符级声像不导出（MIDI 只有通道级声像）——见 `midi.ExportSong.channel_pan`。
-    pub fn exportChannelPans(self: *const App) [16]u8 {
+    /// 导出用：按**显示顺序**列出“真的有音符”的乐器槽位（`pattern` < 0 = 全部样式）。
+    /// 空乐器/未用到的乐器不导出（通道号也随之紧凑重排）。调用方负责释放。
+    pub fn exportMidiUsedSlots(self: *App, allocator: std.mem.Allocator, pattern: i32) ![]usize {
+        self.ensureOrder();
+        const used = try allocator.alloc(bool, self.instruments.items.len);
+        defer allocator.free(used);
+        @memset(used, false);
+        if (pattern >= 0) {
+            // **单个样式导出**：直接看该样式的音符（不需要片段；步号即样式内局部步）
+            for (self.notes.items) |n| {
+                if (n.pattern != pattern) continue;
+                if (n.pitch < 0 or n.pitch > 127 or n.len <= 0) continue;
+                if (n.instrument < 0) continue;
+                const slot: usize = @intCast(n.instrument);
+                if (slot >= used.len) continue;
+                used[slot] = true;
+            }
+        } else {
+            // **整曲导出**：按片段窗口展开（片段外的音符听不到，也不算）
+            for (self.clips.items) |clip| {
+                for (self.notes.items) |n| {
+                    if (n.pattern != clip.pattern) continue;
+                    if (n.pitch < 0 or n.pitch > 127 or n.len <= 0) continue;
+                    if (n.instrument < 0) continue;
+                    const slot: usize = @intCast(n.instrument);
+                    if (slot >= used.len) continue;
+                    _ = clipNoteSpan(clip, n) orelse continue; // 被端点裁掉的音符不参与
+                    used[slot] = true;
+                }
+            }
+        }
+        var out: std.ArrayListUnmanaged(usize) = .empty;
+        errdefer out.deinit(allocator);
+        for (self.order.items) |s| {
+            if (s < used.len and used[s]) try out.append(allocator, s);
+        }
+        return out.toOwnedSlice(allocator);
+    }
+
+    /// MIDI 分组数：每 16 个**用到的**乐器一组、一组一个文件（最少 1）。
+    pub fn midiGroupCountFor(n_used: usize) usize {
+        return @max(1, (n_used + 15) / 16);
+    }
+
+    /// 导出用：每组 16 通道的声像（= 该通道乐器的声像）。
+    pub fn exportChannelPansForGroup(self: *App, rows: []const usize, group: usize) [16]u8 {
         var out: [16]u8 = @splat(64);
-        var set: [16]bool = @splat(false);
-        for (self.instruments.items, 0..) |inst, i| {
-            // 无来源通道且乐器号 ≥ 16 → 不导出（与 `exportMidiNotes` 同规则）
-            if (inst.midi_channel < 0 and i >= 16) continue;
-            const ch: usize = if (inst.midi_channel >= 0)
-                @intCast(@mod(inst.midi_channel, 16))
-            else
-                @mod(i, 16);
-            if (set[ch]) continue;
-            set[ch] = true;
-            out[ch] = @intFromFloat(@round(std.math.clamp(inst.pan, 0.0, 1.0) * 127.0));
+        for (0..16) |k| {
+            const i = group * 16 + k;
+            if (i >= rows.len) break;
+            const inst = self.instruments.items[rows[i]];
+            out[k] = @intFromFloat(@round(std.math.clamp(inst.pan, 0.0, 1.0) * 127.0));
         }
         return out;
     }
 
-    /// 导出 MIDI：把**全部片段**里的音符按全局时间展开（同音符被多个片段引用
-    /// 会导出多次——与播放听到的一致）；乐器号 mod 16 → 通道。
-    /// 返回的切片归调用方释放（`allocator.free`）。
-    pub fn exportMidiNotes(self: *App, allocator: std.mem.Allocator) ![]midi.ExportNote {
+    /// 导出第 `group` 组的音符：通道 = **该组内序号**（0..15）；`rows` = 用到的槽位（显示顺序）。
+    /// `pattern` < 0 = 全部样式；否则只导出该样式。
+    pub fn exportMidiNotesForGroup(self: *App, allocator: std.mem.Allocator, rows: []const usize, group: usize, pattern: i32) ![]midi.ExportNote {
+        // 槽位 → rows 下标（一次建表；避免每个音符线性查找）
+        var idx_of = try allocator.alloc(i32, self.instruments.items.len);
+        defer allocator.free(idx_of);
+        @memset(idx_of, -1);
+        for (rows, 0..) |slot, i| {
+            if (slot < idx_of.len) idx_of[slot] = @intCast(i);
+        }
         var out: std.ArrayListUnmanaged(midi.ExportNote) = .empty;
         errdefer out.deinit(allocator);
-
+        if (pattern >= 0) {
+            // **单个样式**：步号即样式内局部步，不需要片段（与钢琴卷帘看到的一致）
+            for (self.notes.items) |n| {
+                if (n.pattern != pattern) continue;
+                if (n.pitch < 0 or n.pitch > 127 or n.len <= 0) continue;
+                if (n.instrument < 0) continue;
+                const slot: usize = @intCast(n.instrument);
+                if (slot >= idx_of.len) continue;
+                const ri = idx_of[slot];
+                if (ri < 0) continue;
+                const i: usize = @intCast(ri);
+                if (i / 16 != group) continue;
+                try out.append(allocator, .{
+                    .start_step = @max(0, n.step),
+                    .len_steps = @max(1, n.len),
+                    .pitch = @intCast(n.pitch),
+                    .channel = @intCast(i % 16),
+                    .velocity = @intCast(std.math.clamp(n.velocity, 1, 127)),
+                });
+            }
+            return out.toOwnedSlice(allocator);
+        }
         for (self.clips.items) |clip| {
             for (self.notes.items) |n| {
                 if (n.pattern != clip.pattern) continue;
                 if (n.pitch < 0 or n.pitch > 127 or n.len <= 0) continue;
                 if (n.instrument < 0) continue;
-                // 通道：优先乐器记录的来源通道（MIDI 导入往返稳定）；否则乐器号 = 通道。
-                // **无来源通道且乐器号 ≥ 16 → 不导出**（MIDI 只有 16 通道；此前用
-                // 乐器号 mod 16 折回，会挤占已有通道——用户拍板偷懒：宁缺毋挤）
-                const ii = @as(usize, @intCast(n.instrument));
-                var ch: i32 = undefined;
-                if (ii < self.instruments.items.len) {
-                    const mc = self.instruments.items[ii].midi_channel;
-                    if (mc >= 0) {
-                        ch = @mod(mc, 16);
-                    } else if (ii < 16) {
-                        ch = @intCast(ii);
-                    } else {
-                        continue;
-                    }
-                } else {
-                    continue; // 悬空引用（理论不可达）：不导出
-                }
-                // 全局步 = 局部步 + 片段起点 − 片段左缘偏移（与序列器同一公式）
-                const gs = clip.start + (n.step - clip.offset);
-                const ge = gs + n.len;
-                if (ge <= clip.start or gs >= clip.start + clip.len) continue; // 窗口外
-                const s = @max(gs, clip.start);
-                const e = @min(ge, clip.start + clip.len);
+                const slot: usize = @intCast(n.instrument);
+                if (slot >= idx_of.len) continue;
+                const ri = idx_of[slot];
+                if (ri < 0) continue; // 未用到的乐器：不导出
+                const i: usize = @intCast(ri);
+                if (i / 16 != group) continue;
+                const ch: i32 = @intCast(i % 16);
+                const sp = clipNoteSpan(clip, n) orelse continue; // 被端点裁掉的音符不导出
                 try out.append(allocator, .{
-                    .start_step = s,
-                    .len_steps = @max(1, e - s),
+                    .start_step = sp.start,
+                    .len_steps = @max(1, sp.end - sp.start),
                     .pitch = @intCast(n.pitch),
                     .channel = @intCast(ch),
                     .velocity = @intCast(std.math.clamp(n.velocity, 1, 127)),
@@ -9491,7 +10219,7 @@ test "app: MIDI 导入为纯追加（不干扰已有乐器/音符/样式；含�
     try std.testing.expectEqual(old_insts + 1, app.instruments.items.len);
 }
 
-test "app: MIDI 导出——超过 16 的乐器不导出（防通道挤占；带来源通道者除外）" {
+test "app: MIDI 导出——只用到的乐器、按显示顺序分组（每 16 个一组）" {
     var app = App{ .allocator = std.testing.allocator };
     defer app.clips.deinit(app.allocator);
     defer app.notes.deinit(app.allocator);
@@ -9502,20 +10230,25 @@ test "app: MIDI 导出——超过 16 的乐器不导出（防通道挤占；带
     while (i < 17) : (i += 1) {
         try std.testing.expect(app.addInstrument("减法合成器") >= 0);
     }
+    // 只有 0 号和 16 号乐器有音符 → 两个“用到的”乐器 → **1 组**（原为 2 组）
     app.addNote(.{ .step = 0, .len = 4, .pitch = 60, .pattern = 0, .instrument = 0 });
-    app.addNote(.{ .step = 0, .len = 4, .pitch = 62, .pattern = 0, .instrument = 16 }); // 超限：不导出
+    app.addNote(.{ .step = 0, .len = 4, .pitch = 62, .pattern = 0, .instrument = 16 });
     app.clips.append(app.allocator, .{ .track = 0, .start = 0, .len = 96, .pattern = 0, .offset = 0 }) catch {};
-    const evs = try app.exportMidiNotes(app.allocator);
-    defer app.allocator.free(evs);
-    try std.testing.expectEqual(@as(usize, 1), evs.len);
-    try std.testing.expect(evs[0].channel == 0);
-    // 带来源通道的记录（导入而来）：即使 ≥16 也按记录通道导出（往返稳定）
-    app.instruments.items[16].midi_channel = 5;
-    const evs2 = try app.exportMidiNotes(app.allocator);
-    defer app.allocator.free(evs2);
-    try std.testing.expectEqual(@as(usize, 2), evs2.len);
-}
 
+    const rows = try app.exportMidiUsedSlots(app.allocator, -1);
+    defer app.allocator.free(rows);
+    try std.testing.expectEqual(@as(usize, 2), rows.len); // 空乐器被过滤掉
+    try std.testing.expectEqual(@as(usize, 1), App.midiGroupCountFor(rows.len));
+
+    const g0 = try app.exportMidiNotesForGroup(app.allocator, rows, 0, -1);
+    defer app.allocator.free(g0);
+    try std.testing.expectEqual(@as(usize, 2), g0.len);
+    // 通道按“用到的乐器”紧凑编号：0 号乐器 → 通道 0，16 号乐器 → 通道 1
+    var chans: [2]u8 = undefined;
+    for (g0, 0..) |ev, k| chans[k] = ev.channel;
+    try std.testing.expectEqual(@as(u8, 0), chans[0]);
+    try std.testing.expectEqual(@as(u8, 1), chans[1]);
+}
 test "app: 池化——乐器无人工上限（40 个自动扩容；容量只增不减）" {
     var app = App{ .allocator = std.testing.allocator };
     defer app.clips.deinit(app.allocator);
@@ -10403,6 +11136,91 @@ test "app: 游标平滑——前馈+收敛（渲染帧下线性；缓冲量化�
     try std.testing.expectEqual(@as(f32, 5), app.cursorDisplay(true));
 }
 
+test "app: 静音→取消静音后，song 模式下游标之外（重扫限窗之外）的音符仍能发声【音频级】" {
+    // 这是"取消静音后扫过去是哑的"的**音频级**复现：不走"看队列里有没有事件"，
+    // 而是真的 renderBlock 推进播放，断言那个音高**真的起音了**。
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("初始状态");
+
+    app.bpm = 400;
+    app.time_den = 4;
+    app.params.sample_rate = 48_000;
+    app.params.volume.store(1.0, .monotonic);
+    app.params.bpm.store(@intCast(app.bpm), .monotonic); // main 每帧同步它；测试也必须同步，否则安全界算错
+    app.params.steps_per_beat.store(24, .monotonic); // 与工程默认一致（96 步/小节）
+    app.sel.song_mode = true;
+
+    // 音符放在 280 步（约 2.9 小节：> 重扫限窗 from+96，但在 4 小节前瞻内）= 用户实测的距离
+    app.addNote(.{ .step = 280, .len = 8, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.addClip(.{ .track = 0, .start = 0, .len = 8192, .pattern = 0 });
+
+    app.params.events = &app.events;
+    app.params.sched_events = &app.sched_events;
+    app.engine.params = &app.params;
+    app.engine.allocator = std.testing.allocator;
+    try app.engine.setCapacity(app.params.instruments_cap, app.params.channels_cap, app.params.slots_cap);
+    defer app.engine.deinit();
+    var sp = synth.SynthParams{};
+    sp.release.store(0.0, .monotonic);
+    app.params.synth_ptrs[0].store(&sp, .monotonic);
+    app.params.channel_count.store(1, .monotonic);
+    app.params.instrument_channel[0].store(0, .monotonic);
+    app.params.instrument_gain[0].store(1.0, .monotonic);
+
+    app.playing = true;
+    app.params.playing.store(true, .monotonic);
+    app.params.start_frame.store(0, .monotonic);
+    app.params.start_step.store(0, .monotonic);
+    app.params.frames_played.store(0, .monotonic);
+    app.scheduler.scheduled_upto = 0;
+    if (app.scheduler.muted == null) app.scheduler.muted = &app.track_muted;
+    app.scheduler.edit_gen = app.params.sched_edit_gen.load(.monotonic);
+
+    var out: [512 * 2]f32 = undefined;
+    var muted_done = false;
+    var unmuted_done = false;
+    var sounded = false;
+    var blocks: usize = 0;
+    while (blocks < 4000) : (blocks += 1) {
+        // ① 每"帧"：先推进前瞻（与 main.zig 同款），再推一格音频
+        const cur = app.params.last_step.load(.monotonic); // 音频线程回传的当前步
+        const full = cur + app.steps_per_bar * 4;
+        const capped = app.scheduler.scheduled_upto + 16;
+        const horizon = if (app.scheduler.scheduled_upto >= cur + 4) @min(full, capped) else full;
+        if (horizon > app.scheduler.scheduled_upto) {
+            sequencer.scheduleRange(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, true, 0, app.scheduler.scheduled_upto, horizon);
+        }
+        // ② 在游标 ~120 时做两次 Ctrl+M（中间隔一些块，模拟真实连按）
+        if (cur >= 120 and !muted_done) {
+            _ = app.toggleNoteMute(&.{0});
+            app.commitHistory("音符静音");
+            muted_done = true;
+        }
+        if (cur >= 130 and muted_done and !unmuted_done) {
+            _ = app.toggleNoteMute(&.{0});
+            app.commitHistory("音符静音");
+            unmuted_done = true;
+        }
+        @memset(&out, 0);
+        audio.renderBlock(&app.engine, &app.params, &out, 512, 48000);
+        // ③ 音符应该响的区间：150..158
+        const cur2 = app.params.last_step.load(.monotonic);
+        if (cur2 >= 280 and cur2 <= 288) {
+            for (app.engine.synths[0].voices) |v| {
+                if (v.pitch == 60 and v.env_stage != .idle and v.env_stage != .release) sounded = true;
+            }
+        }
+        if (cur2 > 320) break;
+    }
+    try std.testing.expect(muted_done and unmuted_done);
+    try std.testing.expect(sounded); // ← 哑掉的话这里失败
+}
 test "app: 导出 WAV——离线渲染整曲（长度 = 内容 + 2s 尾；有实际声音）" {
     var app = App{ .allocator = std.testing.allocator };
     defer app.clips.deinit(app.allocator);
@@ -10540,6 +11358,452 @@ test "app: Del 优先删框选；框选为空时删循环区域内音符" {
     try std.testing.expectEqual(@as(usize, 1), app.notes.items.len);
 }
 
+test "app: 取消静音后，**重扫窗口之外但在前瞻内**的音符能重新排上 on" {
+    // 用户实测场景：song 模式，游标后 1~3 小节的音符，Ctrl+M 两次（静音→不静音）→ 扫过不响。
+    // 关键差别：重扫只覆盖 `[from, from+96)`，而这类音符在 96 步之外——
+    // 由主循环前瞻（单向）补齐。这里验证：重扫 + 一次前瞻补推之后，
+    // 该音符的 on **必须**重新出现在队列里。
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+
+    app.addNote(.{ .step = 150, .len = 4, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.addClip(.{ .track = 0, .start = 0, .len = 8192, .pattern = 0 });
+    app.resetHistory("初始状态");
+    app.playing = true;
+    app.sel.song_mode = true;
+    app.playback.song_step = 0;
+    app.scheduler.scheduled_upto = 0;
+    if (app.scheduler.muted == null) app.scheduler.muted = &app.track_muted;
+
+    var out: [512]synth.SchedEvent = undefined;
+
+    // 模拟主循环前瞻推进（与 main.zig 同款：cur + 4 小节，每帧最多 +16 步）
+    const pump = struct {
+        fn run(a: *App) void {
+            const cur = a.playback.cursorStep(a.sel.song_mode);
+            const full = cur + a.steps_per_bar * 4;
+            const capped = a.scheduler.scheduled_upto + 16;
+            const horizon = if (a.scheduler.scheduled_upto >= cur + 4) @min(full, capped) else full;
+            if (horizon > a.scheduler.scheduled_upto) {
+                sequencer.scheduleRange(&a.scheduler, &a.sched_events, a.clips.items, a.notes.items, a.sel.song_mode, a.sel.pattern, a.scheduler.scheduled_upto, horizon);
+            }
+        }
+        fn hasOn(a: *App, step: i32, buf: []synth.SchedEvent) bool {
+            // **只认真会生效的事件**：音频侧会丢弃 `edit_gen < 当前代` 的旧代事件，
+            // 所以这里必须同样过滤 —— 否则测试会被“看起来发了、但会被丢”的副本骗过。
+            const gen = a.params.sched_edit_gen.load(.monotonic);
+            const n = a.sched_events.drain(buf);
+            for (buf[0..n]) |ev| {
+                if (ev.edit_gen < gen) continue;
+                if (ev.kind == .on and ev.step == step and ev.pitch == 60) return true;
+            }
+            return false;
+        }
+    };
+
+    // ① 正常推进到覆盖 150 步
+    var i: usize = 0;
+    while (i < 30) : (i += 1) pump.run(&app);
+    try std.testing.expect(pump.hasOn(&app, 150, &out)); // 未静音时能排上
+
+    // ② Ctrl+M #1：静音（应在窗口内 → 重扫），并让前瞻推完（模拟真实两下之间的几十帧）
+    _ = app.sched_events.drain(&out);
+    const gen0 = app.scheduler.edit_gen;
+    _ = app.toggleNoteMute(&.{0});
+    app.commitHistory("音符静音");
+    try std.testing.expect(app.scheduler.edit_gen != gen0);
+    i = 0;
+    while (i < 30) : (i += 1) pump.run(&app);
+    try std.testing.expect(!pump.hasOn(&app, 150, &out)); // 静音后不该再有 on
+
+    // ③ Ctrl+M #2：取消静音 → 全段重扫（作废 + 按新状态重发），on 必须重新出现在队列里
+    _ = app.sched_events.drain(&out);
+    _ = app.toggleNoteMute(&.{0});
+    app.commitHistory("音符静音");
+    try std.testing.expect(!app.notes.items[0].muted);
+    try std.testing.expect(pump.hasOn(&app, 150, &out)); // 当前代、step=150 的 on
+
+    // ④ 再来一遍前瞻推演：不应因为重复补发而崩，且 on 仍在（或已被前瞻重发）
+    i = 0;
+    while (i < 30) : (i += 1) pump.run(&app);
+}
+test "app: 取消静音也必须重扫（音符/片段）——否则扫过去是哑的" {
+    // 实测 bug：song 模式选中游标后 2~3 小节的音符，连按两下 Ctrl+M（静音→不静音），
+    // 游标扫过时不响。根因：重扫门控只收了"刚变成静音"的对象，
+    // 取消静音时集合为空 → 不重扫 → 窗口里那段 audion 已按"静音"发过（没有 on），
+    // 而前瞻是单向的，不会补回来。
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+
+    // 两个音符：一个在窗口内（步 16），一个在窗口外（步 5000）
+    app.addNote(.{ .step = 16, .len = 4, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.addNote(.{ .step = 5000, .len = 4, .pitch = 62, .pattern = 0, .instrument = 0 });
+    app.addClip(.{ .track = 0, .start = 0, .len = 8192, .pattern = 0 });
+    app.resetHistory("初始状态");
+    app.playing = true;
+    app.sel.song_mode = true;
+    app.playback.song_step = 0;
+    app.scheduler.scheduled_upto = 64; // 窗口 [0, 64)
+    if (app.scheduler.muted == null) app.scheduler.muted = &app.track_muted;
+
+    // ① 窗口内音符：两个方向都是**全段重扫**（静音作废已排 on；取消静音把 on 补回来）
+    var buf: [64]synth.SchedEvent = undefined;
+    const gen0 = app.scheduler.edit_gen;
+    _ = app.toggleNoteMute(&.{0});
+    try std.testing.expect(app.scheduler.edit_gen != gen0); // 静音：重扫
+    _ = app.sched_events.drain(&buf);
+    _ = app.toggleNoteMute(&.{0});
+    try std.testing.expect(!app.notes.items[0].muted);
+    // 队列里必须出现 step=16 的 **当前代** on（这就是"取消静音后能响"的保证）
+    {
+        const gen = app.params.sched_edit_gen.load(.monotonic);
+        const n = app.sched_events.drain(&buf);
+        var found = false;
+        for (buf[0..n]) |ev| {
+            if (ev.edit_gen < gen) continue;
+            if (ev.kind == .on and ev.step == 16 and ev.pitch == 60) found = true;
+        }
+        try std.testing.expect(found);
+    }
+
+    // ② 窗口外音符：两个方向都不该重扫（保留"远处编辑不惊动音频线程"的收益）
+    const gen2 = app.scheduler.edit_gen;
+    _ = app.toggleNoteMute(&.{1});
+    try std.testing.expectEqual(gen2, app.scheduler.edit_gen);
+    _ = app.toggleNoteMute(&.{1});
+    try std.testing.expectEqual(gen2, app.scheduler.edit_gen);
+
+    // ③ 片段同理：两个方向都全段重扫
+    const gen3 = app.scheduler.edit_gen;
+    _ = app.toggleClipMute(&.{0});
+    try std.testing.expect(app.scheduler.edit_gen != gen3);
+    _ = app.sched_events.drain(&buf);
+    _ = app.toggleClipMute(&.{0});
+    {
+        const gen = app.params.sched_edit_gen.load(.monotonic);
+        const n = app.sched_events.drain(&buf);
+        var found = false;
+        for (buf[0..n]) |ev| {
+            if (ev.edit_gen < gen) continue;
+            if (ev.kind == .on and ev.step == 16 and ev.pitch == 60) found = true;
+        }
+        try std.testing.expect(found);
+    }
+    try std.testing.expect(!app.clips.items[0].muted);
+}
+test "app: 片段被端点裁短后，**窗外**（已裁掉）的音符不再算作窗口内事件" {
+    // 用户实测：把片段左右端点拖短，视觉/听觉上整体在游标之外，但切轨道静音仍卡。
+    // 根因：门控用"音符→歌曲步"的**裸映射**，没按片段 trim 窗口 `[offset, offset+len)` 过滤；
+    // 而调度器（`sequencer.mapSong`）是过滤的 → 被裁掉的音符被当成了"待排事件"。
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+
+    // 片段被裁到 [0, 8)；音符在 pattern 步 40（**已被裁掉**，调度器不会排它）
+    app.addNote(.{ .step = 40, .len = 4, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.addClip(.{ .track = 0, .start = 0, .len = 8, .pattern = 0 }); // len=8 → 窗口 [0,8)
+    app.resetHistory("初始状态");
+
+    app.playing = true;
+    app.sel.song_mode = true;
+    app.playback.song_step = 20; // 游标在 20
+    app.scheduler.scheduled_upto = 84; // 窗口 [20, 84)
+    if (app.scheduler.muted == null) app.scheduler.muted = &app.track_muted;
+
+    // ① 只有"被裁掉的音符"落在窗口里 → **不该**重扫
+    const gen0 = app.scheduler.edit_gen;
+    app.setTrackMuted(0, true);
+    try std.testing.expectEqual(gen0, app.scheduler.edit_gen);
+    app.setTrackMuted(0, false);
+
+    // ② 对照：把片段拉长到 [0, 64)（音符 40 重新变成可调度）→ 必须重扫
+    app.clips.items[0].len = 64;
+    app.setTrackMuted(0, true);
+    try std.testing.expect(app.scheduler.edit_gen != gen0);
+}
+test "app: 切轨道静音时，该轨里**片段自身已静音**的片段不触发重扫" {
+    // 实测：track2 的片段本来就 Ctrl+M 静音了，再点 track2 的静音开关 → track1 卡一下。
+    // 因为该片段前后都不可闻，轨道开关对它毫无影响 → 重扫纯属浪费。
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+
+    app.addNote(.{ .step = 16, .len = 4, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.addClip(.{ .track = 0, .start = 0, .len = 64, .pattern = 0 }); // track1：可闻，正常播
+    var c2 = model.Clip{ .track = 1, .start = 0, .len = 64, .pattern = 0 };
+    c2.muted = true; // track2 里这个片段**自身静音**
+    app.addClip(c2);
+    app.resetHistory("初始状态");
+
+    app.playing = true;
+    app.sel.song_mode = true;
+    app.playback.song_step = 0;
+    app.scheduler.scheduled_upto = 64; // 窗口 [0, 64)
+    if (app.scheduler.muted == null) app.scheduler.muted = &app.track_muted;
+
+    // ① 切 track2 的静音开关 → 该轨只有"已静音的片段" → **不重扫**
+    const gen0 = app.scheduler.edit_gen;
+    app.setTrackMuted(1, true);
+    try std.testing.expectEqual(gen0, app.scheduler.edit_gen);
+    app.setTrackMuted(1, false);
+    try std.testing.expectEqual(gen0, app.scheduler.edit_gen);
+
+    // ② 对照：把那个片段解除静音后，切轨道静音**必须**重扫
+    app.clips.items[1].muted = false;
+    app.setTrackMuted(1, true);
+    try std.testing.expect(app.scheduler.edit_gen != gen0);
+
+    // ③ 反向对照：片段在**静音轨**上时，切它自己的静音开关 → 不重扫
+    const gen1 = app.scheduler.edit_gen;
+    _ = app.toggleClipMute(&.{1}); // track2 仍静音 → 片段开关无听觉影响
+    try std.testing.expectEqual(gen1, app.scheduler.edit_gen);
+}
+test "app: 上移/下移乐器进历史 + 标脏 + 可撤销" {
+    // 顺序是**存档字段**（`instrument_order`，且决定 MIDI 导出通道）→ 必须进历史并标脏；
+    // 否则"拖了乐器顺序但关闭不提示保存"、"Ctrl+Z 撤不掉"。
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("A");
+    _ = app.addInstrument("B");
+    _ = app.addInstrument("C");
+    app.resetHistory("初始状态");
+    try std.testing.expect(!app.dirty);
+    const h0 = app.history.items.len;
+
+    // 下移第 0 行（A 与 B 交换）→ 提交
+    try std.testing.expect(app.moveInstrument(0, false));
+    app.commitHistory("移动乐器");
+    try std.testing.expect(app.dirty); // **标脏**
+    try std.testing.expectEqual(h0 + 1, app.history.items.len); // **进历史**
+    try std.testing.expectEqual(@as(u32, 1), app.order.items[0]);
+    try std.testing.expectEqual(@as(u32, 0), app.order.items[1]);
+
+    // 撤销 → 顺序恢复
+    try std.testing.expect(app.undo());
+    try std.testing.expectEqual(@as(u32, 0), app.order.items[0]);
+    try std.testing.expectEqual(@as(u32, 1), app.order.items[1]);
+    try std.testing.expectEqual(@as(u32, 2), app.order.items[2]);
+    try std.testing.expect(!app.dirty); // 回到基线 → 不脏
+}
+test "app: 音频片段的静音/轨道静音 → 播放表增益 0" {
+    // 音频片段不走音符调度，所以"静音"必须体现在音频播放表的行增益上。
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+
+    const c0 = model.Clip{ .track = 2, .start = 0, .len = 16, .pattern = 0, .audio_style = 0 };
+    try std.testing.expectEqual(@as(f32, 1.0), app.audioRowGain(c0, 1.0)); // 正常
+
+    var c1 = c0;
+    c1.muted = true;
+    try std.testing.expectEqual(@as(f32, 0.0), app.audioRowGain(c1, 1.0)); // 片段静音
+
+    var c2 = c0;
+    c2.track = 1;
+    app.setTrackMuted(1, true);
+    try std.testing.expectEqual(@as(f32, 0.0), app.audioRowGain(c2, 0.8)); // 轨道静音
+    app.setTrackMuted(1, false);
+    try std.testing.expectEqual(@as(f32, 0.8), app.audioRowGain(c2, 0.8)); // 恢复（保留样式增益）
+}
+test "app: 在远离游标处增删片段不触发重扫（窗口指纹判定）" {
+    // 实测现象：远离游标处增删/拖动片段也会让正在播的轨"卡一下"。
+    // 判据统一为"已排程窗口 [cur, 水位线) 里的可闻 on 指纹有没有变"。
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+
+    app.addNote(.{ .step = 0, .len = 4, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.addClip(.{ .track = 2, .start = 0, .len = 64, .pattern = 0 }); // 窗口内（正在播）
+    app.resetHistory("初始状态");
+
+    app.playing = true;
+    app.sel.song_mode = true;
+    app.playback.song_step = 0;
+    app.scheduler.scheduled_upto = 64;
+    if (app.scheduler.muted == null) app.scheduler.muted = &app.track_muted;
+
+    // ① 远处**新增**片段 → 不该重扫
+    const gen0 = app.scheduler.edit_gen;
+    app.addClip(.{ .track = 3, .start = 5000, .len = 64, .pattern = 0 });
+    app.commitHistory("放置片段");
+    try std.testing.expectEqual(gen0, app.scheduler.edit_gen);
+
+    // ② 远处**删除**片段 → 不该重扫
+    _ = app.clips.orderedRemove(1);
+    app.dirty = true;
+    app.commitHistory("删除片段");
+    try std.testing.expectEqual(gen0, app.scheduler.edit_gen);
+
+    // ③ 窗口内**新增**片段（游标下）→ 必须重扫（新 on 要被排上）
+    app.addClip(.{ .track = 3, .start = 8, .len = 16, .pattern = 0 });
+    app.commitHistory("放置片段");
+    try std.testing.expect(app.scheduler.edit_gen != gen0);
+
+    // ④ 改窗口内片段的**力度**（音符属性）→ 必须重扫
+    const gen1 = app.scheduler.edit_gen;
+    app.notes.items[0].velocity = 40;
+    app.commitHistory("改力度");
+    try std.testing.expect(app.scheduler.edit_gen != gen1);
+}
+test "app: 把远期片段拖进静音轨（落到游标下）不触发重扫" {
+    // 实测现象：track1 静音空轨、track2 正在播、track3 有个远期片段；
+    // 把 track3 的片段拖进 track1 并落到游标下 → track2 卡一下。
+    // 根因同上：换轨分支**无条件**重扫，而该内容在窗口里根本没有任何事件。
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+
+    app.addNote(.{ .step = 0, .len = 4, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.addClip(.{ .track = 2, .start = 0, .len = 64, .pattern = 0 }); // track2：正在播
+    app.addClip(.{ .track = 3, .start = 5000, .len = 64, .pattern = 0 }); // track3：远期
+    app.resetHistory("初始状态");
+
+    app.playing = true;
+    app.sel.song_mode = true;
+    app.playback.song_step = 0;
+    app.scheduler.scheduled_upto = 64;
+    if (app.scheduler.muted == null) app.scheduler.muted = &app.track_muted;
+    app.setTrackMuted(1, true); // track1 静音（空轨）
+
+    var drain: [64]synth.SchedEvent = undefined;
+    _ = app.sched_events.drain(&drain);
+
+    // 把远期片段（下标 1）拖进静音轨 1，起点 8（游标下）
+    var preview = app.clips.items[1];
+    preview.track = 1;
+    preview.start = 8;
+    app.playlist.preview_idx = 1;
+    app.playlist.preview_clip = preview;
+    const gen0 = app.scheduler.edit_gen;
+    app.commitDragPreview();
+    try std.testing.expectEqual(gen0, app.scheduler.edit_gen); // 不该重扫
+    try std.testing.expectEqual(@as(i32, 1), app.clips.items[1].track);
+
+    // 对照：同样的拖动，但落到**可闻**轨（track0）→ 必须重扫（窗口里出现了新 on）
+    app.playlist.preview_idx = 1;
+    var preview2 = app.clips.items[1];
+    preview2.track = 0;
+    preview2.start = 8;
+    app.playlist.preview_clip = preview2;
+    app.commitDragPreview();
+    try std.testing.expect(app.scheduler.edit_gen != gen0);
+}
+test "app: 切换**远期**片段的静音不触发重扫（否则别的轨会卡一下）" {
+    // 实测现象：track3 的片段放在游标很远之后，Ctrl+M 切它静音 / 点轨道静音
+    // → track2 短暂消音。根因是"静音变化一律重扫整窗"，而该内容根本不在已排程窗口里。
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+
+    app.addNote(.{ .step = 0, .len = 4, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.addClip(.{ .track = 0, .start = 0, .len = 64, .pattern = 0 }); // 近处（窗口内）
+    app.addClip(.{ .track = 3, .start = 5000, .len = 64, .pattern = 0 }); // 远期（窗口外）
+    app.resetHistory("初始状态");
+
+    app.playing = true;
+    app.sel.song_mode = true;
+    app.playback.song_step = 0;
+    app.scheduler.scheduled_upto = 64; // 已排程窗口 [0, 64)
+    if (app.scheduler.muted == null) app.scheduler.muted = &app.track_muted;
+
+    var drain: [64]synth.SchedEvent = undefined;
+    _ = app.sched_events.drain(&drain);
+
+    // ① 静音**远期**轨（track 3，窗口外）→ 不重扫
+    const gen0 = app.scheduler.edit_gen;
+    app.setTrackMuted(3, true);
+    try std.testing.expectEqual(gen0, app.scheduler.edit_gen);
+
+    // ② 静音**窗口内**轨（track 0）→ 必须重扫
+    app.setTrackMuted(0, true);
+    try std.testing.expect(app.scheduler.edit_gen != gen0);
+}
+test "app: 拖动静音轨里的片段不触发重扫（避免音频线程被整窗重发挤爆）" {
+    // 实测现象：track1 静音、track2 播放同一片段，左右乱拖 track1 → track2"卡一下/消音一下"。
+    // 根因：拖动提交 → `commitHistory` 判定"片段变了" → 整窗重扫（`edit_gen++`、重发上千条事件），
+    // 而音频线程 `stashInsert` 每条是 O(n)（去重扫描 + 挪位）→ 毫秒级尖峰 → 掉块。
+    // 修法：可闻性感知——两边都不可闻的片段，位置变化与调度无关，**不重扫**。
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+
+    // 两条轨各一个同样式片段；track 1 静音
+    app.addClip(.{ .track = 0, .start = 0, .len = 64, .pattern = 0 });
+    app.addClip(.{ .track = 1, .start = 0, .len = 64, .pattern = 0 });
+    app.addNote(.{ .step = 0, .len = 4, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.setTrackMuted(1, true);
+    app.resetHistory("初始状态");
+    app.playing = true;
+    app.sel.song_mode = true;
+    app.playback.song_step = 0;
+    app.scheduler.scheduled_upto = 64; // 已排程窗口 [0, 64)
+
+    var drain: [64]synth.SchedEvent = undefined;
+    _ = app.sched_events.drain(&drain);
+    const gen0 = app.scheduler.edit_gen;
+
+    // ① 拖**静音轨**的片段 → 不应重扫、不应重发任何事件
+    app.clips.items[1].start = 16;
+    app.commitHistory("移动片段");
+    try std.testing.expectEqual(gen0, app.scheduler.edit_gen);
+    try std.testing.expectEqual(@as(usize, 0), app.sched_events.drain(&drain));
+
+    // ② 对照：拖**可闻轨**的片段 → 必须重扫
+    app.clips.items[0].start = 16;
+    app.commitHistory("移动片段");
+    try std.testing.expect(app.scheduler.edit_gen != gen0);
+
+    // ③ 对照：给静音轨的片段解静音（可闻性变化）→ 必须重扫
+    const gen1 = app.scheduler.edit_gen;
+    app.clips.items[1].muted = true; // 片段自身再静音一次（由静音轨 → 双层不可闻）
+    app.commitHistory("片段静音");
+    _ = app.scheduler.edit_gen; // 静音开关由 setTrackMuted/片段静音路径自己重扫；这里只验证不崩
+    app.clips.items[1].muted = false;
+    app.setTrackMuted(1, false); // 变可闻
+    app.commitHistory("轨道静音");
+    try std.testing.expect(app.scheduler.edit_gen != gen1);
+}
 test "app: 播放中新增音符——提交历史时补发调度（修“追加的音符不响”）" {
     // 复现：水位线已扫到 32、游标在 8；播放中放置/克隆/粘贴到 [8,32) 的音符
     // 必须被补发（否则永远不响——实测 bug）
@@ -14174,7 +15438,13 @@ test "app: SONG 下静音轨道不调度其音符片段" {
     sequencer.scheduleRange(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, true, 0, 0, 64);
 
     var outq: [512]synth.SchedEvent = undefined;
-    try std.testing.expectEqual(@as(usize, 0), app.sched_events.drain(&outq));
+    const nout = app.sched_events.drain(&outq);
+    // 静音语义（v8 起）：静音轨**不发 on**，但 off 照发（否则正在响的音会挂住）
+    var ons: usize = 0;
+    for (outq[0..nout]) |ev| {
+        if (ev.kind == .on) ons += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), ons);
 }
 
 test "app: 音频样式重命名——只改名字；空串恢复文件名" {
@@ -14662,4 +15932,69 @@ test "工程加载（异步解码）：工程立刻可见，音频随后就位" 
     try std.testing.expect(a2.audioStyleAsset(0) != null);
     try std.testing.expect(a2.audioStyleAsset(1) != null);
     try std.testing.expectEqual(@as(usize, 0), a2.audioLoadPending());
+}
+
+test "app: 移动乐器槽位——只改显示顺序，音符引用不变" {
+    var app = App{ .allocator = std.testing.allocator };
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    defer app.deinitAll();
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+
+    for (0..3) |_| {
+        if (app.addInstrument("乐器") < 0) return error.SkipZigTest;
+    }
+    try std.testing.expect(app.instruments.items.len >= 3);
+
+    // 每个乐器一个音符（同一样式）——物理槽位即音符的 instrument
+    for (0..3) |k| {
+        try app.notes.append(app.allocator, .{ .step = @intCast(k * 4), .len = 4, .pitch = 60, .pattern = 0, .instrument = @intCast(k) });
+    }
+
+    app.ensureOrder();
+    // 初始顺序 = 0,1,2
+    try std.testing.expectEqual(@as(usize, 0), app.slotAt(0).?);
+    try std.testing.expectEqual(@as(usize, 2), app.slotAt(2).?);
+
+    // 把 0 号槽位下移两行（显示顺序变 1,2,0）
+    try std.testing.expect(app.moveInstrument(0, false));
+    try std.testing.expect(app.moveInstrument(0, false));
+    try std.testing.expectEqual(@as(usize, 1), app.slotAt(0).?);
+    try std.testing.expectEqual(@as(usize, 2), app.slotAt(1).?);
+    try std.testing.expectEqual(@as(usize, 0), app.slotAt(2).?);
+    // **音符引用一个都没变**（这是本次改动的核心）
+    for (0..3) |k| try std.testing.expectEqual(@as(i32, @intCast(k)), app.notes.items[k].instrument);
+
+    // 首位上移 / 末位下移：无效
+    try std.testing.expect(!app.moveInstrument(1, true));
+    try std.testing.expect(!app.moveInstrument(0, false));
+}
+
+test "app: MIDI 样式导出——无片段也能导出该样式的音符" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(2);
+    app.resetMixerChannels(default_mixer_channels);
+    try std.testing.expect(app.addInstrument("乐器") >= 0);
+    try std.testing.expect(app.addInstrument("乐器") >= 0);
+    // **不建任何片段**：样式 1 里两个乐器各一个音符
+    app.addNote(.{ .step = 0, .len = 4, .pitch = 60, .pattern = 1, .instrument = 0 });
+    app.addNote(.{ .step = 8, .len = 4, .pitch = 64, .pattern = 1, .instrument = 1 });
+
+    const rows = try app.exportMidiUsedSlots(app.allocator, 1);
+    defer app.allocator.free(rows);
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    const evs = try app.exportMidiNotesForGroup(app.allocator, rows, 0, 1);
+    defer app.allocator.free(evs);
+    try std.testing.expectEqual(@as(usize, 2), evs.len);
+    try std.testing.expectEqual(@as(i32, 0), evs[0].start_step);
+    try std.testing.expectEqual(@as(i32, 8), evs[1].start_step);
+
+    // 另一个样式（0）没有音符 → 空
+    const rows0 = try app.exportMidiUsedSlots(app.allocator, 0);
+    defer app.allocator.free(rows0);
+    try std.testing.expectEqual(@as(usize, 0), rows0.len);
 }

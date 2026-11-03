@@ -328,8 +328,16 @@ pub const X11Window = struct {
     root_win: XWindow = 0,
     gc: ?*XGC = null,
     img: ?*XImage = null,
-    /// MIT-SHM（零拷贝上屏）：建立时 pixmap 内存就是共享段，服务器直接读
-    shm: ?ShmSegmentInfo = null,
+    /// MIT-SHM（零拷贝上屏）：建立时 pixmap 内存就是共享段，服务器直接读。
+    ///
+    /// **必须是成员、不能是局部变量**：`XShmCreateImage` 会把传进去的 `&shminfo`
+    /// 存到返回的 `XImage.obdata` 里，之后 `XShmPutImage` **通过 `obdata` 取 `shmseg`**。
+    /// 若传栈上的临时变量，函数返回即销毁 → `obdata` 变悬垂指针 →
+    /// 服务器收到垃圾段号（BadSeg/BadValue）→ **表现为完全没画面**。
+    /// （WSLg 上 SHM 本来就不可用、走 XPutImage 回退，所以那边复现不了这个 bug。）
+    shm: ShmSegmentInfo = .{},
+    /// 上面那个段是否已建立并 attach（`shm` 本身总是有效地址，用这个标志判断）
+    shm_active: bool = false,
     /// 服务器不支持 SHM（例如 WSLg 的 Xwayland 在别的 IPC 命名空间）→ 永久回退 XPutImage
     shm_unsupported: bool = false,
     depth: c_int = 24,
@@ -567,24 +575,27 @@ pub const X11Window = struct {
     fn shmInit(self: *X11Window, dpy: *Display, width: u32, height: u32) bool {
         if (self.shm_unsupported) return false;
         if (XShmQueryExtension(dpy) == 0) return false;
-        var info = ShmSegmentInfo{};
+        // 用成员 `self.shm`（地址稳定）：`XShmCreateImage` 会把该指针存进 `img->obdata`，
+        // `XShmPutImage` 之后还要靠它取 `shmseg`。若用局部变量，函数返回即销毁 → 悬垂指针。
+        self.shm = .{};
+        self.shm_active = false;
         const bytes: usize = @as(usize, width) * height * 4;
-        info.shmid = shmget(IPC_PRIVATE, bytes, IPC_CREAT | 0o600);
-        if (info.shmid < 0) return false;
-        const addr = shmat(info.shmid, null, 0) orelse {
-            _ = shmctl(info.shmid, IPC_RMID, null);
+        self.shm.shmid = shmget(IPC_PRIVATE, bytes, IPC_CREAT | 0o600);
+        if (self.shm.shmid < 0) return false;
+        const addr = shmat(self.shm.shmid, null, 0) orelse {
+            _ = shmctl(self.shm.shmid, IPC_RMID, null);
             return false;
         };
         const raw = @intFromPtr(addr);
         if (raw == std.math.maxInt(usize)) { // (void*)-1
-            _ = shmctl(info.shmid, IPC_RMID, null);
+            _ = shmctl(self.shm.shmid, IPC_RMID, null);
             return false;
         }
-        info.shmaddr = addr;
-        info.readOnly = 0;
-        const img = XShmCreateImage(dpy, self.visual, @intCast(self.depth), ZPixmap, @ptrCast(addr), &info, width, height) orelse {
+        self.shm.shmaddr = addr;
+        self.shm.readOnly = 0;
+        const img = XShmCreateImage(dpy, self.visual, @intCast(self.depth), ZPixmap, @ptrCast(addr), &self.shm, width, height) orelse {
             _ = shmdt(addr);
-            _ = shmctl(info.shmid, IPC_RMID, null);
+            _ = shmctl(self.shm.shmid, IPC_RMID, null);
             return false;
         };
         // **探测式 attach**：X 错误是异步的，`XShmAttach` 返回非 0 不代表服务器真的接到了段。
@@ -592,7 +603,7 @@ pub const X11Window = struct {
         // SysV 共享段它根本看不到 → BadAccess，画面全灰。所以这里临时挂错误处理器做判定。
         shm_attach_errors = 0;
         const prev_handler = XSetErrorHandler(shmAttachErrHandler);
-        const attach_ok = XShmAttach(dpy, &info) != 0;
+        const attach_ok = XShmAttach(dpy, &self.shm) != 0;
         _ = XSync(dpy, 0);
         _ = XSetErrorHandler(@ptrCast(prev_handler));
         if (!attach_ok or shm_attach_errors != 0) {
@@ -600,32 +611,32 @@ pub const X11Window = struct {
             clearImageData(img);
             _ = XDestroyImage(img);
             _ = shmdt(addr);
-            _ = shmctl(info.shmid, IPC_RMID, null);
+            _ = shmctl(self.shm.shmid, IPC_RMID, null);
             std.debug.print("[x11] MIT-SHM 不可用（服务器在别的 IPC 命名空间，典型：WSLg）→ 回退 XPutImage\n", .{});
             return false;
         }
-        _ = shmctl(info.shmid, IPC_RMID, null);
+        _ = shmctl(self.shm.shmid, IPC_RMID, null);
         _ = XFlush(dpy);
 
         const px: [*]u32 = @ptrCast(@alignCast(addr));
         @memset(px[0 .. @as(usize, width) * height], 0xFF000000);
         self.img = img;
-        self.shm = info;
+        self.shm_active = true;
         self.fb = .{ .pixels = px[0 .. @as(usize, width) * height], .width = width, .height = height };
         return true;
     }
 
     /// 拆掉 MIT-SHM（换尺寸/退出时）；从 fb 引用的内存也交回内核
     fn shmTeardown(self: *X11Window, dpy: *Display) void {
-        const info = self.shm orelse return;
-        self.shm = null;
+        if (!self.shm_active) return;
+        self.shm_active = false;
         if (self.img) |img| {
             clearImageData(img); // shm 内存由 shmdt 释放，绝不让 XDestroyImage 去 free
             _ = XDestroyImage(img);
             self.img = null;
         }
-        _ = XShmDetach(dpy, @constCast(&info));
-        if (info.shmaddr) |a| _ = shmdt(a);
+        _ = XShmDetach(dpy, &self.shm);
+        if (self.shm.shmaddr) |a| _ = shmdt(a);
         _ = XFlush(dpy);
         self.fb = .{ .pixels = &.{}, .width = 0, .height = 0 };
     }
@@ -748,7 +759,7 @@ pub const X11Window = struct {
         const dpy = self.dpy orelse return;
         const img = self.img orelse return;
         if (self.fb.width == 0 or self.fb.height == 0) return;
-        if (self.shm != null) {
+        if (self.shm_active) {
             // 零拷贝：只告诉服务器“去读那块共享内存”。
             // `XSync` 保证服务器已拷完才返回，下一帧我们才安全地覆写同一块内存
             // （本地实测这仍是 XPutImage 的零头；后续可换成 ShmCompletion 事件省掉往返）

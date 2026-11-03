@@ -74,6 +74,9 @@ pub fn main(init: std.process.Init) !u8 {
     if (hasScanArg(init)) return vstscan.cliMain(init);
 
     vstscan.attachParentConsole(); // 从终端启动时接回父控制台（panic/日志可见）
+    // 调度诊断（`--sched-log` / `--sched-log=2`）：不开则音频线程零开销
+    audio.sched_log_level = schedLogLevelArg(init);
+
     // 内置文件选择器（B 方案）：非 null = 模态选择器开着（主循环照常跑）
     var picker: ?file_picker.Picker = null;
     defer if (picker) |*pk| pk.deinit();
@@ -90,6 +93,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     var app = App{ .allocator = allocator };
     app.attachIo(io); // 0.17：异步导入的 worker 用 futex 等活，需要进程 Io
+    app.initQueues(); // 队列缓冲清零（`Ring.buf` 用 `undefined` 默认值省 .rodata 体积）
     app.initAudioCapacity() catch {}; // 音频容量数组（池化：乐器/通道/效果槽动态容量）
     app.main_hwnd = win.hwnd;
     app.scheduler.muted = &app.track_muted; // 静音轨道集合挂载（SONG 调度时过滤）
@@ -173,6 +177,8 @@ pub fn main(init: std.process.Init) !u8 {
         app.frame_dt_ns = std.math.clamp(frame_dt_raw, 1_000_000, 100_000_000);
         app.tickToast(app.frame_dt_ns); // 状态栏提示递减（按实际流逝）
         app.tickCursorSmooth(); // 游标平滑（渲染帧推进；音频缓冲量化不显——实测“游标还是抖”的根因）
+        schedLogTick(&app, io); // 调度诊断（仅 SAWDUST_SCHED_LOG 时生效；每秒一行汇总）
+
         // ── 脏确认流程（自绘模态；**不用系统 MessageBox**——
         // 系统弹窗会把鼠标吸到默认按钮上，实测体验差）──
         // 两种场景共用：① 退出程序；② 打开其他工程（都会丢失未保存修改）
@@ -633,6 +639,7 @@ pub fn main(init: std.process.Init) !u8 {
                     if (k.ctrl and (k.code == 'X' or k.code == 'x')) app.pending_edit_op = .cut;
                     if (k.ctrl and (k.code == 'V' or k.code == 'v')) app.pending_edit_op = .paste;
                     if (k.ctrl and (k.code == 'A' or k.code == 'a')) app.pending_edit_op = .select_all;
+                    if (k.ctrl and (k.code == 'M' or k.code == 'm')) app.pending_edit_op = .toggle_mute;
                     // ── 撤销/重做 ──
                     // Ctrl+Z 撤销；Ctrl+Alt+Z（或 Ctrl+Shift+Z）重做
                     if (k.ctrl and (k.code == 'Z' or k.code == 'z')) {
@@ -869,7 +876,13 @@ pub fn main(init: std.process.Init) !u8 {
 
             // 调度 lookahead：提前 4 小节（步单位随拍号/分辨率变化）
             const cur2 = app.playback.cursorStep(app.sel.song_mode);
-            const horizon = cur2 + app.steps_per_bar * 4;
+            const full = cur2 + app.steps_per_bar * 4;
+            // **每帧推进量上限**：播放中重扫会把 `scheduled_upto` 拉回安全界，
+            // 下一帧这里会一口气补满整个窗口——密集工程可达上千条，把音频侧
+            // stash 挤爆（丢的多是 off → 长音不释，实测“极小概率挂音”）。
+            // 已经领先游标 ≥4 步时按 16 步/帧渐进补齐；落后时（跳转/卡顿）不限。
+            const capped = app.scheduler.scheduled_upto + 16;
+            const horizon = if (app.scheduler.scheduled_upto >= cur2 + 4) @min(full, capped) else full;
             if (horizon > app.scheduler.scheduled_upto) {
                 sequencer.scheduleRange(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, app.sel.song_mode, app.sel.pattern, app.scheduler.scheduled_upto, horizon);
             }
@@ -1257,6 +1270,25 @@ fn hasCliArg(init: std.process.Init, name: []const u8) bool {
         if (std.mem.eql(u8, a, name)) return true;
     }
     return false;
+}
+
+/// 调度诊断档位（`--sched-log` = 1，`--sched-log=2` = 逐条明细）。
+/// 比环境变量更好用：照着命令行就能复现，不用记变量名/不用改全局环境。
+fn schedLogLevelArg(init: std.process.Init) u8 {
+    var it = std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa) catch return 0;
+    defer it.deinit();
+    _ = it.skip(); // argv0
+    while (it.next()) |a| {
+        if (std.mem.eql(u8, a, "--sched-log")) return 1;
+        if (std.mem.startsWith(u8, a, "--sched-log=")) {
+            const v = a["--sched-log=".len..];
+            if (v.len > 0 and v[0] == '2') return 2;
+            if (v.len > 0 and (v[0] == '0' or v[0] == 'o')) return 0; // =off
+            return 1;
+        }
+        if (std.mem.eql(u8, a, "--log")) return 1;
+    }
+    return 0;
 }
 
 /// 可执行文件**完整路径**（UTF-8 写入 `buf`；失败返回 ""）。
@@ -2934,6 +2966,154 @@ fn settingsPath(app: *const App) ?[]u8 {
 /// VST3 乐器实例同步（每帧帧末）：
 /// 1) 有路径、无实例 → 惰性加载（工程加载/撤销恢复/新建后的场景）；
 /// 2) 编辑器内参数编辑 → 标脏 + 手势（与效果器一致）。
+// ── 调度诊断日志（`SAWDUST_SCHED_LOG`）────────────────────────────────
+// 历史问题：作废事件曾经**逐条**打印，一次重扫会作废整个 lookahead 窗口 →
+// 刷屏上千行，把真正有用的信息全淹了。现在改为：
+//   1 档（=1）：每秒**一行汇总**（丢弃数增量 + 当前编辑代）；
+//   2 档（=2 或 v）：另加逐条明细（排障用，会刷屏）。
+// 汇总同时**追加写** `<cwd>/sawdust-sched.log`（超过 256KB 时只保留后半），
+// 这样不接 stderr 也能事后复盘。
+var sched_log_enabled: ?bool = null;
+var sched_log_accum_ns: i64 = 0;
+var sched_log_prev_obsolete: u64 = 0;
+var sched_log_prev_stash: u64 = 0;
+var sched_log_prev_vsti: u64 = 0;
+var sched_log_prev_ring: u64 = 0;
+/// 挂音检测：每乐器“正在发声的音高集合”若连续 N 秒不变且非空 → 打印（VSTi/鼓组也适用）
+var sched_log_prev_lo: [32]u64 = @splat(0);
+var sched_log_prev_hi: [32]u64 = @splat(0);
+var sched_log_streak: [32]u8 = @splat(0);
+/// 每个（乐器, 音高）当前这轮“持续发声”的起点步；-1 = 没在响
+var sched_log_pitch_since: [32][128]i32 = @splat(@splat(-1));
+
+fn schedLogEnabled() bool {
+    return audio.schedLogOn(); // CLI `--sched-log` 优先，兼容旧的 `SAWDUST_SCHED_LOG`
+}
+
+fn schedLogTick(app: *App, io: std.Io) void {
+    if (!schedLogEnabled()) return;
+    sched_log_accum_ns += app.frame_dt_ns;
+    if (sched_log_accum_ns < 1_000_000_000) return;
+    sched_log_accum_ns = 0;
+
+    const obsolete = app.params.dbg_drop_obsolete.load(.monotonic);
+    const stash = app.params.dbg_drop_stash.load(.monotonic);
+    const vsti = app.params.dbg_drop_vsti.load(.monotonic);
+    const ring = app.sched_events.dropped.load(.monotonic);
+    const d_obs = obsolete - sched_log_prev_obsolete;
+    const d_stash = stash - sched_log_prev_stash;
+    const d_vsti = vsti - sched_log_prev_vsti;
+    const d_ring = ring - sched_log_prev_ring;
+    sched_log_prev_obsolete = obsolete;
+    sched_log_prev_stash = stash;
+    sched_log_prev_vsti = vsti;
+    sched_log_prev_ring = ring;
+
+    // 挂音排查关键指标：**最老声部的年龄**（步）。正常音符最多几十步；
+    // 几百步 = 有 off 没送到（挂音）。声部数比预期多 = 双实例。
+    const voices = app.params.dbg_voices.load(.monotonic);
+    const max_age = app.params.dbg_max_age.load(.monotonic);
+    const age_p = app.params.dbg_max_age_pitch.load(.monotonic);
+    const age_i = app.params.dbg_max_age_inst.load(.monotonic);
+    const off_hit = app.params.dbg_off_hit.load(.monotonic);
+    const off_miss = app.params.dbg_off_miss.load(.monotonic);
+    const retrig = app.params.dbg_retrig.load(.monotonic);
+    const drop_off = app.params.dbg_drop_off.load(.monotonic);
+    const drop_gen = app.params.dbg_drop_gen.load(.monotonic);
+
+    const local_off = app.params.dbg_local_off.load(.monotonic);
+    const ov_now = app.params.dbg_overrun_now.load(.monotonic);
+    const ov_peak = app.params.dbg_overrun_peak.load(.monotonic);
+    const ov_late = app.params.dbg_late_max.load(.monotonic);
+    const off_ahead_min = app.params.dbg_drop_off_ahead_min.load(.monotonic);
+    const off_ahead_max = app.params.dbg_drop_off_ahead_max.load(.monotonic);
+    const stash_n = app.params.dbg_stash_n.load(.monotonic);
+    const ring_used = app.params.dbg_ring_used.load(.monotonic);
+
+    // 挂音检测（覆盖 VSTi / 鼓组 / 内置 synth：用音频线程回传的“正在发声音高位图”）：
+    // **逐音高**记录它从哪一步开始一直没被释放——即使别的音符进进出出也能抓到。
+    {
+        const cap = @min(@as(usize, 32), @as(usize, app.params.instruments_cap));
+        const cur_step = app.playback.cursorStep(app.sel.song_mode);
+        const limit = app.steps_per_bar * 4; // 超过 4 小节还没释 = 挂音
+        var i: usize = 0;
+        while (i < cap) : (i += 1) {
+            const lo = app.params.sounding_lo[i].load(.monotonic);
+            const hi = app.params.sounding_hi[i].load(.monotonic);
+            var p: u8 = 0;
+            while (p < 128) : (p += 1) {
+                const on = if (p < 64)
+                    (lo >> @intCast(p)) & 1 != 0
+                else
+                    (hi >> @intCast(p - 64)) & 1 != 0;
+                if (!on) {
+                    sched_log_pitch_since[i][p] = -1;
+                    continue;
+                }
+                const since = sched_log_pitch_since[i][p];
+                if (since < 0) {
+                    sched_log_pitch_since[i][p] = cur_step;
+                } else if (cur_step - since > limit) {
+                    std.debug.print("[sched] 疑似挂音: 乐器={d} 音高={d} 已持续={d}步（起点={d}）\n", .{ i, p, cur_step - since, since });
+                    // 报过一次就重置计时，避免每秒刷屏
+                    sched_log_pitch_since[i][p] = cur_step;
+                }
+            }
+        }
+    }
+
+    var line_buf: [512]u8 = undefined;
+    const line = std.fmt.bufPrint(&line_buf, "[sched] 1s: 作废 on={d} off={d}(累计{d}) gen不符={d} off超前[{d},{d}] stash满={d} vsti满={d} 队列满={d} | 声部={d} 最老={d}步(p{d} i{d}) | off 命中={d} 落空={d} 重触发={d} | 积压 stash={d} 队列={d} | 本地off={d} 超时={d}/{d} 迟到={d}步 | edit_gen={d} 步={d}\n", .{
+        d_obs,   drop_off,  obsolete,  drop_gen, off_ahead_min, off_ahead_max, d_stash,                d_vsti,
+        d_ring,  voices,    max_age,   age_p,    age_i,         off_hit,       off_miss,               retrig,
+        stash_n, ring_used, local_off, ov_now,   ov_peak,       ov_late,       app.scheduler.edit_gen, app.playback.cursorStep(app.sel.song_mode),
+    }) catch return;
+    std.debug.print("{s}", .{line});
+
+    // 取走音频线程记下的**长音/挂音**记录（“哪个音高响了多久”），一起写进日志：
+    // 事后排序就能定位超长音符出现的前后到底发生了什么。
+    const ln = app.params.dbg_long_n.load(.acquire);
+    var recs_buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer recs_buf.deinit(app.allocator);
+    if (ln > 0) {
+        const rn = @min(ln, app.params.dbg_long.len);
+        for (app.params.dbg_long[0..rn]) |r| {
+            var rbuf: [200]u8 = undefined;
+            const rl = std.fmt.bufPrint(&rbuf, "[long] inst={d} kind={d} pitch={d} start={d} len={d} hung={d} off_seen={d} on={d} off={d} pend={d} pend_ahead={d}\n", .{ r.inst, r.kind, r.pitch, r.start, r.len, r.hung, r.off_seen, r.on_cnt, r.off_cnt, r.pend, r.pend_ahead }) catch continue;
+            std.debug.print("{s}", .{rl});
+            recs_buf.appendSlice(app.allocator, rl) catch {};
+        }
+        app.params.dbg_long_n.store(0, .release);
+    }
+
+    // 追加写文件（读-并-写；调试模式，1Hz，代价可接受）
+    // 路径与其它数据一致：**<exe 目录>/data/logs/**（不跟随 CWD——否则从终端启动会
+    // 在任意工作目录里撒日志文件）。目录不存在则自动创建。
+    var dir_buf: [1024]u8 = undefined;
+    const dir = exeDir(app.allocator, io, &dir_buf);
+    var logs_buf: [1200]u8 = undefined;
+    const logs_dir = std.fmt.bufPrint(&logs_buf, "{s}/data/logs", .{dir}) catch return;
+    std.Io.Dir.cwd().createDirPath(io, logs_dir) catch {};
+    const path = std.fmt.allocPrint(app.allocator, "{s}/sched.log", .{logs_dir}) catch return;
+    defer app.allocator.free(path);
+    const old: []u8 = std.Io.Dir.cwd().readFileAlloc(io, path, app.allocator, .limited(256 * 1024)) catch &[_]u8{};
+    defer if (old.len > 0) app.allocator.free(old);
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(app.allocator);
+    if (old.len > 128 * 1024) {
+        buf.appendSlice(app.allocator, old[old.len / 2 ..]) catch return; // 只保留后半
+    } else {
+        buf.appendSlice(app.allocator, old) catch return;
+    }
+    buf.appendSlice(app.allocator, line) catch return;
+    buf.appendSlice(app.allocator, recs_buf.items) catch return;
+    // App 侧攒下的诊断行（[mute]/[rescan] 等）一并写盘
+    if (app.sched_log_pending.items.len > 0) {
+        buf.appendSlice(app.allocator, app.sched_log_pending.items) catch {};
+        app.sched_log_pending.clearRetainingCapacity();
+    }
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = buf.items }) catch {};
+}
 /// 加载失败后的重试节流（帧；~2s @120fps）——防每帧反复探测缺失文件
 const plugin_retry_frames: u16 = 240;
 
@@ -3490,7 +3670,7 @@ fn dispatchPick(app: *App, io: std.Io, use_: app_mod.PickUse, path: []const u8) 
         .import_midi => importMidiFromPath(app, io, path),
         .import_json => loadProjectFromPath(app, io, path),
         .export_json => exportJsonToPath(app, io, path),
-        .export_midi => exportMidiToPath(app, io, path),
+        .export_midi => |em| exportMidiCommon(app, io, path, em.pattern),
         .export_wav => exportWavToPath(app, io, path),
         .plugin_folder => addPluginFolderPath(app, path),
         .plugin_file => addPluginFilePath(app, path),
@@ -4274,34 +4454,86 @@ fn exportJsonToPath(app: *App, io: std.Io, path: []const u8) void {
 fn exportMidiWithDialog(app: *App, win: *window.Window, io: std.Io) void {
     _ = win;
     _ = io;
-    app.requestPick(.{ .kind = .save, .use_ = .export_midi, .title = "导出 MIDI", .filter = midi_filter, .default_name = "song.mid" });
+    // 默认文件名：<工程名>.mid（未保存过的新工程 → song.mid）
+    const S = struct {
+        var buf: [300]u8 = undefined;
+    };
+    const default_name = blk: {
+        if (app.project_path) |p| {
+            const base = std.fs.path.basename(p);
+            const stem = if (std.mem.lastIndexOfScalar(u8, base, '.')) |i| base[0..i] else base;
+            if (stem.len > 0 and stem.len < 290) break :blk std.fmt.bufPrint(&S.buf, "{s}.mid", .{stem}) catch "song.mid";
+        }
+        break :blk "song.mid";
+    };
+    app.requestPick(.{ .kind = .save, .use_ = .{ .export_midi = .{ .pattern = -1 } }, .title = "导出 MIDI", .filter = midi_filter, .default_name = default_name });
 }
 
 /// 导出 MIDI 的实际执行（对话框结果）
 fn exportMidiToPath(app: *App, io: std.Io, path: []const u8) void {
-    const notes = app.exportMidiNotes(app.allocator) catch |e| {
-        app.setToastWith("导出失败：收集音符失败（{s}）", .{@errorName(e)});
-        return;
-    };
-    defer app.allocator.free(notes);
+    exportMidiCommon(app, io, path, -1); // -1 = 全部样式
+}
 
-    const bytes = midi.write(app.allocator, .{
-        .bpm = app.bpm,
-        .time_num = @intCast(std.math.clamp(app.time_num, 1, 255)),
-        .time_den = @intCast(std.math.clamp(app.time_den, 1, 64)),
-        .notes = notes,
-        .channel_pan = app.exportChannelPans(), // 通道声像 = 乐器声像（音符级不导出）
-    }) catch |e| {
-        app.setToastWith("导出失败：生成失败（{s}）", .{@errorName(e)});
+/// MIDI 导出主体：`pattern` < 0 = 全部样式；否则只导出该样式。
+/// 每 16 个**用到的**乐器一组、一组一个文件；只有一组时不加后缀。
+fn exportMidiCommon(app: *App, io: std.Io, path: []const u8, pattern: i32) void {
+    const rows = app.exportMidiUsedSlots(app.allocator, pattern) catch |e| {
+        app.setToastWith("导出失败：收集乐器失败（{s}）", .{@errorName(e)});
         return;
     };
-    defer app.allocator.free(bytes);
+    defer app.allocator.free(rows);
+    if (rows.len == 0) {
+        app.setToast("没有可导出的音符（该范围内没有用到任何乐器）");
+        return;
+    }
+    const groups = App.midiGroupCountFor(rows.len);
+    var total: usize = 0;
+    var written: usize = 0;
+    var g: usize = 0;
+    while (g < groups) : (g += 1) {
+        const notes = app.exportMidiNotesForGroup(app.allocator, rows, g, pattern) catch |e| {
+            app.setToastWith("导出失败：收集音符失败（{s}）", .{@errorName(e)});
+            return;
+        };
+        defer app.allocator.free(notes);
+        if (notes.len == 0) continue; // 空组不落盘
+        const bytes = midi.write(app.allocator, .{
+            .bpm = app.bpm,
+            .time_num = @intCast(std.math.clamp(app.time_num, 1, 255)),
+            .time_den = @intCast(std.math.clamp(app.time_den, 1, 64)),
+            .notes = notes,
+            .channel_pan = app.exportChannelPansForGroup(rows, g), // 通道声像 = 乐器声像
+        }) catch |e| {
+            app.setToastWith("导出失败：生成失败（{s}）", .{@errorName(e)});
+            return;
+        };
+        defer app.allocator.free(bytes);
 
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = bytes }) catch |e| {
-        app.setToastWith("导出失败：写入失败（{s}）", .{@errorName(e)});
-        return;
-    };
-    app.setToastWith("已导出 {d} 个音符：{s}", .{ notes.len, path });
+        // 文件名：单组 → 原样；多组 → “<名> - 1-16.mid”“<名> - 17-32.mid”…
+        var pbuf: [1024]u8 = undefined;
+        const out_path = if (groups <= 1)
+            path
+        else blk: {
+            const dir = std.fs.path.dirname(path) orelse "";
+            const base = std.fs.path.basename(path);
+            const stem = if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot| base[0..dot] else base;
+            const ext = if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot| base[dot..] else ".mid";
+            const lo = g * 16 + 1;
+            const hi = @min(rows.len, (g + 1) * 16);
+            break :blk std.fmt.bufPrint(&pbuf, "{s}{s}{s} - {d}-{d}{s}", .{ dir, if (dir.len > 0) "/" else "", stem, lo, hi, ext }) catch path;
+        };
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = out_path, .data = bytes }) catch |e| {
+            app.setToastWith("导出失败：写入失败（{s}）", .{@errorName(e)});
+            return;
+        };
+        total += notes.len;
+        written += 1;
+    }
+    if (written > 1) {
+        app.setToastWith("已导出 {d} 个音符（{d} 个乐器），分 {d} 个文件：{s}", .{ total, rows.len, written, path });
+    } else {
+        app.setToastWith("已导出 {d} 个音符（{d} 个乐器）：{s}", .{ total, rows.len, path });
+    }
 }
 
 /// 导出音频（WAV, 24-bit）/ 整曲**离线渲染**：停播 + 暂停设备 → 快照 → 逐块渲染写盘。
@@ -4858,6 +5090,7 @@ test {
     _ = @import("view_mixer.zig");
     _ = @import("view_panels.zig");
     _ = @import("vst_scan.zig");
+    _ = @import("sched_stress.zig");
     _ = @import("plugin_db.zig");
     _ = @import("ui_test.zig");
 }

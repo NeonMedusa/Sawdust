@@ -122,11 +122,13 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
     {
         const saved = ui.renderer.pushClip(x + 1, list_y, ww - 2 - rack_sb_w, list_h);
         defer ui.renderer.popClip(saved);
-        var i: usize = 0;
+        // 按**显示顺序**（`order`）逐行画：上下移只改这个顺序，物理槽位不变
+        app.ensureOrder();
+        var row: usize = 0;
         var ry = list_y - rk.scroll;
-        while (i < app.instruments.items.len) : (i += 1) {
+        while (row < app.order.items.len) : (row += 1) {
             if (ry + util.rack_row_h > list_y and ry < list_y + list_h) {
-                drawRow(ui, app, i, x + 1, ry, ww - 2 - rack_sb_w, list_y, list_y + list_h);
+                if (app.slotAt(row)) |slot| drawRow(ui, app, slot, row, x + 1, ry, ww - 2 - rack_sb_w, list_y, list_y + list_h);
             }
             ry += util.rack_row_h;
         }
@@ -157,9 +159,9 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
         if (ci < app.instruments.items.len) {
             const is_vst3 = app.instruments.items[ci].kind == .vst3;
             const items: []const []const u8 = if (is_vst3)
-                &.{ "重新定位插件…", "重命名", "更换乐器…", "删除乐器" }
+                &.{ "重新定位插件…", "重命名", "更换乐器…", "删除乐器", "上移", "下移" }
             else
-                &.{ "重命名", "更换乐器…", "删除乐器" };
+                &.{ "重命名", "更换乐器…", "删除乐器", "上移", "下移" };
             const mw: i32 = 160;
             const mh: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
             const mx = app.rack.ctx_x; // 固定位置（打开时记录，不跟鼠标跑）
@@ -180,7 +182,13 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
                 if (ih and ui.mouse_pressed) clicked = i;
             }
             if (clicked) |ic| {
-                if (is_vst3 and ic == 0) {
+                if (ic == items.len - 2) {
+                    // 上移：只交换显示顺序（物理槽位/音符引用不变）——已在首位则无效
+                    if (app.moveInstrument(ci, true)) app.commitHistory("移动乐器");
+                } else if (ic == items.len - 1) {
+                    // 下移——已在末尾则无效
+                    if (app.moveInstrument(ci, false)) app.commitHistory("移动乐器");
+                } else if (is_vst3 and ic == 0) {
                     // 重新定位插件…（文件对话框 → 换路径；pending 保留）
                     app.pending_relocate_instrument = ci;
                 } else {
@@ -247,7 +255,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
 /// 通道机架的一行乐器：静音 / 声像旋钮 / 音量旋钮 / 混音通道 / 名称 / 音符 minimap
 /// `clip_top`/`clip_bot`：列表可视区（行可能部分滚出，可视区外的部分不应响应点击——
 /// 否则会与标题栏拖动/添加按钮重叠）
-fn drawRow(ui: *Ui, app: *App, idx: usize, x: i32, y: i32, w: i32, clip_top: i32, clip_bot: i32) void {
+fn drawRow(ui: *Ui, app: *App, idx: usize, row: usize, x: i32, y: i32, w: i32, clip_top: i32, clip_bot: i32) void {
     // 鼠标不在列表可视区（含纵向）：屏蔽本行所有交互（绘制照常）
     const prev_blocked = ui.input_blocked;
     if (!(ui.mouse_y >= clip_top and ui.mouse_y < clip_bot)) ui.input_blocked = true;
@@ -255,7 +263,7 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, x: i32, y: i32, w: i32, clip_top: i32
 
     const inst = &app.instruments.items[idx];
     const selected = app.sel.instrument == @as(i32, @intCast(idx));
-    const bg = if (selected) ui.theme.item_selected else if (idx % 2 == 1) ui.theme.item_alt else ui.theme.panel;
+    const bg = if (selected) ui.theme.item_selected else if (row % 2 == 1) ui.theme.item_alt else ui.theme.panel;
     ui.renderer.fillRect(x, y, w, util.rack_row_h, bg);
     ui.renderer.hline(x, y + util.rack_row_h - 1, w, ui.theme.panel_border);
 

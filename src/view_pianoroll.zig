@@ -5,6 +5,11 @@
 
 const std = @import("std");
 const r_mod = @import("render.zig");
+
+/// 选区中的**静音**音符：暗琥珀（可闻音符选中是亮橙，二者一眼可区分）。
+/// 注意两点：① 色相偏红/橙（绿分量高的浅黄压在偏蓝背景上会读成"发绿"）；② 亮度要明显低于
+/// 可闻音符的选中橙（`theme.note_selected` ≈ 228,150,40），否则两者太接近。
+const muted_selected_note: r_mod.Color = r_mod.rgb(150, 106, 56);
 const Ui = @import("ui.zig").Ui;
 const Theme = @import("ui.zig").Theme;
 const App = @import("app.zig").App;
@@ -533,8 +538,18 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 if (nx + nw < lane_x or nx > lane_x + view_w) continue;
                 if (ny + kh < lane_y or ny > lane_y + lane_h) continue;
                 const active = if (app.piano.drag_note) |dn| dn == ni else false;
-                // 颜色层级：拖动中（accent）> 选中（橙）> 普通（波形绿）
-                const note_color = if (active) ui.theme.accent else if (n.selected) ui.theme.note_selected else ui.theme.waveform;
+                // 颜色层级：静音（暗灰 / 选中时淡黄）> 拖动中（accent）> 选中（橙）> 普通（波形绿）
+                // 静音音符用暗色表示"听不到"；但**被选中**时必须能看出来，
+                // 所以给一个淡黄（既区别于可闻的橙色，又能看出框选范围）——实测反馈：
+                // 之前静音音符选中前后颜色一样，框选时非常怪。
+                const note_color = if (n.muted)
+                    (if (n.selected) muted_selected_note else ui.theme.text_dim)
+                else if (active)
+                    ui.theme.accent
+                else if (n.selected)
+                    ui.theme.note_selected
+                else
+                    ui.theme.waveform;
                 ui.renderer.fillRect(nx, ny, nw, kh - 1, note_color);
                 // 描边只在“不会被填充满”时才画：宽/高 ≤ 2px 时描边会完全
                 // 覆盖填充（1px 音符被灰色描边包成灰线——实测 bug）。
@@ -1319,6 +1334,23 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 if (n > 0) {
                     app.setToastWith("已粘贴 {d} 个音符", .{n});
                     app.commitHistory("粘贴音符");
+                }
+            },
+            .toggle_mute => {
+                // 收集选中的音符 → App 统一处理：
+                //   · 静音方向：立即释音 + 作废已排队的 on（重扫）
+                //   · 取消静音方向：同样全段重扫（把窗口里的 on 补回来）
+                var scope = std.ArrayListUnmanaged(usize).empty;
+                defer scope.deinit(app.allocator);
+                for (app.notes.items, 0..) |nt, i| {
+                    if (nt.pattern != pattern or nt.instrument != app.sel.instrument) continue;
+                    if (!nt.selected) continue;
+                    scope.append(app.allocator, i) catch {};
+                }
+                const n = app.toggleNoteMute(scope.items);
+                if (n > 0) {
+                    app.setToastWith("已切换 {d} 个音符的静音", .{n});
+                    app.commitHistory("音符静音");
                 }
             },
             .select_all => {

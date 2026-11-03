@@ -1,9 +1,13 @@
 # AGENTS.md — 给 AI 协作者的约定
 
 > 这是 Sawdust 项目的 AI 协作约定。**动手改代码前先读本文 + `docs/pitfalls.md`。**
+> 要动**调度 / 释音 / 播放中编辑**（`sequencer.zig`、`audio.zig` 的事件与声部、`app.zig` 的 `release*`）时，
+> **先读 `docs/scheduler-protocol.md`** —— 那里写了必须守住的不变量与各入口的门控表。
 >
 > 复杂控件的设计文档：`docs/timeline-scrollbar.md`（横向时间轴滚动条——
 > 改这块之前务必先读：手势、不变量、快照语义、物理下限都有说明）。
+> 要动**大数组/静态缓冲/环形队列**或**发布体积/出包口径**时，先读 `docs/resources.md` 第六节
+> （字段默认值会材料化进 `.rodata`；比体积必须同口径 + 同工具链）。
 
 ## 临时文件与测试产物：一律放 `tmp/`
 

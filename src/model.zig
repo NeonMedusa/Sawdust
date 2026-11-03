@@ -35,6 +35,8 @@ pub const Clip = struct {
     trim_len: i32 = 0,
     /// 框选/批量操作选中（**瞬态**：不存档）
     selected: bool = false,
+    /// 静音（**存档**；调度阶段只跳过 on，off 照发 → 不挂音）
+    muted: bool = false,
 
     pub fn isAudio(self: *const Clip) bool {
         return self.audio_style >= 0;
@@ -57,6 +59,8 @@ pub const Note = struct {
     pan: i32 = default_pan,
     /// 框选/批量操作选中（**瞬态**：不存档）
     selected: bool = false,
+    /// 静音（**存档**；调度阶段跳过——“以后不再触发”，不追着掐正在响的音）
+    muted: bool = false,
 };
 
 /// 默认力度（新音符；MIDI 惯例 100——柱条不顶格、有编辑余量）

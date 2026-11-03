@@ -26,7 +26,10 @@ pub fn clipXW(c: model.Clip, lane_x: i32, step_px: f32, scroll_x: i32, zoom: f32
 
 /// 样式配色（minimap / 片段色块）：按序号在色相上分布，保证相邻样式颜色可区分。
 /// 静音视觉（浅灰）：轨道名与片段整体变灰
+/// 片段自身静音（Ctrl+M）的灰
 pub const muted_gray: r_mod.Color = r_mod.rgb(150, 150, 154);
+/// **轨道静音**：比片段静音更暗（让用户一眼分辨"是自己静音了"还是"轨道静音了"）
+pub const muted_gray_track: r_mod.Color = r_mod.rgb(92, 92, 96);
 
 pub fn patternColor(pattern: i32) r_mod.Color {
     const palette = [_]r_mod.Color{
@@ -404,18 +407,26 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                     // 暂存下标表排序（片段数小；表跨帧复用，见 `PlaylistState.draw_order`）。
                     app.playlist.draw_order.clearRetainingCapacity();
                     for (app.clips.items, 0..) |c0, ci0| {
-                        if (c0.track == @as(i32, @intCast(i))) {
+                        // 拖动/拉伸预览优先：预览可能改了轨道，要归到**目标行**绘制
+                        const eff = app.previewClipAt(ci0) orelse c0;
+                        if (eff.track == @as(i32, @intCast(i))) {
                             app.playlist.draw_order.append(app.allocator, ci0) catch {};
                         }
                     }
                     std.mem.sort(usize, app.playlist.draw_order.items, app.clips.items, clipLayerLess);
                     for (app.playlist.draw_order.items) |ci| {
-                        const clip = app.clips.items[ci];
+                        const clip = app.previewClipAt(ci) orelse app.clips.items[ci];
                         const rect = clipXW(clip, lane_x, step_px, app.playlist.scroll_x, zoom);
                         const clip_x = rect.x;
                         const clip_w = rect.w;
                         if (clip_x + clip_w < lane_x or clip_x > lane_x + view_w) continue;
-                        const base = if (row_muted) muted_gray else patternColor(clip.pattern);
+                        const base = if (row_muted) muted_gray_track else if (clip.muted) muted_gray else patternColor(clip.pattern); // 轨道静音=更暗的灰；片段静音=灰
+                        // 静音片段内的**前景**（音符缩略图 / 波形 / 名字）：
+                        // 未选中用深灰（“看就知道不响”，用户认可）；
+                        // **选中时提亮一档**——否则“深灰底 + 橙色叠加”下几乎看不见（实测反馈）。
+                        const inner_col = if (row_muted and clip.selected) muted_gray else base; // 只有轨道静音需要提亮
+                        const wave_col = if (row_muted or clip.muted) inner_col else ui.theme.waveform;
+                        const text_col = if (row_muted or clip.muted) inner_col else ui.theme.text;
                         // 底色 = 样式色（32% 不透明）+ 描边 = 样式色全亮；
                         // 选中片段：额外叠加橙色高亮（框选/批量操作的视觉反馈）
                         //
@@ -430,7 +441,11 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                             const fill = (@as(u32, 80) << 24) | (base & 0x00FFFFFF);
                             ui.renderer.fillRect(clip_x, ty, clip_w, track_h, fill);
                             if (clip.selected) {
-                                const sel_fill = (@as(u32, 60) << 24) | (ui.theme.note_selected & 0x00FFFFFF);
+                                // 只有**轨道静音**（整体很暗）才换暗橙——深灰底 + 亮橙会混成“橙灰”；
+                                // **片段自身静音**（底是中灰 150，叠加后仍然耐看）保持原来的亮橙 24%。
+                                const sel_color = if (row_muted) r_mod.rgb(150, 96, 28) else ui.theme.note_selected;
+                                const sel_alpha: u32 = if (row_muted) 90 else 60;
+                                const sel_fill = (sel_alpha << 24) | (sel_color & 0x00FFFFFF);
                                 ui.renderer.fillRect(clip_x, ty, clip_w, track_h, sel_fill);
                             }
                         }
@@ -463,13 +478,13 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                                             const pk = asset.peaks[bi];
                                             const y0: i32 = mid - @as(i32, @intFromFloat(pk.max * half));
                                             const y1: i32 = mid - @as(i32, @intFromFloat(pk.min * half));
-                                            ui.renderer.vline(clip_x + px, y0, @max(1, y1 - y0), if (row_muted) muted_gray else ui.theme.waveform);
+                                            ui.renderer.vline(clip_x + px, y0, @max(1, y1 - y0), wave_col);
                                         }
                                         // 名称：与音符片段**同一位置/风格**（无底色标签——用户拍板）
                                         if (label_h > 0) {
                                             const sidx: usize = @intCast(clip.audio_style);
                                             if (sidx < app.audio_styles.items.len) {
-                                                ui.labelClipped(app.audio_styles.items[sidx].name, clip_x + 6, ty + 4, clip_w - 12, if (row_muted) muted_gray else ui.theme.text);
+                                                ui.labelClipped(app.audio_styles.items[sidx].name, clip_x + 6, ty + 4, clip_w - 12, text_col);
                                             }
                                         }
                                     }
@@ -530,7 +545,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                                     const nw = @max(1, @divTrunc((e - s) * inner_w, win_steps));
                                     const y_norm = range.yOf(n.pitch);
                                     const ny = inner_y + inner_h - 2 - @as(i32, @intFromFloat(y_norm * @as(f32, @floatFromInt(inner_h - 2))));
-                                    ui.renderer.fillRect(nx, ny, nw, 2, base);
+                                    ui.renderer.fillRect(nx, ny, nw, 2, inner_col);
                                 }
                             }
                         }
@@ -556,7 +571,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                             else
                                 "";
                             const label_text = if (pname.len > 0) pname else std.fmt.bufPrint(&buf, "样式 {d}", .{clip.pattern + 1}) catch "";
-                            ui.labelClipped(label_text, clip_x + 6, ty + 4, clip_w - 12, if (row_muted) muted_gray else ui.theme.text);
+                            ui.labelClipped(label_text, clip_x + 6, ty + 4, clip_w - 12, text_col);
                         }
                     }
                 }
@@ -790,7 +805,10 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 命中：鼠标下的片段 + 命中模式（中部 / 左缘 / 右缘，边缘区 8px）
     // 注：框选手势期间不命中（框选优先）
     var clip_hit: ?struct { index: usize, mode: model.ClipHitMode } = null;
-    if (in_lane and valid_track and !app.playlist.marquee_active and !ui.mods_ctrl) {
+    // 拖动/拉伸进行中不重新命中（模型位置未变，会让另一个片段"假悬停"）
+    const drag_busy = app.playlist.drag_clip != null or app.playlist.resize_clip != null or
+        app.playlist.drag_batch or app.playlist.batch_trim;
+    if (in_lane and valid_track and !app.playlist.marquee_active and !ui.mods_ctrl and !drag_busy) {
         // 叠放（用户拍板）：命中取**最顶层**（左端越右越上；同左端取数组序最大）
         if (model.topmostClipAt(app.clips.items, track_i, step_i)) |ci| {
             const c = app.clips.items[ci];
@@ -889,12 +907,15 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             const batch_sel = c.selected and app.selectedClipCount() >= 2;
             if (batch_sel and hit.mode == .body) {
                 app.beginClipBatchSnap();
+                app.beginDragSnaps(null); // 批量移动：记下所有选中片段的旧位置
                 app.playlist.drag_batch = true;
                 app.playlist.batch_down_step = step_i;
                 app.playlist.batch_down_track = track_i;
+                app.playlist.preview_rows = rows_draw;
                 app.history_pending = "批量移动片段"; // 松手时 coalesce 提交
             } else if (batch_sel) {
                 app.beginClipBatchSnap();
+                app.beginDragSnaps(null); // 批量拉伸：同上
                 app.playlist.batch_trim = true;
                 app.playlist.batch_trim_down_step = step_i;
                 app.playlist.batch_trim_grid = @max(1, snap_steps);
@@ -910,14 +931,17 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 switch (hit.mode) {
                     .left => {
                         app.playlist.resize_clip = hit.index;
+                        app.beginDragSnaps(hit.index);
                         app.playlist.resize_left = true;
                     },
                     .right => {
                         app.playlist.resize_clip = hit.index;
+                        app.beginDragSnaps(hit.index);
                         app.playlist.resize_left = false;
                     },
                     .body => {
                         app.playlist.drag_clip = hit.index;
+                        app.beginDragSnaps(hit.index);
                         app.playlist.drag_grab = step_i - c.start;
                     },
                 }
@@ -958,7 +982,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             if (app.playlist.drag_armed) {
                 const d_step = model.snapRound(step_i - app.playlist.batch_down_step, snap_steps);
                 const d_track = track_i - app.playlist.batch_down_track;
-                _ = app.moveSelectedClips(d_step, d_track, rows_draw);
+                // **只更新预览**，松手才真正移动（拖动期间调度器看到的仍是旧位置）
+                app.playlist.preview_batch_step = d_step;
+                app.playlist.preview_batch_track = d_track;
             }
         }
         // ── 批量拉伸（选区 ≥ 2 边缘拖动；全组同步，与音符一致）──
@@ -977,6 +1003,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                     step_i - app.playlist.batch_trim_down_step; // 右缘：右移为正（加长）
                 const k = model.gridSteps(delta, g);
                 _ = app.applyClipBatchTrim(k, g, app.playlist.resize_left);
+                _ = app.syncDragSnaps(); // 播放中改时间 → 旧实例释音 + 重扫
             }
         }
         // 死区：位移超过 3px 才真正开始编辑（防单击片段被吸附）
@@ -990,21 +1017,22 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         if (app.playlist.drag_armed) {
             if (app.playlist.drag_clip) |ci| {
                 if (ci < app.clips.items.len) {
-                    const c = &app.clips.items[ci];
+                    const c = app.clips.items[ci];
                     // **目标位置**吸附到网格（而非鼠标位置——抓取点不在格上时会脱格）
                     const target = @max(0, step_i - app.playlist.drag_grab);
                     const new_start = @max(0, model.snapRound(target, snap_steps));
                     const new_track = std.math.clamp(track_i, 0, rows_draw - 1);
-                    if (new_start != c.start or new_track != c.track) { // 叠放实验：不再拦截重叠
-                        c.track = new_track;
-                        c.start = new_start;
-                        app.dirty = true;
-                    }
+                    // **只写预览**：拖动期间不动模型（音频零干扰，松手一次性提交）
+                    var pc = c;
+                    pc.start = new_start;
+                    pc.track = new_track;
+                    app.playlist.preview_idx = ci;
+                    app.playlist.preview_clip = pc;
                 }
             }
             if (app.playlist.resize_clip) |ci| {
                 if (ci < app.clips.items.len) {
-                    const c = &app.clips.items[ci];
+                    const c = app.clips.items[ci];
                     const min_len = model.trimMinGridLen(app.playlist.resize_orig_len, snap_steps);
                     if (app.playlist.resize_left) {
                         // 左缘：右端固定；长度增量式（鼠标左移 = 拉长）
@@ -1024,19 +1052,21 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                             alen = @min(alen, right);
                             const new_start = right - alen;
                             const dsteps: i64 = @as(i64, new_start) - @as(i64, app.playlist.resize_orig_start);
-                            const nts = std.math.clamp(@as(i64, app.playlist.resize_orig_trim) + dsteps * fps, 0, @max(0, @as(i64, if (app.clipAudioData(c.*)) |d| @as(i32, @intCast(d.engFrames())) else 1) - 1));
+                            const nts = std.math.clamp(@as(i64, app.playlist.resize_orig_trim) + dsteps * fps, 0, @max(0, @as(i64, if (app.clipAudioData(c)) |d| @as(i32, @intCast(d.engFrames())) else 1) - 1));
                             if (nts != c.trim_start or new_start != c.start or alen != c.len) {
-                                c.trim_start = @intCast(nts);
-                                c.start = new_start;
-                                c.len = alen;
-                                c.trim_len = 0; // 切片模型：长度即裁切，不用 trim_len
-                                app.dirty = true;
+                                var pc = c;
+                                pc.trim_start = @intCast(nts);
+                                pc.start = new_start;
+                                pc.len = alen;
+                                pc.trim_len = 0; // 切片模型：长度即裁切，不用 trim_len
+                                app.playlist.preview_idx = ci;
+                                app.playlist.preview_clip = pc;
                             }
-                        } else if (model.clipTrimLeft(c.*, right - len, min_len)) |nc| {
+                        } else if (model.clipTrimLeft(c, right - len, min_len)) |nc| {
                             // 叠放实验：不再拦截重叠
                             if (nc.start != c.start or nc.len != c.len or nc.offset != c.offset) {
-                                c.* = nc;
-                                app.dirty = true;
+                                app.playlist.preview_idx = ci;
+                                app.playlist.preview_clip = nc;
                             }
                         }
                     } else {
@@ -1045,16 +1075,24 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                         const delta = step_i - app.playlist.resize_down_step;
                         const new_len = @max(min_len, model.trimLenByGrid(app.playlist.resize_orig_len, delta, snap_steps));
                         if (new_len != c.len) {
-                            c.len = new_len;
-                            app.dirty = true;
+                            var pc = c;
+                            pc.len = new_len;
+                            app.playlist.preview_idx = ci;
+                            app.playlist.preview_clip = pc;
                         }
                     }
                 }
             }
+
+            // 批量拉伸仍是**实时应用**（逐片段增量式改长，预览成本高）→ 每帧同步音频
+            _ = app.syncDragSnaps();
         }
     } else {
+        // **松手才应用**：提交拖动/拉伸预览（位置/长度/轨道）→ 旧实例释音 + 重扫
+        app.commitDragPreview();
         app.playlist.drag_clip = null;
         app.playlist.resize_clip = null;
+        app.endDragSnaps();
         app.playlist.drag_armed = false; // 下次按下重新评估死区
         app.playlist.drag_batch = false;
         app.playlist.batch_trim = false;
@@ -1250,6 +1288,20 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 if (n > 0) {
                     app.setToastWith("已删除 {d} 个片段", .{n});
                     app.commitHistory("删除片段");
+                }
+            },
+            .toggle_mute => {
+                // 收集选中的片段 → App 统一处理（释音 + 两个方向的重扫门控）
+                var scope = std.ArrayListUnmanaged(usize).empty;
+                defer scope.deinit(app.allocator);
+                for (app.clips.items, 0..) |c, ci| {
+                    if (!c.selected) continue;
+                    scope.append(app.allocator, ci) catch {};
+                }
+                const n = app.toggleClipMute(scope.items);
+                if (n > 0) {
+                    app.setToastWith("已切换 {d} 个片段的静音", .{n});
+                    app.commitHistory("片段静音");
                 }
             },
             .select_all => {
