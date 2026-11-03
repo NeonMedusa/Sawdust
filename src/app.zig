@@ -5688,7 +5688,9 @@ pub const App = struct {
     }
 
     /// 通道上移/下移（`dir`：-1 上、+1 下）；返回是否移动了。
-    /// **乐器的通道路由与选中通道跟随交换**。
+    /// **乐器路由是“通道号”（下标）语义**：乐器存的是号（`Instrument.mixer`），
+    /// 交换两个号 **不重映射路由** —— 1 号通道从 A 变成 B 之后，路由到 1 号的乐器
+    /// 就该走 B（用户约定）。只有选中/面板跟随被拖动的通道（纯 UI 焦点，与路由无关）。
     pub fn moveMixerChannel(self: *App, ch: usize, dir: i32) bool {
         const n = self.mixer_channels_state.items.len;
         if (ch >= n or n < 2) return false;
@@ -5699,14 +5701,8 @@ pub const App = struct {
         if (ni == ch) return false;
         if (ni == 0) return false;
         std.mem.swap(MixerChannel, &self.mixer_channels_state.items[ch], &self.mixer_channels_state.items[ni]);
-        // 乐器路由跟随（交换两个通道号）
-        for (self.instruments.items) |*inst| {
-            if (inst.mixer == @as(i32, @intCast(ch))) {
-                inst.mixer = @intCast(ni);
-            } else if (inst.mixer == @as(i32, @intCast(ni))) {
-                inst.mixer = @intCast(ch);
-            }
-        }
+        // 注：**不要**重映射 `inst.mixer`——路由按通道号（下标），不跟随被移走的通道。
+        // 曾经在这里交换两个通道号，导致“乐器仍走旧通道”的 bug。
         // 选中/面板跟随
         if (self.mixer_win.selected_channel == @as(i32, @intCast(ch))) {
             self.mixer_win.selected_channel = @intCast(ni);
@@ -8469,6 +8465,41 @@ pub const App = struct {
         return ins;
     }
 
+    /// 右键擦除的一个位置上的命中项。
+    pub const EraseMode = enum {
+        /// 只擦**最上层**（单击：叠放时不会把整叠一次擦光）
+        topmost,
+        /// 擦掉命中**全部**（按住右键拖动扫过：划过即清）
+        all,
+    };
+
+    /// 右键擦除片段：(轨道, 步) 处的命中。`.topmost` 只删最上层，`.all` 全删。
+    /// 返回删除数量（".all" 用循环重算最顶层，删除顺序无关）。
+    pub fn eraseClipsAt(self: *App, track: i32, step: i32, mode: EraseMode) usize {
+        var n: usize = 0;
+        while (true) {
+            const ci = model.topmostClipAt(self.clips.items, track, step) orelse break;
+            _ = self.clips.orderedRemove(ci);
+            n += 1;
+            if (mode == .topmost) break;
+        }
+        if (n > 0) self.dirty = true;
+        return n;
+    }
+
+    /// 右键擦除音符：(样式, 乐器, 音高, 步) 处的命中；语义同 `eraseClipsAt`。
+    pub fn eraseNotesAt(self: *App, pattern: i32, instrument: i32, pitch: i32, step: i32, mode: EraseMode) usize {
+        var n: usize = 0;
+        while (true) {
+            const ni = model.topmostNoteAt(self.notes.items, pattern, instrument, pitch, step) orelse break;
+            _ = self.notes.orderedRemove(ni);
+            n += 1;
+            if (mode == .topmost) break;
+        }
+        if (n > 0) self.dirty = true;
+        return n;
+    }
+
     /// 导入 MIDI：每个用到的通道 → 一个新乐器（默认减法合成器参数）；
     /// 音符全部写进**一个新建样式**（不自动放片段——由用户自己放置）。
     /// 失败返回错误；成功返回统计信息。
@@ -10007,7 +10038,87 @@ test "app: 手势历史顺序（新操作起手先钉 → 撤销按因果顺序�
     try std.testing.expectEqual(@as(i32, 120), app.bpm); // 回到基线
 }
 
-test "app: 调音台——通道/效果器上移下移 + 删除通道（路由跟随）" {
+test "app: 右键擦除——单击只删命中的一个，拖动擦除则全删" {
+    // 语义（用户拍板）：右键**起点在片段/音符上** → 只删那一个（后续拖动不处理）；
+    // **起点在空白** → 拖动时鼠标碰到的全部删（走 `.all`）。
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+
+    // 轨道 0、同左端点、三层叠放片段（pattern 0/1/2 便于辨认层级）
+    for (0..3) |k| {
+        try app.clips.append(app.allocator, .{
+            .track = 0,
+            .start = 0,
+            .len = model.units_per_whole,
+            .pattern = @intCast(k),
+        });
+    }
+    // 样式 0 / 乐器 0 / 音高 60 上三层叠放音符
+    for (0..3) |k| {
+        try app.notes.append(app.allocator, .{
+            .step = 0,
+            .len = 16,
+            .pitch = 60,
+            .pattern = 0,
+            .instrument = 0,
+        });
+        _ = k;
+    }
+
+    // 片段：`.topmost` 只删**最上层**（同左端 → 数组序最大 = pattern 2）
+    try std.testing.expectEqual(@as(usize, 1), app.eraseClipsAt(0, 0, .topmost));
+    try std.testing.expectEqual(@as(usize, 2), app.clips.items.len);
+    try std.testing.expectEqual(@as(i32, 1), app.clips.items[1].pattern);
+
+    // 音符：`.topmost` 同样只删一个
+    try std.testing.expectEqual(@as(usize, 1), app.eraseNotesAt(0, 0, 60, 0, .topmost));
+    try std.testing.expectEqual(@as(usize, 2), app.notes.items.len);
+
+    // 拖动语义：`.all` 把余下命中的全删（叠放一起清）
+    try std.testing.expectEqual(@as(usize, 2), app.eraseClipsAt(0, 0, .all));
+    try std.testing.expectEqual(@as(usize, 0), app.clips.items.len);
+    try std.testing.expectEqual(@as(usize, 2), app.eraseNotesAt(0, 0, 60, 0, .all));
+    try std.testing.expectEqual(@as(usize, 0), app.notes.items.len);
+
+    // 空位置：两个模式都不删（返回 0，不会误标脏）
+    app.dirty = false;
+    try std.testing.expectEqual(@as(usize, 0), app.eraseClipsAt(0, 500, .all));
+    try std.testing.expect(!app.dirty);
+}
+test "app: 调音台交换通道后，乐器按通道号路由（A/B 互换的例子）" {
+    // 用户复现：1 号 = A、2 号 = B，乐器路由到 1 号；把 B 上移与 A 交换后 1 号变成 B
+    // —— 乐器必须改走 B（路由是“号”，不是“通道身份”）。
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(3); // 0 = 主通道；1 = A；2 = B
+    _ = app.addInstrument("减法合成器");
+    app.instruments.items[0].mixer = 1;
+
+    const nm_a = "A";
+    @memcpy(app.mixer_channels_state.items[1].name[0..nm_a.len], nm_a);
+    app.mixer_channels_state.items[1].name_len = nm_a.len;
+    const nm_b = "B";
+    @memcpy(app.mixer_channels_state.items[2].name[0..nm_b.len], nm_b);
+    app.mixer_channels_state.items[2].name_len = nm_b.len;
+
+    // B（2 号）上移 → 与 1 号交换
+    try std.testing.expect(app.moveMixerChannel(2, -1));
+
+    // 乐器仍然指向 **1 号**；而 1 号现在装的是 B（自定义名随通道走）
+    try std.testing.expectEqual(@as(i32, 1), app.instruments.items[0].mixer);
+    var buf: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("B", app.mixer_channels_state.items[1].displayName(1, &buf));
+    try std.testing.expectEqualStrings("A", app.mixer_channels_state.items[2].displayName(2, &buf));
+}
+
+test "app: 调音台——通道/效果器上移下移 + 删除通道（路由按通道号）" {
     var app = App{ .allocator = std.testing.allocator };
     defer app.clips.deinit(app.allocator);
     defer app.notes.deinit(app.allocator);
@@ -10037,18 +10148,19 @@ test "app: 调音台——通道/效果器上移下移 + 删除通道（路由�
     try std.testing.expect(app.moveEffect(1, 1, -1));
     try std.testing.expectApproxEqAbs(@as(f32, 0.1), app.mixer_channels_state.items[1].effects.items[0].mix, 0.001);
 
-    // 通道下移：通道 1（含效果链）→ 2；**乐器路由跟随交换**
+    // 通道下移：通道 1（含效果链）→ 2；**乐器路由按通道号（不跟随被移走的通道）**
     try std.testing.expect(app.moveMixerChannel(1, 1));
-    try std.testing.expectEqual(@as(usize, 2), app.mixer_channels_state.items[2].effects.items.len); // 链跟着走
-    try std.testing.expectEqual(@as(i32, 2), app.instruments.items[0].mixer); // 1 → 2
-    try std.testing.expectEqual(@as(i32, 1), app.instruments.items[1].mixer); // 2 → 1
+    try std.testing.expectEqual(@as(usize, 2), app.mixer_channels_state.items[2].effects.items.len); // 链跟着通道走
+    try std.testing.expectEqual(@as(i32, 1), app.instruments.items[0].mixer); // 号不变（现由原通道 2 占住）
+    try std.testing.expectEqual(@as(i32, 2), app.instruments.items[1].mixer); // 号不变
 
     // 删除通道 2（当前它带 2 个效果器）→ 路由补位；视图层会提交历史，测试里手动提交
     try std.testing.expect(app.removeMixerChannel(2));
     app.commitHistory("删除通道");
     try std.testing.expectEqual(@as(usize, 3), app.mixer_channels_state.items.len);
-    // 原来路由到 2 的乐器 → 被钳到 2（现最大下标）
-    try std.testing.expectEqual(@as(i32, 2), app.instruments.items[0].mixer);
+    // 乐器号 1（< 删除点）不变；乐器号 2（= 删除点）钳到新最大下标 2
+    try std.testing.expectEqual(@as(i32, 1), app.instruments.items[0].mixer);
+    try std.testing.expectEqual(@as(i32, 2), app.instruments.items[1].mixer);
 
     // 只剩 1 条时不能删
     _ = app.removeMixerChannel(0);

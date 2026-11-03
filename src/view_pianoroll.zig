@@ -890,21 +890,32 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 放置音符时也试听一声（原型手感）：仅新放置（非拖动）
     // （按住即发声，松开琴键/点击后自然释音）
 
-    // 右键：删除音符（按下或拖动划过）
+    // 右键：**起点在音符上 → 只删这一个**（之后拖到哪都不再处理）；
+    // **起点在空白鼓面 → 按住拖动 = 擦除划过的一切**（与旧行为相同）
     // **点在空白处**（没命中音符）→ 取消选区（与左键点空白的语义一致）
     if (!menu_click and ui.mouse_right_pressed and ui.hitRect(main_x, lane_y, main_w, lane_h)) {
-        if (note_hit == null) app.clearNoteSelection();
-        app.playlist.erase_drag = true;
+        if (note_hit != null) {
+            app.playlist.erase_drag = false; // 起点有内容：拖动不再擦
+            if (app.eraseNotesAt(pattern, app.sel.instrument, pitch_i, step_i, .topmost) > 0) {
+                app.piano.drag_note = null;
+                app.history_pending = "擦除音符";
+            }
+            note_hit = null; // 下标已失效，后续不要再用
+        } else if (!ui.mods_ctrl) {
+            app.clearNoteSelection();
+            app.playlist.erase_drag = true;
+        }
     }
     if (app.playlist.erase_drag) {
         if (!ui.mouse_right_down) {
             app.playlist.erase_drag = false;
-        } else if (note_hit) |hit| {
-            _ = app.notes.orderedRemove(hit.index);
-            app.piano.drag_note = null;
-            app.dirty = true;
-            // 历史：右键擦除（含拖动划过多个）→ 松开右键时 coalesce 提交一次
-            app.history_pending = "擦除音符";
+        } else if (in_lane and pitch_i >= 0 and pitch_i <= 127 and !app.piano.marquee_active and !ui.mods_ctrl) {
+            // 拖动擦除：鼠标碰到的音符**全部**删（叠放也一起）
+            if (app.eraseNotesAt(pattern, app.sel.instrument, pitch_i, step_i, .all) > 0) {
+                app.piano.drag_note = null;
+                // 历史：右键擦除（含拖动划过多个）→ 松开右键时 coalesce 提交一次
+                app.history_pending = "擦除音符";
+            }
         }
     }
 

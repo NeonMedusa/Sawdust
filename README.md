@@ -10,6 +10,24 @@ SAWtooth（锯齿波）是我最喜欢的波形之一，而Zig的'Z'就是锯齿
 ## 示例工程和演示视频：
 https://drive.google.com/drive/folders/1vHJcw6CiEt24WLKBgtTzmiMKY8IMpbfF?usp=sharing
 
+## 下载与安装
+
+**直接使用**：从 [Releases](https://github.com/NeonMedusa/Sawdust/releases) 下载对应二进制，双击（或命令行）运行即可——**单个二进制，无需安装任何运行时**：
+
+- Windows：`Sawdust.exe`
+- Linux（x86-64，动态链接 X11）：`Sawdust-Linux-amd64`（依赖与已知差异见 [`docs/linux.md`](docs/linux.md)）
+
+首次启动会在 **exe 同目录自动创建 `data/` 子目录**（设置 `settings.json`、预设 `presets/`、日志 `logs/` 都在里面），整个目录可以随意移动/拷贝，即插即用。
+
+**使用 Scoop 安装**（Windows）：本程序已收录进 [lemon bucket](https://github.com/hoilc/scoop-lemon)，执行：
+
+```powershell
+scoop bucket add lemon https://github.com/hoilc/scoop-lemon
+scoop install sawdust
+```
+
+升级 `scoop update sawdust`；卸载 `scoop uninstall sawdust`（`data/` 目录**默认保留**——设置/预设/日志在里面；加 `-p` 连数据一起删）。
+
 ## 当前状态
 
 已经是一个**可以拿来写东西**的工作站——从编曲到混音的全流程闭环都在：

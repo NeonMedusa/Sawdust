@@ -862,22 +862,34 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         ui.cursor = if (hit.mode == .body) .size_all else .resize_h;
     }
 
-    // 右键：按下处删除；按住拖动 = 擦除（划过即删；起点需在播放列表内）
+    // 右键：**起点在片段上 → 只删这一个**（之后拖到哪都不再处理）；
+    // **起点在空白网格 → 按住拖动 = 擦除划过的一切**（划过即删；与旧行为相同）
     // **点在空白处**（没命中片段）→ 取消选区（与左键点空白的语义一致）
     if (ui.mouse_right_pressed and ui.hitRect(main_x, tracks_y, main_w, tracks_h)) {
-        if (clip_hit == null) app.clearClipSelection();
-        app.playlist.erase_drag = true;
+        if (clip_hit != null) {
+            app.playlist.erase_drag = false; // 起点有内容：拖动不再擦
+            if (app.eraseClipsAt(track_i, step_i, .topmost) > 0) {
+                app.playlist.drag_clip = null;
+                app.playlist.resize_clip = null;
+                app.history_pending = "擦除片段";
+            }
+            clip_hit = null; // 下标已失效，后续不要再用
+        } else if (!ui.mods_ctrl) {
+            app.clearClipSelection();
+            app.playlist.erase_drag = true;
+        }
     }
     if (app.playlist.erase_drag) {
         if (!ui.mouse_right_down) {
             app.playlist.erase_drag = false;
-        } else if (clip_hit) |hit| {
-            _ = app.clips.orderedRemove(hit.index);
-            app.dirty = true;
-            app.playlist.drag_clip = null;
-            app.playlist.resize_clip = null;
-            // 历史：右键擦除（含拖动划过多个）→ 松开右键时 coalesce 提交一次
-            app.history_pending = "擦除片段";
+        } else if (in_lane and valid_track and !app.playlist.marquee_active and !ui.mods_ctrl and !drag_busy) {
+            // 拖动擦除：鼠标碰到的片段**全部**删（叠放也一起）
+            if (app.eraseClipsAt(track_i, step_i, .all) > 0) {
+                app.playlist.drag_clip = null;
+                app.playlist.resize_clip = null;
+                // 历史：右键擦除（含拖动划过多个）→ 松开右键时 coalesce 提交一次
+                app.history_pending = "擦除片段";
+            }
         }
     }
 
