@@ -2,7 +2,9 @@
 
 > 这是 Sawdust 项目的 AI 协作约定。**动手改代码前先读本文 + `docs/pitfalls.md`。**
 > 要动**调度 / 释音 / 播放中编辑**（`sequencer.zig`、`audio.zig` 的事件与声部、`app.zig` 的 `release*`）时，
-> **先读 `docs/scheduler-protocol.md`** —— 那里写了必须守住的不变量与各入口的门控表。
+> **先读 `docs/scheduler-protocol.md`** —— 那里写了必须守住的不变量与各入口的门控表；
+> **§10 = 为什么有前瞻与重扫（架构审计）、§11 = 已定的 Pull 模型改造计划**：
+> 想在 push 模型上再打补丁之前，先对照 §10.3 的根因（粗粒度作废 + 整窗重发 + 音频侧插入排序尖峰）。
 >
 > 复杂控件的设计文档：`docs/timeline-scrollbar.md`（横向时间轴滚动条——
 > 改这块之前务必先读：手势、不变量、快照语义、物理下限都有说明）。

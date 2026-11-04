@@ -134,7 +134,6 @@ pub fn main(init: std.process.Init) !u8 {
     _ = app.addInstrument("减法合成器");
     app.resetHistory("初始状态"); // 空基线 = 历史基线（脏标记由历史派生）
     app.params.events = &app.events;
-    app.params.sched_events = &app.sched_events;
 
     audio_pref.load(io, app.dataRoot()); // 音频后端偏好（data/audio.txt）
     app.engine.init(&app.params, allocator) catch |e| {
@@ -598,7 +597,7 @@ pub fn main(init: std.process.Init) !u8 {
                             app.params.playing.store(true, .monotonic);
                             // 调度：作废旧事件 + 为跨起点长音符补发 on；重置调度窗口
                             app.markGenSoft(false); // 硬切换（起播）：照旧释放（无残留声部）
-                            sequencer.reset(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, app.sel.song_mode, app.sel.pattern, from);
+                            sequencer.reset(&app.scheduler);
                             app.params.sched_gen.store(app.scheduler.gen, .monotonic);
                         } else {
                             app.params.playing.store(false, .monotonic);
@@ -874,18 +873,7 @@ pub fn main(init: std.process.Init) !u8 {
             // 必须在推进后、调度前检查：回跳会重置传输基准并重扫调度窗口。
             app.tickPlaybackLoop();
 
-            // 调度 lookahead：提前 4 小节（步单位随拍号/分辨率变化）
-            const cur2 = app.playback.cursorStep(app.sel.song_mode);
-            const full = cur2 + app.steps_per_bar * 4;
-            // **每帧推进量上限**：播放中重扫会把 `scheduled_upto` 拉回安全界，
-            // 下一帧这里会一口气补满整个窗口——密集工程可达上千条，把音频侧
-            // stash 挤爆（丢的多是 off → 长音不释，实测“极小概率挂音”）。
-            // 已经领先游标 ≥4 步时按 16 步/帧渐进补齐；落后时（跳转/卡顿）不限。
-            const capped = app.scheduler.scheduled_upto + 16;
-            const horizon = if (app.scheduler.scheduled_upto >= cur2 + 4) @min(full, capped) else full;
-            if (horizon > app.scheduler.scheduled_upto) {
-                sequencer.scheduleRange(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, app.sel.song_mode, app.sel.pattern, app.scheduler.scheduled_upto, horizon);
-            }
+            // **A4**：前瞻推送已删除——音频线程直接从快照取事件（见 docs/scheduler-protocol.md §11）
         }
         // 同步发声音高缓存（音频线程回传的位掩码 → 当前乐器的音高集合）
         {
@@ -1036,7 +1024,9 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
         app.pollGestureHistory();
-        app.pollCapacityReclaim(); // 容量自动回收（删除/装载后滞回缩容；无声时几乎零开销）
+        app.pollCapacityReclaim();
+        app.pollSnapshotRebuild(); // A2：影子对拍快照（未接主路）
+        // 容量自动回收（删除/装载后滞回缩容；无声时几乎零开销）
 
         // 4.1z) 文件对话框：推进待处理的"选文件"请求（B 方案；内部目前仍是外部对话框）
         handlePick(&app, &win, io, &picker);
@@ -2710,7 +2700,7 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
             app.params.start_step.store(from, .monotonic);
             app.params.playing.store(true, .monotonic);
             app.markGenSoft(false); // 硬切换（起播）：照旧释放（无残留声部）
-            sequencer.reset(&app.scheduler, &app.sched_events, app.clips.items, app.notes.items, app.sel.song_mode, app.sel.pattern, from);
+            sequencer.reset(&app.scheduler);
             app.params.sched_gen.store(app.scheduler.gen, .monotonic);
         } else {
             app.params.playing.store(false, .monotonic);
@@ -2996,18 +2986,11 @@ fn schedLogTick(app: *App, io: std.Io) void {
     if (sched_log_accum_ns < 1_000_000_000) return;
     sched_log_accum_ns = 0;
 
-    const obsolete = app.params.dbg_drop_obsolete.load(.monotonic);
+    // **A4**：`dbg_drop_obsolete/stash/vsti` 这套“丢事件”统计只对已退役的 push 模型有意义，
+    // 现在事件来源唯一（快照），保留 `dbg_drop_stash` 作为“stash 满”告警即可。
     const stash = app.params.dbg_drop_stash.load(.monotonic);
-    const vsti = app.params.dbg_drop_vsti.load(.monotonic);
-    const ring = app.sched_events.dropped.load(.monotonic);
-    const d_obs = obsolete - sched_log_prev_obsolete;
     const d_stash = stash - sched_log_prev_stash;
-    const d_vsti = vsti - sched_log_prev_vsti;
-    const d_ring = ring - sched_log_prev_ring;
-    sched_log_prev_obsolete = obsolete;
     sched_log_prev_stash = stash;
-    sched_log_prev_vsti = vsti;
-    sched_log_prev_ring = ring;
 
     // 挂音排查关键指标：**最老声部的年龄**（步）。正常音符最多几十步；
     // 几百步 = 有 off 没送到（挂音）。声部数比预期多 = 双实例。
@@ -3018,17 +3001,12 @@ fn schedLogTick(app: *App, io: std.Io) void {
     const off_hit = app.params.dbg_off_hit.load(.monotonic);
     const off_miss = app.params.dbg_off_miss.load(.monotonic);
     const retrig = app.params.dbg_retrig.load(.monotonic);
-    const drop_off = app.params.dbg_drop_off.load(.monotonic);
-    const drop_gen = app.params.dbg_drop_gen.load(.monotonic);
 
     const local_off = app.params.dbg_local_off.load(.monotonic);
     const ov_now = app.params.dbg_overrun_now.load(.monotonic);
     const ov_peak = app.params.dbg_overrun_peak.load(.monotonic);
     const ov_late = app.params.dbg_late_max.load(.monotonic);
-    const off_ahead_min = app.params.dbg_drop_off_ahead_min.load(.monotonic);
-    const off_ahead_max = app.params.dbg_drop_off_ahead_max.load(.monotonic);
     const stash_n = app.params.dbg_stash_n.load(.monotonic);
-    const ring_used = app.params.dbg_ring_used.load(.monotonic);
 
     // 挂音检测（覆盖 VSTi / 鼓组 / 内置 synth：用音频线程回传的“正在发声音高位图”）：
     // **逐音高**记录它从哪一步开始一直没被释放——即使别的音符进进出出也能抓到。
@@ -3062,13 +3040,51 @@ fn schedLogTick(app: *App, io: std.Io) void {
         }
     }
 
+    // **A4**：调度现在只有一条路径（快照），旧 push 模型的“作废/队列/编辑代”指标已删。
     var line_buf: [512]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buf, "[sched] 1s: 作废 on={d} off={d}(累计{d}) gen不符={d} off超前[{d},{d}] stash满={d} vsti满={d} 队列满={d} | 声部={d} 最老={d}步(p{d} i{d}) | off 命中={d} 落空={d} 重触发={d} | 积压 stash={d} 队列={d} | 本地off={d} 超时={d}/{d} 迟到={d}步 | edit_gen={d} 步={d}\n", .{
-        d_obs,   drop_off,  obsolete,  drop_gen, off_ahead_min, off_ahead_max, d_stash,                d_vsti,
-        d_ring,  voices,    max_age,   age_p,    age_i,         off_hit,       off_miss,               retrig,
-        stash_n, ring_used, local_off, ov_now,   ov_peak,       ov_late,       app.scheduler.edit_gen, app.playback.cursorStep(app.sel.song_mode),
+    const line = std.fmt.bufPrint(&line_buf, "[sched] 1s: 声部={d} 最老={d}步(p{d} i{d}) | off 命中={d} 落空={d} 重触发={d} | 积压 stash={d} 满增={d} | 本地off={d} 超时={d}/{d} 迟到={d}步 | 步={d}\n", .{
+        voices,   max_age, age_p,   age_i,                                      off_hit,
+        off_miss, retrig,  stash_n, d_stash,                                    local_off,
+        ov_now,   ov_peak, ov_late, app.playback.cursorStep(app.sel.song_mode),
     }) catch return;
     std.debug.print("{s}", .{line});
+
+    // **A2 影子对拍**：队列侧 vs 快照侧的“本块事件数”不一致计数（健康状态应恒为 0）
+    var sb: [224]u8 = undefined;
+    const shadow_line = std.fmt.bufPrint(&sb, "[shadow] 1s: 路径={s} 块={d} 不一致 on={d} off={d} 溢出={d} 跳过={d} 实例={d}\n", .{
+        if (app.params.snapshot_ptr.load(.acquire) != 0) "快照" else "队列",
+        app.params.dbg_shadow_blocks.load(.monotonic),
+        app.params.dbg_shadow_mismatch_on.load(.monotonic),
+        app.params.dbg_shadow_mismatch_off.load(.monotonic),
+        app.params.dbg_shadow_overflow.load(.monotonic),
+        app.params.dbg_shadow_skipped.load(.monotonic),
+        app.snap_insts,
+    }) catch "";
+    std.debug.print("{s}", .{shadow_line});
+    // 如果有不一致，把**最近一次的明细**也写进日志（否则只能靠控制台）
+    var detbuf: [200]u8 = undefined;
+    const det_n = app.params.shadow_det_n.load(.monotonic);
+    const det_line = if (det_n > 0)
+        std.fmt.bufPrint(&detbuf, "[shadow] 最近不一致: step[{d},{d}) 队列 on={d} off={d} / 快照 on={d} off={d}（共 {d} 次）\n", .{
+            app.params.shadow_det_s0.load(.monotonic),
+            app.params.shadow_det_s1.load(.monotonic),
+            app.params.shadow_det_qon.load(.monotonic),
+            app.params.shadow_det_qoff.load(.monotonic),
+            app.params.shadow_det_kon.load(.monotonic),
+            app.params.shadow_det_koff.load(.monotonic),
+            det_n,
+        }) catch ""
+    else
+        "";
+    if (det_line.len > 0) std.debug.print("{s}", .{det_line});
+    app.params.dbg_shadow_blocks.store(0, .monotonic);
+    app.params.dbg_shadow_mismatch_on.store(0, .monotonic);
+    app.params.dbg_shadow_mismatch_off.store(0, .monotonic);
+    app.params.dbg_shadow_overflow.store(0, .monotonic);
+    app.params.dbg_shadow_skipped.store(0, .monotonic);
+    app.params.shadow_det_n.store(0, .monotonic);
+    app.sched_cost_ahead.reset();
+    app.sched_cost_rescan.reset();
 
     // 取走音频线程记下的**长音/挂音**记录（“哪个音高响了多久”），一起写进日志：
     // 事后排序就能定位超长音符出现的前后到底发生了什么。
@@ -3106,6 +3122,8 @@ fn schedLogTick(app: *App, io: std.Io) void {
         buf.appendSlice(app.allocator, old) catch return;
     }
     buf.appendSlice(app.allocator, line) catch return;
+    if (shadow_line.len > 0) buf.appendSlice(app.allocator, shadow_line) catch return;
+    if (det_line.len > 0) buf.appendSlice(app.allocator, det_line) catch return;
     buf.appendSlice(app.allocator, recs_buf.items) catch return;
     // App 侧攒下的诊断行（[mute]/[rescan] 等）一并写盘
     if (app.sched_log_pending.items.len > 0) {
@@ -5091,6 +5109,7 @@ test {
     _ = @import("view_panels.zig");
     _ = @import("vst_scan.zig");
     _ = @import("sched_stress.zig");
+    _ = @import("snapshot.zig"); // A1：Pull 快照与 gatherRange 的逐事件对拍
     _ = @import("plugin_db.zig");
     _ = @import("ui_test.zig");
 }

@@ -28,11 +28,6 @@ pub const max_instruments: usize = 32;
 /// 立即事件队列容量（UI 每秒推入的事件数远小于此值）
 const queue_size: usize = 1024;
 
-/// 调度事件队列容量（UI 按 lookahead 提前调度；数秒的余量）。
-/// **播放中重扫会一次推入整个 lookahead 窗口**（4 小节）的事件——
-/// 密集工程可达上千条，容量小了会静默丢弃（丢的往往是 off → 挂音，实测）。
-const sched_capacity: usize = 16384;
-
 /// 每块最多处理的立即事件数
 pub const drain_max = 64;
 
@@ -175,10 +170,6 @@ pub const SchedEvent = struct {
     end_step: i32 = -1,
     /// 调度 generation（transport 变化时递增；旧事件作废）
     gen: u32 = 0,
-    /// 编辑代（播放中编辑提交时递增）：音频线程丢弃 `edit_gen` **小于**
-    /// 当前值的事件（丢弃但不释放声部）——见 `sequencer.rescanForEdit`
-    edit_gen: u32 = 0,
-    /// 力度（1-127）——播放中改力度需重扫（水位线不回头）
     velocity: u8 = default_velocity,
     /// 声像（0-127；64 = 居中）
     pan: u8 = default_pan,
@@ -244,7 +235,6 @@ pub fn Ring(comptime T: type, comptime capacity: usize) type {
 }
 
 pub const EventQueue = Ring(NoteEvent, queue_size);
-pub const SchedQueue = Ring(SchedEvent, sched_capacity);
 
 // ── 声部状态 ──
 
@@ -1087,23 +1077,6 @@ test "synth: render(add=true) 叠加而不覆盖" {
     var e2: f32 = 0;
     for (buf) |s| e2 += @abs(s);
     try std.testing.expect(e2 > e1 * 1.5);
-}
-
-test "synth: SchedQueue 推入/取出保序" {
-    var sq = SchedQueue{};
-    sq.push(.{ .kind = .on, .pitch = 60, .step = 10, .gen = 1 });
-    sq.push(.{ .kind = .off, .pitch = 60, .step = 20, .gen = 1 });
-    sq.push(.{ .kind = .on, .pitch = 64, .step = 30, .gen = 1 });
-
-    var out: [8]SchedEvent = undefined;
-    const n = sq.drain(&out);
-    try std.testing.expectEqual(@as(usize, 3), n);
-    try std.testing.expectEqual(@as(i32, 10), out[0].step);
-    try std.testing.expectEqual(@as(i32, 20), out[1].step);
-    try std.testing.expectEqual(@as(i32, 30), out[2].step);
-    try std.testing.expectEqual(@as(u8, 64), out[2].pitch);
-    // 取空后再次 drain 应为 0
-    try std.testing.expectEqual(@as(usize, 0), sq.drain(&out));
 }
 
 test "synth: 归一化映射（时间 / 截止频率）" {

@@ -26,6 +26,7 @@ pub const FxBox = struct {
     },
 };
 const synth = @import("synth.zig");
+const snapshot = @import("snapshot.zig");
 const eq = @import("eq.zig");
 const fx = @import("effects.zig");
 const vst_host = @import("vst_host.zig");
@@ -68,7 +69,6 @@ const Trace = struct {
     step: i32 = -1,
     on_step: i32 = -1,
     gen: u32 = 0,
-    edit_gen: u32 = 0,
 };
 
 /// 调音台通道数**初始容量**（与 app.max_mixer_channels 对齐；音频层不能 import app——循环依赖）。
@@ -91,17 +91,10 @@ pub const Params = struct {
     playing: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// 音频线程回传：已播放帧数（UI 读取用于显示播放位置/驱动游标）
     frames_played: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    /// 音频线程回传：作废丢弃的调度事件累计数（旧编辑代/旧传输代；UI 每秒汇总打印）
-    dbg_drop_obsolete: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// 音频线程回传：stash 满丢弃的累计数
     dbg_drop_stash: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// 音频线程回传：VSTi 事件批满丢弃的累计数
     dbg_drop_vsti: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    /// 音频线程回传：作废丢弃里 on / off 各自的累计数（挂音排查：off 不该被丢）
-    dbg_drop_on: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    dbg_drop_off: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    /// 音频线程回传：传输代不符丢弃 / 被丢 off 的超前量（step - 当前步）极值
-    dbg_drop_gen: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     /// **不变量自检**：此刻“已过 end_step + 1 小节仍在响”的声部数（当前值 / 历史峰值 / 最大迟到步数）
     dbg_overrun_now: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
@@ -109,8 +102,6 @@ pub const Params = struct {
     dbg_local_off: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     dbg_overrun_peak: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     dbg_late_max: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
-    dbg_drop_off_ahead_min: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
-    dbg_drop_off_ahead_max: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
     /// 音频线程回传：当前播放步（供上面算超前量）
     last_step: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
     /// 音频线程 → UI：**长音记录**（音符发声时长统计；UI 线程取走后写进日志文件）。
@@ -119,7 +110,29 @@ pub const Params = struct {
     dbg_long_n: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// 音频线程回传：stash 里待触发的事件数 / UI→音频队列里待取的事件数
     dbg_stash_n: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    dbg_ring_used: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// **A2 影子对拍**：当前快照指针（0 = 无；UI 用 release 发布，音频 acquire 读取）。
+    /// 快照释放由 UI 侧**延迟退休**（≥30 帧 ≫ 一个 block），因此音频持有指针安全。
+    snapshot_ptr: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// A2：UI 侧的调度水位线（步）。音频用它判断“队列是否已覆盖到本块”——
+    /// 重扫后水位线回退期间队列会短暂落后，此时**跳过**影子比对（否则是假不一致）。
+    sched_upto: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
+    /// A3a：快照代（UI 每次发布 +1）。音频看到变化 → 丢弃 stash 里旧数据的事件，
+    /// 并按新快照重发当前块（= pull 模型下的“编辑生效”机制，不需要重扫/编辑代）。
+    snap_gen: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// A2 计数：比较过的块数 / on 不一致 / off 不一致 / 影子缓冲溢出
+    dbg_shadow_blocks: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    dbg_shadow_mismatch_on: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    dbg_shadow_mismatch_off: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    dbg_shadow_overflow: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    dbg_shadow_skipped: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// A2 不一致明细（最近一次）：步区间 + 两侧计数（UI 每秒写进日志）
+    shadow_det_s0: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
+    shadow_det_s1: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
+    shadow_det_qon: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    shadow_det_qoff: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    shadow_det_kon: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    shadow_det_koff: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    shadow_det_n: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// 音频线程回传：off 命中/落空（落空 = 孤儿 off，无害；命中数少于 on 数 = 有挂音）
     dbg_off_hit: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     dbg_off_miss: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -151,20 +164,11 @@ pub const Params = struct {
     /// （单次消费——音频 `handleGenChange` 用 swap 清位）。其余路径（跳转/
     /// 起播）在 gen 递增前写 false。发布顺序：本标志 → gen → 事件入队。
     sched_gen_soft: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-    /// 编辑代（播放中编辑重扫时递增）：音频线程丢弃 `edit_gen` **小于**
-    /// 当前值、**且步号 >= `sched_rescan_from`** 的旧事件（= 已有重发
-    /// 副本替换；低于安全界的旧副本**保留触发**）——见 `sequencer.rescanForEdit`
-    sched_edit_gen: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
-    /// 最近一次重扫的**安全界**（步）：用 `schedEventObsolete` 判定旧事件
-    /// 是否已被重发替换——UI 必须**先本值、后 `sched_edit_gen`**发布
-    /// （见 `App.rescanForPlaybackEdit`）
-    sched_rescan_from: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
 
     // ── 队列与乐器（指针地址稳定）──
     /// 立即事件队列（试听/all_off）
     events: *synth.EventQueue = undefined,
     /// 调度事件队列（序列器）
-    sched_events: *synth.SchedQueue = undefined,
     /// 每乐器的合成器参数指针（UI 每帧同步；空槽位 = null）
     /// 注：以下全部数组为**运行时容量**（长度 = `instruments_cap` 等，见 `initCapacity`）
     synth_ptrs: []std.atomic.Value(?*synth.SynthParams) = &.{},
@@ -589,6 +593,19 @@ pub const Engine = struct {
     stash_n: usize = 0,
     /// stash 满导致丢弃的累计次数（排查“丢 off → 挂音”）
     stash_dropped: usize = 0,
+    /// A2：影子不一致的日志条数限额（防刷屏）
+    shadow_log_left: u32 = 8,
+    /// A2：传送/编辑代刚变化后的**稳定期**（块数）——期间跳过比对：
+    /// 起播/循环跳变会补发 `gatherMidOns` 的“中途 on”，重扫后 `[安全界, 旧水位线)` 区间
+    /// 本来就是“旧事件继续触发 + 新数据稍后覆盖”的过渡态，两者都**不是真不一致**。
+    shadow_settle: u16 = 0,
+    /// **A3a**：已从快照发出的最后一步（-1 = 本世代还没发过 → 要补 mid-on）。
+    /// 只在 `gen` 变化（起播/跳转/停止）时重置。
+    snap_step: i32 = -1,
+    /// 已见过的快照代（与 `Params.snap_gen` 比对）
+    snap_gen_seen: u32 = 0,
+    shadow_last_gen: u32 = 0,
+    shadow_last_snap_gen: u32 = 0,
     /// VSTi 事件批满导致丢弃的累计次数
     vsti_dropped: usize = 0,
     /// 诊断（仅 `--sched-log` 时维护）：最近派发的 64 条事件，用于挂音现场回溯
@@ -599,7 +616,6 @@ pub const Engine = struct {
     /// 诊断：本轮是否已经记过“长音记录”（防同一次发声重复记）
     long_rec_flag: [32][128]bool = @splat(@splat(false)),
     /// 上一次看到的编辑代（变化 = 刚重扫过 → 跑一次“补 off”修补）
-    last_edit_gen: u32 = 0,
     /// VSTi 每个（乐器, 音高）**应该结束**的步（-1 = 未知/没在响）。诊断 + 方案 B 基础。
     vsti_end: [32][128]i32 = @splat(@splat(-1)),
     /// 音频片段播放表的**逐行增益**（对 `row.gain` 平滑，防静音切换时的咔哒）。
@@ -915,6 +931,8 @@ pub const SamplerVoice = struct {
     gain_r: f32 = 0,
     /// 触发音高（发声高亮回传用）
     pitch: u8 = 0,
+    /// **A3b**：触发它的音符起点步（-1 = 未知）——换代对账按它精确匹配实例
+    start_step: i32 = -1,
     active: bool = false,
 };
 
@@ -1122,7 +1140,7 @@ fn kitSamplerState(engine: *const Engine, i: usize) ?*KitSamplerState {
 }
 
 /// 采样器层：触发一次（一次性；找空闲声部，无 → 覆盖 0 号）
-fn kitSamplerNoteOn(engine: *Engine, i: usize, l: usize, pitch: u8, velocity: u8, pan: f32) void {
+fn kitSamplerNoteOn(engine: *Engine, i: usize, l: usize, pitch: u8, velocity: u8, pan: f32, at_step: i32) void {
     const st = kitSamplerState(engine, i) orelse return;
     const params = engine.params;
     const asset = params.kit_layer_asset[i][l].load(.acquire) orelse return;
@@ -1158,6 +1176,7 @@ fn kitSamplerNoteOn(engine: *Engine, i: usize, l: usize, pitch: u8, velocity: u8
         .gain_l = g * bg[0],
         .gain_r = g * bg[1],
         .pitch = pitch,
+        .start_step = at_step, // A3b：实例标识（对账用）
         .active = true,
     };
 }
@@ -1273,6 +1292,255 @@ fn vstiActiveSet(engine: *Engine, i: usize, pitch: u8, on: bool) void {
     }
 }
 
+/// **A3b：换代对账**（见 `docs/scheduler-protocol.md` §11.7）——
+/// 让“实际在响的声部”与快照“应该正在响的”一致：
+/// 1. 在响但**不在**结转集里 → 释放（内置合成器按 `(音高, on_step)` **精确**匹配，不会误切同音高实例）；
+/// 2. 结转集里有但**没在响** → 补一条 on（编辑新增“起点在游标之前”的音符时，它要立刻响）。
+/// 只在快照换代时调用（每次编辑一次，O(实例数)）。
+/// ⚠️ VSTi 没有声部模型：只能按音高发 off（同音高多实例不可区分，**已知限制**）；
+/// ⚠️ 鼓组（pad/层模型）暂不参与，仍走原有释音路径。
+fn reconcileVoices(engine: *Engine, params: *Params, cur_step: i32, insts: []const snapshot.Inst, cross: []const u32) void {
+    const n_cap = @min(@as(usize, 32), params.instruments_cap, engine.synths.len);
+
+    // ── 1) 释放“多余”的声部（内置合成器：精确匹配）──
+    var i: usize = 0;
+    while (i < n_cap) : (i += 1) {
+        if (params.instrument_kind[i].load(.monotonic) != 0) continue; // 只处理内置合成器
+        const sy = &engine.synths[i];
+        var vi: usize = 0;
+        while (vi < sy.voices.len) : (vi += 1) {
+            const v = sy.voices[vi];
+            if (v.env_stage == .idle or v.env_stage == .release) continue;
+            if (v.start_step < 0) continue;
+            const p: u8 = @intCast(@max(0, v.pitch));
+            // 结转集里有同 (音高, 起点) 的实例 → 应该在响，留着
+            var keep = false;
+            for (cross) |ci| {
+                const it = insts[ci];
+                if (it.instrument == @as(i32, @intCast(i)) and it.pitch == @as(i32, p) and it.start == v.start_step) {
+                    keep = true;
+                    break;
+                }
+            }
+            if (!keep) _ = synth.noteOff(sy, p, v.start_step);
+        }
+    }
+
+    // ── 1b) 鼓组（kind == 1）：**pad 就是音高**，与普通乐器同语义（同 pad 重叠 = 两个声部都该响）
+    i = 0;
+    while (i < n_cap) : (i += 1) {
+        if (params.instrument_kind[i].load(.monotonic) != 1) continue;
+        const n_layers = @min(params.kit_layer_count[i].load(.monotonic), kit_max_layers);
+        var l: usize = 0;
+        while (l < n_layers) : (l += 1) {
+            const lkind = params.kit_layer_kind[i][l].load(.monotonic);
+            const pad_pitch: u8 = @intCast(@min(127, params.kit_layer_pitch[i][l].load(.monotonic)));
+            if (lkind == 3) {
+                // 采样器层：一次性；按 (pad, start_step) 精确停（不影响同 pad 的另一个实例）
+                if (kitSamplerState(engine, i)) |st| {
+                    for (&st.layers[l].voices) |*sv| {
+                        if (!sv.active) continue;
+                        if (sv.pitch != pad_pitch or sv.start_step < 0) continue;
+                        var keep = false;
+                        for (cross) |ci| {
+                            const it = insts[ci];
+                            if (it.instrument == @as(i32, @intCast(i)) and it.pitch == @as(i32, pad_pitch) and it.start == sv.start_step) {
+                                keep = true;
+                                break;
+                            }
+                        }
+                        if (!keep) sv.active = false;
+                    }
+                }
+            } else if (lkind == 2) {
+                // VSTi 层：没有声部模型 → 只能 pad 级（同 pad 多实例不可区分，已知限制）
+                var has = false;
+                for (cross) |ci| {
+                    const it = insts[ci];
+                    if (it.instrument == @as(i32, @intCast(i)) and it.pitch == @as(i32, pad_pitch)) {
+                        has = true;
+                        break;
+                    }
+                }
+                if (!has and params.kit_layer_plugin[i][l].load(.acquire) != null) {
+                    kitLayerVstiNoteOff(engine, i, l, pad_pitch);
+                }
+            } else {
+                // 合成器层：与普通乐器同样的**精确**释放（按 (pad, start_step)）
+                const ks = engine.kitSynth(i, l) orelse continue;
+                for (ks.voices) |v| {
+                    if (v.env_stage == .idle or v.env_stage == .release) continue;
+                    if (v.start_step < 0) continue;
+                    const p: u8 = @intCast(@max(0, v.pitch));
+                    var keep = false;
+                    for (cross) |ci| {
+                        const it = insts[ci];
+                        if (it.instrument == @as(i32, @intCast(i)) and it.pitch == @as(i32, p) and it.start == v.start_step) {
+                            keep = true;
+                            break;
+                        }
+                    }
+                    if (!keep) _ = synth.noteOff(ks, p, v.start_step);
+                }
+            }
+        }
+    }
+    // ── 2) VSTi：按音高“不再应该响”就发 off ──
+    var k: usize = 0;
+    while (k < @min(n_cap, engine.vsti_active_lo.len)) : (k += 1) {
+        if (params.instrument_kind[k].load(.monotonic) != 2) continue;
+        var p: u8 = 0;
+        while (p < 128) : (p += 1) {
+            const active = if (p < 64)
+                (engine.vsti_active_lo[k] >> @intCast(p)) & 1 != 0
+            else
+                (engine.vsti_active_hi[k] >> @intCast(p - 64)) & 1 != 0;
+            if (!active) continue;
+            var keep = false;
+            for (cross) |ci| {
+                const it = insts[ci];
+                if (it.instrument == @as(i32, @intCast(k)) and it.pitch == @as(i32, p)) {
+                    keep = true;
+                    break;
+                }
+            }
+            if (!keep) vstiNoteOff(engine, k, p);
+        }
+    }
+
+    // ── 3) 结转集里有、但没在响 → 补 on（只在“起点早于游标”时需要）──
+    for (cross) |ci| {
+        const it = insts[ci];
+        if (it.instrument < 0 or it.instrument >= @as(i32, @intCast(n_cap))) continue;
+        if (params.instrument_kind[@intCast(it.instrument)].load(.monotonic) != 0) continue; // 只补内置合成器
+        const sy = &engine.synths[@intCast(it.instrument)];
+        var found = false;
+        for (sy.voices) |v| {
+            if (v.env_stage == .idle or v.env_stage == .release) continue;
+            if (v.pitch == it.pitch and v.start_step == it.start) {
+                found = true;
+                break;
+            }
+        }
+        if (found) continue;
+        if (it.start >= cur_step) continue; // 还没到起点 → 正常调度会发
+        _ = synth.noteOn(sy, @intCast(it.pitch), @intCast(@max(1, @min(127, it.velocity))), @intCast(@max(0, @min(127, it.pan))), it.start, it.end);
+    }
+}
+test "audio: A3b 换代对账——多余声部被精确释放，应该响的留着" {
+    const alloc = std.testing.allocator;
+    var params = Params{};
+    try params.initCapacity(alloc, 2, 1, 0);
+    defer params.deinit(alloc);
+
+    var engine = Engine{ .params = &params };
+    engine.allocator = alloc;
+    try engine.setCapacity(2, 1, 0);
+    defer engine.deinit();
+
+    params.instrument_kind[0].store(0, .monotonic); // 内置合成器
+    params.instrument_kind[1].store(0, .monotonic);
+
+    // 让三个声部响起来：inst0/p60、inst0/p64、inst1/p60（起点都是 0）
+    _ = synth.noteOn(&engine.synths[0], 60, 100, 64, 0, 96);
+    _ = synth.noteOn(&engine.synths[0], 64, 100, 64, 0, 96);
+    _ = synth.noteOn(&engine.synths[1], 60, 100, 64, 0, 96);
+
+    // 快照里只有 (inst0, p60, start 0) 应该在响
+    var clips = [_]@import("model.zig").Clip{.{ .track = 0, .start = 0, .len = 96, .pattern = 0 }};
+    var notes = [_]@import("model.zig").Note{.{ .step = 0, .len = 96, .pitch = 60, .pattern = 0, .instrument = 0 }};
+    var snap = snapshot.build(alloc, &clips, &notes, true, 0, null) catch unreachable;
+    defer snap.deinit();
+
+    var cross: [16]u32 = undefined;
+    const cn = snap.crossingInsts(&cross, 10) orelse unreachable;
+    try std.testing.expectEqual(@as(usize, 1), cn);
+
+    // “真在发声”的声部数（`noteOff` 只是进入 release，尾音还会继续算 active）
+    const sounding = struct {
+        fn f(sy: anytype) usize {
+            var n: usize = 0;
+            for (sy.voices) |v| {
+                if (v.env_stage == .idle or v.env_stage == .release) continue;
+                n += 1;
+            }
+            return n;
+        }
+    }.f;
+    try std.testing.expectEqual(@as(usize, 2), sounding(&engine.synths[0]));
+    try std.testing.expectEqual(@as(usize, 1), sounding(&engine.synths[1]));
+    reconcileVoices(&engine, &params, 10, snap.insts, cross[0..cn]);
+
+    // inst0：p64 被精确释放（进 release），p60 留着（**不会**误切同音高的别的实例）
+    try std.testing.expectEqual(@as(usize, 1), sounding(&engine.synths[0]));
+    // inst1：整个都该释放（快照里没有它的音符）
+    try std.testing.expectEqual(@as(usize, 0), sounding(&engine.synths[1]));
+    // 幸存的那个必须还是 p60、起点 0
+    for (engine.synths[0].voices) |v| {
+        if (v.env_stage == .idle or v.env_stage == .release) continue;
+        try std.testing.expectEqual(@as(i32, 60), @as(i32, v.pitch));
+        try std.testing.expectEqual(@as(i32, 0), v.start_step);
+    }
+}
+test "audio: A3b 鼓组对账——同 pad 两个实例只停被删的那个" {
+    const alloc = std.testing.allocator;
+    var params = Params{};
+    try params.initCapacity(alloc, 2, 1, 0);
+    defer params.deinit(alloc);
+
+    var engine = Engine{ .params = &params };
+    engine.allocator = alloc;
+    try engine.setCapacity(2, 1, 0);
+    defer engine.deinit();
+
+    // 乐器 0 = 鼓组；1 层 = 合成器层，pad 音高 36
+    params.instrument_kind[0].store(1, .monotonic);
+    params.kit_layer_count[0].store(1, .monotonic);
+    params.kit_layer_kind[0][0].store(0, .monotonic); // 0 = 合成器层
+    params.kit_layer_pitch[0][0].store(36, .monotonic);
+    // 层池需要真实 SynthParams
+    var lp = synth.SynthParams{};
+    params.kit_layer_params[0][0].store(&lp, .monotonic);
+
+    // 层池是**惰性分配**的（真实运行时由 App 建）——测试里自己建一个
+    const kp = try alloc.create(KitPool);
+    for (kp) |*s| s.* = .{};
+    defer alloc.destroy(kp);
+    engine.kit_chunks[0].store(kp, .monotonic);
+    defer engine.kit_chunks[0].store(null, .monotonic);
+
+    // 手动让层池里两个实例响起来（pad 36，起点 0 与 8）
+    const ks = engine.kitSynth(0, 0) orelse return error.TestUnexpectedResult;
+    _ = synth.noteOn(ks, 36, 100, 64, 0, 96);
+    _ = synth.noteOn(ks, 36, 100, 64, 8, 96);
+
+    const sounding = struct {
+        fn f(s: *synth.KitLayerSynth) usize {
+            var n: usize = 0;
+            for (s.voices) |v| {
+                if (v.env_stage == .idle or v.env_stage == .release) continue;
+                n += 1;
+            }
+            return n;
+        }
+    }.f;
+    try std.testing.expectEqual(@as(usize, 2), sounding(ks));
+
+    // 快照里只保留 start=0 的实例（第二个被删）→ 对账只应释放 start=8
+    var clips = [_]@import("model.zig").Clip{.{ .track = 0, .start = 0, .len = 96, .pattern = 0 }};
+    var notes = [_]@import("model.zig").Note{.{ .step = 0, .len = 96, .pitch = 36, .pattern = 0, .instrument = 0 }};
+    var snap = snapshot.build(alloc, &clips, &notes, true, 0, null) catch unreachable;
+    defer snap.deinit();
+    var cross: [8]u32 = undefined;
+    const cn = snap.crossingInsts(&cross, 10) orelse unreachable;
+    reconcileVoices(&engine, &params, 10, snap.insts, cross[0..cn]);
+
+    try std.testing.expectEqual(@as(usize, 1), sounding(ks)); // 只停一个
+    for (ks.voices) |v| {
+        if (v.env_stage == .idle or v.env_stage == .release) continue;
+        try std.testing.expectEqual(@as(i32, 0), v.start_step); // 幸存者必须是 start=0
+    }
+}
 fn vstiNoteOn(engine: *Engine, i: usize, pitch: u8, velocity: u8) void {
     vstiActiveSet(engine, i, pitch, true);
     vstiPush(engine, i, .{
@@ -1431,6 +1699,7 @@ fn handleGenChange(engine: *Engine, params: *Params, gen: u32, was_playing: bool
     if (schedLogOn()) std.debug.print("[sched] gen {d} -> {d} stash={d} was_playing={}\n", .{ engine.stash_gen, gen, engine.stash_n, was_playing });
     engine.stash_n = 0;
     engine.stash_gen = gen;
+    engine.snap_step = -1; // A3a：新世代 → 快照从 s0 重新开始发（并补 mid-on）
     if (was_playing) {
         // 软切换（保位模式切换）：声部保持发声（见 `Params.sched_gen_soft`）。
         // 跳转/起播路径写 false → 照旧释放（跳转必需：上面注释的悬挂依据）。
@@ -1445,6 +1714,11 @@ fn handleGenChange(engine: *Engine, params: *Params, gen: u32, was_playing: bool
 /// 追加会被前面的事件挡着，拖到很晚才触发（表现：补发的 on 迟到/整段不响）。
 /// 插不进去（stash 满）时丢弃——宁可丢一个事件也不阻塞音频线程；
 /// stash 溢出本身会由下一块的重扫/正常排水自愈。
+/// 步区间换算的 ceil 除法：块内事件触发判据 `k*step_frames < D` ⇔ `k < ceil(D/step_frames)`。
+/// 用 floor 会让“步边界没正好落在块末尾”的块每块错一位（实测每秒 3–6 次假不一致）。
+fn ceilDiv(a: u64, b: u64) u64 {
+    return if (a == 0) 0 else (a - 1) / b + 1;
+}
 fn stashInsert(engine: *Engine, ev: synth.SchedEvent) void {
     if (engine.stash_n >= engine.stash.len) {
         // 满：**优先保 off**（丢 off = 声部永远收不到释放 = 挂音，实测最难查的 bug）。
@@ -1474,7 +1748,8 @@ fn stashInsert(engine: *Engine, ev: synth.SchedEvent) void {
     var di: usize = 0;
     while (di < engine.stash_n) {
         const ex = engine.stash[di];
-        if (ex.edit_gen < ev.edit_gen and ex.kind == ev.kind and ex.pitch == ev.pitch and
+        // **A4**：快照是权威数据 → 同 (kind, 音高, 乐器, 步) 已在等待就跳过（不再有“编辑代新旧”之分）
+        if (ex.kind == ev.kind and ex.pitch == ev.pitch and
             ex.instrument == ev.instrument and ex.step == ev.step)
         {
             std.mem.copyForwards(synth.SchedEvent, engine.stash[di .. engine.stash_n - 1], engine.stash[di + 1 .. engine.stash_n]);
@@ -1496,22 +1771,6 @@ fn stashInsert(engine: *Engine, ev: synth.SchedEvent) void {
 /// - 旧传输代（`ev.gen != gen`）：reset/跳转语义，作废；
 /// - 旧编辑代且**步号 >= 该代重扫的安全界**：已有重发副本替换，作废；
 /// - 旧编辑代但步号更低：**保留触发**——重扫没覆盖这段（见
-///   `sequencer.rescanForEdit`），它们还没被音频走到，正常触发一次即可。
-fn schedEventObsolete(ev: synth.SchedEvent, gen: u32, edit_gen: u32, rescan_from: i32) bool {
-    if (ev.gen != gen) return true; // 传输代变化（停止/跳转/循环回跳）
-    if (ev.edit_gen >= edit_gen) return false; // 本代事件：照常
-    // ── 旧编辑代的事件 ──
-    // **on：一律作废**。重扫会按新数据重发 `[安全界, 水位线)` 的 on；
-    //   落在 `[游标, 安全界)` 这几十毫秒里的 on 干脆不响（宁缺勿滥）——
-    //   让它触发就是“孤儿 on”（新数据里那个音符可能已经在别处或已经过去），
-    //   之后要么没 off（挂音），要么被后来的 off 误切（只响音头），都是实测过的坑。
-    // **off：只作废重扫覆盖段内的**（`step >= rescan_from`）。更早的 off 保留触发——
-    //   它们对应的是**已经起音的声部**（多半是别的轨 / 别的片段的正常收尾），
-    //   丢掉就会挂音。
-    if (ev.kind == .on) return true;
-    return ev.step >= rescan_from;
-}
-
 /// 在最近 64 条派发记录里统计该（乐器,音高）在 `[since, cur]` 期间的 on/off 条数
 fn fillTraceStats(engine: *Engine, rec: *LongRec, inst: usize, pitch: u8, since: i32, cur: i32) void {
     var on_cnt: u32 = 0;
@@ -1528,11 +1787,9 @@ fn fillTraceStats(engine: *Engine, rec: *LongRec, inst: usize, pitch: u8, since:
     // stash 里还有没有“待触发的 off”（= 只是还没到点，不是丢了）
     var pend: u32 = 0;
     var pend_ahead: i32 = -9999;
-    const cur_gen2 = engine.params.sched_edit_gen.load(.monotonic);
     for (engine.stash[0..engine.stash_n]) |se| {
         if (se.kind != .off) continue;
         if (se.instrument != @as(u8, @intCast(inst)) or se.pitch != pitch) continue;
-        if (se.edit_gen < cur_gen2) continue; // 旧代不算
         pend += 1;
         const ahead = se.step - cur;
         if (pend_ahead == -9999 or ahead < pend_ahead) pend_ahead = ahead;
@@ -1604,7 +1861,7 @@ fn recordLongNotes(engine: *Engine, params: *Params, inst: usize, lo: u64, hi: u
                 const idx = (engine.trace_n - tn + k) % engine.trace.len;
                 const t = engine.trace[idx];
                 if (t.inst != inst or t.pitch != p) continue;
-                std.debug.print("   [trace] {s} step={d} on_step={d} gen={d} edit={d}\n", .{ if (t.kind == .on) "ON " else "OFF", t.step, t.on_step, t.gen, t.edit_gen });
+                std.debug.print("   [trace] {s} step={d} on_step={d} gen={d}\n", .{ if (t.kind == .on) "ON " else "OFF", t.step, t.on_step, t.gen });
             }
         }
         // 只**记录**，不再强制释音：真正的释音由“本地到点释音”负责（见 renderBlock）。
@@ -1745,7 +2002,6 @@ fn dispatchNote(engine: *Engine, ev: anytype) void {
             .step = if (@hasField(@TypeOf(ev), "step")) ev.step else -1,
             .on_step = ev.on_step,
             .gen = if (@hasField(@TypeOf(ev), "gen")) ev.gen else 0,
-            .edit_gen = if (@hasField(@TypeOf(ev), "edit_gen")) ev.edit_gen else 0,
         };
         engine.trace_n +%= 1;
     }
@@ -1773,7 +2029,7 @@ fn dispatchNote(engine: *Engine, ev: anytype) void {
                     }
                     // 采样器层：一次性触发（不需要声部池的 kit pool）
                     if (lkind == 3) {
-                        kitSamplerNoteOn(engine, ev.instrument, l, ev.pitch, ev.velocity, pan);
+                        kitSamplerNoteOn(engine, ev.instrument, l, ev.pitch, ev.velocity, pan, ev.on_step);
                         continue;
                     }
                     const ks = engine.kitSynth(ev.instrument, l) orelse continue;
@@ -2277,22 +2533,16 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
     // 4) 播放：stash 管理 + 样本级事件触发
     if (gen != engine.stash_gen) handleGenChange(engine, params, gen, was_playing);
     // 编辑代（重扫）：**不**清空 stash（有 drain 竞态会丢新事件），
-    // 由触发循环按 `schedEventObsolete` 过滤——在响的音符保持发声。
     // 注：读顺序为“代后界”（界先于代发布，读到新代时界必已就位）
-    const edit_gen = params.sched_edit_gen.load(.monotonic);
-    const rescan_from = params.sched_rescan_from.load(.monotonic);
+    const edit_gen = params.snap_gen.load(.monotonic);
+    const rescan_from = 0;
     // 尽量多取新事件（stash 有空位时）。**按步序插入**（不是追加）：
     // 播放中重扫补发的事件可能落在已 stash 的事件之前
     // （见 `sequencer.rescanForEdit`）——追加的话它们会被前面的事件挡着，
     // 拖到很晚才触发（表现：新增音符的 on 迟到/整段不响）。
     // 作废事件（旧 gen / 旧编辑代）**不在此处过滤**——存进 stash 由触发
     // 循环统一丢（避免过滤后 `got == 0` 提前退出而漏取后续有效事件）。
-    if (engine.stash_n < engine.stash.len) {
-        var tmp: [synth.sched_drain_max]synth.SchedEvent = undefined;
-        const want = @min(engine.stash.len - engine.stash_n, tmp.len);
-        const got = params.sched_events.drain(tmp[0..want]);
-        for (tmp[0..got]) |ev| stashInsert(engine, ev);
-    }
+    // **A4**：事件唯一来源是快照（见 §11.8）——调度队列已无生产者，兜底路径删除。
 
     // 把音频线程的丢弃计数回传给 UI（每秒汇总打印用；每块一次 store，代价可忽略）
     params.dbg_drop_stash.store(engine.stash_dropped, .monotonic);
@@ -2331,6 +2581,47 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
         params.dbg_max_age.store(max_age, .monotonic);
         params.dbg_max_age_pitch.store(age_p, .monotonic);
         params.dbg_max_age_inst.store(age_i, .monotonic);
+    }
+
+    // ── **A3a**：事件来源改为**快照**（权威数据；无前瞻、无水位线、无重扫）──
+    // 只在“本世代还没发过”（`snap_step < 0`）时补发跨游标长音符的 on（与旧 `gatherMidOns` 同义）。
+    // 队列路径保留为兜底：没有快照时（例如启动瞬间）仍走 `drain → stash`。
+    const snap_raw2 = params.snapshot_ptr.load(.acquire);
+    if (snap_raw2 != 0) {
+        const snap2: *const snapshot.Snapshot = @ptrFromInt(snap_raw2);
+        const d1b: u64 = (abs0 + frames) -| start_frame;
+        const s1b: i32 = start_step + @as(i32, @intCast(ceilDiv(d1b, step_frames)));
+        const s0b: i32 = if (engine.snap_step >= 0)
+            engine.snap_step
+        else
+            start_step + @as(i32, @intCast(ceilDiv(abs0 -| start_frame, step_frames)));
+        // **快照换代**（编辑提交后重建）：stash 里还没触发的事件来自**旧数据**，
+        // 一律丢弃，并从当前块起点按新快照重发（不补 mid-on——在响的不重复触发）。
+        const sg_now = params.snap_gen.load(.acquire);
+        if (sg_now != engine.snap_gen_seen) {
+            engine.snap_gen_seen = sg_now;
+            engine.stash_n = 0;
+            engine.snap_step = s0b;
+            // **A3b：换代对账**——把“在响的声部”校正到快照的“应该正在响”（见 §11.7）
+            var cross_idx: [256]u32 = undefined;
+            if (snap2.crossingInsts(&cross_idx, s0b)) |cn| {
+                reconcileVoices(engine, params, s0b, snap2.insts, cross_idx[0..cn]);
+            }
+        }
+        var evb: [256]synth.SchedEvent = undefined;
+        if (s1b > s0b) {
+            if (snap2.gatherRaw(&evb, s0b, s1b, gen)) |n| {
+                for (evb[0..n]) |sev| stashInsert(engine, sev);
+            } else {
+                _ = params.dbg_shadow_overflow.fetchAdd(1, .monotonic);
+            }
+            if (engine.snap_step < 0) {
+                if (snap2.gatherMidOns(&evb, s0b, gen)) |n| {
+                    for (evb[0..n]) |sev| stashInsert(engine, sev);
+                }
+            }
+            engine.snap_step = s1b;
+        }
     }
 
     params.last_step.store(start_step + @as(i32, @intCast((abs0 -| start_frame) / step_frames)), .monotonic);
@@ -2431,32 +2722,72 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
     // 编辑代刚变（= 刚重扫/作废旧事件）：立刻做一次“谁还缺 off”的修补
 
     params.dbg_stash_n.store(@intCast(engine.stash_n), .monotonic);
-    params.dbg_ring_used.store(@intCast(params.sched_events.write.load(.monotonic) -% params.sched_events.read.load(.monotonic)), .monotonic);
+
+    // ── **A2 影子对拍**：从快照按 block 求值，与队列侧“本块应触发的事件数”对比 ──
+    // **只统计，绝不参与发声**。用途：切主路（A3）前的等价性证明。
+    const sp_raw = params.snapshot_ptr.load(.acquire);
+    if (sp_raw != 0) {
+        const snap: *const snapshot.Snapshot = @ptrFromInt(sp_raw);
+        // 事件在块内触发的判据是 `ev_frame < abs0 + frames`（见下方触发循环），
+        // 即 `k*step_frames < D` ⟺ `k < ceil(D/step_frames)` —— 所以区间上界要用 **ceil**，
+        // 用 floor 会让“步边界没正好落在块末尾”的块**每块错一位**（实测每秒 3–6 次假不一致）。
+        const d0: u64 = abs0 -| start_frame;
+        const d1: u64 = (abs0 + frames) -| start_frame;
+
+        const s0: i32 = start_step + @as(i32, @intCast(ceilDiv(d0, step_frames)));
+        const s1: i32 = start_step + @as(i32, @intCast(ceilDiv(d1, step_frames)));
+        const upto = params.sched_upto.load(.acquire);
+        // 传送/编辑代刚变 → 进入稳定期（见 `shadow_settle` 注释）
+        if (gen != engine.shadow_last_gen or edit_gen != engine.shadow_last_snap_gen) {
+            engine.shadow_last_gen = gen;
+            engine.shadow_last_snap_gen = edit_gen;
+            engine.shadow_settle = 64;
+        }
+        // 本块落在“重扫安全界之前”= 旧事件仍在触发、新数据尚未覆盖的过渡区 → 跳过
+        // A3a 之后 `rescan_from` / `sched_upto` 只在“队列路径”下有意义；快照路径下不适用
+        const in_rescan_gap = sp_raw == 0 and s0 <= rescan_from + 1;
+        // 队列还没覆盖到本块末尾（重扫后水位线回退/UI 落后）→ 比对无意义，跳过
+        if ((sp_raw == 0 and s1 > upto -| 8) or engine.shadow_settle > 0 or in_rescan_gap) {
+            if (engine.shadow_settle > 0) engine.shadow_settle -= 1;
+            _ = params.dbg_shadow_skipped.fetchAdd(1, .monotonic);
+        } else {
+            var q_on: u32 = 0;
+            var q_off: u32 = 0;
+            for (engine.stash[0..engine.stash_n]) |se| {
+                if (se.step < s0 or se.step >= s1) continue;
+                if (se.kind == .off) q_off += 1 else q_on += 1;
+            }
+            var shadow_evs: [256]synth.SchedEvent = undefined;
+            if (s1 > s0) {
+                if (snap.gatherRaw(&shadow_evs, s0, s1, gen)) |n| {
+                    var k_on: u32 = 0;
+                    var k_off: u32 = 0;
+                    for (shadow_evs[0..n]) |sev| {
+                        if (sev.kind == .off) k_off += 1 else k_on += 1;
+                    }
+                    _ = params.dbg_shadow_blocks.fetchAdd(1, .monotonic);
+                    if (q_on != k_on) _ = params.dbg_shadow_mismatch_on.fetchAdd(1, .monotonic);
+                    if (q_off != k_off) _ = params.dbg_shadow_mismatch_off.fetchAdd(1, .monotonic);
+                    if (q_on != k_on or q_off != k_off) {
+                        // 明细回传给 UI（音频线程不能分配/打印）——每秒汇总时写进日志
+                        params.shadow_det_s0.store(s0, .monotonic);
+                        params.shadow_det_s1.store(s1, .monotonic);
+                        params.shadow_det_qon.store(q_on, .monotonic);
+                        params.shadow_det_qoff.store(q_off, .monotonic);
+                        params.shadow_det_kon.store(k_on, .monotonic);
+                        params.shadow_det_koff.store(k_off, .monotonic);
+                        _ = params.shadow_det_n.fetchAdd(1, .monotonic);
+                    }
+                } else {
+                    _ = params.dbg_shadow_overflow.fetchAdd(1, .monotonic);
+                }
+            }
+        }
+    }
     var done: u32 = 0;
     var si: usize = 0;
     while (done < frames and si < engine.stash_n) {
         const ev = engine.stash[si];
-        if (schedEventObsolete(ev, gen, edit_gen, rescan_from)) {
-            // **不再逐条打印**（一次重扫会作废整窗口 → 刷屏上千行，实测把有意义的信息淹了）。
-            // 累计到 `dbg_drop_obsolete`，由 UI 线程每秒汇总一次；逐条明细用 SAWDUST_SCHED_LOG=2。
-            _ = params.dbg_drop_obsolete.fetchAdd(1, .monotonic);
-            if (ev.gen != gen) {
-                _ = params.dbg_drop_gen.fetchAdd(1, .monotonic); // 传输代不符（循环回跳/停止后的残留）
-            } else if (ev.kind == .on) {
-                _ = params.dbg_drop_on.fetchAdd(1, .monotonic);
-            } else {
-                _ = params.dbg_drop_off.fetchAdd(1, .monotonic);
-                // 记录被丢 off 的“超前量”（step - 当前步）：远大于 lookahead = 陈旧积压
-                const ahead = ev.step - params.last_step.load(.monotonic);
-                const old_min = params.dbg_drop_off_ahead_min.load(.monotonic);
-                const old_max = params.dbg_drop_off_ahead_max.load(.monotonic);
-                if (old_min == 0 or ahead < old_min) params.dbg_drop_off_ahead_min.store(ahead, .monotonic);
-                if (ahead > old_max) params.dbg_drop_off_ahead_max.store(ahead, .monotonic);
-            }
-            if (schedLogVerbose()) std.debug.print("[sched-drop] step={d} kind={d} ev.gen={d} gen={d} edit={d}/{d}\n", .{ ev.step, @backingInt(ev.kind), ev.gen, gen, ev.edit_gen, edit_gen });
-            si += 1; // 作废（旧传输代 / 已被重发替换的旧编辑代）：丢弃，**不**释放声部
-            continue;
-        }
         // 事件应在的绝对帧位置
         const ev_frame: i64 = @as(i64, @intCast(start_frame)) +
             (@as(i64, ev.step) - @as(i64, start_step)) * @as(i64, @intCast(step_frames));
@@ -2589,33 +2920,6 @@ test "audio: Params 默认值" {
     try std.testing.expect(p.synth_ptrs[0].load(.monotonic) == null);
 }
 
-test "audio: 事件作废判定——旧代低步保留（安全界过滤）" {
-    // 实测 bug：重扫把音频已走过的 on 再发一次 → 双声部 → off 只释一个 →
-    // 悬挂。修法：重扫从**安全界**起；音频只作废“步 >= 安全界”的旧编辑代
-    // 事件（已有重发副本替换），低于安全界的旧副本保留、正常触发一次。
-    const ev = synth.SchedEvent{ .kind = .on, .pitch = 60, .step = 12, .gen = 1, .edit_gen = 1 };
-    // 同代：任何情况都不作废
-    try std.testing.expect(!schedEventObsolete(ev, 1, 1, 14));
-    try std.testing.expect(!schedEventObsolete(ev, 1, 1, 0));
-    // 旧传输代：作废（reset/跳转语义，不管步号）
-    try std.testing.expect(schedEventObsolete(ev, 2, 1, 14));
-    try std.testing.expect(schedEventObsolete(ev, 2, 1, 0));
-    // 旧编辑代的 **on：一律作废**（含步 < 安全界的缝隙段——让它触发就会变成孤儿声部：
-    // 新数据里那个音符可能已经挪走/已经过去，之后要么没 off（挂音），
-    // 要么被后来的 off 误切（只响音头），都是实测过的坑）
-    try std.testing.expect(schedEventObsolete(ev, 1, 2, 14));
-    var big = ev;
-    big.step = 20;
-    try std.testing.expect(schedEventObsolete(big, 1, 2, 14));
-    try std.testing.expect(schedEventObsolete(big, 1, 2, 20)); // 边界：等于安全界 → 作废
-    // 旧编辑代的 **off**：只作废重扫覆盖段内的；缝隙段（步 < 安全界）保留触发
-    // ——那对应**已经起音的声部**，丢掉就会让它永远不释音
-    var off_ev = ev;
-    off_ev.kind = .off;
-    try std.testing.expect(!schedEventObsolete(off_ev, 1, 2, 14));
-    try std.testing.expect(schedEventObsolete(off_ev, 1, 2, 12)); // 边界：等于安全界 → 作废
-}
-
 test "audio: stash 去重——同键更旧代被替换；同代重复保留" {
     var params = Params{};
     try params.initCapacity(std.testing.allocator, 1, 0, 0);
@@ -2625,32 +2929,25 @@ test "audio: stash 去重——同键更旧代被替换；同代重复保留" {
     try engine.setCapacity(1, 0, 0);
     defer engine.deinit();
 
-    // 旧副本（代 1）→ 重发副本（代 2）：后者插入时清掉前者
-    const e1 = synth.SchedEvent{ .kind = .on, .pitch = 60, .instrument = 0, .step = 100, .gen = 1, .edit_gen = 1 };
-    var e2 = e1;
-    e2.edit_gen = 2;
+    // **A4 后的去重规则**：同 (kind, 音高, 乐器, 步) 已在等待 → 跳过（快照是权威数据，
+    // 同一个块里同一位置只该有一条同种事件）
+    const e1 = synth.SchedEvent{ .kind = .on, .pitch = 60, .instrument = 0, .step = 100, .gen = 1 };
     stashInsert(&engine, e1);
-    stashInsert(&engine, e2);
+    stashInsert(&engine, e1);
     try std.testing.expectEqual(@as(usize, 1), engine.stash_n);
-    try std.testing.expectEqual(@as(u32, 2), engine.stash[0].edit_gen);
 
-    // 同代重复：两条都保留（合法：同位置同音高的两个音符）
-    stashInsert(&engine, e2);
-    try std.testing.expectEqual(@as(usize, 2), engine.stash_n);
-
-    // 不同键（不同步号）不受影响，且保持步序
+    // 不同步号：独立插入 + 保持步序
     var e3 = e1;
     e3.step = 50;
-    e3.edit_gen = 3;
     stashInsert(&engine, e3);
-    try std.testing.expectEqual(@as(usize, 3), engine.stash_n);
+    try std.testing.expectEqual(@as(usize, 2), engine.stash_n);
     try std.testing.expectEqual(@as(i32, 50), engine.stash[0].step); // 插入到最前
 
-    // 不同编辑代的“不同种类/音高”不误删
-    var off = e2;
+    // 不同种类（off）不算重复
+    var off = e1;
     off.kind = .off;
     stashInsert(&engine, off);
-    try std.testing.expectEqual(@as(usize, 4), engine.stash_n);
+    try std.testing.expectEqual(@as(usize, 3), engine.stash_n);
 }
 
 test "audio: EQ 干湿比生效（100% 与 0% 输出显著不同——非占位）" {

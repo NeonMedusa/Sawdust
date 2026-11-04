@@ -127,7 +127,8 @@ zig translate-c -I libs/stb       libs/stb/stb_truetype.h    > src/c/stb_truetyp
 力度/声像编辑轨见 `docs/note-lane.md`；时间轴滚动条见 `docs/timeline-scrollbar.md`；
 VST3 宿主见 `docs/plugin-hosting.md`；**Zig 0.17 迁移实录**见 `docs/zig-017-migration.md`；
 **播放中编辑的调度与释音协议**见 `docs/scheduler-protocol.md`（不变量 / 事件生命期 / 重扫门控 / 诊断字段）；
-**内存 / CPU / 二进制体积账本**见 `docs/resources.md`（池化现状 / 优化 backlog / 发布口径矩阵 / `.rodata` 初值镜像坑）。
+**内存 / CPU / 二进制体积账本**见 `docs/resources.md`（池化现状 / 优化 backlog / 发布口径矩阵 / `.rodata` 初值镜像坑）；
+**自动化（参数曲线）的模型与计划**见 `docs/automation.md`（点 + 每段插值 / 两种编辑视图 / 存取与历史纪律）。
 
 **线程模型**：UI 在主线程，音频回调在 miniaudio 的实时线程；
 参数用 `std.atomic.Value` 传递（无锁，实时安全）；编辑提交走"重扫"机制
