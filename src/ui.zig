@@ -159,6 +159,11 @@ pub const Ui = struct {
     /// - `7600-7900`：效果器窗口（窗口 7600/7601、干湿 7602、EQ 7800+、VST3 参数行 7900+）
     /// - `8100-8711`：调音台控件（声像 8100+ / 音量 8150+ / 干湿 8200+）
     active_id: u64 = 0,
+    /// Debug：本帧已认领的 id（撞车检测用；见 `claimActive`）
+    seen_ids: [128]u64 = @splat(0),
+    seen_n: usize = 0,
+    seen_frame: u64 = 0,
+    frame_n: u64 = 0,
     drag_anchor: f32 = 0,
     /// 拖动起始值（splitter 初值 / 滚动条的鼠标抓取偏移，像素）
     drag_start: i32 = 0,
@@ -842,6 +847,34 @@ pub const Ui = struct {
         return self.dragNumberEx(id, x, y, w, h, value, min_v, max_v, pixels_per_unit, 0, null);
     }
 
+    /// **浮点数值控件**（BPM 等；两位小数）：内部按 **1/100 单位（cents）** 驱动，
+    /// 复用整数拖拽的同一套步进/余数累积 → 手感与 `dragNumber` 一致；
+    /// 最小值/最大值也是浮点，但换算成 cents 后仍走整数夹取。
+    pub fn dragNumberF(
+        self: *Ui,
+        id: u64,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        value: *f32,
+        min_v: f32,
+        max_v: f32,
+        pixels_per_cent: i32,
+    ) bool {
+        var cents: i32 = @intFromFloat(@round(value.* * 100.0));
+        const lo: i32 = @intFromFloat(@round(min_v * 100.0));
+        const hi: i32 = @intFromFloat(@round(max_v * 100.0));
+        const changed = self.dragNumberEx(id, x, y, w, h, &cents, lo, hi, pixels_per_cent, 0, fmtCents);
+        if (changed) value.* = @as(f32, @floatFromInt(cents)) / 100.0;
+        return changed;
+    }
+
+    /// cents → “xxx.yy”文本（`dragNumberF` 专用）
+    fn fmtCents(v: i32, buf: []u8) []const u8 {
+        return std.fmt.bufPrint(buf, "{d}.{d:0>2}", .{ @divTrunc(v, 100), @abs(@rem(v, 100)) }) catch "---";
+    }
+
     /// `dragNumber` 的扩展版：支持**拖动值 ↔ 显示值解耦**。
     /// - `exp_scale` > 0 时：拖动的是“指数”（1 单位 = ×2，用于拍号分母等 2 的幂序列），
     ///   存储值是 `2^exponent`；拖动手感线性（不会因吸附写回而振荡）。
@@ -972,6 +1005,69 @@ pub const Ui = struct {
             self.zoom_rem = 0;
             self.mouse_capture = true;
         }
+        return changed;
+    }
+
+    /// **BPM 专用控件**：拖动只改**整数位**，保留三位小数；
+    /// 推到边界时小数**清零**（20.555 ↓ → 20.000；999 同理），之后整数增减不再带小数。
+    /// 小数只能通过右键「输入值…」键入（如 `120.555`）。
+    pub fn dragNumberBpm(
+        self: *Ui,
+        id: u64,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        value: *f32,
+        min_v: f32,
+        max_v: f32,
+        pixels_per_unit: i32,
+    ) bool {
+        const min_i: i32 = @intFromFloat(@round(min_v));
+        const max_i: i32 = @intFromFloat(@round(max_v));
+        const hovered = self.hit(x, y, w, h);
+        var changed = false;
+
+        var ip: i32 = @intFromFloat(@floor(value.*));
+        const frac: f32 = value.* - @as(f32, @floatFromInt(ip));
+
+        if (self.active_id == id) {
+            const dd = self.frozen_dy - self.zoom_last_dy;
+            self.zoom_last_dy = self.frozen_dy;
+            const r = zoomStep(ip, dd, self.zoom_rem, pixels_per_unit, min_i, max_i);
+            self.zoom_rem = r.rem;
+            ip = r.v;
+            const at_edge = ip <= min_i or ip >= max_i;
+            const nv: f32 = @as(f32, @floatFromInt(ip)) + (if (at_edge) 0.0 else frac);
+            if (nv != value.*) {
+                value.* = nv;
+                changed = true;
+            }
+            if (!self.mouse_down) {
+                self.active_id = 0;
+                self.mouse_capture = false;
+            }
+        } else if (hovered and self.mouse_pressed) {
+            self.active_id = id;
+            self.zoom_last_dy = self.frozen_dy;
+            self.zoom_rem = 0;
+            self.mouse_capture = true;
+        }
+
+        // 绘制：整数位 + 三位小数
+        const active = self.active_id == id;
+        const bg = if (active) self.theme.accent else if (hovered) self.theme.item_hover else self.theme.toolbar;
+        self.renderer.fillRect(x, y, w, h, bg);
+        self.renderer.strokeRect(x, y, w, h, self.theme.panel_border);
+        var buf: [16]u8 = undefined;
+        const v = value.*;
+        const iv: i32 = @intFromFloat(@floor(v));
+        const f3: i32 = @intFromFloat(@round((v - @as(f32, @floatFromInt(iv))) * 1000.0));
+        const t = std.fmt.bufPrint(&buf, "{d}.{d:0>3}", .{ iv, @abs(f3) }) catch "---";
+        const tw: i32 = @intFromFloat(self.font.measure(t));
+        const tx = x + @divTrunc(w - tw, 2);
+        self.font.draw(self.renderer, t, @floatFromInt(tx), @floatFromInt(self.centeredBaselineY(y, h)), self.theme.text);
+        if (hovered or active) self.cursor = .resize_v;
         return changed;
     }
 
@@ -1647,6 +1743,38 @@ pub const Ui = struct {
     // ── 内部：命中测试与拖动 ──
 
     /// 公开的命中测试（供调用方判断"鼠标是否在区域内"，如滚动处理）
+    /// **控件 id：编译期稳定、scope 内唯一**。
+    /// 立即式 UI 的 `active_id` 必须“跨帧稳定 + 同帧唯一”，所以不能用运行时自增：
+    /// 一旦某帧多/少一个控件（弹窗、列表长度、窗口 z 序变化），递增 id 会整体位移，
+    /// 正在拖的控件会突然变成别人。用 `id("scope", 序号)` 把 id 绑在**代码标签**上。
+    /// 用法：`ui.claimActive(Ui.idOf("note_lane_list", ii))`（编译期算好，运行时零成本）
+    pub fn idOf(comptime scope: []const u8, comptime idx: anytype) u64 {
+        return std.hash.Fnv1a_64.hash(scope) ^ (@as(u64, @intCast(idx)) *% 0x9E3779B97F4A7C15);
+    }
+
+    /// 认领 `active_id`（**所有设置 active_id 的地方都应走这里**）。
+    pub fn claimActive(self: *Ui, idv: u64) void {
+        const m = @import("builtin").mode;
+        if (m == .debug or m == .safe) { // Debug / ReleaseSafe 都做撞车检测（无分配、128 项）
+            if (self.seen_frame != self.frame_n) {
+                self.seen_frame = self.frame_n;
+                self.seen_n = 0;
+            }
+            var i: usize = 0;
+            while (i < self.seen_n) : (i += 1) {
+                if (self.seen_ids[i] == idv) {
+                    std.debug.print("[ui] 重复的控件 id（同帧内）：0x{x} —— 两个控件撞车了\n", .{idv});
+                    @panic("duplicate widget id");
+                }
+            }
+            if (self.seen_n < self.seen_ids.len) {
+                self.seen_ids[self.seen_n] = idv;
+                self.seen_n += 1;
+            }
+        }
+        self.active_id = idv;
+    }
+
     pub fn hitRect(self: *Ui, x: i32, y: i32, w: i32, h: i32) bool {
         return self.hit(x, y, w, h);
     }

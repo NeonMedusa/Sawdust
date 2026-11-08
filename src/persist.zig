@@ -89,6 +89,46 @@ pub const SavedClip = struct {
     }
 };
 
+/// **自动化曲线的锚点**（存档用；`step/value` 是世界坐标，pivot/curve 是手柄的几何位置）
+pub const SavedLanePoint = struct {
+    step: i32 = 0,
+    value: f32 = 0,
+    /// 手柄在两点之间的水平位置（0..1）
+    pivot: f32 = 0.5,
+    /// 手柄值 − 直连线值（已夹在两端值之间）
+    curve: f32 = 0,
+    /// 出生序号：同一步的多个点靠它定序（垂直断崖）
+    seq: u32 = 0,
+};
+
+/// **自动化曲线**（一条 lane = 一条可被多条绑定引用的曲线）
+pub const SavedLane = struct {
+    id: u32 = 0,
+    /// 曲线名（堆分配；空 = 用默认名“曲线N”）
+    name: []const u8 = "",
+    /// 0 = hold / 1 = linear / 2 = smooth
+    interp: u8 = 2,
+    /// 曲线算法版本（**当前恒 1**）：将来换数学时旧工程可继续按旧算法渲染
+    curve_kind: u8 = 1,
+    /// 行头列显示单位（只影响 UI）
+    display_unit: u8 = 0,
+    points: []SavedLanePoint = &.{},
+};
+
+/// **自动化绑定**：曲线 → 参数（同一条曲线可绑多个目标）
+pub const SavedBinding = struct {
+    curve_id: u32 = 0,
+    /// `view_lane.Target.Kind` 的序号
+    target_kind: u8 = 0,
+    target_uid: u32 = 0,
+    /// 叠加深度
+    depth: f32 = 1.0,
+    /// 基准值（`null` = 用目标类型默认值）；JSON 里用哨兵 -1 表示 null
+    base: f32 = -1.0,
+    bipolar: bool = false,
+    enabled: bool = true,
+};
+
 /// 存档中的音符
 pub const SavedNote = struct {
     step: i32,
@@ -289,7 +329,7 @@ pub const SavedMixerChannel = struct {
 
 pub const Project = struct {
     version: u32 = file_version,
-    bpm: i32 = 120,
+    bpm: f32 = 120,
     /// 主音量（0-1；旧存档缺失 → 默认 0.75，与 App.volume 一致）
     volume: f32 = 0.75,
     time_num: i32 = 4,
@@ -320,6 +360,10 @@ pub const Project = struct {
     instrument_order: []u32 = &.{},
     /// 调音台通道（旧存档缺失 → 全默认 8 通道；加载时长度不匹配则重置）
     mixer: []SavedMixerChannel = &.{},
+    /// **自动化曲线**（每条点列表内联）与绑定；`auto_sel` = 当前选中的曲线 id
+    auto_lanes: []SavedLane = &.{},
+    auto_bindings: []SavedBinding = &.{},
+    auto_sel: u32 = 0,
 };
 
 /// 从合成器参数导出存档结构（读原子 → 普通值）
@@ -896,7 +940,7 @@ test "persist: JSON 往返（序列化 → 解析）" {
     defer parsed.deinit();
 
     try std.testing.expectEqual(@as(u32, 4), parsed.value.version);
-    try std.testing.expectEqual(@as(i32, 140), parsed.value.bpm);
+    try std.testing.expectEqual(@as(f32, 140), parsed.value.bpm);
     try std.testing.expectApproxEqAbs(@as(f32, 0.42), parsed.value.volume, 1e-6); // 主音量往返
     try std.testing.expectEqual(@as(i32, 3), parsed.value.time_num);
     try std.testing.expectEqual(@as(i32, 72), parsed.value.steps_per_bar);
@@ -917,7 +961,7 @@ test "persist: 未知字段被忽略（向前兼容）" {
     ;
     const parsed = try fromJson(allocator, json);
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(i32, 100), parsed.value.bpm);
+    try std.testing.expectEqual(@as(f32, 100), parsed.value.bpm);
 }
 
 test "persist: v1 存档自动迁移（小节 → 步）" {
@@ -978,7 +1022,7 @@ test "persist: 缺失字段用默认值（向后兼容）" {
     ;
     const parsed = try fromJson(allocator, json);
     defer parsed.deinit();
-    try std.testing.expectEqual(@as(i32, 90), parsed.value.bpm);
+    try std.testing.expectEqual(@as(f32, 90), parsed.value.bpm);
     try std.testing.expectEqual(@as(i32, 4), parsed.value.time_num); // 默认
     try std.testing.expectApproxEqAbs(@as(f32, 0.75), parsed.value.volume, 1e-6); // 缺字段 → 默认主音量
     try std.testing.expectEqual(@as(usize, 0), parsed.value.clips.len);
@@ -1323,7 +1367,7 @@ test "persist: parseAuto——JSON/二进制自动识别 + magic 严格性" {
     try std.testing.expect(std.mem.startsWith(u8, bin, binary_magic));
     var pb = try parseAuto(a, bin);
     defer pb.deinit();
-    try std.testing.expectEqual(@as(i32, 150), pb.value.bpm);
+    try std.testing.expectEqual(@as(f32, 150), pb.value.bpm);
     const js = try toJson(a, p);
     defer a.free(js);
     var pj = try parseAuto(a, js);

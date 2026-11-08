@@ -252,7 +252,7 @@ pub const ExportNote = struct {
 };
 
 pub const ExportSong = struct {
-    bpm: i32 = 120,
+    bpm: f32 = 120,
     time_num: u8 = 4,
     time_den: u8 = 4,
     notes: []const ExportNote,
@@ -287,7 +287,7 @@ fn writeConductorTrack(
     // tempo：微秒/四分音符 = 60,000,000 / BPM
     try writeVlq(out, allocator, 0);
     try out.appendSlice(allocator, &.{ 0xFF, 0x51, 0x03 });
-    const us: u32 = @intCast(@divTrunc(60_000_000, @max(1, song.bpm)));
+    const us: u32 = @intFromFloat(@round(60_000_000.0 / @max(1.0, song.bpm)));
     try out.append(allocator, @intCast((us >> 16) & 0xFF));
     try out.append(allocator, @intCast((us >> 8) & 0xFF));
     try out.append(allocator, @intCast(us & 0xFF));

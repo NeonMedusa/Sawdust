@@ -483,6 +483,26 @@ pub fn render(
     gain: f32,
     add: bool,
 ) void {
+    renderBalanced(params, state, out, frames, sample_rate, gain, add, 1.0, 1.0, 1.0, 1.0);
+}
+
+/// 同 `render`，额外带**乐器级声像平衡**（等功率左/右增益）：
+/// 声部声像（`note.pan`）之后再乘一次总线平衡，两者互不干扰。
+/// `a` = 段首、`b` = 段尾：块内**逐采样线性插值**（与 VSTi / 调音台同一口径），
+/// 所以垂直断崖不会变成单采样硬跳。
+pub fn renderBalanced(
+    params: *const SynthParams,
+    state: anytype,
+    out: [*]f32,
+    frames: u32,
+    sample_rate: f32,
+    gain: f32,
+    add: bool,
+    bal_l_a: f32,
+    bal_r_a: f32,
+    bal_l_b: f32,
+    bal_r_b: f32,
+) void {
     // ── 活跃声部快照（空闲时快速返回）──
     var active: [max_voices]u16 = undefined;
     var nactive: usize = 0;
@@ -558,7 +578,6 @@ pub fn render(
 
     // 静默启动/静音恢复：直接跳到目标增益（避免“开头淡入”迟滞）
     if (state.smoothed_master <= 0.0001) state.smoothed_master = gain;
-
     var i: u32 = 0;
     while (i < frames) : (i += 1) {
         // 逐声部 L/R 两路累加（声像需要各声部自己的左右增益；
@@ -648,10 +667,15 @@ pub fn render(
         // ── 主音量平滑（防拖动旋钮的 zipper 噪声）──
         state.smoothed_master += (gain - state.smoothed_master) * 0.0008;
 
+        // ── 声像平衡：**块内从段首值线性走到段尾值**（断崖不再硬跳）──
+        const bt: f32 = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(@max(1, frames)));
+        const bal_l = bal_l_a + (bal_l_b - bal_l_a) * bt;
+        const bal_r = bal_r_a + (bal_r_b - bal_r_a) * bt;
+
         // ── 输出（软削波防爆音；多声部叠加溢出时自然压缩）──
-        var s_l = mix_l * state.smoothed_master;
+        var s_l = mix_l * state.smoothed_master * bal_l;
         s_l = s_l / (1.0 + @abs(s_l));
-        var s_r = mix_r * state.smoothed_master;
+        var s_r = mix_r * state.smoothed_master * bal_r;
         s_r = s_r / (1.0 + @abs(s_r));
         const prev_l: f32 = if (add) out[i * 2] else 0;
         const prev_r: f32 = if (add) out[i * 2 + 1] else 0;
