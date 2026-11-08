@@ -159,6 +159,11 @@ pub const Ui = struct {
     /// - `7600-7900`：效果器窗口（窗口 7600/7601、干湿 7602、EQ 7800+、VST3 参数行 7900+）
     /// - `8100-8711`：调音台控件（声像 8100+ / 音量 8150+ / 干湿 8200+）
     active_id: u64 = 0,
+    /// Debug：本帧已认领的 id（撞车检测用；见 `claimActive`）
+    seen_ids: [128]u64 = @splat(0),
+    seen_n: usize = 0,
+    seen_frame: u64 = 0,
+    frame_n: u64 = 0,
     drag_anchor: f32 = 0,
     /// 拖动起始值（splitter 初值 / 滚动条的鼠标抓取偏移，像素）
     drag_start: i32 = 0,
@@ -1647,6 +1652,38 @@ pub const Ui = struct {
     // ── 内部：命中测试与拖动 ──
 
     /// 公开的命中测试（供调用方判断"鼠标是否在区域内"，如滚动处理）
+    /// **控件 id：编译期稳定、scope 内唯一**。
+    /// 立即式 UI 的 `active_id` 必须“跨帧稳定 + 同帧唯一”，所以不能用运行时自增：
+    /// 一旦某帧多/少一个控件（弹窗、列表长度、窗口 z 序变化），递增 id 会整体位移，
+    /// 正在拖的控件会突然变成别人。用 `id("scope", 序号)` 把 id 绑在**代码标签**上。
+    /// 用法：`ui.claimActive(Ui.idOf("note_lane_list", ii))`（编译期算好，运行时零成本）
+    pub fn idOf(comptime scope: []const u8, comptime idx: anytype) u64 {
+        return std.hash.Fnv1a_64.hash(scope) ^ (@as(u64, @intCast(idx)) *% 0x9E3779B97F4A7C15);
+    }
+
+    /// 认领 `active_id`（**所有设置 active_id 的地方都应走这里**）。
+    pub fn claimActive(self: *Ui, idv: u64) void {
+        const m = @import("builtin").mode;
+        if (m == .debug or m == .safe) { // Debug / ReleaseSafe 都做撞车检测（无分配、128 项）
+            if (self.seen_frame != self.frame_n) {
+                self.seen_frame = self.frame_n;
+                self.seen_n = 0;
+            }
+            var i: usize = 0;
+            while (i < self.seen_n) : (i += 1) {
+                if (self.seen_ids[i] == idv) {
+                    std.debug.print("[ui] 重复的控件 id（同帧内）：0x{x} —— 两个控件撞车了\n", .{idv});
+                    @panic("duplicate widget id");
+                }
+            }
+            if (self.seen_n < self.seen_ids.len) {
+                self.seen_ids[self.seen_n] = idv;
+                self.seen_n += 1;
+            }
+        }
+        self.active_id = idv;
+    }
+
     pub fn hitRect(self: *Ui, x: i32, y: i32, w: i32, h: i32) bool {
         return self.hit(x, y, w, h);
     }

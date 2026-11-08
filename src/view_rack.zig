@@ -10,6 +10,7 @@ const app_mod = @import("app.zig");
 const App = app_mod.App;
 const model = @import("model.zig");
 const util = @import("view_util.zig");
+const view_lane = @import("view_lane.zig");
 
 /// 通道机架（浮动窗口）：乐器行 + 添加按钮；可拖动标题、右下角缩放、关闭。
 /// `menu_was_open`：帧首是否有任何下拉菜单展开（本帧窗口控件应全部让位，
@@ -218,32 +219,58 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
         }
     }
 
-    // 声像旋钮右键菜单（恢复默认值）——单项，与调音台一致
-    if (app.rack.ctx_pan) |pi| {
+    // 旋钮右键菜单（乐器 音量 / 声像 共用）：恢复默认值 / 自动化…
+    if (app.rack.ctx_vol != null or app.rack.ctx_pan != null) {
+        const is_vol = app.rack.ctx_vol != null;
+        const pi = app.rack.ctx_vol orelse app.rack.ctx_pan.?;
         if (pi < app.instruments.items.len) {
-            const item = "恢复默认值";
-            const mw2: i32 = 130;
-            const mh2: i32 = util.menu_item_h + 4;
-            const mx = app.rack.ctx_x; // 固定位置（打开时记录，不跟鼠标跑）
+            const items = [_][]const u8{ "恢复默认值", "自动化…" };
+            const mw2: i32 = 140;
+            const mh2: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
+            const mx = app.rack.ctx_x;
             const my = app.rack.ctx_y;
             ui.renderer.fillRect(mx, my, mw2, mh2, ui.theme.panel);
             ui.renderer.strokeRect(mx, my, mw2, mh2, ui.theme.accent);
             ui.noteOverlayRect(mx, my, mw2, mh2); // 遮挡插件子窗口
-            const iy = my + 2;
-            const hovered = util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, mw2 - 2, util.menu_item_h);
-            if (hovered) ui.renderer.fillRect(mx + 1, iy, mw2 - 2, util.menu_item_h, ui.theme.item_hover);
-            ui.label(item, mx + 8, iy + 2, ui.theme.text);
-            if (hovered and ui.mouse_pressed) {
-                const inst = &app.instruments.items[pi];
-                if (inst.pan != 0.5) {
-                    inst.pan = 0.5; // 居中
-                    app.commitHistory("恢复乐器声像");
+            var clicked: ?usize = null;
+            var inside = false;
+            for (items, 0..) |item, k| {
+                const iy = my + 2 + @as(i32, @intCast(k)) * util.menu_item_h;
+                const hovered = util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, mw2 - 2, util.menu_item_h);
+                if (hovered) {
+                    inside = true;
+                    ui.renderer.fillRect(mx + 1, iy, mw2 - 2, util.menu_item_h, ui.theme.item_hover);
                 }
+                ui.label(item, mx + 8, iy + 2, ui.theme.text);
+                if (hovered and ui.mouse_pressed) clicked = k;
+            }
+            if (clicked) |k| {
+                const inst = &app.instruments.items[pi];
+                if (k == 0) {
+                    if (is_vol) {
+                        if (inst.volume != 0.8) {
+                            inst.volume = 0.8;
+                            app.commitHistory("恢复乐器音量");
+                        }
+                    } else if (inst.pan != 0.5) {
+                        inst.pan = 0.5; // 居中
+                        app.commitHistory("恢复乐器声像");
+                    }
+                } else {
+                    const tgt = view_lane.Target{
+                        .kind = if (is_vol) .inst_vol else .inst_pan,
+                        .uid = inst.uid,
+                    };
+                    app.auto_win = .{ .open = true, .x = 240, .y = 150, .target = tgt, .just_opened = true };
+                }
+                app.rack.ctx_vol = null;
                 app.rack.ctx_pan = null;
-            } else if (ui.mouse_pressed and !util.inRect(ui.mouse_x, ui.mouse_y, mx, my, mw2, mh2)) {
+            } else if (ui.mouse_pressed and !inside and !util.inRect(ui.mouse_x, ui.mouse_y, mx, my, mw2, mh2)) {
+                app.rack.ctx_vol = null;
                 app.rack.ctx_pan = null;
             }
         } else {
+            app.rack.ctx_vol = null;
             app.rack.ctx_pan = null;
         }
     }
@@ -286,17 +313,26 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, row: usize, x: i32, y: i32, w: i32, c
 
     // 声像旋钮 / 音量旋钮（拖动中 coalesce，松手时提交）
     const ky = y + @divTrunc(util.rack_row_h - util.rack_knob_size, 2);
-    const pan_kx = cx;
+    // 声像旋钮（x = cx）
     if (ui.knob(4000 + @as(u64, idx) * 2, &inst.pan, cx, ky, util.rack_knob_size)) app.history_pending = "调整声像";
-    // 声像旋钮右键 → “恢复默认值”菜单（与调音台一致；名称右键另有乐器菜单）
-    if (util.hitUI(ui, pan_kx, ky, util.rack_knob_size, util.rack_knob_size) and ui.mouse_right_pressed) {
+    if (util.hitUI(ui, cx, ky, util.rack_knob_size, util.rack_knob_size) and ui.mouse_right_pressed) {
         app.rack.ctx_pan = idx;
+        app.rack.ctx_vol = null;
         app.rack.ctx_instrument = null; // 互斥
         app.rack.ctx_x = ui.mouse_x;
         app.rack.ctx_y = ui.mouse_y;
     }
     cx += util.rack_knob_size + 6;
+    // 音量旋钮（x = 前进后的 cx）——右键菜单用**音量旋钮自己的 x**（原来误用了声像的 x：
+    // 右键声像弹出音量菜单、右键音量没反应，实测 bug）
     if (ui.knob(4000 + @as(u64, idx) * 2 + 1, &inst.volume, cx, ky, util.rack_knob_size)) app.history_pending = "调整乐器音量";
+    if (util.hitUI(ui, cx, ky, util.rack_knob_size, util.rack_knob_size) and ui.mouse_right_pressed) {
+        app.rack.ctx_vol = idx;
+        app.rack.ctx_pan = null;
+        app.rack.ctx_instrument = null;
+        app.rack.ctx_x = ui.mouse_x;
+        app.rack.ctx_y = ui.mouse_y;
+    }
     cx += util.rack_knob_size + 10;
 
     // 混音通道（**推子式**：上下拖动改路由通道 0..n-1；点击不拖动 = 平推）

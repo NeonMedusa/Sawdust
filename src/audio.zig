@@ -84,6 +84,161 @@ pub const eq_bands = eq.band_count;
 pub const kit_max_layers = 16;
 
 /// UI ↔ 音频线程共享的参数（原子，无锁）
+/// 工程作用域自动化曲线的**音频侧副本**（无锁发布）。
+/// 由 `App.publishAutoLane` 从 UI 线程填充（3 缓冲轮转 + 下标原子发布），
+/// 音频线程每段 `acquire` 读一次，取**段首/段末**两个端点值做块内斜坡。
+/// 注：`evalAt` 与 `view_lane.Lane.evalAt` 是**同一套数学**（`app.zig` 里有逐点对拍测试）。
+pub const LaneSnap = struct {
+    /// 每条曲线最多支持的锚点数（固定缓冲；超出部分忽略）
+    pub const capacity: usize = 64;
+    /// 是否有曲线在驱动本通道（false → 用静态推子值）
+    active: bool = false,
+    /// 目标通道（0 = 主通道）
+    ch: u8 = 0,
+    /// 0 = hold, 1 = linear, 2 = smooth（与 `view_lane.Interp` 同序）
+    interp: u8 = 1,
+    /// 叠加深度（0..4）与极性（false = 单向，true = 双向）
+    depth: f32 = 1.0,
+    bipolar: bool = false,
+    /// 0 = 增益（volume），1 = 声像（pan）
+    kind: u8 = 0,
+    /// **基线值**（叠加起点）：音量类 0，声像类 0.5
+    base: f32 = 0.0,
+    n: u32 = 0,
+    steps: [64]i32 = @splat(0),
+    vals: [64]f32 = @splat(0),
+    curves: [64]f32 = @splat(0),
+    /// 峰值位置（0..1；0.5 = 正中）——与 `view_lane.Point.pivot` 同义
+    pivots: [64]f32 = @splat(0.5),
+
+    /// **段形状**（与 `view_lane.segEval` 逐字一致）：折线 A→H→B + H 处倒圆角
+    fn segEval(a: f32, b: f32, pivot: f32, curve: f32, t_in: f32) f32 {
+        const p = std.math.clamp(pivot, 0.0, 1.0);
+        const t = std.math.clamp(t_in, 0.0, 1.0);
+        const lo = @min(a, b);
+        const hi = @max(a, b);
+        const h = std.math.clamp(a + (b - a) * p + curve, lo, hi);
+        if (p <= 1e-5) return h + (b - h) * t;
+        if (p >= 1.0 - 1e-5) return a + (h - a) * t;
+        const f: f32 = 0.25;
+        const x1 = p * (1.0 - f);
+        const x2 = p + (1.0 - p) * f;
+        const v1 = a + (h - a) * (1.0 - f);
+        const v2 = h + (b - h) * f;
+        if (t <= x1) return a + (h - a) * (t / p);
+        if (t >= x2) return h + (b - h) * ((t - p) / (1.0 - p));
+        const e2 = x1 - 2.0 * p + x2;
+        const e1 = 2.0 * (p - x1);
+        const e0 = x1 - t;
+        var u: f32 = 0.5;
+        if (@abs(e2) < 1e-6) {
+            u = if (@abs(e1) < 1e-6) 0.5 else -e0 / e1;
+        } else {
+            const disc = @max(0.0, e1 * e1 - 4.0 * e2 * e0);
+            const sq = @sqrt(disc);
+            const ur1 = (-e1 + sq) / (2.0 * e2);
+            const ur2 = (-e1 - sq) / (2.0 * e2);
+            u = if (ur1 >= -0.001 and ur1 <= 1.001) ur1 else ur2;
+        }
+        u = std.math.clamp(u, 0.0, 1.0);
+        const w0 = (1.0 - u) * (1.0 - u);
+        const w1 = 2.0 * u * (1.0 - u);
+        const w2 = u * u;
+        return w0 * v1 + w1 * h + w2 * v2;
+    }
+
+    /// **连续**求值（小数步）；`n == 0` → -1（= 无曲线）。
+    /// 语义：同一 step 允许多点（**垂直断崖**）——取“最后一个 step ≤ 查询步”的点，
+    /// 再与下一个点插值；因此断崖左侧 = 组内最左，右侧 = 组内最右。
+    pub fn evalAt(self: *const LaneSnap, step: f32) f32 {
+        const n = self.n;
+        if (n == 0) return -1;
+        var i: usize = n;
+        while (i > 0) : (i -= 1) {
+            if (@as(f32, @floatFromInt(self.steps[i - 1])) <= step) break;
+        }
+        if (i == 0) return self.vals[0];
+        const a = i - 1;
+        if (i >= n) return self.vals[a];
+        const a_step: f32 = @floatFromInt(self.steps[a]);
+        const b_step: f32 = @floatFromInt(self.steps[a + 1]);
+        const span: f32 = @max(1.0, b_step - a_step);
+        const t: f32 = std.math.clamp((step - a_step) / span, 0.0, 1.0);
+        const v = switch (self.interp) {
+            0 => self.vals[a], // hold
+            1 => self.vals[a] + (self.vals[a + 1] - self.vals[a]) * t, // linear
+            else => segEval(self.vals[a], self.vals[a + 1], self.pivots[a], self.curves[a], t), // smooth
+        };
+        return std.math.clamp(v, 0.0, 1.0);
+    }
+
+    /// 偏斜鼓包（与 `view_lane.bell` 逐字一致）：峰值 1 在 `pivot`、两端 0、两端零斜率
+    fn bell(t: f32, pivot: f32) f32 {
+        const p = std.math.clamp(pivot, 0.02, 0.98);
+        if (t <= 0.0 or t >= 1.0) return 0;
+        const u: f32 = if (t < p) t / p else (1.0 - t) / (1.0 - p);
+        return u * u * (3.0 - 2.0 * u);
+    }
+};
+
+/// 一组 lane（同一段内按**通道**匹配；`n` = 有效项数）。一条曲线可绑多个目标 → 一次发布多条。
+pub const LaneSet = struct {
+    n: u32 = 0,
+    lanes: [4]LaneSnap = .{ .{}, .{}, .{}, .{} },
+
+    /// 找（或分配）该通道的一个空槽：同一通道可叠多条曲线。满了 → null
+    pub fn slotFor(self: *LaneSet) ?*LaneSnap {
+        var i: usize = 0;
+        while (i < self.lanes.len) : (i += 1) {
+            if (!self.lanes[i].active) {
+                if (self.n <= i) self.n = @intCast(i + 1);
+                return &self.lanes[i];
+            }
+        }
+        return null;
+    }
+
+    /// 该通道已有多少条曲线（`pan` = 区分声像/增益两类目标）
+    pub fn countForChannel(self: *const LaneSet, ch: usize, pan: bool) usize {
+        var k: usize = 0;
+        var i: usize = 0;
+        while (i < self.n and i < self.lanes.len) : (i += 1) {
+            const l = &self.lanes[i];
+            if (l.active and l.ch == ch and (l.kind == 1) == pan) k += 1;
+        }
+        return k;
+    }
+
+    /// 该通道的**叠加贡献**（单向 v，双向 2v−1，各乘深度后求和）
+    pub fn contribution(self: *const LaneSet, ch: usize, step: f32, pan: bool) f32 {
+        var sum: f32 = 0;
+        var i: usize = 0;
+        while (i < self.n and i < self.lanes.len) : (i += 1) {
+            const l = &self.lanes[i];
+            if (!l.active or l.n == 0 or l.ch != ch or (l.kind == 1) != pan) continue;
+            const v = l.evalAt(step);
+            if (v < 0) continue;
+            sum += if (l.bipolar) (v - 0.5) * 2.0 * l.depth else v * l.depth;
+        }
+        return sum;
+    }
+
+    /// 该通道该分组的**基线值**（有绑定 → 曲线自己定值；无 → null = 用静态推子/旋钮）
+    pub fn baseOf(self: *const LaneSet, ch: usize, pan: bool) ?f32 {
+        var i: usize = 0;
+        while (i < self.n and i < self.lanes.len) : (i += 1) {
+            const l = &self.lanes[i];
+            if (l.active and l.n > 0 and l.ch == ch and (l.kind == 1) == pan) return l.base;
+        }
+        return null;
+    }
+
+    /// 该通道是否被自动化（任一 lane 命中）
+    pub fn hasChannel(self: *const LaneSet, ch: usize, pan: bool) bool {
+        return self.countForChannel(ch, pan) > 0;
+    }
+};
+
 pub const Params = struct {
     /// 主音量 0.0 - 1.0
     volume: std.atomic.Value(f32) = std.atomic.Value(f32).init(0.75),
@@ -110,6 +265,14 @@ pub const Params = struct {
     dbg_long_n: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// 音频线程回传：stash 里待触发的事件数 / UI→音频队列里待取的事件数
     dbg_stash_n: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// **诊断**：`renderSegment` 里 i==0 的 instrument_gain / kind，以及 synth.render 调用计数
+    dbg_seg_g: std.atomic.Value(f32) = std.atomic.Value(f32).init(-1),
+    dbg_seg_kind: std.atomic.Value(u32) = std.atomic.Value(u32).init(99),
+    dbg_seg_render: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// **音频线程看到的 `instrument_gain[0]` 元素指针**（与 UI 侧对比 → 判断是否同一个数组）
+    dbg_seg_ptr: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// UI 侧 envelope 写入的最后一个值（证明“UI 确实写了”）
+    dbg_env_wrote: std.atomic.Value(f32) = std.atomic.Value(f32).init(-1),
     /// **A2 影子对拍**：当前快照指针（0 = 无；UI 用 release 发布，音频 acquire 读取）。
     /// 快照释放由 UI 侧**延迟退休**（≥30 帧 ≫ 一个 block），因此音频持有指针安全。
     snapshot_ptr: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
@@ -248,6 +411,12 @@ pub const Params = struct {
     // ── 调音台：每通道参数（UI 写、音频线程读）──
     /// 通道增益（0-1）
     channel_gain: []std.atomic.Value(f32) = &.{},
+    /// 工程自动化曲线：**3 缓冲轮转**（UI 写非当前缓冲 → release 发布下标；音频 acquire 读）
+    lane_bufs: [3]LaneSet = .{ .{}, .{}, .{} },
+    /// 当前已发布的缓冲下标
+    lane_pub: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// 诊断：本块做过“块内斜坡”的通道数（UI 每秒汇总打印）
+    dbg_lane_ramps: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// 通道声像（0-1；0.5 = 居中）
     channel_pan: []std.atomic.Value(f32) = &.{},
     /// 通道静音（增益已在 UI 侧合并——但保留独立标志以便 UI 同步）
@@ -2090,6 +2259,26 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
     // 本段的宿主时间（tempo/拍号/位置/ppq；VST3 插件的 ProcessContext）
     const host_time = currentHostTime(engine, params, sr);
 
+    // ── 工程自动化（A：**音频线程求值** + 块内斜坡）──
+    // 段起/段末的小数步位置 = start_step + (abs帧 − start_frame)/step_frames
+    // （与下方音频片段那套映射**同式**；用段坐标 `seg_abs0`，不是整块起点）
+    const lane_set = &params.lane_bufs[params.lane_pub.load(.acquire)];
+    const lane_on: bool = lane_set.n > 0;
+    var lane_st0: f32 = 0;
+    var lane_st1: f32 = 0;
+    if (lane_on) {
+        const bpm_a: u64 = @max(20, params.bpm.load(.monotonic));
+        const spb_a: u64 = @max(1, params.steps_per_beat.load(.monotonic));
+        const step_frames: u64 = @max(1, @as(u64, @intFromFloat(@as(f64, sr))) * 60 / (bpm_a * spb_a));
+        const abs0 = engine.seg_abs0;
+        const sf_a = params.start_frame.load(.monotonic);
+        const ss_a = params.start_step.load(.monotonic);
+        const el: f32 = @floatFromInt(abs0 -| sf_a);
+        const sf_f: f32 = @floatFromInt(step_frames);
+        lane_st0 = @as(f32, @floatFromInt(ss_a)) + el / sf_f;
+        lane_st1 = lane_st0 + @as(f32, @floatFromInt(frames)) / sf_f;
+    }
+
     // 频谱目标（UI 每帧发布）：目标效果器所在通道/槽位（-1 = 不分析）。
     // 目标变化时丢弃旧滑窗——否则两种信号的样本会混进同一窗（频谱错乱）。
     const tgt_ch = params.spec_target_ch.load(.monotonic);
@@ -2108,6 +2297,11 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
         const kind = params.instrument_kind[i].load(.monotonic);
         const ch: usize = @min(params.instrument_channel[i].load(.monotonic), if (n_ch > 0) n_ch - 1 else 0);
         const g = params.instrument_gain[i].load(.monotonic); // 乐器音量×静音（推子前）
+        if (i == 0) {
+            params.dbg_seg_g.store(g, .monotonic);
+            params.dbg_seg_ptr.store(if (params.instrument_gain.len > 0) @intFromPtr(&params.instrument_gain[0]) else 0, .monotonic);
+            params.dbg_seg_kind.store(kind, .monotonic);
+        }
         const cbuf: [*]f32 = @ptrCast(&engine.chan_bufs[ch * buf_stride]);
         if (kind == 2) {
             // VST3 乐器（VSTi）：渲染到中转缓冲 → 增益 × 等功率立体声平衡 → 叠加进通道缓冲
@@ -2186,6 +2380,7 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
             }
         } else {
             synth.render(sp, &engine.synths[i], cbuf, frames, sr, g, true);
+            if (i == 0) _ = params.dbg_seg_render.fetchAdd(1, .monotonic);
         }
     }
 
@@ -2315,16 +2510,41 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
         const buf = engine.chan_bufs[ch_i * buf_stride ..][0..n];
         processChannelChain(engine, params, ch_i, buf, frames, sr, tgt_ch, tgt_slot);
 
-        const gain = if (params.channel_muted[ch_i].load(.monotonic)) 0.0 else params.channel_gain[ch_i].load(.monotonic);
-        const pan = std.math.clamp(params.channel_pan[ch_i].load(.monotonic), 0, 1);
+        const muted = params.channel_muted[ch_i].load(.monotonic);
+        const stat = params.channel_gain[ch_i].load(.monotonic);
+        // **叠加语义**：静态推子 = 基准值；所有绑到本通道的曲线贡献求和（钳到 0..1）
+        const auto_this = lane_on and lane_set.hasChannel(ch_i, false);
+        const base_g = if (auto_this) (lane_set.baseOf(ch_i, false) orelse stat) else stat;
+        const g_a: f32 = if (muted) 0.0 else if (auto_this) std.math.clamp(base_g + lane_set.contribution(ch_i, lane_st0, false), 0.0, 1.0) else stat;
+        const g_b: f32 = if (muted) 0.0 else if (auto_this) std.math.clamp(base_g + lane_set.contribution(ch_i, lane_st1, false), 0.0, 1.0) else stat;
+        // 声像：静态旋钮 = 基准，曲线贡献叠加（取段首值；等功率声像不做逐采样斜坡）
+        var pan = std.math.clamp(params.channel_pan[ch_i].load(.monotonic), 0, 1);
+        if (lane_on and lane_set.hasChannel(ch_i, true)) {
+            const base_p = lane_set.baseOf(ch_i, true) orelse pan;
+            pan = std.math.clamp(base_p + lane_set.contribution(ch_i, lane_st0, true), 0.0, 1.0);
+        }
         const ang = pan * (std.math.pi / 2.0);
-        const gl = @cos(ang) * gain * std.math.sqrt2;
-        const gr = @sin(ang) * gain * std.math.sqrt2;
+        const cl = @cos(ang) * std.math.sqrt2;
+        const cr = @sin(ang) * std.math.sqrt2;
         const dst = engine.chan_bufs[0..][0..n];
         var f2: usize = 0;
-        while (f2 < frames) : (f2 += 1) {
-            dst[f2 * 2] += buf[f2 * 2] * gl;
-            dst[f2 * 2 + 1] += buf[f2 * 2 + 1] * gr;
+        if (g_a == g_b) {
+            // 无自动化（或段内值不变）→ 常量增益（与旧路径完全相同，零额外开销）
+            const gl = cl * g_a;
+            const gr = cr * g_a;
+            while (f2 < frames) : (f2 += 1) {
+                dst[f2 * 2] += buf[f2 * 2] * gl;
+                dst[f2 * 2 + 1] += buf[f2 * 2 + 1] * gr;
+            }
+        } else {
+            // 自动化激活 → **块内线性斜坡**（消除 16ms 阶梯 / zipper）
+            const inv: f32 = 1.0 / @as(f32, @floatFromInt(@max(1, frames)));
+            while (f2 < frames) : (f2 += 1) {
+                const gg = g_a + (g_b - g_a) * @as(f32, @floatFromInt(f2)) * inv;
+                dst[f2 * 2] += buf[f2 * 2] * cl * gg;
+                dst[f2 * 2 + 1] += buf[f2 * 2 + 1] * cr * gg;
+            }
+            _ = params.dbg_lane_ramps.fetchAdd(1, .monotonic);
         }
     }
 
@@ -2333,15 +2553,36 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
     if (n_ch > 0) {
         const buf = engine.chan_bufs[0..][0..n];
         processChannelChain(engine, params, 0, buf, frames, sr, tgt_ch, tgt_slot);
-        const gain = if (params.channel_muted[0].load(.monotonic)) 0.0 else params.channel_gain[0].load(.monotonic);
-        const pan = std.math.clamp(params.channel_pan[0].load(.monotonic), 0, 1);
+        const muted0 = params.channel_muted[0].load(.monotonic);
+        const stat0 = params.channel_gain[0].load(.monotonic);
+        const auto0 = lane_on and lane_set.hasChannel(0, false);
+        const base0 = if (auto0) (lane_set.baseOf(0, false) orelse stat0) else stat0;
+        const g0a: f32 = if (muted0) 0.0 else if (auto0) std.math.clamp(base0 + lane_set.contribution(0, lane_st0, false), 0.0, 1.0) else stat0;
+        const g0b: f32 = if (muted0) 0.0 else if (auto0) std.math.clamp(base0 + lane_set.contribution(0, lane_st1, false), 0.0, 1.0) else stat0;
+        var pan = std.math.clamp(params.channel_pan[0].load(.monotonic), 0, 1);
+        if (lane_on and lane_set.hasChannel(0, true)) {
+            const base_p0 = lane_set.baseOf(0, true) orelse pan;
+            pan = std.math.clamp(base_p0 + lane_set.contribution(0, lane_st0, true), 0.0, 1.0);
+        }
         const ang = pan * (std.math.pi / 2.0);
-        const gl = @cos(ang) * gain * master * std.math.sqrt2;
-        const gr = @sin(ang) * gain * master * std.math.sqrt2;
+        const cl = @cos(ang) * std.math.sqrt2 * master;
+        const cr = @sin(ang) * std.math.sqrt2 * master;
         var f2: usize = 0;
-        while (f2 < frames) : (f2 += 1) {
-            out[f2 * 2] += buf[f2 * 2] * gl;
-            out[f2 * 2 + 1] += buf[f2 * 2 + 1] * gr;
+        if (g0a == g0b) {
+            const gl = cl * g0a;
+            const gr = cr * g0a;
+            while (f2 < frames) : (f2 += 1) {
+                out[f2 * 2] += buf[f2 * 2] * gl;
+                out[f2 * 2 + 1] += buf[f2 * 2 + 1] * gr;
+            }
+        } else {
+            const inv: f32 = 1.0 / @as(f32, @floatFromInt(@max(1, frames)));
+            while (f2 < frames) : (f2 += 1) {
+                const gg = g0a + (g0b - g0a) * @as(f32, @floatFromInt(f2)) * inv;
+                out[f2 * 2] += buf[f2 * 2] * cl * gg;
+                out[f2 * 2 + 1] += buf[f2 * 2 + 1] * cr * gg;
+            }
+            _ = params.dbg_lane_ramps.fetchAdd(1, .monotonic);
         }
     }
 

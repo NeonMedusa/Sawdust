@@ -11,6 +11,7 @@ const model = @import("model.zig");
 const synth = @import("synth.zig");
 const sequencer = @import("sequencer.zig");
 const snapshot = @import("snapshot.zig");
+const view_lane = @import("view_lane.zig");
 const persist = @import("persist.zig");
 const ivstevents = @import("zig_vst3").pluginterfaces.vst.ivstevents;
 const midi = @import("midi.zig");
@@ -395,12 +396,14 @@ pub const ModalKind = enum {
     track_clear,
     /// 删除**轨道行** → 确认（删除/取消）——空行直接删（下方整体上移）
     track_delete,
+    /// 删除**自动化曲线** → 确认（删除/取消；被多个参数链接时必弹，单绑定直接删）
+    delete_auto_curve,
     /// 旧版存档（v1–v3 JSON）打开 → “备份并升级”确认（③ 迁移流程）
     save_upgrade,
 };
 
 /// 待确认的结构删除（`struct_del_req`；`modal == .pattern_delete/.track_clear/.track_delete` 时有效）
-pub const DelReq = union(enum) { pattern: usize, track: usize, track_row: usize };
+pub const DelReq = union(enum) { pattern: usize, track: usize, track_row: usize, auto_curve: u32 };
 
 /// 待确认的覆写保存请求（确认后重新排队；取消即丢弃）
 pub const OverwriteReq = struct {
@@ -664,9 +667,13 @@ pub const PianoState = struct {
 
     // ── 力度/声像编辑轨（钢琴卷帘底部；见 `docs/note-lane.md`）──
     /// 编辑轨高度（像素；**0 = 未初始化**——首帧按内容 12% 初始化）
-    lane_h: i32 = 0,
     /// 编辑模式：力度 / 声像
+    /// 钢琴窗底部编辑区高度（像素；**与播放列表自动化区各自独立**）
+    lane_h: i32 = 0,
     lane_mode: NoteLaneMode = .velocity,
+    /// 钢琴窗行头列列表的滚动行偏移（目前只有 2 项，为一致性保留）
+    lane_scroll: i32 = 0,
+    /// **v1**：编辑区是否切到 **envelope 模式**（乐器音量/声像）；false = 现有 per-note 柱条
     /// 拖动中：上次刷过的鼠标 x（扫刷插值用；-1 = 未刷）
     lane_last_x: i32 = -1,
     /// 画笔范围（**按下瞬间**判定）：true = 只编辑选中的柱条；
@@ -692,6 +699,8 @@ pub const NoteLaneMode = enum { velocity, pan };
 
 /// 通道机架（浮动窗口）状态
 pub const RackState = struct {
+    /// 乐器**音量**旋钮右键菜单的目标（`null` = 未开）
+    ctx_vol: ?usize = null,
     // ── 窗口几何 ──
     open: bool = true,
     x: i32 = 200,
@@ -771,12 +780,14 @@ pub const Playback = struct {
 /// 交互：字符追加；退格删末尾一个 code point；回车 = 提交；ESC = 取消；
 /// 点击输入框外 = 提交（吞掉该次点击）。
 pub const TextInput = struct {
-    pub const Target = enum { instrument, mixer_channel, pattern, track, preset_name, kit_pad_name, preset_rename, preset_search, audio_style };
+    pub const Target = enum { instrument, mixer_channel, pattern, track, preset_name, kit_pad_name, preset_rename, preset_search, audio_style, automation_value, automation_curve_name, automation_base };
 
     active: bool = false,
     target: Target = .instrument,
-    /// 目标下标（乐器槽位 / 通道序号 / **鼓垫音高** / **预设分类序号**）
+    /// 目标下标（乐器槽位 / 通道序号 / **鼓垫音高** / **预设分类序号** / **自动化点序号**）
     index: usize = 0,
+    /// `automation_value` 用：目前恒为 `-1`（= `app.auto_lane`；钢琴窗 CC lane 已移除，字段保留以便将来扩展）
+    auto_lane: i16 = -1,
     /// 目标乐器槽位（`kit_pad_name` 用；音高在 `index`）
     instrument: i32 = -1,
     /// 附加固定载荷（`preset_rename` 的**旧名字**；固定缓冲避免生命周期问题）
@@ -1042,6 +1053,9 @@ pub const MixerChannel = struct {
     volume: f32 = 0.8, // 0-1（线性增益）
     pan: f32 = 0.5, // 0-1（0.5 = 居中）
     muted: bool = false,
+    /// **稳定身份**（0 = 未分配，惰性分配）：自动化绑定按键靠它，而**不是数组下标**——
+    /// 通道上移/下移只是元素交换，uid 跟着通道走（用户明确要求：绑到通道 A 的曲线要一直跟着 A）。
+    uid: u32 = 0,
     /// 自定义名字（UTF-8；`name_len == 0` = 用默认占位名“主通道/通道#N”）。
     /// 定长存储（≤ 32 字节 ≈ 10 个汉字）——避免动态分配的生命周期管理
     name: [32]u8 = @splat(0),
@@ -1064,6 +1078,8 @@ pub fn defaultChannelName(index: usize, buf: []u8) []const u8 {
 
 /// 调音台窗口状态
 pub const MixerWindow = struct {
+    /// **音量推子**右键菜单（恢复默认值 / 自动化…）所属通道（null = 未展开）
+    ctx_vol: ?usize = null,
     open: bool = false,
     x: i32 = 120,
     y: i32 = 90,
@@ -1468,6 +1484,49 @@ pub const App = struct {
     /// **A0 基线诊断**：调度耗时/事件数（仅 UI 线程；`schedLogTick` 每秒汇总后清零）
     sched_cost_ahead: SchedCost = .{},
     sched_cost_rescan: SchedCost = .{},
+    /// **自动化 v0 原型**（`docs/automation.md` §九）：单 lane、不进历史/存档。
+    /// 每帧由 `applyAutoLane()` 求值并覆盖通道增益 → **听得见**手感。
+    /// **曲线仓库**（工程作用域；每条曲线有稳定 `id` 与名字）
+    auto_curves: std.ArrayListUnmanaged(view_lane.Lane) = .empty,
+    /// **绑定表**：曲线 → 参数（多对多；同参数多条曲线 → 叠加）
+    auto_bindings: std.ArrayListUnmanaged(view_lane.Binding) = .empty,
+    /// 当前选中的曲线 id（播放列表编辑的那条；0 = 尚无）
+    auto_sel: u32 = 0,
+    /// 播放列表行头列（曲线列表）的滚动行偏移
+    auto_list_scroll: i32 = 0,
+    /// 曲线行**右键菜单**（重命名 / 删除曲线）
+    curve_menu: struct {
+        open: bool = false,
+        just_opened: bool = false,
+        x: i32 = 0,
+        y: i32 = 0,
+        curve_id: u32 = 0,
+    } = .{},
+    /// **自动化链接窗口**（从混音台右键 `自动化…` 打开；一个参数一个窗口）
+    auto_win: struct {
+        open: bool = false,
+        x: i32 = 240,
+        y: i32 = 150,
+        target: view_lane.Target = .{},
+        /// 拖动偏移（标题栏拖动用）
+        drag_dx: i32 = 0,
+        drag_dy: i32 = 0,
+        /// 刚打开的那一帧标记（保留：将来若恢复“点窗外关闭”会用到）
+        just_opened: bool = false,
+        /// 「链接到曲线…」下拉列表是否展开（老版本是底部平铺芯片，曲线一多就溢出）
+        pick_open: bool = false,
+        /// 下拉列表的滚动行偏移
+        pick_scroll: i32 = 0,
+        /// 绑定行列表的滚动行偏移
+        rows_scroll: i32 = 0,
+    } = .{},
+    /// 曲线 id 分配器（单调、不重用）
+    next_curve_id: u32 = 0,
+    /// **钢琴窗编辑区**：envelope 编辑的当前目标 + **每个目标一条独立 lane**
+    ///（否则切目标会共用同一条曲线——实测：乐器音量画的线会出现在乐器声像里）
+    /// 播放列表自动化区高度（像素；**与钢琴窗编辑区各自独立**，布局数学共用 `view_lane.layoutPanel`）
+    auto_panel_h: i32 = 220,
+
     /// **A2 影子对拍**：快照双缓冲 + 延迟退休（音频线程可能还在读旧快照）
     snap_slots: [2]?snapshot.Snapshot = .{ null, null },
     snap_active: u8 = 0,
@@ -1704,6 +1763,10 @@ pub const App = struct {
     z_top: i32 = 50,
     /// 调音台通道（**动态**；默认 2 个，可添加；乐器通过 `Instrument.mixer` 路由到其中之一）
     mixer_channels_state: std.ArrayListUnmanaged(MixerChannel) = .empty,
+    /// 通道 uid 分配器（单调递增、永不复用；0 = 未分配）；自动化绑定用
+    next_channel_uid: u32 = 0,
+    /// 乐器 uid 分配器（同上）
+    next_instrument_uid: u32 = 0,
     /// 已删除但可能仍被音频线程引用的插件实例（**延迟销毁**）——
     /// `countdown` 帧后由 `reapRetiredPlugins` 真正释放（远大于音频缓冲周期）
     retired_plugins: std.ArrayListUnmanaged(RetiredPlugin) = .empty,
@@ -2864,6 +2927,11 @@ pub const App = struct {
     }
 
     pub fn addInstrument(self: *App, base_name: []const u8) i32 {
+        // 稳定身份（自动化绑定用）：函数结束时给新乐器补 uid（成功/失败都幂等）
+        defer if (self.instruments.items.len > 0) {
+            const last = self.instruments.items.len - 1;
+            if (self.instruments.items[last].uid == 0) self.instruments.items[last].uid = self.takeInstrumentUid();
+        };
         self.ensureAudioCapacity(self.instruments.items.len + 1, 0, 0);
         // 1) 生成不重复的名字：统计已有同名（忽略 #N 后缀）数量
         var same: usize = 0;
@@ -3978,6 +4046,10 @@ pub const App = struct {
     /// 释放全部乐器（名字 + 合成器参数，含退役的）+ 保存相关字段——进程退出时调用
     pub fn deinitAll(self: *App) void {
         self.sched_log_pending.deinit(self.allocator); // 诊断缓冲（--sched-log 用）
+        for (self.auto_curves.items) |*lc| lc.deinit(self.allocator);
+        self.auto_curves.deinit(self.allocator);
+        self.auto_bindings.deinit(self.allocator); // 自动化（内存态）
+
         self.params.snapshot_ptr.store(0, .release); // A2：先断开音频侧对快照的引用
         for (&self.snap_slots) |*s| {
             if (s.*) |*sp| sp.deinit();
@@ -5344,6 +5416,12 @@ pub const App = struct {
         while (i < n) : (i += 1) {
             self.mixer_channels_state.append(self.allocator, .{}) catch break;
         }
+        self.ensureChannelUids(); // 通道稳定身份（自动化绑定用）
+        // 通道全部重建（新工程/读档）→ 自动化窗口的目标 uid 已失效，顺手关掉
+        if (self.auto_win.open and (self.auto_win.target.kind == .mixer_vol or self.auto_win.target.kind == .mixer_pan)) {
+            self.auto_win.open = false;
+            self.auto_win.pick_open = false;
+        }
         self.shrink_pending = true; // 帧末尝试回收容量
     }
 
@@ -5373,6 +5451,284 @@ pub const App = struct {
 
     /// 队列缓冲运行时清零（`Ring.buf` 故意用 `undefined` 默认值，省掉 `.rodata`
     /// 里 ~450 KB 的初值镜像；启动时清一次只为可重复性）——`initAudioCapacity` 前调用
+    // ──────────────────────── 自动化：曲线仓库 + 绑定表 ────────────────────────
+
+    /// 分配一个**永不复用**的曲线 id
+    fn takeCurveId(self: *App) u32 {
+        self.next_curve_id +%= 1;
+        if (self.next_curve_id == 0) self.next_curve_id = 1;
+        return self.next_curve_id;
+    }
+
+    /// 按**参数名**生成曲线名（`通道1 · 音量` / `主通道 · 音量` / `通道2 · 声像`），重名自动加 `(2)`。
+    pub fn autoCurveNameFor(self: *App, target: view_lane.Target, buf: []u8) []const u8 {
+        var tb: [48]u8 = undefined;
+        const base: []const u8 = blk: {
+            switch (target.kind) {
+                .none => break :blk "未绑定",
+                .master_vol => break :blk "主通道 · 音量",
+                .mixer_vol, .mixer_pan => {
+                    const suffix: []const u8 = if (target.kind == .mixer_vol) "音量" else "声像";
+                    const idx = self.channelIndexByUid(target.uid) orelse
+                        break :blk std.fmt.bufPrint(&tb, "通道? · {s}", .{suffix}) catch "曲线";
+                    var nb: [32]u8 = undefined;
+                    const nm = self.mixer_channels_state.items[idx].displayName(idx, &nb);
+                    break :blk std.fmt.bufPrint(&tb, "{s} · {s}", .{ nm, suffix }) catch "曲线";
+                },
+                .inst_vol, .inst_pan => {
+                    const suffix: []const u8 = if (target.kind == .inst_vol) "音量" else "声像";
+                    const idx = self.instrumentIndexByUid(target.uid) orelse
+                        break :blk std.fmt.bufPrint(&tb, "乐器? · {s}", .{suffix}) catch "曲线";
+                    const nm = self.instruments.items[idx].name;
+                    break :blk std.fmt.bufPrint(&tb, "{s} · {s}", .{ nm, suffix }) catch "曲线";
+                },
+            }
+        };
+        // 重名 → 追加 (2)/(3)…
+        var out = std.fmt.bufPrint(buf, "{s}", .{base}) catch return "曲线";
+        var dup: usize = 1;
+        while (self.curveNameTaken(out)) {
+            dup += 1;
+            out = std.fmt.bufPrint(buf, "{s}{d}", .{ base, dup }) catch return out;
+            if (dup > 64) break;
+        }
+        return out;
+    }
+
+    /// 曲线名是否已被占用（区分命名用）
+    fn curveNameTaken(self: *const App, name: []const u8) bool {
+        for (self.auto_curves.items) |*lc| {
+            if (lc.name_len > 0 and std.mem.eql(u8, lc.name_buf[0..lc.name_len], name)) return true;
+        }
+        return false;
+    }
+
+    /// 新建一条曲线（不绑定）；返回 id（失败 0）
+    pub fn addAutoCurve(self: *App, name: []const u8) u32 {
+        const id = self.takeCurveId();
+        self.auto_curves.append(self.allocator, .{ .id = id }) catch return 0;
+        self.auto_curves.items[self.auto_curves.items.len - 1].setName(name);
+        if (self.auto_sel == 0) self.auto_sel = id;
+        return id;
+    }
+
+    pub fn curveIndexById(self: *const App, id: u32) ?usize {
+        for (self.auto_curves.items, 0..) |lc, i| {
+            if (lc.id == id) return i;
+        }
+        return null;
+    }
+
+    pub fn curveById(self: *App, id: u32) ?*view_lane.Lane {
+        const i = self.curveIndexById(id) orelse return null;
+        return &self.auto_curves.items[i];
+    }
+
+    /// **当前编辑的曲线**（播放列表画/编辑的那条）。没有就惰性建一条。
+    pub fn autoCurve(self: *App) ?*view_lane.Lane {
+        if (self.auto_curves.items.len == 0) {
+            const id = self.addAutoCurve("曲线1");
+            if (id == 0) return null;
+            self.auto_sel = id;
+        }
+        if (self.curveById(self.auto_sel)) |lc| return lc;
+        self.auto_sel = self.auto_curves.items[0].id;
+        return &self.auto_curves.items[0];
+    }
+
+    /// 开始编辑某条绑定的**基准值**（复用文本输入；`auto_lane` 复用为绑定下标）
+    pub fn beginEditAutomationBase(self: *App, binding_idx: usize, prefill: []const u8, x: i32, y: i32, w: i32) void {
+        const ti = &self.text_input;
+        ti.active = true;
+        ti.target = .automation_base;
+        ti.index = binding_idx;
+        ti.auto_lane = @intCast(binding_idx);
+        ti.len = @min(prefill.len, ti.buf.len);
+        @memcpy(ti.buf[0..ti.len], prefill[0..ti.len]);
+        ti.cursor = ti.len;
+        ti.sel_anchor = if (ti.len > 0) 0 else null;
+        ti.drag_active = false;
+        ti.view_off = 0;
+        ti.x = x;
+        ti.y = y;
+        ti.w = w;
+        ti.aux_len = 0;
+    }
+
+    /// 开始重命名曲线（复用文本输入基建）
+    pub fn beginRenameAutoCurve(self: *App, curve_id: u32, x: i32, y: i32, w: i32) void {
+        const i = self.curveIndexById(curve_id) orelse return;
+        const lc = &self.auto_curves.items[i];
+        const ti = &self.text_input;
+        ti.active = true;
+        ti.target = .automation_curve_name;
+        ti.index = i;
+        ti.len = @min(@as(usize, lc.name_len), ti.buf.len);
+        @memcpy(ti.buf[0..ti.len], lc.name_buf[0..ti.len]);
+        ti.cursor = ti.len;
+        ti.sel_anchor = if (ti.len > 0) 0 else null;
+        ti.drag_active = false;
+        ti.view_off = 0;
+        ti.x = x;
+        ti.y = y;
+        ti.w = w;
+        ti.aux_len = 0;
+    }
+
+    /// 删除曲线（连带它的所有绑定）。返回是否删了。
+    pub fn removeAutoCurve(self: *App, id: u32) bool {
+        const i = self.curveIndexById(id) orelse return false;
+        var lc = self.auto_curves.orderedRemove(i);
+        lc.deinit(self.allocator);
+        var k: usize = 0;
+        while (k < self.auto_bindings.items.len) {
+            if (self.auto_bindings.items[k].curve_id == id) {
+                _ = self.auto_bindings.orderedRemove(k);
+            } else k += 1;
+        }
+        if (self.auto_sel == id) {
+            self.auto_sel = if (self.auto_curves.items.len > 0) self.auto_curves.items[0].id else 0;
+        }
+        return true;
+    }
+
+    /// 该曲线绑定的条目数
+    pub fn bindingCountOfCurve(self: *const App, id: u32) usize {
+        var n: usize = 0;
+        for (self.auto_bindings.items) |b| {
+            if (b.curve_id == id) n += 1;
+        }
+        return n;
+    }
+
+    /// 某参数的全部绑定（窗口按参数看）
+    pub fn bindingsOfTarget(self: *const App, target: view_lane.Target, out: []view_lane.Binding) []const view_lane.Binding {
+        var n: usize = 0;
+        for (self.auto_bindings.items) |b| {
+            if (n >= out.len) break;
+            if (view_lane.Target.eql(b.target, target)) {
+                out[n] = b;
+                n += 1;
+            }
+        }
+        return out[0..n];
+    }
+
+    pub fn bindingIndex(self: *const App, curve_id: u32, target: view_lane.Target) ?usize {
+        for (self.auto_bindings.items, 0..) |b, i| {
+            if (b.curve_id == curve_id and view_lane.Target.eql(b.target, target)) return i;
+        }
+        return null;
+    }
+
+    /// 该参数是否已被某条曲线绑定
+    pub fn isTargetBound(self: *const App, target: view_lane.Target) bool {
+        for (self.auto_bindings.items) |b| {
+            if (view_lane.Target.eql(b.target, target)) return true;
+        }
+        return false;
+    }
+
+    /// **绑定**：曲线 → 参数（已存在则返回 false）。默认 100% / 单向。
+    pub fn bindCurveTarget(self: *App, curve_id: u32, target: view_lane.Target) bool {
+        if (self.curveIndexById(curve_id) == null) return false;
+        if (self.bindingIndex(curve_id, target) != null) return false;
+        // **声像默认双向**（围绕中心摆动才符合直觉）；音量默认单向
+        self.auto_bindings.append(self.allocator, .{
+            .curve_id = curve_id,
+            .target = target,
+            .bipolar = view_lane.Target.defaultBipolar(target.kind),
+        }) catch return false;
+        return true;
+    }
+
+    /// **解绑**（按曲线 + 参数）
+    pub fn unbindCurveTarget(self: *App, curve_id: u32, target: view_lane.Target) bool {
+        const i = self.bindingIndex(curve_id, target) orelse return false;
+        _ = self.auto_bindings.orderedRemove(i);
+        return true;
+    }
+
+    /// **工程自动化（A）**：把绑定**展开成每通道一组 lane** 发布给音频线程。
+    ///
+    /// 无锁发布：写在 `lane_pub` 之外的缓冲（3 缓冲轮转），写完后 `release` 发布下标；
+    /// 音频线程每段 `acquire` 读一次，取段首/段末两个端点值做**块内斜坡**。
+    /// **叠加语义**：`参数 = clamp(静态推子 + Σ 深度×(单向: v / 双向: 2v−1), 0, 1)`。
+    pub fn publishAutoLane(self: *App) void {
+        // 惰性分配通道 uid（读档/旧工程/初始化后第一条车道发布时补齐；幂等）
+        if (self.mixer_channels_state.items.len > 0 and self.mixer_channels_state.items[0].uid == 0) self.ensureChannelUids();
+        // 乐器 uid 惰性补齐（读档/旧工程）
+        if (self.instruments.items.len > 0 and self.instruments.items[0].uid == 0) self.ensureInstrumentUids();
+        const cur = self.params.lane_pub.load(.monotonic);
+        const next = (cur + 1) % 3;
+        const set = &self.params.lane_bufs[next];
+        set.* = .{};
+        defer self.params.lane_pub.store(next, .release);
+        if (self.auto_bindings.items.len == 0) return;
+
+        for (self.auto_bindings.items) |b| {
+            if (!b.enabled) continue;
+            if (b.target.kind == .none) continue;
+            // 目标 → 通道**当前下标**（混音台目标按 uid 解析：通道上下移动后仍跟着走）
+            const ch: usize = switch (b.target.kind) {
+                .master_vol => 0,
+                .mixer_vol, .mixer_pan => self.channelIndexByUid(b.target.uid) orelse continue,
+                // 乐器目标：uid 与命名已就绪，音频侧贡献留到下一轮（`instrument_gain/pan`）
+                .inst_vol, .inst_pan => continue,
+                .none => continue,
+            };
+            const is_pan = b.target.kind == .mixer_pan;
+            const lc = self.curveById(b.curve_id) orelse continue;
+            const n = @min(lc.points.items.len, audio.LaneSnap.capacity);
+            if (n == 0) continue;
+            const snap = set.slotFor() orelse continue; // 每通道最多 `lanes.len` 条
+            snap.active = true;
+            snap.ch = @intCast(ch);
+            snap.kind = if (is_pan) 1 else 0;
+            snap.base = b.base orelse view_lane.Target.defaultBase(b.target.kind);
+            snap.interp = switch (lc.interp) {
+                .hold => 0,
+                .linear => 1,
+                .smooth => 2,
+            };
+            snap.depth = std.math.clamp(b.depth, 0.0, 4.0);
+            snap.bipolar = b.bipolar;
+            snap.n = @intCast(n);
+            for (lc.points.items[0..n], 0..) |p, i| {
+                snap.steps[i] = p.step;
+                snap.vals[i] = p.value;
+                snap.curves[i] = p.curve;
+                snap.pivots[i] = p.pivot;
+            }
+        }
+    }
+
+    /// 该参数**所有**绑定的叠加值（UI 预览/状态行用；`step` 为工程步）
+    pub fn autoValueFor(self: *const App, target: view_lane.Target, step: f32, base: f32) f32 {
+        // 有绑定 → 基准取**第一条绑定的 base**（未设则用类型默认：音量 0 / 声像 0.5）；无 → 静态推子/旋钮值
+        var sum: f32 = blk: {
+            for (self.auto_bindings.items) |b| {
+                if (!self.isTargetBound(target)) break :blk base;
+                if (view_lane.Target.eql(b.target, target)) {
+                    break :blk b.base orelse view_lane.Target.defaultBase(target.kind);
+                }
+            }
+            break :blk base;
+        };
+        for (self.auto_bindings.items) |b| {
+            if (!b.enabled) continue;
+            if (!view_lane.Target.eql(b.target, target)) continue;
+            if (b.target.kind == .inst_vol or b.target.kind == .inst_pan) continue; // 乐器链路下一轮
+            const i = self.curveIndexById(b.curve_id) orelse continue;
+            const lc = &self.auto_curves.items[i];
+            const v = lc.evalAt(step);
+            if (v < 0) continue;
+            const contrib = if (b.bipolar) (v - 0.5) * 2.0 * b.depth else v * b.depth;
+            sum += contrib;
+        }
+        return std.math.clamp(sum, 0.0, 1.0);
+    }
+
     pub fn initQueues(self: *App) void {
         self.events.zeroed();
     }
@@ -5612,7 +5968,60 @@ pub const App = struct {
     pub fn addMixerChannel(self: *App) ?usize {
         self.ensureAudioCapacity(0, self.mixer_channels_state.items.len + 1, 0);
         self.mixer_channels_state.append(self.allocator, .{}) catch return null;
-        return self.mixer_channels_state.items.len - 1;
+        const idx = self.mixer_channels_state.items.len - 1;
+        // **稳定身份**：新通道立刻分配 uid（自动化绑定用；不用数组下标）
+        self.mixer_channels_state.items[idx].uid = self.takeChannelUid();
+        return idx;
+    }
+
+    /// 分配一个**永不复用**的通道 uid（自动化绑定键）
+    fn takeChannelUid(self: *App) u32 {
+        self.next_channel_uid +%= 1;
+        if (self.next_channel_uid == 0) self.next_channel_uid = 1; // 0 = 未分配
+        return self.next_channel_uid;
+    }
+
+    /// 给所有未分配 uid 的通道补上（读档/旧工程/初始化后调用）。幂等。
+    pub fn ensureChannelUids(self: *App) void {
+        for (self.mixer_channels_state.items) |*mc| {
+            if (mc.uid != 0) self.next_channel_uid = @max(self.next_channel_uid, mc.uid);
+        }
+        for (self.mixer_channels_state.items) |*mc| {
+            if (mc.uid == 0) mc.uid = self.takeChannelUid();
+        }
+    }
+
+    /// 乐器：分配一个永不复用的 uid
+    fn takeInstrumentUid(self: *App) u32 {
+        self.next_instrument_uid +%= 1;
+        if (self.next_instrument_uid == 0) self.next_instrument_uid = 1;
+        return self.next_instrument_uid;
+    }
+
+    /// 给所有未分配 uid 的乐器补上（读档/旧工程/初始化后调用）。幂等。
+    pub fn ensureInstrumentUids(self: *App) void {
+        for (self.instruments.items) |*inst| {
+            if (inst.uid != 0) self.next_instrument_uid = @max(self.next_instrument_uid, inst.uid);
+        }
+        for (self.instruments.items) |*inst| {
+            if (inst.uid == 0) inst.uid = self.takeInstrumentUid();
+        }
+    }
+
+    /// 乐器 uid → 当前数组下标（已删除/未知 → null）
+    pub fn instrumentIndexByUid(self: *const App, uid: u32) ?usize {
+        for (self.instruments.items, 0..) |inst, i| {
+            if (inst.uid == uid) return i;
+        }
+        return null;
+    }
+
+    /// uid → 当前数组下标（已删除/未知 → null）
+    pub fn channelIndexByUid(self: *const App, uid: u32) ?usize {
+        for (self.mixer_channels_state.items, 0..) |mc, i| {
+            if (mc.uid == uid) return i;
+        }
+        return null;
     }
 
     /// 给某通道添加一个效果器（返回新槽下标；失败 null）
@@ -5834,6 +6243,15 @@ pub const App = struct {
     pub fn removeMixerChannel(self: *App, ch: usize) bool {
         const n = self.mixer_channels_state.items.len;
         if (ch >= n or n <= 1) return false;
+        // 该通道的自动化窗口跟着关（用户约定：只有通道被删时才自动关闭窗口）
+        const gone_uid = self.mixer_channels_state.items[ch].uid;
+        if (self.auto_win.open and gone_uid != 0 and
+            (self.auto_win.target.kind == .mixer_vol or self.auto_win.target.kind == .mixer_pan) and
+            self.auto_win.target.uid == gone_uid)
+        {
+            self.auto_win.open = false;
+            self.auto_win.pick_open = false;
+        }
         var removed = self.mixer_channels_state.items[ch];
         removed.effects.deinit(self.allocator);
         _ = self.mixer_channels_state.orderedRemove(ch);
@@ -9336,11 +9754,53 @@ pub const App = struct {
     }
 
     /// 提交：写入目标；空串 → 乐器保持原名、通道恢复默认占位名
+    /// **键入自动化点的值**（行头列第 2 行点击触发）。
+    /// `env_lane`：目前恒为 `-1` = `app.auto_lane`（播放列表）；参数保留以便将来扩展。
+    /// 注：自动化曲线**尚未进历史**（S5），所以这里**不提交历史**——否则会快照一份
+    /// “不含曲线”的状态，撤销时其它内容回退、曲线不回退（不一致）。
+    pub fn beginEditAutomationValue(self: *App, env_lane: i16, point_idx: usize, prefill: []const u8, x: i32, y: i32, w: i32) void {
+        const ti = &self.text_input;
+        ti.active = true;
+        ti.target = .automation_value;
+        ti.index = point_idx;
+        ti.auto_lane = env_lane;
+        ti.len = @min(prefill.len, ti.buf.len);
+        @memcpy(ti.buf[0..ti.len], prefill[0..ti.len]);
+        ti.cursor = ti.len;
+        ti.sel_anchor = if (ti.len > 0) 0 else null; // 全选 → 直接输入即替换
+        ti.drag_active = false;
+        ti.view_off = 0;
+        ti.x = x;
+        ti.y = y;
+        ti.w = w;
+        ti.aux_len = 0;
+    }
+
     pub fn textInputCommit(self: *App) void {
         const ti = &self.text_input;
         if (!ti.active) return;
         const val = ti.buf[0..ti.len];
         switch (ti.target) {
+            .automation_base => {
+                if (ti.auto_lane >= 0 and @as(usize, @intCast(ti.auto_lane)) < self.auto_bindings.items.len) {
+                    if (@import("view_lane.zig").parseValue(.percent, val)) |v| {
+                        self.auto_bindings.items[@intCast(ti.auto_lane)].base = std.math.clamp(v, 0.0, 1.0);
+                    }
+                }
+            },
+            .automation_curve_name => {
+                if (ti.index < self.auto_curves.items.len and val.len > 0) {
+                    self.auto_curves.items[ti.index].setName(val);
+                }
+            },
+            .automation_value => {
+                const lane: *@import("view_lane.zig").Lane = self.autoCurve() orelse return;
+                if (ti.index < lane.points.items.len) {
+                    if (@import("view_lane.zig").parseValue(lane.display_unit, val)) |v| {
+                        lane.points.items[ti.index].value = std.math.clamp(v, 0.0, 1.0);
+                    }
+                }
+            },
             .instrument => {
                 if (ti.index < self.instruments.items.len and val.len > 0) {
                     const inst = &self.instruments.items[ti.index];
@@ -15040,4 +15500,314 @@ test "app: MIDI 样式导出——无片段也能导出该样式的音符" {
     const rows0 = try app.exportMidiUsedSlots(app.allocator, 0);
     defer app.allocator.free(rows0);
     try std.testing.expectEqual(@as(usize, 0), rows0.len);
+}
+
+test "automation_value: 键入数值按显示单位解析（% / dB 静音 / 非法输入）" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    const lc = app.autoCurve().?;
+    _ = lc;
+
+    try app.autoCurve().?.points.append(alloc, .{ .step = 0, .value = 0.5 });
+    app.autoCurve().?.sel_idx = 0;
+
+    // % ：键入 80 → 0.8
+    app.autoCurve().?.display_unit = .percent;
+    app.beginEditAutomationValue(-1, 0, "50", 0, 0, 60);
+    while (app.text_input.text().len > 0) app.textInputBackspace();
+    for ("80") |c| app.textInputAppend(c);
+    app.textInputCommit();
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), app.autoCurve().?.points.items[0].value, 1e-6);
+
+    // dB ：键入 −60 = 静音（0）
+    app.autoCurve().?.display_unit = .db;
+    app.beginEditAutomationValue(-1, 0, "", 0, 0, 60);
+    for ("-60") |c| app.textInputAppend(c);
+    app.textInputCommit();
+    try std.testing.expectEqual(@as(f32, 0.0), app.autoCurve().?.points.items[0].value);
+
+    // 非法输入 → 值不变
+    app.autoCurve().?.display_unit = .percent;
+    app.beginEditAutomationValue(-1, 0, "", 0, 0, 60);
+    for ("abc") |c| app.textInputAppend(c);
+    app.textInputCommit();
+    try std.testing.expectEqual(@as(f32, 0.0), app.autoCurve().?.points.items[0].value);
+
+    // 越界钳制：% 里键入 999 → 1.0
+    app.beginEditAutomationValue(-1, 0, "", 0, 0, 60);
+    for ("999") |c| app.textInputAppend(c);
+    app.textInputCommit();
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), app.autoCurve().?.points.items[0].value, 1e-6);
+}
+
+test "automation: LaneSnap（音频侧副本）与 view_lane.evalAt 逐点一致" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+
+    app.resetMixerChannels(3); // 0 = 主通道；1/2 = 普通通道（含稳定 uid）
+    const uid1 = app.mixer_channels_state.items[1].uid;
+    const cid = app.addAutoCurve("对拍");
+    app.auto_sel = cid;
+    _ = app.autoCurve().?.insertPoint(alloc, 0, 0.1);
+    _ = app.autoCurve().?.insertPoint(alloc, 40, 0.9);
+    _ = app.autoCurve().?.insertPoint(alloc, 96, 0.3);
+    app.autoCurve().?.points.items[0].curve = 0.25;
+    try std.testing.expect(app.bindCurveTarget(cid, .{ .kind = .mixer_vol, .uid = uid1 }));
+
+    for ([_]view_lane.Interp{ .hold, .linear, .smooth }) |it| {
+        app.autoCurve().?.interp = it;
+        app.publishAutoLane();
+        const set = &app.params.lane_bufs[app.params.lane_pub.load(.monotonic)];
+        const snap = &set.lanes[0];
+        try std.testing.expect(snap.active);
+        try std.testing.expectEqual(@as(u32, 3), snap.n);
+        var s: f32 = -5.0;
+        while (s < 105.0) : (s += 0.37) {
+            const a = app.autoCurve().?.evalAt(s);
+            const b = snap.evalAt(s);
+            try std.testing.expectApproxEqAbs(a, b, 1e-6);
+        }
+    }
+
+    // 无点 → 不发布（音频侧回落静态推子）
+    app.autoCurve().?.points.clearRetainingCapacity();
+    app.publishAutoLane();
+    try std.testing.expectEqual(@as(u32, 0), app.params.lane_bufs[app.params.lane_pub.load(.monotonic)].n);
+
+    // 声像目标：也发布（`kind = 1` → 音频侧叠加到声像而不是增益）
+    _ = app.unbindCurveTarget(cid, .{ .kind = .mixer_vol, .uid = uid1 });
+    _ = app.autoCurve().?.insertPoint(alloc, 0, 1.0);
+    try std.testing.expect(app.bindCurveTarget(cid, .{ .kind = .mixer_pan, .uid = uid1 }));
+    // 声像目标**默认双向**（曲线 0.5 处不动，1.0 处 → +1×深度）
+    try std.testing.expect(app.auto_bindings.items[app.bindingIndex(cid, .{ .kind = .mixer_pan, .uid = uid1 }).?].bipolar);
+    app.publishAutoLane();
+    const setp = &app.params.lane_bufs[app.params.lane_pub.load(.monotonic)];
+    try std.testing.expectEqual(@as(u32, 1), setp.n);
+    try std.testing.expectEqual(@as(u8, 1), setp.lanes[0].kind);
+    // 声像通道的贡献算在 pan 分组里（增益分组应为 0）
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), setp.contribution(1, 0, true), 1e-5);
+    try std.testing.expectEqual(@as(usize, 0), setp.countForChannel(1, false));
+}
+
+test "通道 uid：稳定身份——分配单调、移动后跟随通道、uid→下标可反查" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+
+    app.resetMixerChannels(3); // 0 = 主通道；1 / 2 = 普通通道（uid 由 reset 内部分配）
+    const uid0 = app.mixer_channels_state.items[0].uid;
+    const uid1 = app.mixer_channels_state.items[1].uid;
+    const uid2 = app.mixer_channels_state.items[2].uid;
+    try std.testing.expect(uid0 != 0 and uid1 != 0 and uid2 != 0);
+    try std.testing.expect(uid0 != uid1 and uid1 != uid2 and uid0 != uid2);
+
+    // 通道2 上移一位 → 与通道1 交换：uid 必须**跟着通道走**
+    app.mixer_channels_state.items[2].name_len = 0;
+    const moved_uid = uid2;
+    try std.testing.expect(app.moveMixerChannel(2, -1));
+    try std.testing.expectEqual(moved_uid, app.mixer_channels_state.items[1].uid);
+    try std.testing.expectEqual(uid1, app.mixer_channels_state.items[2].uid);
+    // uid → 下标 反查跟着变
+    try std.testing.expectEqual(@as(?usize, 1), app.channelIndexByUid(moved_uid));
+    try std.testing.expectEqual(@as(?usize, 2), app.channelIndexByUid(uid1));
+    try std.testing.expectEqual(@as(?usize, null), app.channelIndexByUid(9999));
+
+    // 幂等：已分配的 uid 不会被改写
+    app.ensureChannelUids();
+    try std.testing.expectEqual(uid0, app.mixer_channels_state.items[0].uid);
+    try std.testing.expectEqual(moved_uid, app.mixer_channels_state.items[1].uid);
+}
+
+test "automation: 曲线仓库 + 绑定（多通道共享一条曲线，发布为多条 lane）" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+
+    app.resetMixerChannels(3); // 0 主通道 / 1 / 2
+    const uid1 = app.mixer_channels_state.items[1].uid;
+    const uid2 = app.mixer_channels_state.items[2].uid;
+
+    const cid = app.addAutoCurve("渐强");
+    try std.testing.expect(cid != 0);
+    app.auto_sel = cid;
+    _ = app.autoCurve().?.insertPoint(alloc, 0, 0.2);
+    _ = app.autoCurve().?.insertPoint(alloc, 48, 0.8);
+
+    // 一条曲线绑多个通道
+    try std.testing.expect(app.bindCurveTarget(cid, .{ .kind = .mixer_vol, .uid = uid1 }));
+    try std.testing.expect(app.bindCurveTarget(cid, .{ .kind = .mixer_vol, .uid = uid2 }));
+    try std.testing.expect(app.bindCurveTarget(cid, .{ .kind = .master_vol }));
+    try std.testing.expect(!app.bindCurveTarget(cid, .{ .kind = .mixer_vol, .uid = uid2 })); // 重复
+    try std.testing.expectEqual(@as(usize, 3), app.bindingCountOfCurve(cid));
+
+    app.publishAutoLane();
+    const set = &app.params.lane_bufs[app.params.lane_pub.load(.monotonic)];
+    try std.testing.expectEqual(@as(u32, 3), set.n);
+    try std.testing.expectEqual(@as(usize, 1), set.countForChannel(0, false));
+    try std.testing.expectEqual(@as(usize, 1), set.countForChannel(1, false));
+    try std.testing.expectEqual(@as(usize, 1), set.countForChannel(2, false));
+    // 贡献 = 曲线值 × 深度(1.0)；步 24 → 线性中点 0.5
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), set.contribution(1, 24, false), 1e-5);
+
+    // 通道 2 上移 → 绑定跟着 uid 走
+    try std.testing.expect(app.moveMixerChannel(2, -1));
+    app.publishAutoLane();
+    const set2 = &app.params.lane_bufs[app.params.lane_pub.load(.monotonic)];
+    try std.testing.expectEqual(@as(usize, 1), set2.countForChannel(1, false));
+    try std.testing.expectEqual(@as(usize, 1), set2.countForChannel(2, false));
+
+    // 删曲线 → 绑定一起消失、发布为空
+    try std.testing.expect(app.removeAutoCurve(cid));
+    try std.testing.expectEqual(@as(usize, 0), app.auto_bindings.items.len);
+    app.publishAutoLane();
+    try std.testing.expectEqual(@as(u32, 0), app.params.lane_bufs[app.params.lane_pub.load(.monotonic)].n);
+}
+
+test "automation: 一参数叠两条曲线——深度 / 极性 / 启用 / 钳制" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+
+    app.resetMixerChannels(2);
+    const uid1 = app.mixer_channels_state.items[1].uid;
+    const tgt = view_lane.Target{ .kind = .mixer_vol, .uid = uid1 };
+
+    // 曲线 A：恒定 0.5（单向 100% → +0.5）
+    const ca = app.addAutoCurve("A");
+    app.auto_sel = ca;
+    _ = app.autoCurve().?.insertPoint(alloc, 0, 0.5);
+    // 曲线 B：恒定 1.0，深度 50%，**双向** → (1−0.5)*2*0.5 = +0.5
+    const cb = app.addAutoCurve("B");
+    app.auto_sel = cb;
+    _ = app.autoCurve().?.insertPoint(alloc, 0, 1.0);
+
+    try std.testing.expect(app.bindCurveTarget(ca, tgt));
+    try std.testing.expect(app.bindCurveTarget(cb, tgt));
+    {
+        const i = app.bindingIndex(cb, tgt).?;
+        app.auto_bindings.items[i].depth = 0.5;
+        app.auto_bindings.items[i].bipolar = true;
+    }
+
+    app.publishAutoLane();
+    const set = &app.params.lane_bufs[app.params.lane_pub.load(.monotonic)];
+    try std.testing.expectEqual(@as(usize, 2), set.countForChannel(1, false)); // 同一通道叠了两条
+    // 基准 0.2 + 0.5 + 0.5 = 1.2 → 音频侧钳到 1.0
+    const contrib = set.contribution(1, 0, false);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), contrib, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), std.math.clamp(0.2 + contrib, 0.0, 1.0), 1e-5);
+    // UI 侧预览值与音频侧一致
+    try std.testing.expectApproxEqAbs(std.math.clamp(0.0 + contrib, 0.0, 1.0), app.autoValueFor(tgt, 0, 0.2), 1e-5);
+
+    // 禁用 B → 只剩 A 的 +0.5
+    {
+        const i = app.bindingIndex(cb, tgt).?;
+        app.auto_bindings.items[i].enabled = false;
+    }
+    app.publishAutoLane();
+    const set2 = &app.params.lane_bufs[app.params.lane_pub.load(.monotonic)];
+    try std.testing.expectEqual(@as(usize, 1), set2.countForChannel(1, false));
+    // 有绑定 → 基准 = 类型默认（音量 0）；只剩 A 的 +0.5\n    try std.testing.expectApproxEqAbs(@as(f32, 0.5), app.autoValueFor(tgt, 0, 0.2), 1e-5);
+
+    // 全部解绑 → 发布为空、参数回到基准值
+    try std.testing.expect(app.unbindCurveTarget(ca, tgt));
+    try std.testing.expect(app.unbindCurveTarget(cb, tgt));
+    try std.testing.expect(!app.unbindCurveTarget(ca, tgt)); // 已经没了
+    app.publishAutoLane();
+    try std.testing.expectEqual(@as(u32, 0), app.params.lane_bufs[app.params.lane_pub.load(.monotonic)].n);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), app.autoValueFor(tgt, 0, 0.2), 1e-5);
+}
+
+test "automation: 新建曲线按参数名自动命名（重名加序号）" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+
+    app.resetMixerChannels(3);
+    const uid1 = app.mixer_channels_state.items[1].uid;
+    var nb: [48]u8 = undefined;
+
+    const tgt = view_lane.Target{ .kind = .mixer_vol, .uid = uid1 };
+    const n1 = app.autoCurveNameFor(tgt, &nb);
+    try std.testing.expect(std.mem.endsWith(u8, n1, "· 音量"));
+    const c1 = app.addAutoCurve(n1);
+    try std.testing.expect(c1 != 0);
+
+    // 同名再建 → 自动加 (2)
+    const n2 = app.autoCurveNameFor(tgt, &nb);
+    try std.testing.expect(std.mem.endsWith(u8, n2, "音量2")); // 去括号格式：`…音量2`
+    _ = app.addAutoCurve(n2);
+
+    // 主通道
+    const nm = app.autoCurveNameFor(.{ .kind = .master_vol }, &nb);
+    try std.testing.expectEqualStrings("主通道 · 音量", nm);
+
+    // 删除带绑定的曲线 → 绑定一起清
+    const c3 = app.addAutoCurve("临时");
+    try std.testing.expect(app.bindCurveTarget(c3, tgt));
+    try std.testing.expectEqual(@as(usize, 1), app.bindingCountOfCurve(c3));
+    try std.testing.expect(app.removeAutoCurve(c3));
+    try std.testing.expectEqual(@as(usize, 0), app.bindingCountOfCurve(c3));
+    try std.testing.expect(app.curveIndexById(c3) == null);
+}
+
+test "automation: 基准值可编辑 + 控件右键恢复默认（base/bipolar）" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+
+    app.resetMixerChannels(2);
+    const uid1 = app.mixer_channels_state.items[1].uid;
+    const tgt = view_lane.Target{ .kind = .mixer_vol, .uid = uid1 };
+    const cid = app.addAutoCurve("c1");
+    app.auto_sel = cid;
+    _ = app.autoCurve().?.insertPoint(alloc, 0, 0.5);
+    try std.testing.expect(app.bindCurveTarget(cid, tgt));
+    const bi = app.bindingIndex(cid, tgt).?;
+
+    // 默认：base = null → 类型默认（音量 0）；极性单向
+    try std.testing.expect(app.auto_bindings.items[bi].base == null);
+    try std.testing.expectEqual(@as(f32, 0.0), view_lane.Target.defaultBase(tgt.kind));
+    try std.testing.expect(!app.auto_bindings.items[bi].bipolar);
+
+    // 合成值 = 0（基准）+ 0.5（曲线）= 0.5
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), app.autoValueFor(tgt, 0, 0.9), 1e-5);
+
+    // 键入基准 30% → 合成 = 0.3 + 0.5 = 0.8
+    app.beginEditAutomationBase(bi, "30", 0, 0, 60);
+    while (app.text_input.text().len > 0) app.textInputBackspace();
+    for ("30") |ch| app.textInputAppend(ch);
+    app.textInputCommit();
+    try std.testing.expectApproxEqAbs(@as(f32, 0.3), app.auto_bindings.items[bi].base.?, 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), app.autoValueFor(tgt, 0, 0.9), 1e-5);
+
+    // 右键恢复默认 → base 回到 null，合成回到 0.5；极性恢复默认仍是单向
+    app.auto_bindings.items[bi].base = null;
+    app.auto_bindings.items[bi].bipolar = true;
+    app.auto_bindings.items[bi].bipolar = view_lane.Target.defaultBipolar(tgt.kind);
+    try std.testing.expect(!app.auto_bindings.items[bi].bipolar);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), app.autoValueFor(tgt, 0, 0.9), 1e-5);
+
+    // 声像：默认基准 0.5、默认双向
+    const pt = view_lane.Target{ .kind = .mixer_pan, .uid = uid1 };
+    try std.testing.expectEqual(@as(f32, 0.5), view_lane.Target.defaultBase(pt.kind));
+    try std.testing.expect(view_lane.Target.defaultBipolar(pt.kind));
+    try std.testing.expect(app.bindCurveTarget(cid, pt));
+    try std.testing.expect(app.auto_bindings.items[app.bindingIndex(cid, pt).?].bipolar);
 }

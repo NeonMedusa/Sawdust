@@ -16,7 +16,7 @@ const vst_host = @import("vst_host.zig");
 // ── 布局常量 ──
 pub const toolbar_h: i32 = 40; // 顶部工具栏高度
 pub const status_h: i32 = 26; // 底部状态栏高度
-pub const splitter_w: i32 = 4; // 分隔条宽度
+pub const splitter_w: i32 = 4; // 分隔条宽度（视觉厚度；命中区另外外扩，见 ui.splitter_pad）
 pub const min_pane_w: i32 = 100; // 每栏最小宽度
 pub const title_h: i32 = 24; // 面板标题栏高度
 

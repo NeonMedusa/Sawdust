@@ -6,6 +6,7 @@ const Ui = @import("ui.zig").Ui;
 const App = @import("app.zig").App;
 const model = @import("model.zig");
 const util = @import("view_util.zig");
+const view_lane = @import("view_lane.zig");
 
 /// 片段在轨道内容区的绘制矩形（x / 宽；屏幕像素，含 zoom 换算）。
 /// **边缘与格子对齐**（不缩进）；起点/终点各自取整 → 并排片段严格相接、无 1px 缝。
@@ -163,10 +164,26 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 游标跳到鼠标位置）。
     const menu_click = (snap_menu_was_open or snap_clicked) and ui.mouse_pressed;
 
-    const header_w: i32 = 90; // 轨道名列宽
+    const header_w: i32 = util.piano_header_w; // 轨道名列宽（**与钢琴窗琴键列同宽**，用户约定）
     const ruler_h: i32 = 20; // 标尺行高 = 滚动条厚度（横条高 = 纵条宽）
     const list_y = y + util.title_h;
-    const list_h = h - util.title_h;
+    const list_h_full = h - util.title_h;
+    // ── **自动化面板**（`docs/automation.md` §九）：与钢琴窗一致的**上下真分隔** ──
+    // 先在总高度里扣出面板高度，再让 `list_h` 用剩余部分——
+    // 这样标尺/轨道/横纵滚动条（含其命中区域）**全部**自动不进入面板带，
+    // 不再是“盖在上面”（那样会点击穿透、滚动条滑进面板里）。
+    // 上限与钢琴窗**同一个基准**：都按「轨道/音符内容区（扣掉两行标尺）」的一半来算。
+    // 面板自己含一行目标切换按钮（hdr_h），所以要把这 20px 加回上限，
+    // 否则用户会看到“播放列表的编辑区能拉得更高”（多出来的正好是按钮行高，实测）。
+    // （按钮行高 20 已含在面板内部；上限不再额外加它）
+    // **与钢琴窗走同一份布局数学**（`view_lane.layoutPanel`），高度也共用 `app.auto_panel_h`
+    const lay = view_lane.layoutPanel(list_y + ruler_h * 2, list_y + list_h_full, 4, app.auto_panel_h, 60);
+    const auto_h: i32 = lay.panel_h;
+    // 分隔条：**与钢琴窗完全同款**——只让出自身厚度，只画这一条（不加“带子”底色）。
+    // 悬停/按下都严格限制在本体内（`ui.splitterH` 已改成不外扩）→ 不会误放片段。
+    // 粗细取 6px：4px 的横线视觉上明显比 4px 的竖线细，6px 才看起来等宽。
+    const splitter_h: i32 = 4;
+    const list_h = @max(1, list_h_full - auto_h - splitter_h);
 
     const main_x = x + 1;
     const main_w = w - 2 - ruler_h; // 主区宽（右侧留出滚动条列）
@@ -175,6 +192,14 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     const ruler_y = list_y + ruler_h; // 标尺行（右端为 □ 缺口：自然留空）
     const tracks_y = list_y + ruler_h * 2;
     const tracks_h = list_h - ruler_h * 2;
+
+    // ── **分隔条先处理**（在一切内容之前）：认领这次按下并吃掉它，
+    //    否则面板里的“点空白放片段 / 拖柱条改力度”会先吃到这一下（实测）。
+    {
+        const split_y0 = view_lane.layoutPanel(list_y + ruler_h * 2, list_y + list_h_full, 4, app.auto_panel_h, 60).split_y;
+        _ = ui.splitterH(Ui.idOf("playlist_auto_splitter", 0), &app.auto_panel_h, split_y0, main_x, @max(1, x + w - main_x), splitter_h, 60, view_lane.layoutPanel(list_y + ruler_h * 2, list_y + list_h_full, 4, app.auto_panel_h, 60).max_h);
+        app.auto_panel_h = view_lane.layoutPanel(list_y + ruler_h * 2, list_y + list_h_full, 4, app.auto_panel_h, 60).panel_h;
+    }
     const lane_x = main_x + header_w;
     const view_w = @max(1, main_w - header_w); // 轨道内容可视宽度
     // 时间轴尺寸（与钢琴卷帘统一）：步 = U=96 单位；
@@ -322,6 +347,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 行高必须在 □ 缩放块**之后**捕获：否则本帧会用「旧行高 + 新滚动偏移」绘制，
     // 每步缩放都会跳一帧（实测明显上下跳变），下一帧才恢复。
     const track_h: i32 = app.playlist.track_h;
+
     // 几何写回（拖入文件的落点换算用；与绘制同一套坐标）
     app.playlist.geom = .{ .lane_x = lane_x, .tracks_y = tracks_y, .view_w = view_w, .tracks_h = tracks_h, .track_h = track_h };
     // 可见行数（“行轴无限延伸”的可视化）：行照常铺到视口底——**悬空时视口下方的行
@@ -725,7 +751,11 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // ── 鼠标交互（轨道内容区）──
     // 左键空位：放置样式；左键片段：拖动移动；片段右缘：拉伸长度；右键片段：删除
     // （`menu_click` 门控已在函数顶部提前计算——标尺/轨道区都用它）
-    const in_lane = !menu_click and ui.hitRect(lane_x, tracks_y, view_w, tracks_h);
+    // **面板带（分割条 + 自动化面板）整块不属于轨道区**：显式排除，
+    // 不再依赖“tracks_h 已经减过 auto_h”这种间接保证（实测：点面板会落到轨道行上）。
+    const panel_top: i32 = list_y + list_h;
+    const in_panel = ui.mouse_y >= panel_top;
+    const in_lane = !menu_click and !in_panel and ui.hitRect(lane_x, tracks_y, view_w, tracks_h);
     const track_i = @divFloor(ui.mouse_y - tracks_y + app.playlist.scroll, track_h);
     // 鼠标 → 内容坐标（除以 zoom）→ **全局步**（U=96）
     const mouse_cx: f32 = @as(f32, @floatFromInt(app.playlist.scroll_x)) + @as(f32, @floatFromInt(ui.mouse_x - lane_x)) / zoom;
@@ -1114,7 +1144,13 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 中键拖动中：屏蔽滚轮（含 Ctrl/Shift 缩放）——缩放会让锚定比例失准、
     // 拖动跟随抽动（用户约定：拖动期间只平移，不缩放）
     // 网格区**和**纵向滚动条上都响应滚轮（鼠标停在滚动条上滚不动不符合直觉）
-    if (!app.playlist.nav_active and (ui.hitRect(main_x, tracks_y, main_w, tracks_h) or ui.hitRect(sb_x, tracks_y, ruler_h, tracks_h))) {
+    // **Ctrl+滚轮（横向缩放）的范围要把自动化面板也算进来**（与钢琴窗对齐：
+    // 钢琴窗的命中区是 `lane_h + splitter_h + editor_h`）。其余修饰键保持原范围，
+    // 以免面板里的滚轮被播放列表抢走。
+    const over_tracks = ui.hitRect(main_x, tracks_y, main_w, tracks_h);
+    const over_with_panel = ui.hitRect(main_x, tracks_y, main_w, tracks_h + splitter_h + auto_h);
+    const wheel_area = if (ui.wheel_ctrl) over_with_panel else over_tracks;
+    if (!app.playlist.nav_active and (wheel_area or ui.hitRect(sb_x, tracks_y, ruler_h, tracks_h))) {
         if (ui.wheel_ctrl) {
             // Ctrl+滚轮：横向缩放——**只更新补间目标**（滚轮离散，逐帧平滑逼近；
             // 补间块在本段之后；锚定用事件时的鼠标偏移，补间每一步都锚定）
@@ -1352,6 +1388,116 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         app.pending_edit_op = null;
     }
 
+    // ── **自动化面板（v0 原型）**：与钢琴窗底部**同一套布局**（`docs/automation.md` §九）──
+    // 横向只覆盖**播放列表主区**（行头列 + 剪辑区），不压左侧样式栏/右侧历史栏；
+    // 行头列位置放**目标切换按钮**（对应钢琴窗的 力度/声像 toggle2）。
+    if (auto_h >= 48) {
+        const ay = lay.panel_y;
+        const panel_w = @max(1, x + w - lane_x); // 自动化区没有滚动条 → 铺到窗口右沿
+
+        // ── **共用外壳**（底色/顶线/分隔线/竖向网格/播放游标）——与钢琴窗编辑区同一份代码 ──
+        const cur_steps: f32 = app.cursorDisplay(true);
+        const ghost = !app.sel.song_mode and app.patOriginClip() == null;
+        view_lane.drawShell(ui, .{
+            .x = main_x,
+            .y = ay,
+            .w = @max(1, x + w - main_x),
+            .h = auto_h,
+            .lane_x = lane_x,
+            .step_w = @floatFromInt(util.piano_step_w),
+            .zoom = app.playlist.zoom,
+            .scroll_x = app.playlist.scroll_x,
+            .bar_steps = app.steps_per_bar,
+            .beat_steps = @max(1, @divTrunc(app.steps_per_bar, 4)),
+            .snap_steps = model.snapSteps(app.playlist.snap),
+            .cursor_step = if (ghost) null else cur_steps,
+            .playing = app.playing,
+        });
+
+        // 横向值参考线：与钢琴窗**同一个函数**（1/8 等分；中线只画一次、正好在 50%）
+        view_lane.drawValueGrid(ui, .{ .x = lane_x, .y = ay, .w = panel_w, .h = auto_h }, auto_h >= 64);
+
+        // 行头列顶部两行：单位按钮 + 当前点数值（与钢琴窗同一份代码）
+        const cur_lane = app.autoCurve() orelse return;
+        const hh = view_lane.drawValueHeader(ui, cur_lane, main_x, ay, util.piano_header_w);
+        if (hh.value_clicked) {
+            if (cur_lane.sel_idx) |si| {
+                var vb: [24]u8 = undefined;
+                const pre = view_lane.formatValue(cur_lane.display_unit, cur_lane.points.items[si].value, &vb);
+                app.beginEditAutomationValue(-1, si, pre, hh.rect.x, hh.rect.y, hh.rect.w);
+            }
+        }
+        // ── 行头列：**曲线列表**（显示曲线名）──
+        // 左键 = 选中编辑；双击 = 重命名；右键 = 菜单（重命名 / 删除曲线）
+        {
+            const n = @min(app.auto_curves.items.len, 32);
+            var names: [32][24]u8 = undefined;
+            var shown: [32][]const u8 = undefined;
+            var entries: [32]view_lane.ListEntry = undefined;
+            for (0..n) |k| {
+                const lc = &app.auto_curves.items[k];
+                shown[k] = lc.name(&names[k]);
+                entries[k] = .{ .text = shown[k], .active = app.auto_sel == lc.id };
+            }
+            if (n == 0) {
+                entries[0] = .{ .text = "（点下方轨道右键 → 自动化…）", .active = false };
+            }
+            const list = if (n == 0) entries[0..1] else entries[0..n];
+            const lh = view_lane.drawList(ui, main_x, ay, auto_h, util.piano_header_w, 40, &app.auto_list_scroll, list);
+            if (n > 0) {
+                if (lh.index) |hi| {
+                    if (hi < n) app.auto_sel = app.auto_curves.items[hi].id;
+                }
+                if (lh.dbl) |hi| {
+                    if (hi < n) {
+                        const cid = app.auto_curves.items[hi].id;
+                        app.beginRenameAutoCurve(cid, main_x + 4, ay + 44 + 18, util.piano_header_w);
+                    }
+                }
+                // 右键 → **菜单**（不是直接删）
+                if (lh.right) |hi| {
+                    if (hi < n) {
+                        app.curve_menu = .{
+                            .open = true,
+                            .just_opened = true,
+                            .x = ui.mouse_x,
+                            .y = ui.mouse_y,
+                            .curve_id = app.auto_curves.items[hi].id,
+                        };
+                    }
+                }
+            }
+        }
+
+        // ── 曲线行右键菜单（重命名 / 删除曲线）──
+        if (app.curve_menu.open) {
+            const items = [_][]const u8{ "重命名", "删除曲线" };
+            const en = [_]bool{ true, true };
+            const bounds: @import("ui.zig").Rect = .{ .x = main_x, .y = ay, .w = @max(1, x + w - main_x), .h = auto_h };
+            if (util.menuPanel(ui, &app.curve_menu.x, &app.curve_menu.y, &app.curve_menu.open, app.curve_menu.just_opened, .{ .cursor = {} }, bounds, &items, 110, &en)) |ci| {
+                const cid = app.curve_menu.curve_id;
+                switch (ci) {
+                    0 => app.beginRenameAutoCurve(cid, main_x + 4, ay + 44 + 18, util.piano_header_w),
+                    else => {
+                        if (app.bindingCountOfCurve(cid) > 1) {
+                            app.struct_del_req = .{ .auto_curve = cid };
+                            app.modal = .delete_auto_curve;
+                            app.modal_choice = null;
+                        } else if (app.removeAutoCurve(cid)) {
+                            app.setToast("已删除曲线");
+                        }
+                    },
+                }
+            }
+            app.curve_menu.just_opened = false;
+        }
+
+        // 值轨本体（内容层）：与剪辑区同一横坐标映射。
+        // ⚠️ **必须在这里重新解析曲线指针**：上面可能删过曲线（`removeAutoCurve` 会搬移/释放
+        // 仓库内存），沿用旧指针 = use-after-free（实测：右键删曲线后崩溃在 `view_lane.draw`）。
+        const draw_lane = app.autoCurve() orelse return;
+        view_lane.draw(ui, draw_lane, lane_x, ay, panel_w, auto_h, @floatFromInt(util.piano_step_w), app.steps_per_bar, app.playlist.scroll_x, app.playlist.zoom, app.allocator);
+    }
     // 吸附网格下拉（在**全部内容之后** → 绘制在最上层）
     if (app.playlist.snap_menu_open and snap_btn_x + 40 < x + w - 24) {
         _ = util.snapSelectorMenu(ui, snap_btn_x, y + util.title_h, &app.playlist.snap, &app.playlist.snap_menu_open, snap_clicked);

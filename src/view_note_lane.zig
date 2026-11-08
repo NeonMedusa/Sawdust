@@ -19,6 +19,7 @@ const model = @import("model.zig");
 const app_mod = @import("app.zig");
 const Ui = @import("ui.zig").Ui;
 const util = @import("view_util.zig");
+const view_lane = @import("view_lane.zig");
 
 const App = app_mod.App;
 const NoteLaneMode = app_mod.NoteLaneMode;
@@ -28,7 +29,7 @@ pub const min_h: i32 = 44;
 /// 编辑轨最大高度占内容区的比例（35%）
 pub const max_frac: f32 = 0.35;
 /// 柱条纵向内缩（上下各留白；值域映射的可用高度 = lane_h − 2*inset）
-const inset: i32 = 4;
+const inset: i32 = 0; // 值轴**不内缩**（0 → 底边、1 → 顶边；与 `view_lane.yOf` 同一映射）
 /// 柱条宽度范围
 const bar_w_min: i32 = 4;
 const bar_w_max: i32 = 8;
@@ -106,23 +107,51 @@ pub fn draw(
     const head_x = x;
     const track_x = lane_x;
     const track_w = @max(1, x + w - lane_x);
-    // 背景 = 深灰（`bg`；与钢琴卷帘的音符区外底色呼应）
-    ui.renderer.fillRect(x, y, w, h, ui.theme.bg);
-    ui.renderer.hline(x, y, w, ui.theme.panel_border);
-    // 轨道头 / 柱条区的分界（与钢琴卷帘的琴键列分界一致）
-    ui.renderer.vline(lane_x, y, h, ui.theme.panel_border);
+    // ── **共用外壳**：底色 / 顶线 / 行头列分隔线 / 竖向网格 —— 与播放列表自动化区**同一份代码** ──
+    //（横向值参考线仍各自画：它依赖本模式的值→像素映射，见下方 8/32 刻度）
+    // 播放游标位置（**与卷帘/标尺同一映射**）：SONG 模式映射到当前片段局部，不在片段内不画
+    const cur_vis = blk: {
+        if (!app.sel.song_mode) break :blk @as(?f32, app.cursorDisplay(false));
+        const c = app.patOriginClip() orelse break :blk null;
+        if (model.clipSongToLocal(c, app.playback.song_step) == null) break :blk null;
+        break :blk app.cursorDisplay(true) - @as(f32, @floatFromInt(c.start)) + @as(f32, @floatFromInt(c.offset));
+    };
+    view_lane.drawShell(ui, .{
+        .x = x,
+        .y = y,
+        .w = w,
+        .h = h,
+        .lane_x = lane_x,
+        .step_w = step_ws / @max(0.0001, zoom), // 内容步宽（drawShell 内部再乘 zoom）
+        .zoom = zoom,
+        .scroll_x = scroll_x,
+        .bar_steps = app.steps_per_bar,
+        .beat_steps = model.stepsPerBeat(app.time_den),
+        .snap_steps = snap_steps,
+        .cursor_step = cur_vis,
+        .playing = app.playing,
+    });
 
-    // ── 轨道头：模式切换 + 读数 ──
+    // ── 行头列：**共用 lane 列表**（per-note 项 + 样式作用域的 MIDI CC 项）──
+    // ── 行头列：**音符级**两种视图（力度 / 声像）──
+    // 用户拍板：钢琴窗**只做音符级**控制；BPM / 通道 / 乐器音量声像等连续曲线全部归播放列表
+    // 的自动化区（工程作用域），所以这里不再有 MIDI CC lane，也没有 envelope 曲线视图。
     var mode_changed = false;
     {
-        const bh = @min(22, h - 20);
-        const bw = util.piano_header_w - 12;
-        const bx = head_x + 6;
-        const by = y + 4;
-        const left_active = app.piano.lane_mode == .velocity;
-        if (ui.toggle2(7000, "力度", "声像", left_active, bx, by, bw, bh)) {
-            app.piano.lane_mode = if (left_active) .pan else .velocity;
-            mode_changed = true;
+        const items = [_]struct { text: []const u8, mode: app_mod.NoteLaneMode }{
+            .{ .text = "音符力度", .mode = .velocity },
+            .{ .text = "音符声像", .mode = .pan },
+        };
+        var entries: [items.len]view_lane.ListEntry = undefined;
+        for (items, 0..) |it, i| {
+            entries[i] = .{ .text = it.text, .active = app.piano.lane_mode == it.mode };
+        }
+        if (view_lane.drawList(ui, head_x, y, h, util.piano_header_w, 22, &app.piano.lane_scroll, &entries).index) |hit| {
+            const m = items[hit].mode;
+            if (app.piano.lane_mode != m) {
+                app.piano.lane_mode = m;
+                mode_changed = true;
+            }
         }
     }
 
@@ -185,48 +214,13 @@ pub fn draw(
             }
             break :blk "—";
         };
-        ui.label(text, head_x + 8, y + 30, ui.theme.text_dim);
+        ui.labelClipped(text, head_x + 2, y + 22, util.piano_header_w - 4, ui.theme.text_dim);
     }
-
-    // ── 网格：纵向与钢琴窗**同参数**（步线/拍线/小节线）；
-    //          横向 = 值域参考线（0-127 按 32 分 4 格、每格再按 8 分 4 小格）──
     {
-        const saved = ui.renderer.pushClip(track_x, y, track_w, h);
-        defer ui.renderer.popClip(saved);
-        util.drawTimelineGrid(
-            &ui.renderer,
-            &ui.theme,
-            track_x,
-            track_w,
-            y,
-            h,
-            track_x,
-            scroll_x, // 帧首快照（与音符区同帧——本函数在缩放补间之后绘制，勿现读 app）
-            zoom,
-            @floatFromInt(util.piano_step_w),
-            app.steps_per_bar,
-            model.stepsPerBeat(app.time_den),
-            snap_steps,
-        );
-        // 横向参考线：值与像素映射与柱条**同一公式**（两种模式共用值域坐标——
-        // 力度/声像的 32/64/96 在屏幕上同位）。主线 = 32 的倍数（4 格 3 线），
-        // 细线 = 8 的倍数（每格 4 小格 3 线；太矮时不画，否则糊成一片）。
-        var v: i32 = 8;
-        while (v < 127) : (v += 8) {
-            const is_major = @mod(v, 32) == 0;
-            if (!is_major and avail < 64) continue;
-            const ly = if (mode == .velocity)
-                top + avail - velBarH(v, avail)
-            else
-                top + @divTrunc(avail, 2) - panBarH(v, avail);
-            if (ly <= top or ly >= top + avail) continue;
-            ui.renderer.hline(track_x, ly, track_w, if (is_major) ui.theme.grid_beat else ui.theme.grid_snap);
-        }
-        // 声像模式：中线（64；比主线更亮）
+        // 横向参考线：与包络视图**同一个函数**（1/8 等分；中线只画一次）
+        view_lane.drawValueGrid(ui, .{ .x = track_x, .y = top, .w = track_w, .h = avail }, avail >= 64);
+        // 声像模式：两端提示 R（上）/ L（下）
         if (mode == .pan) {
-            const mid_y = top + @divTrunc(avail, 2);
-            ui.renderer.hline(track_x, mid_y, track_w, ui.theme.grid_bar);
-            // 两端提示：R（上）/ L（下）
             ui.label("R", x + w - 14, top, ui.theme.text_dim);
             ui.label("L", x + w - 14, top + avail - 12, ui.theme.text_dim);
         }
@@ -335,31 +329,6 @@ pub fn draw(
                 ui.renderer.fillRect(s0, y, track_x + track_w - s0, h, scrim);
             }
             if (dx[1] >= track_x and dx[1] <= track_x + track_w) ui.renderer.vline(dx[1], y, h, ui.theme.text_dim);
-        }
-    }
-
-    // ── 播放游标（贯穿编辑轨）──
-    {
-        // **平滑小数步**（子步 + 渲染侧前馈/收敛；音频缓冲量化不显——“游标还是抖”的终解）。
-        // SONG：与卷帘同法映射到当前片段局部（不在片段内不画）；PAT：局部步。
-        var cur_f: f32 = app.cursorDisplay(false);
-        var show = true;
-        if (app.sel.song_mode) {
-            show = false;
-            // SONG 模式片段参照 = **锚**（双击的片段；无快照回退最左）——与钢琴窗统一
-            if (app.patOriginClip()) |c| {
-                if (model.clipSongToLocal(c, app.playback.song_step) != null) {
-                    cur_f = app.cursorDisplay(true) - @as(f32, @floatFromInt(c.start)) + @as(f32, @floatFromInt(c.offset));
-                    show = true;
-                }
-            }
-        }
-        if (show) {
-            const cx = track_x + @as(i32, @intFromFloat(cur_f * step_ws - scroll_s));
-            if (cx >= track_x - 2 and cx <= track_x + track_w + 2) {
-                const col = if (app.playing) ui.theme.cursor_play else ui.theme.cursor_idle;
-                ui.renderer.vline(cx, y, h, col);
-            }
         }
     }
 

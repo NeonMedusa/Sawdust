@@ -35,6 +35,7 @@ const view_panels = @import("view_panels.zig");
 const view_presets = @import("view_presets.zig");
 const view_drumkit = @import("view_drumkit.zig");
 const view_help = @import("view_help.zig");
+const view_auto_win = @import("view_auto_win.zig");
 const view_wave = @import("view_wave.zig");
 const view_settings = @import("view_settings.zig");
 const font_info = @import("font_info.zig");
@@ -284,7 +285,7 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
         // 样式/轨道清空确认（非空删除/清空；Enter = 确认、Esc = 取消）
-        if (app.modal == .pattern_delete or app.modal == .track_clear or app.modal == .track_delete) {
+        if (app.modal == .pattern_delete or app.modal == .track_clear or app.modal == .track_delete or app.modal == .delete_auto_curve) {
             if (app.modal_choice) |choice| {
                 app.modal = null;
                 app.modal_choice = null;
@@ -302,6 +303,9 @@ pub fn main(init: std.process.Init) !u8 {
                             .track_row => |ti| {
                                 app.removeTrackRow(ti);
                                 app.commitHistory("删除轨道");
+                            },
+                            .auto_curve => |cid| {
+                                if (app.removeAutoCurve(cid)) app.setToast("已删除曲线");
                             },
                         }
                     }
@@ -780,6 +784,11 @@ pub fn main(init: std.process.Init) !u8 {
             app.params.kit_layer_count[i].store(@intCast(slot), .monotonic);
         }
 
+        // **自动化必须在静态同步之后“立刻”写入**：静态同步每帧会把 `instrument_gain`
+        // 写回推子的值；若自动化延后到帧末再写，两者在同一帧内交替存在 →
+        // 音频线程随机读到“推子值”或“自动化值”（实测：同一场景一次全正常、一次半静音）。
+        app.publishAutoLane();
+
         // 同步调音台通道参数（增益/声像/静音/效果链）到音频线程
         const n_mixer: usize = @min(app.mixer_channels_state.items.len, app.params.channels_cap);
         app.params.channel_count.store(@intCast(n_mixer), .monotonic);
@@ -888,6 +897,7 @@ pub fn main(init: std.process.Init) !u8 {
         app.params.steps_per_beat.store(@intCast(model.stepsPerBeat(app.time_den)), .monotonic);
 
         ui.renderer = r_mod.Renderer.init(&win.fb);
+        ui.frame_n +%= 1; // 立即式 UI：本帧序号（Debug 撞车检测按帧重置）
         ui.mouse_x = ui_input.mouse_x;
         ui.mouse_y = ui_input.mouse_y;
         ui.mouse_down = ui_input.mouse_down;
@@ -1026,6 +1036,7 @@ pub fn main(init: std.process.Init) !u8 {
         app.pollGestureHistory();
         app.pollCapacityReclaim();
         app.pollSnapshotRebuild(); // A2：影子对拍快照（未接主路）
+
         // 容量自动回收（删除/装载后滞回缩容；无声时几乎零开销）
 
         // 4.1z) 文件对话框：推进待处理的"选文件"请求（B 方案；内部目前仍是外部对话框）
@@ -2467,6 +2478,12 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     if (app.wave_win.open) {
         _ = ui.declare(.{ .prio = 1 + @as(i32, @intCast(nwin)), .rect = .{ .x = app.wave_win.x, .y = app.wave_win.y, .w = app.wave_win.w, .h = app.wave_win.h } });
     }
+    // 自动化链接窗口：**最上层**（prio 900 以下、高于所有 wins/wave）——
+    // 必须在这里声明，主界面（含播放列表）绘制时才知道自己被盖住，
+    // 否则点击会穿透到下层（实测：点窗口 → 在播放列表里放了片段）。
+    if (app.auto_win.open) {
+        _ = ui.declare(.{ .prio = 1 + @as(i32, @intCast(nwin)) + 1, .rect = .{ .x = app.auto_win.x, .y = app.auto_win.y, .w = @import("view_auto_win.zig").W, .h = @import("view_auto_win.zig").H } });
+    }
 
     // 主界面（prio 0）
     _ = ui.beginLayer(0);
@@ -2483,19 +2500,20 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     app.layout.left_w = std.math.clamp(app.layout.left_w, util.min_pane_w, @max(util.min_pane_w, total - app.layout.mid_w - util.min_pane_w - util.splitter_w * 2));
     app.layout.mid_w = std.math.clamp(app.layout.mid_w, util.min_pane_w, @max(util.min_pane_w, total - app.layout.left_w - util.min_pane_w - util.splitter_w * 2));
 
+    // ── **分隔条先处理**（顺序很重要）：认领按下 + `input_blocked` 屏蔽本帧其它控件，
+    //    然后再画/处理面板内容。否则面板先跑 → 同一次按下会被“历史/样式条目”吃掉（实测）。
+    //    分割条与面板矩形不重叠，所以先画线、后画面板不影响观感。
+    _ = ui.splitterV(1, &app.layout.left_w, app.layout.left_w, body_y, body_h, util.splitter_w, util.min_pane_w, @max(util.min_pane_w, total - app.layout.mid_w - util.min_pane_w - util.splitter_w * 2));
+    app.layout.left_w = std.math.clamp(app.layout.left_w, util.min_pane_w, @max(util.min_pane_w, total - app.layout.mid_w - util.min_pane_w - util.splitter_w * 2));
+    const mid_x = app.layout.left_w + util.splitter_w;
+    const sp2_x = mid_x + app.layout.mid_w;
+    _ = ui.splitterV(2, &app.layout.mid_w, sp2_x, body_y, body_h, util.splitter_w, util.min_pane_w, @max(util.min_pane_w, total - app.layout.left_w - util.min_pane_w - util.splitter_w * 2));
+    app.layout.mid_w = std.math.clamp(app.layout.mid_w, util.min_pane_w, @max(util.min_pane_w, total - app.layout.left_w - util.min_pane_w - util.splitter_w * 2));
+
     // 左栏：操作历史
     view_panels.drawHistory(ui, app, 0, body_y, app.layout.left_w, body_h);
-
-    // 分隔条 1（x == left_w == pos）
-    _ = ui.splitterV(1, &app.layout.left_w, app.layout.left_w, body_y, body_h, util.splitter_w, util.min_pane_w, @max(util.min_pane_w, total - app.layout.mid_w - util.min_pane_w - util.splitter_w * 2));
-
     // 中栏：样式
-    const mid_x = app.layout.left_w + util.splitter_w;
     view_panels.drawPatterns(ui, app, mid_x, body_y, app.layout.mid_w, body_h);
-
-    // 分隔条 2（x = left_w + splitter_w + mid_w；pos 指向 mid_w）
-    const sp2_x = app.layout.left_w + util.splitter_w + app.layout.mid_w;
-    _ = ui.splitterV(2, &app.layout.mid_w, sp2_x, body_y, body_h, util.splitter_w, util.min_pane_w, @max(util.min_pane_w, total - app.layout.left_w - util.min_pane_w - util.splitter_w * 2));
 
     // 右栏：播放列表 / 钢琴卷帘（互斥；用更新后的宽度）
     const right_x2 = app.layout.left_w + util.splitter_w + app.layout.mid_w + util.splitter_w;
@@ -2531,6 +2549,13 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
             .settings => _ = view_settings.draw(ui, app, w, h),
             .plugin_mgr => _ = view_plugins.draw(ui, app, w, h),
         }
+        ui.endLayer();
+    }
+
+    // 自动化链接窗口（最上层；声明见帧首）
+    if (app.auto_win.open) {
+        _ = ui.beginLayer(1 + @as(i32, @intCast(nwin)) + 1);
+        view_auto_win.draw(ui, app);
         ui.endLayer();
     }
 
@@ -3042,10 +3067,12 @@ fn schedLogTick(app: *App, io: std.Io) void {
 
     // **A4**：调度现在只有一条路径（快照），旧 push 模型的“作废/队列/编辑代”指标已删。
     var line_buf: [512]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buf, "[sched] 1s: 声部={d} 最老={d}步(p{d} i{d}) | off 命中={d} 落空={d} 重触发={d} | 积压 stash={d} 满增={d} | 本地off={d} 超时={d}/{d} 迟到={d}步 | 步={d}\n", .{
-        voices,   max_age, age_p,   age_i,                                      off_hit,
-        off_miss, retrig,  stash_n, d_stash,                                    local_off,
-        ov_now,   ov_peak, ov_late, app.playback.cursorStep(app.sel.song_mode),
+    const line = std.fmt.bufPrint(&line_buf, "[sched] 1s: 声部={d} 最老={d}步(p{d} i{d}) | off 命中={d} 落空={d} 重触发={d} | 积压 stash={d} 满增={d} | 本地off={d} 超时={d}/{d} 迟到={d}步 | 步={d} | lane 斜坡={d} | inst0_g={d:.3} synth0_sm={d:.3} seg_g={d:.3} seg_kind={d} seg_n={d} seg_ptr={x} ui_ptr={x}\n", .{
+        voices,                                         max_age,                                                                                    age_p,                                 age_i,                                      off_hit,
+        off_miss,                                       retrig,                                                                                     stash_n,                               d_stash,                                    local_off,
+        ov_now,                                         ov_peak,                                                                                    ov_late,                               app.playback.cursorStep(app.sel.song_mode), app.params.dbg_lane_ramps.swap(0, .monotonic),
+        app.params.instrument_gain[0].load(.monotonic), if (app.engine.synths.len > 0) app.engine.synths[0].smoothed_master else @as(f32, -1),      app.params.dbg_seg_g.load(.monotonic), app.params.dbg_seg_kind.load(.monotonic),   app.params.dbg_seg_render.swap(0, .monotonic),
+        app.params.dbg_seg_ptr.load(.monotonic),        if (app.params.instrument_gain.len > 0) @intFromPtr(&app.params.instrument_gain[0]) else 0,
     }) catch return;
     std.debug.print("{s}", .{line});
 
@@ -4683,6 +4710,7 @@ fn drawModal(ui: *Ui, app: *App) void {
         .preset_delete => drawPresetDelete(ui, app, w, h),
         .pattern_delete => drawDeleteConfirm(ui, app, w, h),
         .track_clear => drawDeleteConfirm(ui, app, w, h),
+        .delete_auto_curve => drawDeleteConfirm(ui, app, w, h),
         .track_delete => drawDeleteConfirm(ui, app, w, h),
         .save_upgrade => drawUpgradeConfirm(ui, app, w, h),
     }
@@ -4830,6 +4858,14 @@ fn drawDeleteConfirm(ui: *Ui, app: *App, w: i32, h: i32) void {
             const short = name[0..@min(name.len, 24)];
             line1 = std.fmt.bufPrint(&l1, "清空轨道「{s}」？", .{short}) catch "清空轨道？";
             line2 = std.fmt.bufPrint(&l2, "该轨道上有 {d} 个片段；清空将移除这些片段（行与名字保留，可 Ctrl+Z 撤销）。", .{app.trackUsage(ti)}) catch "清空将移除这些片段。";
+        },
+        .auto_curve => |cid| {
+            const ci = app.curveIndexById(cid);
+            var nb: [24]u8 = undefined;
+            const nm = if (ci) |ii| app.auto_curves.items[ii].name(&nb) else "?";
+            const short = nm[0..@min(nm.len, 24)];
+            line1 = std.fmt.bufPrint(&l1, "删除曲线「{s}」？", .{short}) catch "删除曲线？";
+            line2 = std.fmt.bufPrint(&l2, "这条曲线被 {d} 个参数链接；删除后这些链接一并移除（曲线数据无法恢复）。", .{app.bindingCountOfCurve(cid)}) catch "删除后链接一并移除。";
         },
         .track_row => |ti| {
             const name = app.trackName(ti);
