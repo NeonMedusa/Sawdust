@@ -42,6 +42,7 @@ pub const Waveform = enum(u8) {
     triangle = 2,
     sawtooth = 3,
     noise = 4,
+    piano = 5,
 
     pub fn name(self: Waveform) []const u8 {
         return switch (self) {
@@ -50,6 +51,7 @@ pub const Waveform = enum(u8) {
             .triangle => "三角",
             .sawtooth => "锯齿",
             .noise => "噪声",
+            .piano => "钢琴",
         };
     }
 
@@ -58,7 +60,7 @@ pub const Waveform = enum(u8) {
     }
 };
 
-pub const waveform_count: u8 = 5;
+pub const waveform_count: u8 = 6;
 
 /// 振荡器数量（2×2 布局）
 pub const osc_count: usize = 4;
@@ -69,6 +71,16 @@ pub const max_unison: usize = 16;
 /// 参考实测：±25c 已是“宽堆叠”（supersaw 级）——所以 50% ≈ 典型 supersaw、
 /// 100% 留作极端调制（类 JP-8000 满发 ≈ ±200c 的 1/4）
 pub const unison_max_cents: f32 = 50.0;
+/// 钢琴合成使用的分音数：基频两根弦 + 4 个主要泛音。
+pub const piano_partial_count: usize = 6;
+/// 弦的非谐失谐：高频分音略高于整数倍频，避免纯谐波电子琴感。
+const piano_partial_ratios = [piano_partial_count]f32{
+    1.000, 1.0015, 2.003, 3.006, 4.010, 5.015,
+};
+/// 分音幅度：由力度/音高再调整亮度。
+const piano_partial_amps = [piano_partial_count]f32{
+    1.000, 0.180, 0.440, 0.260, 0.170, 0.100,
+};
 /// 合奏立体声展开（0 = 不展开；副本按位置缩放 L/R 增益）
 const unison_spread: f32 = 0.55;
 
@@ -107,6 +119,8 @@ pub const FilterParams = struct {
 };
 
 pub const SynthParams = struct {
+    /// 乐器级钢琴模式，与振荡器波形完全分离。
+    piano_mode: Atomic(bool) = Atomic(bool).init(false),
     /// 默认音色：振荡器 1 开启（正弦、音量 0.6）——保证“选中即能出声”
     osc: [osc_count]OscParams = .{
         .{ .enabled = Atomic(bool).init(true), .volume = Atomic(f32).init(0.6) },
@@ -250,6 +264,12 @@ pub const Voice = struct {
     phase: [osc_count][max_unison]f32 = @splat(@as([max_unison]f32, @splat(0))),
     env_stage: EnvStage = .idle,
     env_level: f32 = 0,
+    /// 钢琴音色的击弦后时间（用于自然衰减与短暂锤击噪声）。
+    age_seconds: f32 = 0,
+    /// 钢琴松键时间点（-1 = 尚未松键）；渲染侧按它做短阻尼。
+    piano_release_age: f32 = -1,
+    /// 钢琴锤击噪声的一阶低通状态。
+    piano_hammer_lp: f32 = 0,
     /// 进入 release 时的电平（线性下降用）
     release_from: f32 = 0,
     /// 分配序号（无空闲声部时偷取最旧）
@@ -315,6 +335,14 @@ pub fn cutoffHz(v: f32) f32 {
     return 20.0 * std.math.pow(f32, 1000.0, t);
 }
 
+/// 钢琴基频分音的时间常数：低音弦长、余音长；高音弦短、消散快。
+fn pianoTau(pitch: i32, decay_param: f32) f32 {
+    const p = std.math.clamp(pitch, 21, 108);
+    const pitch_tau = 1.15 * std.math.pow(f32, 2.0, @as(f32, @floatFromInt(69 - p)) / 23.0);
+    // Decay 滑杆保留一点控制权；默认 0.80 约为 ×0.95。
+    return pitch_tau * (0.55 + 0.5 * std.math.clamp(decay_param, 0, 1));
+}
+
 /// 一阶低通系数（每块计算一次）
 fn onePoleCoeff(fc: f32, sr: f32) f32 {
     const f = std.math.clamp(fc, 5.0, sr * 0.45);
@@ -339,6 +367,12 @@ inline fn waveAt(w: Waveform, phase: f32, rng: *u32) f32 {
         .triangle => 4.0 * @abs(phase - 0.5) - 1.0,
         .sawtooth => 2.0 * phase - 1.0,
         .noise => nextNoise(rng),
+        .piano => blk: {
+            const p = phase * 2.0 * std.math.pi;
+            break :blk @sin(p) * 0.62 + @sin(p * 2.001) * 0.22 +
+                @sin(p * 3.004) * 0.10 + @sin(p * 5.012) * 0.04 +
+                @sin(p * 8.025) * 0.015;
+        },
     };
 }
 
@@ -386,6 +420,9 @@ pub fn noteOn(state: anytype, pitch: u8, velocity: u8, pan: u8, at_step: i32, en
     v.freq = pitchHz(pitch);
     v.env_stage = .attack;
     v.release_from = 0;
+    v.age_seconds = 0;
+    v.piano_release_age = -1;
+    v.piano_hammer_lp = 0;
     v.start_seq = state.note_counter;
     v.vel_gain = @as(f32, @floatFromInt(@max(1, velocity))) / 127.0;
     // 等功率声像：t = -1..+1（64 = 中心），angle = (t+1)·π/4 →
@@ -501,7 +538,8 @@ pub fn render(
 
     // 包络参数（每块读一次）
     const a_sec = mapTime(params.attack.load(.monotonic));
-    const d_sec = mapTime(params.decay.load(.monotonic));
+    const decay_param = std.math.clamp(params.decay.load(.monotonic), 0, 1);
+    const d_sec = mapTime(decay_param);
     const r_sec = mapTime(params.release.load(.monotonic));
     const sustain = std.math.clamp(params.sustain.load(.monotonic), 0, 1);
 
@@ -520,6 +558,8 @@ pub fn render(
         osc_vol[i] = std.math.clamp(params.osc[i].volume.load(.monotonic), 0, 1);
         osc_wave[i] = @fromBackingInt(@intCast(params.osc[i].waveform.load(.monotonic) % waveform_count));
     }
+    const piano_mode = params.piano_mode.load(.monotonic);
+    const piano_gain: f32 = 1.0;
 
     // 合奏（unison）快照（每块一次）：副本数 / 每副本失谐 / 立体声展开 / 增益补偿。
     // 副本位置 d ∈ [-1,+1] 均匀铺开（1 个副本时 d = 0），再经 **powerScale
@@ -570,7 +610,38 @@ pub fn render(
             const v = &state.voices[active[a]];
 
             // ── 包络（线性分段）──
-            switch (v.env_stage) {
+            if (piano_mode) {
+                switch (v.env_stage) {
+                    .idle => continue,
+                    .attack => {
+                        // 钢琴起音很短；限制参数过高导致的“拉弓式”淡入。
+                        const attack_sec = @min(a_sec, 0.02);
+                        v.env_level += dt / attack_sec;
+                        if (v.env_level >= 1.0) {
+                            v.env_level = 1.0;
+                            v.env_stage = .decay;
+                        }
+                    },
+                    .decay => {
+                        // 钢琴没有传统 sustain：衰减分音在下面独立完成。
+                        v.env_level = 1.0;
+                        v.env_stage = .sustain;
+                    },
+                    .sustain => v.env_level = 1.0,
+                    .release => {
+                        if (v.piano_release_age < 0) v.piano_release_age = v.age_seconds;
+                        const held: f32 = @max(0.0, v.age_seconds - v.piano_release_age);
+                        // 松键线性阻尼，保留参数可调；上限防止误设成挂音。
+                        const damp_sec = @max(0.35, r_sec * 4.0);
+                        v.env_level = v.release_from * @exp(-held / damp_sec);
+                        if (v.env_level <= 0.00001) {
+                            v.env_level = 0;
+                            v.env_stage = .idle;
+                            continue;
+                        }
+                    },
+                }
+            } else switch (v.env_stage) {
                 .idle => continue,
                 .attack => {
                     v.env_level += dt / a_sec;
@@ -602,26 +673,65 @@ pub fn render(
             var vmix_l: f32 = 0;
             var vmix_r: f32 = 0;
             const fstep = v.freq * dt; // 基础相位步长（副乘失谐系数）
-            for (0..osc_count) |o| {
-                if (!osc_on[o]) continue;
-                const w = osc_wave[o];
-                const is_noise = w == .noise;
-                const copies = osc_copies[o];
-                const g = osc_vol[o] * osc_copy_gain[o];
-                var k: usize = 0;
-                while (k < copies) : (k += 1) {
-                    const ph = v.phase[o][k];
-                    const s = waveAt(w, ph, &v.rng);
-                    vmix_l += s * (g * osc_spread_l[o][k]);
-                    vmix_r += s * (g * osc_spread_r[o][k]);
-                    if (!is_noise) {
-                        const np = ph + fstep * osc_detune[o][k];
-                        v.phase[o][k] = if (np >= 1.0) np - 1.0 else np;
+            if (piano_mode) {
+                var partial_sum: f32 = 0;
+                const tau = pianoTau(v.pitch, decay_param);
+                // 力度大时高泛音更亮；低音也保留更多琴弦感。
+                const velocity_bright = 0.50 + 0.50 * v.vel_gain;
+                const pitch_bright = std.math.clamp(
+                    1.12 - @as(f32, @floatFromInt(v.pitch - 48)) / 85.0,
+                    0.55,
+                    1.12,
+                );
+                for (0..piano_partial_count) |k| {
+                    const ratio = piano_partial_ratios[k];
+                    const partial_hz = v.freq * ratio;
+                    if (partial_hz >= sample_rate * 0.47) break;
+                    const ph = v.phase[0][k];
+                    const partial_decay = @max(
+                        sustain,
+                        @exp(-v.age_seconds / (tau / std.math.pow(f32, 1.35, @floatFromInt(k)))),
+                    );
+                    partial_sum += @sin(ph * 2.0 * std.math.pi) *
+                        (piano_partial_amps[k] *
+                            std.math.pow(f32, velocity_bright, @as(f32, @floatFromInt(k)) * 0.55) *
+                            std.math.pow(f32, pitch_bright, @as(f32, @floatFromInt(k)) * 0.50) * partial_decay);
+                    const np = ph + ratio * fstep;
+                    v.phase[0][k] = if (np >= 1.0) np - 1.0 else np;
+                }
+                // 击弦：宽频短瞬态 + 一点点低频“音板”冲击。
+                const raw = nextNoise(&v.rng);
+                v.piano_hammer_lp += (raw - v.piano_hammer_lp) * 0.18;
+                const click = (raw - v.piano_hammer_lp) * 0.035 * @exp(-v.age_seconds * 280.0);
+                const thump = v.piano_hammer_lp * 0.012 * @exp(-v.age_seconds * 70.0);
+                const mono = (partial_sum * 0.24 + click + thump) * piano_gain;
+                vmix_l = mono;
+                vmix_r = mono;
+                v.age_seconds += dt;
+            } else {
+                for (0..osc_count) |o| {
+                    if (!osc_on[o]) continue;
+                    const w = osc_wave[o];
+                    const is_noise = w == .noise;
+                    const copies = osc_copies[o];
+                    const g = osc_vol[o] * osc_copy_gain[o];
+                    var k: usize = 0;
+                    while (k < copies) : (k += 1) {
+                        const ph = v.phase[o][k];
+                        const s = waveAt(w, ph, &v.rng);
+                        vmix_l += s * (g * osc_spread_l[o][k]);
+                        vmix_r += s * (g * osc_spread_r[o][k]);
+                        if (!is_noise) {
+                            const np = ph + fstep * osc_detune[o][k];
+                            v.phase[o][k] = if (np >= 1.0) np - 1.0 else np;
+                        }
                     }
                 }
             }
-            vmix_l *= 0.5; // 单声部内多振荡器叠加的余量
-            vmix_r *= 0.5;
+            if (!piano_mode) {
+                vmix_l *= 0.5; // 单声部内多振荡器叠加的余量
+                vmix_r *= 0.5;
+            }
 
             // ── 滤波（L/R 各自状态；无合奏时两路输入相同 → 结果与旧单声道逐位一致）──
             var xl = vmix_l;

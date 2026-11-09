@@ -103,13 +103,14 @@ zig build -Dcpu=baseline -Doptimize=ReleaseFast # 日常用这个：明显更流
 但收益仅限主窗口（插件仍需 XWayland），优先级排在 IME 与音频之后。
 
 ### 音频后端
-- 当前调用是 `ma_device_init(null, …)` → miniaudio 按内置优先级选：
-  **pulseaudio → alsa → jack**（见 `libs/miniaudio/miniaudio.h` 的后端优先级表）。
+- 设置页已可选**自动 / PulseAudio / ALSA / JACK**，并列出该后端枚举到的全部播放
+  设备；选择保存后在下次启动用对应设备初始化。设备暂时不存在时安全回退系统默认。
+- 自动模式由 miniaudio 按内置优先级选：**pulseaudio → alsa → jack**
+  （见 `libs/miniaudio/miniaudio.h` 的后端优先级表）。
 - **JACK 已经是运行时 `dlopen`**（绑定里是 `jack_client_open: ma_proc = null`），
   所以**编译期不需要 jack 头文件/库**，机器上装了 libjack 或 `pipewire-jack` 就能用。
 - PipeWire 现在就能用（`pipewire-pulse` 模拟 Pulse）；想要原生低延迟需走 JACK 接口（pipewire-jack）。
-- 待做：**设置里选后端**（自动 / PulseAudio / ALSA / JACK）+ 采样率/缓冲自适应
-  （JACK 的周期由服务端决定，`ma_device_init` 后要读回实际值）。
+- 待做：采样率/缓冲自适应（JACK 的周期由服务端决定，`ma_device_init` 后要读回实际值）。
 
 ## 4. 已实现能力（按子系统）
 

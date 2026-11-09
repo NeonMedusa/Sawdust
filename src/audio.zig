@@ -42,6 +42,20 @@ const audio_pref = @import("audio_pref.zig");
 /// 每乐器每个分段发送给 VSTi 的事件上限（超出的丢弃；宁可丢事件也不分配）
 pub const vsti_batch_max = 256;
 
+/// 设置页展示的播放设备。ID 只在当前 miniaudio context 的生存期内使用，偏好层只保存名称。
+pub const PlaybackDevice = struct {
+    id: ma.ma_device_id = std.mem.zeroes(ma.ma_device_id),
+    name: [256]u8 = @splat(0),
+    name_len: usize = 0,
+    is_default: bool = false,
+
+    pub fn label(self: *const PlaybackDevice) []const u8 {
+        return self.name[0..self.name_len];
+    }
+};
+
+const playback_device_cap = 64;
+
 /// 一个“发声时长”记录：某个（乐器, 音高）从 start 一直响到 start+len 步。
 /// `hung` = 超过看门狗阈值（只是**标记**，默认不会强制释音）。
 pub const LongRec = struct {
@@ -562,6 +576,9 @@ pub const Engine = struct {
     allocator: std.mem.Allocator = undefined,
     sample_rate: u32 = 0,
     initialized: bool = false,
+    /// 当前后端枚举到的播放设备；给设置页读，ID 仅在 `ctx` 有效期间传入初始化配置。
+    playback_devices: [playback_device_cap]PlaybackDevice = @splat(.{}),
+    playback_device_n: usize = 0,
     /// 每乐器一个声部池（**仅音频线程访问**；堆分配——32 池 × 256 声部体积可观）
     synths: []synth.Synth = &.{},
     /// 鼓组层声部池（**惰性**：每乐器的 16 层池按需分配，见 `App.ensureKitPool`——
@@ -678,18 +695,35 @@ pub const Engine = struct {
         config.dataCallback = dataCallback;
         config.pUserData = self; // 引擎实例（回调里取 params + synths）
 
-        // 后端：显式选中时建 context（失败自动回退默认）；`.auto` 走 null 让 miniaudio 自己挑
+        // 无论是否手选后端都建立 context：既让 miniaudio 选默认后端，又能枚举播放设备。
+        // 设备列表只在启动时取一次；设置页保存选择后下次启动重建 context/device 生效。
         var ctx_ptr: ?*ma.ma_context = null;
-        if (audio_pref.maBackend(audio_pref.current)) |mb| {
+        if (audio_pref.maBackend(audio_pref.current.backend)) |mb| {
             var backends = [_]c_uint{mb};
             if (ma.ma_context_init(&backends, 1, null, &self.ctx) == ma.MA_SUCCESS) {
                 self.ctx_ok = true;
                 ctx_ptr = &self.ctx;
             } else {
-                std.debug.print("[audio] 后端 {s} 不可用 -> 回退自动\n", .{audio_pref.label(audio_pref.current)});
+                std.debug.print("[audio] 后端 {s} 不可用 -> 回退自动\n", .{audio_pref.label(audio_pref.current.backend)});
+            }
+        }
+        if (ctx_ptr == null and ma.ma_context_init(null, 0, null, &self.ctx) == ma.MA_SUCCESS) {
+            self.ctx_ok = true;
+            ctx_ptr = &self.ctx;
+        }
+        if (ctx_ptr) |_| {
+            self.refreshPlaybackDevices();
+            if (self.preferredPlaybackDevice()) |device_i| {
+                config.playback.pDeviceID = &self.playback_devices[device_i].id;
+            } else if (audio_pref.current.deviceName().len > 0) {
+                std.debug.print("[audio] 输出设备“{s}”未找到 -> 回退系统默认\n", .{audio_pref.current.deviceName()});
             }
         }
         if (ma.ma_device_init(ctx_ptr, &config, &self.device) != ma.MA_SUCCESS) {
+            if (self.ctx_ok) {
+                _ = ma.ma_context_uninit(&self.ctx);
+                self.ctx_ok = false;
+            }
             return error.AudioInitFailed;
         }
         self.sample_rate = self.device.sampleRate;
@@ -699,6 +733,40 @@ pub const Engine = struct {
             return error.AudioStartFailed;
         }
         self.initialized = true;
+    }
+
+    /// 返回设置页可展示的播放设备快照（由引擎启动阶段填写，之后只读）。
+    pub fn playbackDevices(self: *const Engine) []const PlaybackDevice {
+        return self.playback_devices[0..self.playback_device_n];
+    }
+
+    fn refreshPlaybackDevices(self: *Engine) void {
+        self.playback_device_n = 0;
+        var infos: [*c]ma.ma_device_info = null;
+        var count: ma.ma_uint32 = 0;
+        if (ma.ma_context_get_devices(&self.ctx, &infos, &count, null, null) != ma.MA_SUCCESS or infos == null) return;
+        const n: usize = @min(@as(usize, @intCast(count)), playback_device_cap);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const info = infos[i];
+            const name_len = std.mem.indexOfScalar(u8, &info.name, 0) orelse info.name.len;
+            self.playback_devices[i] = .{
+                .id = info.id,
+                .name = info.name,
+                .name_len = name_len,
+                .is_default = info.isDefault != 0,
+            };
+        }
+        self.playback_device_n = n;
+    }
+
+    fn preferredPlaybackDevice(self: *const Engine) ?usize {
+        const wanted = audio_pref.current.deviceName();
+        if (wanted.len == 0) return null;
+        for (self.playbackDevices(), 0..) |device, i| {
+            if (std.mem.eql(u8, wanted, device.label())) return i;
+        }
+        return null;
     }
 
     /// 暂停/恢复音频设备（离线导出用：期间实时回调完全停走，渲染由导出循环独占）。

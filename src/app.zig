@@ -26,6 +26,7 @@ const plugin_db = @import("plugin_db.zig");
 const vst_host = @import("vst_host.zig");
 const preset_mod = @import("preset.zig");
 const wav = @import("wav.zig"); // 导出音频（24-bit PCM WAV 写出器）
+const audio_export = @import("audio_export.zig");
 const audio_import = @import("audio_import.zig"); // P2：异步导入（单 worker）
 
 pub const Clip = model.Clip;
@@ -1155,11 +1156,16 @@ pub const PickRequest = struct {
         };
     }
 };
-/// 导出进行中的状态（`App.export_wav`）——生命周期：`exportWavBegin` → 每帧
+/// 导出进行中的状态（`App.export_wav`）——生命周期：`exportAudioBegin` → 每帧
 /// `exportWavFrame` 分块推进 → 完成/取消/失败统一收尾清理。
 pub const ExportWav = struct {
-    /// 目标路径（自有副本；删除半成品/UI 显示用）
+    /// 最终目标路径（自有副本；删除半成品/UI 显示用）
     path: []u8,
+    /// 离线渲染实际写入的 WAV；有损/压缩格式完成渲染后再交给 FFmpeg。
+    render_path: []u8,
+    /// `render_path` 是否与最终路径共用同一段内存（WAV 直写）。
+    render_is_target: bool,
+    options: audio_export.Options,
     writer: wav.Writer,
     /// 插件状态快照（结束时回写）
     states: std.ArrayListUnmanaged(PlStateSnap),
@@ -1196,6 +1202,12 @@ pub const ExportWindow = struct {
     grab_dy: i32 = 0,
 };
 
+/// 导出格式与质量设置（文件选择之前弹出；不进入工程文件）。
+pub const ExportOptionsWindow = struct {
+    open: bool = false,
+    options: audio_export.Options = .{},
+};
+
 /// 导出尾音时长（秒）：内容末尾后再渲染这么久，让混响/延迟/释音自然衰减
 const export_tail_sec: u64 = 2;
 
@@ -1218,12 +1230,14 @@ pub const SettingsWindow = struct {
     x: i32 = 460,
     y: i32 = 130,
     w: i32 = 520,
-    /// 高度要装得下“启动时 / 帧率 / 数据交换 / 字体”四段（加段时同步调）
-    h: i32 = 470,
+    /// 高度要装得下“启动时 / 帧率 / 数据交换 / 字体 / 音频”五段（加段时同步调）
+    h: i32 = 590,
     /// Z 序（越大越靠上；点窗口即置顶）——见 `RackState.z` 注释
     z: i32 = 27,
     grab_dx: i32 = 0,
     grab_dy: i32 = 0,
+    /// 输出设备列表滚动（设备很多时仍可逐个选择）。
+    audio_device_scroll: i32 = 0,
 };
 
 /// 插件管理窗口（工具栏“插件”打开）：扫描文件夹/单文件清单 + 手动扫描 + 结果列表。
@@ -1662,10 +1676,12 @@ pub const App = struct {
     playlist: PlaylistState = .{},
     piano: PianoState = .{},
     rack: RackState = .{},
-    /// 导出进行中状态（null = 空闲）——分块离线渲染；见 `exportWavBegin/exportWavFrame`
+    /// 导出进行中状态（null = 空闲）——分块离线渲染；见 `exportAudioBegin/exportWavFrame`
     export_wav: ?ExportWav = null,
     /// 导出进度窗位置（模态，可拖动；首帧居中）——`drawExportDialog` 用
     export_win: ExportWindow = .{},
+    /// 导出前的格式/质量面板（与进行中的进度窗互斥）。
+    export_options_win: ExportOptionsWindow = .{},
     panels: PanelsState = .{},
     synth_win: SynthWindow = .{},
     mixer_win: MixerWindow = .{},
@@ -2778,6 +2794,12 @@ pub const App = struct {
             }
             self.importDrumKit(&si.kit, target.kit.?, self.instrumentIndexOf(target), prev_idx, target_idx);
             target.kind = .drumkit;
+        } else if (si.kind == 3) {
+            if (target.kit) |kit| {
+                self.deinitDrumKit(kit);
+                target.kit = null;
+            }
+            target.kind = .piano;
         } else {
             if (target.kit) |kit| {
                 self.deinitDrumKit(kit);
@@ -2916,6 +2938,20 @@ pub const App = struct {
         inst.kind = .drumkit;
         inst.key_mode = .drum; // 鼓组默认键列就是鼓名（用户可切回）
         self.ensureKitPool(@intCast(idx)); // 惰性池：创建即分配（试听立即可用）
+        return idx;
+    }
+
+    /// 新建独立钢琴乐器，参数不影响减法合成器的默认音色。
+    pub fn addPianoInstrument(self: *App) i32 {
+        const idx = self.addInstrument("钢琴");
+        if (idx < 0) return idx;
+        const inst = &self.instruments.items[@intCast(idx)];
+        inst.kind = .piano;
+        inst.synth.piano_mode.store(true, .monotonic);
+        inst.synth.attack.store(0.02, .monotonic);
+        inst.synth.decay.store(0.80, .monotonic);
+        inst.synth.sustain.store(0.0, .monotonic);
+        inst.synth.release.store(0.18, .monotonic);
         return idx;
     }
 
@@ -4215,6 +4251,7 @@ pub const App = struct {
                     .drumkit => preset_mod.plugin_drumkit,
                     .vst3 => self.vst3InstrumentCategory(inst),
                     .synth => preset_mod.plugin_subtractive,
+                    .piano => preset_mod.plugin_piano,
                 };
             },
         };
@@ -4247,7 +4284,8 @@ pub const App = struct {
     /// 减法合成器 / 鼓组（已实装）；FM/VST3 将来。
     pub fn pluginSupportedAsInstrument(plugin: []const u8) bool {
         return std.mem.eql(u8, plugin, preset_mod.plugin_subtractive) or
-            std.mem.eql(u8, plugin, preset_mod.plugin_drumkit);
+            std.mem.eql(u8, plugin, preset_mod.plugin_drumkit) or
+            std.mem.eql(u8, plugin, preset_mod.plugin_piano);
     }
 
     /// 该插件是否可作为**鼓垫层**：减法合成器 + VST3 乐器分类
@@ -4816,6 +4854,7 @@ pub const App = struct {
                     inst.kit = null;
                 }
                 inst.kind = .synth;
+                inst.synth.piano_mode.store(false, .monotonic);
                 inst.key_mode = .piano; // 键列模式随类型回默认（与下方 .drumkit 对称）
             },
             .drumkit => {
@@ -4826,6 +4865,19 @@ pub const App = struct {
                 }
                 inst.kind = .drumkit;
                 inst.key_mode = .drum;
+            },
+            .piano => {
+                if (inst.kit) |kit| {
+                    self.deinitDrumKit(kit);
+                    inst.kit = null;
+                }
+                inst.kind = .piano;
+                inst.key_mode = .piano;
+                inst.synth.piano_mode.store(true, .monotonic);
+                inst.synth.attack.store(0.02, .monotonic);
+                inst.synth.decay.store(0.80, .monotonic);
+                inst.synth.sustain.store(0.0, .monotonic);
+                inst.synth.release.store(0.18, .monotonic);
             },
             .vst3 => return false, // 换入 VST3 走预设面板的插件分类（或插件管理加单文件）
         }
@@ -5860,7 +5912,7 @@ pub const App = struct {
     /// 判断（`inRect`，不查输入屏蔽）——弹窗按钮/导出遮罩上的点击会“点穿”到后面窗口
     /// （实测：点“取消”把它后面的窗口提上来；导出中点窗口也能置顶）。
     pub fn bringToFront(self: *App, z: *i32) void {
-        if (self.modal != null or self.export_wav != null) return;
+        if (self.modal != null or self.export_wav != null or self.export_options_win.open) return;
         self.z_top += 1;
         z.* = self.z_top;
     }
@@ -8511,10 +8563,14 @@ pub const App = struct {
         return last;
     }
 
-    /// 导出整曲为 **WAV（24-bit PCM）**——同步整跑（测试/无进度窗场景）；
-    /// 主程序走“分块状态机”：`exportWavBegin` → 每帧 `exportWavFrame`，对话框驱动进度/取消。
+    /// 导出整曲为 WAV（24-bit PCM）——保留给单测/调用方的便捷入口。
     pub fn exportSongWav(self: *App, io: std.Io, path: []const u8) !void {
-        try self.exportWavBegin(io, path);
+        try self.exportSongAudio(io, path, .{});
+    }
+
+    /// 导出整曲为任意支持的目标格式；渲染阶段始终与实时回调共用 `renderBlock`。
+    pub fn exportSongAudio(self: *App, io: std.Io, path: []const u8, options: audio_export.Options) !void {
+        try self.exportAudioBegin(io, path, options);
         while (self.export_wav != null) {
             self.exportWavRun(io, std.math.maxInt(i64)) catch |e| {
                 self.exportWavFail(io, e);
@@ -8523,12 +8579,20 @@ pub const App = struct {
         }
     }
 
-    /// 开始导出：进入状态机（快照 → 暂停设备 → 传输归零 → 打开 WAV）。
-    /// 之后由主循环每帧 `exportWavFrame` 分块推进；完成/取消/失败均自动收尾。
+    /// 兼容旧调用：开始导出 WAV（24-bit PCM）。
     pub fn exportWavBegin(self: *App, io: std.Io, path: []const u8) !void {
+        try self.exportAudioBegin(io, path, .{});
+    }
+
+    /// 开始导出：进入状态机（快照 → 暂停设备 → 传输归零 → 打开 WAV 渲染目标）。
+    /// 之后由主循环每帧 `exportWavFrame` 分块推进；完成/取消/失败均自动收尾。
+    pub fn exportAudioBegin(self: *App, io: std.Io, path: []const u8, options: audio_export.Options) !void {
         if (self.export_wav != null) return error.ExportInProgress;
         const path_copy = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(path_copy);
+        const render_is_target = !options.format.needsEncoder();
+        const render_path = if (render_is_target) path_copy else try audio_export.tempWavPath(self.allocator, path);
+        errdefer if (!render_is_target) self.allocator.free(render_path);
 
         // 插件状态快照（乐器 + 混音台效果链）——导出会推进其 DSP 内部状态；
         // 结束后回写（分配失败的那一个不入快照：该插件保持导出后的状态，可接受）
@@ -8567,8 +8631,8 @@ pub const App = struct {
         const end_step: u64 = @intCast(@max(0, self.clipsEndStep()));
         const total_frames: u64 = end_step * step_frames + sr * export_tail_sec;
 
-        // 写盘器先建：失败时设备/传输都还没动，直接返回
-        const writer = try wav.Writer.create(io, path_copy, @intCast(sr), 2);
+        // 渲染器先建：失败时设备/传输都还没动，直接返回。压缩格式先落临时 WAV。
+        const writer = try wav.Writer.create(io, render_path, @intCast(sr), 2);
 
         // ── 停播 + 暂停设备 + 离线传输（此后无回退错误）──
         if (self.playing) self.stopPlayback();
@@ -8592,6 +8656,9 @@ pub const App = struct {
 
         self.export_wav = .{
             .path = path_copy,
+            .render_path = render_path,
+            .render_is_target = render_is_target,
+            .options = options,
             .writer = writer,
             .states = states,
             .snap_song = snap_song,
@@ -8671,6 +8738,12 @@ pub const App = struct {
             }
         }
         try ew.writer.finish();
+        // WAV 已经完成；压缩格式在主线程做一次外部编码（FFmpeg），期间设备仍暂停，
+        // 所以插件状态不会被实时回调推进。编码失败由统一失败路径清理两份半成品。
+        if (ew.options.format.needsEncoder()) {
+            try audio_export.encodeFromWav(self.allocator, io, ew.render_path, ew.path, ew.options);
+            std.Io.Dir.cwd().deleteFile(io, ew.render_path) catch {};
+        }
         self.exportWavDone(io);
     }
 
@@ -8691,7 +8764,8 @@ pub const App = struct {
     /// 用户取消：丢弃半成品（删文件）→ 恢复快照/设备 → 释放。
     fn exportWavCanceled(self: *App, io: std.Io) void {
         self.export_wav.?.writer.abandon();
-        std.Io.Dir.cwd().deleteFile(io, self.export_wav.?.path) catch {};
+        std.Io.Dir.cwd().deleteFile(io, self.export_wav.?.render_path) catch {};
+        if (!self.export_wav.?.render_is_target) std.Io.Dir.cwd().deleteFile(io, self.export_wav.?.path) catch {};
         self.setToast("已取消导出");
         self.exportWavRestore();
         self.exportWavFree();
@@ -8701,7 +8775,8 @@ pub const App = struct {
     fn exportWavFail(self: *App, io: std.Io, err: anyerror) void {
         if (self.export_wav == null) return;
         self.export_wav.?.writer.abandon();
-        std.Io.Dir.cwd().deleteFile(io, self.export_wav.?.path) catch {};
+        std.Io.Dir.cwd().deleteFile(io, self.export_wav.?.render_path) catch {};
+        if (!self.export_wav.?.render_is_target) std.Io.Dir.cwd().deleteFile(io, self.export_wav.?.path) catch {};
         self.setToastWith("导出失败：{s}", .{@errorName(err)});
         self.exportWavRestore();
         self.exportWavFree();
@@ -8733,6 +8808,7 @@ pub const App = struct {
         if (self.export_wav) |*ew| {
             for (ew.states.items) |s| s.blobs.deinit(self.allocator);
             ew.states.deinit(self.allocator);
+            if (!ew.render_is_target) self.allocator.free(ew.render_path);
             self.allocator.free(ew.path);
             self.export_wav.?.log_buf.deinit(self.allocator);
         }
@@ -12508,9 +12584,10 @@ test "app: 预设面板分类可选性——统一面板（任意入口可选任
     try std.testing.expect(app.presetCategorySelectable(.{ .replace = .{ .kit_layer_replace = layer_ref } }, preset_mod.plugin_subtractive));
     try std.testing.expect(!app.presetCategorySelectable(.{ .replace = .{ .kit_layer_replace = layer_ref } }, preset_mod.plugin_drumkit));
 
-    // 新建/更换乐器：减法 + 鼓组（已实装）；unknown/vst3 不可选
+    // 新建/更换乐器：减法 + 鼓组 + 钢琴；unknown/vst3 不可选
     try std.testing.expect(app.presetCategorySelectable(.create_instrument, preset_mod.plugin_subtractive));
     try std.testing.expect(app.presetCategorySelectable(.create_instrument, preset_mod.plugin_drumkit));
+    try std.testing.expect(app.presetCategorySelectable(.create_instrument, preset_mod.plugin_piano));
     try std.testing.expect(!app.presetCategorySelectable(.create_instrument, "future_synth"));
     try std.testing.expect(!app.presetCategorySelectable(.{ .change_instrument = syn }, "vst3"));
 
@@ -12575,6 +12652,25 @@ test "app: 更换乐器——synth⇄鼓组（保留属性、可撤销/重做）
         try std.testing.expectEqual(model.InstrumentKind.drumkit, it.kind);
         try std.testing.expectEqual(@as(usize, 1), it.kit.?.totalLayers());
     }
+}
+
+test "app: 新建钢琴使用独立音色，不改变合成器默认值" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    const syn = app.addInstrument("减法合成器");
+    const piano = app.addPianoInstrument();
+    try std.testing.expect(syn >= 0 and piano >= 0);
+    try std.testing.expectEqual(model.InstrumentKind.synth, app.instruments.items[@intCast(syn)].kind);
+    try std.testing.expectEqual(@as(u8, 0), app.instruments.items[@intCast(syn)].synth.osc[0].waveform.load(.monotonic));
+    const p = app.instruments.items[@intCast(piano)].synth;
+    try std.testing.expectEqual(model.InstrumentKind.piano, app.instruments.items[@intCast(piano)].kind);
+    try std.testing.expect(p.piano_mode.load(.monotonic));
+    try std.testing.expectEqual(@as(u8, 0), p.osc[0].waveform.load(.monotonic));
+    try std.testing.expectEqual(@as(f32, 0.0), p.sustain.load(.monotonic));
 }
 
 test "app: 鼓组——清空后的无名空垫自动移除（有名垫保留）；蓝点/强调条语义" {

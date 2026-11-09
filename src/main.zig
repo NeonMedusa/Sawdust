@@ -47,6 +47,7 @@ const fx = @import("effects.zig");
 const vst_host = @import("vst_host.zig");
 const eq = @import("eq.zig");
 const audio = @import("audio.zig");
+const audio_export = @import("audio_export.zig");
 const vstscan = @import("vstscan.zig"); // 插件扫描工具（同二进制自举入口 `--vst-scan`）
 const crash = @import("crash.zig"); // 崩溃日志（GUI 子系统下 panic 看不见）
 const port_io = @import("port_io.zig");
@@ -518,6 +519,10 @@ pub fn main(init: std.process.Init) !u8 {
                         if (k.code == 0x1B) app.exportWavCancel();
                         continue;
                     }
+                    if (app.export_options_win.open) {
+                        if (k.code == 0x1B) app.export_options_win.open = false;
+                        continue;
+                    }
                     // 模态确认框优先捕获键盘
                     if (app.modal != null) {
                         switch (k.code) {
@@ -952,6 +957,8 @@ pub fn main(init: std.process.Init) !u8 {
             // 输入由 `setEditorEnabled` 闸门拦截（禁用窗点击归父窗口）。
             drawModal(&ui, &app);
         }
+        // 导出格式面板（模态；文件选择前先选格式与质量）
+        if (app.export_options_win.open) drawExportOptionsDialog(&ui, &app);
         // 导出进度窗（模态；置于最上层——导出期间其余元素均不可操作）
         if (app.export_wav != null) drawExportDialog(&ui, &app, io);
         // 文本输入框（最顶层——跨窗口/菜单，重命名乐器/通道用）
@@ -1053,7 +1060,7 @@ pub fn main(init: std.process.Init) !u8 {
                 .save_as => saveProject(&app, &win, io, true),
                 .import_midi => importMidiWithDialog(&app, &win, io),
                 .export_midi => exportMidiWithDialog(&app, &win, io),
-                .export_wav => exportWavWithDialog(&app, &win, io),
+                .export_wav => app.export_options_win.open = true,
                 .import_json => importJsonWithDialog(&app, &win, io),
                 .export_json => exportJsonWithDialog(&app, &win, io),
             }
@@ -1075,7 +1082,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
 
         // 4.4) 设置落盘（脏 → 写 settings.json；IO 在帧末）
-        // 4.25) 音频后端偏好落盘（设置页刚改；**重启生效**）
+        // 4.25) 音频输出偏好落盘（设置页刚改；**重启生效**）
         if (audio_pref.pending) |pb| {
             audio_pref.pending = null;
             audio_pref.current = pb;
@@ -1876,7 +1883,8 @@ fn applyFxParams(es: *app_mod.EffectSlot, file: ?*const preset_mod.File) void {
 fn applyInstrumentChoice(app: *App, ii: i32, plugin: []const u8, file: ?*const preset_mod.File, patch_name: []const u8) void {
     if (ii < 0 or ii >= @as(i32, @intCast(app.instruments.items.len))) return;
     const is_kit = std.mem.eql(u8, plugin, preset_mod.plugin_drumkit);
-    const kind: model.InstrumentKind = if (is_kit) .drumkit else .synth;
+    const is_piano = std.mem.eql(u8, plugin, preset_mod.plugin_piano);
+    const kind: model.InstrumentKind = if (is_kit) .drumkit else if (is_piano) .piano else .synth;
     const kind_changed = app.changeInstrumentKind(@intCast(ii), kind, false);
     if (is_kit) {
         if (file) |f| {
@@ -1900,6 +1908,24 @@ fn applyInstrumentChoice(app: *App, ii: i32, plugin: []const u8, file: ?*const p
             app.commitHistory("重置音色");
             app.setToast("已重置为空套鼓（可撤销）");
         }
+        return;
+    }
+    if (is_piano) {
+        const inst = &app.instruments.items[@intCast(ii)];
+        if (file) |f| {
+            persist.importSynth(&f.synth, inst.synth);
+            inst.synth.piano_mode.store(true, .monotonic);
+            _ = app.setInstrumentPresetName(@intCast(ii), patch_name);
+        } else {
+            _ = app.setInstrumentPresetName(@intCast(ii), "");
+            inst.synth.piano_mode.store(true, .monotonic);
+            inst.synth.attack.store(0.02, .monotonic);
+            inst.synth.decay.store(0.80, .monotonic);
+            inst.synth.sustain.store(0.0, .monotonic);
+            inst.synth.release.store(0.18, .monotonic);
+        }
+        app.commitHistory(if (kind_changed) "更换乐器" else "重置音色");
+        app.setToast("已切换为钢琴");
         return;
     }
     // 减法：应用音色（文件）或默认基准
@@ -1927,6 +1953,19 @@ fn applyInstrumentChoice(app: *App, ii: i32, plugin: []const u8, file: ?*const p
 
 /// 新建乐器（机架「＋ 添加乐器」）
 fn createInstrumentChoice(app: *App, plugin: []const u8, file: ?*const preset_mod.File, patch_name: []const u8) void {
+    if (std.mem.eql(u8, plugin, preset_mod.plugin_piano)) {
+        const ni = app.addPianoInstrument();
+        if (ni >= 0) {
+            if (file) |f| {
+                persist.importSynth(&f.synth, app.instruments.items[@intCast(ni)].synth);
+                app.instruments.items[@intCast(ni)].synth.piano_mode.store(true, .monotonic);
+                _ = app.setInstrumentPresetName(@intCast(ni), patch_name);
+            }
+        }
+        app.commitHistory("添加乐器");
+        app.setToast("已添加钢琴");
+        return;
+    }
     if (std.mem.eql(u8, plugin, preset_mod.plugin_drumkit)) {
         const ni = app.addDrumkit("鼓组");
         if (ni >= 0) {
@@ -2441,6 +2480,10 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     }
     // 导出进度窗（模态：导出期间屏蔽一切；与确认框同优先级——两者不会同时出现）
     if (app.export_wav != null) {
+        _ = ui.declare(.{ .prio = 1000, .rect = .{ .x = 0, .y = 0, .w = w, .h = h }, .modal = true });
+    }
+    // 导出格式面板与导出进度窗同为全屏模态（两者由流程保证不会重叠）。
+    if (app.export_options_win.open) {
         _ = ui.declare(.{ .prio = 1000, .rect = .{ .x = 0, .y = 0, .w = w, .h = h }, .modal = true });
     }
     // 浮动窗口：prio = 窗口 z（+1 避开主界面 0）；按 z 升序声明（同层上覆盖下）
@@ -4554,32 +4597,116 @@ fn exportMidiCommon(app: *App, io: std.Io, path: []const u8, pattern: i32) void 
     }
 }
 
-/// 导出音频（WAV, 24-bit）/ 整曲**离线渲染**：停播 + 暂停设备 → 快照 → 逐块渲染写盘。
-/// 默认文件名 = 工程名.wav（新建未保存的工程 → Sawdust.wav）。
-fn exportWavWithDialog(app: *App, win: *window.Window, io: std.Io) void {
-    _ = win;
-    _ = io;
-    // 默认文件名：<工程名>.wav（缓冲是栈上的，所以拷贝到静态缓冲里保存）
+/// 打开音频导出的保存框。格式与质量已在前一层面板选定，这里只选位置和文件名。
+fn requestAudioExportPick(app: *App) void {
+    const format = app.export_options_win.options.format;
+    // 默认文件名：<工程名>.<格式>（缓冲是栈上的，所以复制到静态缓冲里保存）
     const S = struct {
         var buf: [300]u8 = undefined;
+        var title_buf: [96]u8 = undefined;
     };
     const default_name = blk: {
         if (app.project_path) |p| {
             const base = std.fs.path.basename(p);
             const stem = if (std.mem.lastIndexOfScalar(u8, base, '.')) |i| base[0..i] else base;
-            if (stem.len > 0 and stem.len < 290) break :blk std.fmt.bufPrint(&S.buf, "{s}.wav", .{stem}) catch "Sawdust.wav";
+            if (stem.len > 0 and stem.len < 290) break :blk std.fmt.bufPrint(&S.buf, "{s}{s}", .{ stem, format.extension() }) catch "Sawdust.wav";
         }
-        break :blk "Sawdust.wav";
+        break :blk std.fmt.bufPrint(&S.buf, "Sawdust{s}", .{format.extension()}) catch "Sawdust.wav";
     };
-    app.requestPick(.{ .kind = .save, .use_ = .export_wav, .title = "导出音频 (WAV)", .filter = filedialog.wav_filter, .default_name = default_name });
+    const title = std.fmt.bufPrint(&S.title_buf, "导出音频（{s}）", .{format.label()}) catch "导出音频";
+    app.requestPick(.{ .kind = .save, .use_ = .export_wav, .title = title, .filter = filedialog.audio_filter, .default_name = default_name });
 }
 
-/// 开始导出 WAV（对话框结果）；进度/取消/完成由主循环的导出状态机负责
+/// 开始导出（对话框结果）；格式与质量取自刚才的导出面板。
 fn exportWavToPath(app: *App, io: std.Io, path: []const u8) void {
-    app.exportWavBegin(io, path) catch |e| {
+    const options = app.export_options_win.options;
+    const target = audio_export.targetPath(app.allocator, path, options.format) catch |e| {
         app.setToastWith("导出失败：{s}", .{@errorName(e)});
         return;
     };
+    defer app.allocator.free(target);
+    app.exportAudioBegin(io, target, options) catch |e| {
+        app.setToastWith("导出失败：{s}", .{@errorName(e)});
+        return;
+    };
+}
+
+/// 导出设置窗（格式 + 码率/压缩级）。保存框只负责路径，避免“靠扩展名猜格式”。
+fn drawExportOptionsDialog(ui: *Ui, app: *App) void {
+    const ww: i32 = 460;
+    const hh: i32 = 222;
+    const win_w = @as(i32, @intCast(ui.renderer.fb.width));
+    const win_h = @as(i32, @intCast(ui.renderer.fb.height));
+    const x = @divTrunc(win_w - ww, 2);
+    const y = @divTrunc(win_h - hh, 3);
+    const state = &app.export_options_win;
+
+    ui.renderer.fillRect(0, 0, win_w, win_h, (@as(u32, 110) << 24) | 0x000000);
+    ui.noteOverlayRect(x, y, ww, hh);
+    ui.renderer.fillRect(x + 4, y + 4, ww, hh, r_mod.rgb(10, 11, 13));
+    ui.renderer.fillRect(x, y, ww, hh, ui.theme.panel);
+    ui.renderer.strokeRect(x, y, ww, hh, ui.theme.accent);
+    ui.label("导出音频", x + 12, y + 7, ui.theme.text);
+
+    ui.label("格式", x + 14, y + 36, ui.theme.text_dim);
+    const formats = [_]audio_export.Format{ .wav, .mp3, .flac, .ogg };
+    const fw: i32 = 102;
+    for (formats, 0..) |format, i| {
+        const bx = x + 14 + @as(i32, @intCast(i)) * fw;
+        const selected = state.options.format == format;
+        const hovered = util.hitUI(ui, bx, y + 52, fw - 4, 24);
+        ui.renderer.fillRect(bx, y + 52, fw - 4, 24, if (selected) ui.theme.accent else if (hovered) ui.theme.item_hover else ui.theme.slider_track);
+        ui.renderer.strokeRect(bx, y + 52, fw - 4, 24, ui.theme.panel_border);
+        const text = switch (format) {
+            .wav => "WAV",
+            .mp3 => "MP3",
+            .flac => "FLAC",
+            .ogg => "OGG",
+        };
+        const tw: i32 = @intFromFloat(ui.font.measure(text));
+        ui.label(text, bx + @divTrunc(fw - 4 - tw, 2), y + 59, if (selected) r_mod.rgb(240, 244, 250) else ui.theme.text);
+        if (hovered and ui.mouse_pressed) state.options.format = format;
+    }
+
+    const format = state.options.format;
+    if (format == .wav) {
+        ui.label("无压缩 PCM，24-bit 立体声；不需要 FFmpeg。", x + 14, y + 94, ui.theme.text_dim);
+    } else if (format == .flac) {
+        ui.label("压缩等级（0 快 / 12 小；音质始终无损）", x + 14, y + 94, ui.theme.text_dim);
+        const levels = [_]u8{ 0, 5, 8, 12 };
+        for (levels, 0..) |level, i| {
+            var buf: [8]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "{d}", .{level}) catch "";
+            const bx = x + 14 + @as(i32, @intCast(i)) * 58;
+            const selected = state.options.flac_compression == level;
+            const hovered = util.hitUI(ui, bx, y + 112, 52, 24);
+            ui.renderer.fillRect(bx, y + 112, 52, 24, if (selected) ui.theme.accent else if (hovered) ui.theme.item_hover else ui.theme.slider_track);
+            ui.renderer.strokeRect(bx, y + 112, 52, 24, ui.theme.panel_border);
+            ui.label(text, bx + 20, y + 119, if (selected) r_mod.rgb(240, 244, 250) else ui.theme.text);
+            if (hovered and ui.mouse_pressed) state.options.flac_compression = level;
+        }
+    } else {
+        ui.label("码率（kbps）", x + 14, y + 94, ui.theme.text_dim);
+        const bitrates = [_]u16{ 128, 192, 256, 320 };
+        for (bitrates, 0..) |bitrate, i| {
+            var buf: [16]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "{d}", .{bitrate}) catch "";
+            const bx = x + 14 + @as(i32, @intCast(i)) * 64;
+            const selected = state.options.bitrate_kbps == bitrate;
+            const hovered = util.hitUI(ui, bx, y + 112, 58, 24);
+            ui.renderer.fillRect(bx, y + 112, 58, 24, if (selected) ui.theme.accent else if (hovered) ui.theme.item_hover else ui.theme.slider_track);
+            ui.renderer.strokeRect(bx, y + 112, 58, 24, ui.theme.panel_border);
+            ui.label(text, bx + 12, y + 119, if (selected) r_mod.rgb(240, 244, 250) else ui.theme.text);
+            if (hovered and ui.mouse_pressed) state.options.bitrate_kbps = bitrate;
+        }
+        ui.label("压缩格式需要系统已安装 FFmpeg。", x + 14, y + 146, ui.theme.text_dim);
+    }
+
+    if (ui.button(9810, "取消", x + 210, y + hh - 38, 82, 26)) state.open = false;
+    if (ui.button(9811, "选择位置并导出", x + 300, y + hh - 38, 146, 26)) {
+        state.open = false;
+        requestAudioExportPick(app);
+    }
 }
 
 /// 导出进度窗（模态；绘于最上层）。进度条 + 取消按钮；标题可拖动（位置记忆在
@@ -4609,7 +4736,10 @@ fn drawExportDialog(ui: *Ui, app: *App, io: std.Io) void {
 
     // 标题（拖动区）
     const title_bar_h: i32 = 22;
-    ui.label("导出音频 (WAV)", x + 10, y + 5, ui.theme.text);
+    const exporting = app.export_wav orelse return;
+    var title_buf: [80]u8 = undefined;
+    const title = std.fmt.bufPrint(&title_buf, "导出音频（{s}）", .{exporting.options.format.label()}) catch "导出音频";
+    ui.label(title, x + 10, y + 5, ui.theme.text);
     if (util.hitUI(ui, x, y, ww, title_bar_h) and ui.mouse_pressed) {
         ui.active_id = 9800; // 导出窗标题拖动（**与插件管理器的 9700 错开**——撞车会拖着两窗一起动，实测）
         ew.grab_dx = ui.mouse_x - x;
