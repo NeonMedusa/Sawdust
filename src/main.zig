@@ -3,7 +3,7 @@
 //! 主入口：窗口 + 主循环 + 工具栏 + 布局组装（三栏 + 浮动窗口）。
 //! - 数据模型与纯逻辑：`model.zig`（可单测）
 //! - 应用状态：`app.zig`
-//! - 视图：`view_playlist.zig` / `view_pianoroll.zig` / `view_rack.zig` / `view_panels.zig`
+//! - 视图：`view_playlist.zig` / `view_pianoroll.zig` / `view_synth.zig` / `view_panels.zig`
 //! - 控件库：`ui.zig`；渲染：`render.zig`；窗口：`window.zig`；音频：`audio.zig`
 
 const std = @import("std");
@@ -27,7 +27,6 @@ const filedialog = @import("filedialog.zig");
 const util = @import("view_util.zig");
 const view_playlist = @import("view_playlist.zig");
 const view_pianoroll = @import("view_pianoroll.zig");
-const view_rack = @import("view_rack.zig");
 const view_synth = @import("view_synth.zig");
 const view_mixer = @import("view_mixer.zig");
 const view_effect = @import("view_effect.zig");
@@ -123,13 +122,9 @@ pub fn main(init: std.process.Init) !u8 {
         app.pending_scan_start = true;
     }
     loadSettings(&app, io); // 设置（settings.json；缺失 = 默认）+ 启动打开上次工程
-    // 初始片段（空基线）：样式 1 放在 Track 1 的最左边（长度 = 样式有效长度）
-    app.addClip(.{
-        .track = 0,
-        .start = 0,
-        .len = app.patternEffectiveLen(0),
-        .pattern = 0,
-    });
+    // 初始内容（空基线）：**轨道上放一个 1 小节的 Part**（线性工作流：不再放样式片段）
+    app.ensureTracks(1);
+    if (app.addPart(0, 0, app.steps_per_bar)) |_| {}
     // 初始乐器：1 个减法合成器（**必须在 engine.init 之前**——
     // 音频回调启动后会解引用参数/队列指针）
     _ = app.addInstrument("减法合成器");
@@ -787,6 +782,10 @@ pub fn main(init: std.process.Init) !u8 {
         // **自动化必须在静态同步之后“立刻”写入**：静态同步每帧会把 `instrument_gain`
         // 写回推子的值；若自动化延后到帧末再写，两者在同一帧内交替存在 →
         // 音频线程随机读到“推子值”或“自动化值”（实测：同一场景一次全正常、一次半静音）。
+        // **乐器 ↔ 轨道同步**（过渡期的双写胶水）：机架里每个乐器都必须有一条轨道挂着它。
+        // 机架将来整体删除后，两者本就是同一份数据，这段同步自然消失。
+        app.syncTracksToInstruments();
+
         app.publishAutoLane();
 
         // 同步调音台通道参数（增益/声像/静音/效果链）到音频线程
@@ -2372,7 +2371,6 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     // 按 z 升序声明层 + 绘制（后声明/后绘制 = 在上）。
     // 注：早期版本给窗口写死 prio（合成器/调音台都是 2）——而 `ui.declare`
     // 对**同 prio 是覆盖**，后声明的把先声明的层顶掉 → 被顶那层点击穿透（实测 bug）。
-    const rack_open = app.rack.open;
     const synth_open = app.synth_win.open;
     const mixer_open = app.mixer_win.open; // 效果器面板（依赖调音台的 panel 选择；通道/槽位有效才显示）
     const effect_open = app.mixer_win.panel != null;
@@ -2402,10 +2400,6 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     // 浮动窗口列表（按 z 升序 = 从下到上）；排序用插入排序（元素很少）
     var wins: [8]struct { z: i32, draw: app_mod.WinKind } = undefined;
     var nwin: usize = 0;
-    if (rack_open) {
-        wins[nwin] = .{ .z = app.rack.z, .draw = .rack };
-        nwin += 1;
-    }
     if (synth_open) {
         wins[nwin] = .{ .z = app.synth_win.z, .draw = .synth };
         nwin += 1;
@@ -2459,7 +2453,6 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     // 同 prio 是覆盖且要求 prio 互不相同；位次天然互异且与排序一致。
     for (wins[0..nwin], 0..) |win, wi| {
         const r: @import("ui.zig").Rect = switch (win.draw) {
-            .rack => .{ .x = app.rack.x, .y = app.rack.y, .w = app.rack.w, .h = app.rack.h },
             .synth => .{ .x = app.synth_win.x, .y = app.synth_win.y, .w = app.synth_win.w, .h = app.synth_win.h },
             .mixer => .{ .x = app.mixer_win.x, .y = app.mixer_win.y, .w = app.mixer_win.w, .h = app.mixer_win.h },
             .effect => .{ .x = app.effect_win.x, .y = app.effect_win.y, .w = app.effect_win.w, .h = app.effect_win.h },
@@ -2540,7 +2533,6 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     for (wins[0..nwin], 0..) |win, wi| {
         _ = ui.beginLayerNoClip(1 + @as(i32, @intCast(wi)));
         switch (win.draw) {
-            .rack => _ = view_rack.draw(ui, app, w, h, menu_open),
             .synth => _ = view_synth.draw(ui, app, w, h),
             .mixer => _ = view_mixer.draw(ui, app, w, h),
             .effect => _ = view_effect.draw(ui, app, w, h),
@@ -2572,7 +2564,6 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     for (wins[0..nwin]) |win| {
         if (app.win_draw_n >= app.win_draw_info.len) break;
         app.win_draw_info[app.win_draw_n] = switch (win.draw) {
-            .rack => .{ .kind = .rack, .x = app.rack.x, .y = app.rack.y, .w = app.rack.w, .h = app.rack.h },
             .synth => .{ .kind = .synth, .x = app.synth_win.x, .y = app.synth_win.y, .w = app.synth_win.w, .h = app.synth_win.h },
             .mixer => .{ .kind = .mixer, .x = app.mixer_win.x, .y = app.mixer_win.y, .w = app.mixer_win.w, .h = app.mixer_win.h },
             .effect => .{ .kind = .effect, .x = app.effect_win.x, .y = app.effect_win.y, .w = app.effect_win.w, .h = app.effect_win.h },
@@ -2601,11 +2592,12 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
     // 帧首：清“刚打开”标记（文件菜单；与机架下拉同一模式——必须逐帧做，
     // 否则“点按钮关闭”失效，且用 `ui.button` 的点击会被模态层屏蔽）
     util.menuFrameBegin(&app.file_menu_just_opened);
-    const menus = [_][]const u8{ "文件", "选项", "乐器", "混音台" };
-    // 工具栏顺序（用户拍板）：文件 选项 帮助 插件 乐器 混音台——
+    const menus = [_][]const u8{ "文件", "选项", "混音台" };
+    // 工具栏顺序（用户拍板）：文件 选项 帮助 插件 混音台——
     // 菜单数组维持原下标（`i` 参与动作分派），按**绘制序列**遍历：
     // 255 = 帮助按钮、254 = 插件按钮（插在菜单之间的非菜单项）
-    const seq = [_]usize{ 0, 1, 255, 254, 2, 3 };
+    // 注：**“乐器”按钮已随通道机架一起删除**（职责已被 Track 接管）
+    const seq = [_]usize{ 0, 1, 255, 254, 2 };
     for (seq) |si| {
         if (si == 255) {
             // “帮助”按钮（无下拉）：单击**切换**帮助页可见性（同“乐器/混音台”）
@@ -2634,31 +2626,26 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
         const i: usize = si;
         const m = menus[i];
         const mw: i32 = @as(i32, @intFromFloat(ui.font.measure(m))) + 16;
-        const active = (i == 2 and app.rack.open) or (i == 0 and app.file_menu_open) or (i == 3 and app.mixer_win.open) or (i == 1 and app.settings_win.open);
+        const active = (i == 0 and app.file_menu_open) or (i == 2 and app.mixer_win.open) or (i == 1 and app.settings_win.open);
         if (active) {
             if (ui.buttonEx(100 + @as(u64, i), m, x, by, mw, bh, true)) {
-                if (i == 2) {
-                    app.rack.open = false;
-                } else if (i == 0) {
+                if (i == 0) {
                     app.file_menu_open = false;
-                } else if (i == 3) {
+                } else if (i == 2) {
                     app.mixer_win.open = false;
                 } else if (i == 1) {
                     app.settings_win.open = false;
                 }
             }
         } else if (ui.button(100 + @as(u64, i), m, x, by, mw, bh)) {
-            if (i == 2) {
-                app.rack.open = true;
-                app.bringToFront(&app.rack.z); // 刚打开：置顶（否则可能被别的窗口盖住）
-            } else if (i == 1) {
+            if (i == 1) {
                 app.settings_win.open = true;
                 app.bringToFront(&app.settings_win.z);
             } else if (i == 0) {
                 app.file_menu_open = !app.file_menu_open;
                 // 刚打开：供 drawFileMenu 区分“打开那一下”（不立即关）
                 if (app.file_menu_open) app.file_menu_just_opened = true;
-            } else if (i == 3) {
+            } else if (i == 2) {
                 app.mixer_win.open = !app.mixer_win.open;
                 // 刚打开：置顶（同上；关闭时不动 z）
                 if (app.mixer_win.open) app.bringToFront(&app.mixer_win.z);
@@ -3757,31 +3744,43 @@ fn handleDroppedFiles(app: *App, win: *window.Window, px: i32, py: i32) void {
     if (app.export_wav != null) return; // 导出期间不接编辑
     // **只有两片**：播放列表网格内（→ 样式 + 片段）/ 网格外（→ 只建样式）。
     // 网格外不再"静默丢弃"（实测：松手偏一点就毫无反应，而文件管理器已显示“复制成功”，很容易误会）。
-    const hit = view_playlist.hitAt(app, px, py) orelse {
-        const n = dropAsStyles(app, paths.items);
-        if (n > 0) app.setToastWith("已导入 {d} 个音频样式（拖到播放列表网格内可直接放片段）", .{n});
-        return;
-    };
-    var track = hit.track;
+    // **落点判定（§10.7）**：
+    // - 落在**音频轨**上 → 该轨建音频片段（多文件依次往下面轨道放，若下面不是音频轨就新建一条）；
+    // - 落在别处（网格外 / 乐器轨 / 无轨道区）→ **每个文件新建一条音频轨**（名 = 文件名），片段放在该轨第 0 步。
+    const hit = view_playlist.hitAt(app, px, py);
+    const on_audio = if (hit) |h| app.isAudioTrack(h.track) else false;
+    var track: i32 = if (hit) |h| h.track else 0;
+    const at_step: i32 = if (hit) |h| h.step else 0;
     var created: usize = 0;
     var last_style: ?i32 = null;
-    app.clearClipSelection(); // 新放入的片段成为选区（用户拍板：选择跟随）
     for (paths.items) |p| {
         const st = createAudioStyle(app, p) orelse continue;
         last_style = st;
-        if (app.audioClipAdd(st, track, hit.step)) |ci| {
-            if (ci < app.clips.items.len) app.clips.items[ci].selected = true;
+        var tgt: i32 = undefined;
+        if (on_audio and app.isAudioTrack(track)) {
+            tgt = track;
+        } else {
+            // 新轨：名字 = 文件名（去扩展名）
+            const base = std.fs.path.basename(p);
+            const stem = if (std.mem.lastIndexOfScalar(u8, base, '.')) |dot| base[0..dot] else base;
+            const row = app.trackAddAudio(stem) orelse continue;
+            tgt = @intCast(row);
+        }
+        // **A2/线性化**：拖入 = 在音频轨上放一个**音频 Part**（不再是旧 Clip）
+        // 长度用 `audioPartAdd` 自己算：它会在资产未解码时用文件头的 `frames_hint`（
+        // 实测 bug：直接读 asset 拿不到帧数 → 长度退化成 1 步）
+        if (app.audioPartAdd(st, tgt, at_step)) |pi| {
+            if (pi < app.parts.items.len) app.parts.items[pi].selected = true;
         }
         created += 1;
-        track += 1; // 多文件：依次放到下面的轨道（用户拍板）
+        track = tgt + 1; // 多文件：依次往下
     }
     if (created == 0) return;
-    app.sel.track = hit.track; // 选择跟随：当前轨道 = 落点轨道
     // 样式面板自动切到「音频」页，并选中本次最后导入的样式
     app.panels.patterns_tab_audio = true;
     if (last_style) |s| app.audio_style_sel = s;
-    app.commitHistory("拖入音频片段");
-    app.setToastWith("已在 Track {d} · 第 {d} 步放入 {d} 个音频片段", .{ hit.track + 1, hit.step, created });
+    app.commitHistory("拖入音频 Part");
+    app.setToastWith("已放入 {d} 个音频 Part", .{created});
 }
 
 /// 鼓垫采样：加载/更换（layer = null → 新增采样器层）
@@ -5139,7 +5138,6 @@ test {
     _ = @import("view_playlist.zig");
     _ = @import("view_pianoroll.zig");
     _ = @import("view_note_lane.zig");
-    _ = @import("view_rack.zig");
     _ = @import("view_synth.zig");
     _ = @import("view_mixer.zig");
     _ = @import("view_panels.zig");

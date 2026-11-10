@@ -271,16 +271,12 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         const hovered = util.hitUI(ui, bx, by, bw, add_ch_h);
         ui.renderer.fillRect(bx, by, bw, add_ch_h, if (hovered) ui.theme.item_hover else ui.theme.slider_track);
         ui.renderer.strokeRect(bx, by, bw, add_ch_h, ui.theme.panel_border);
-        const lbl = "+ 添加通道";
+        const lbl = "+ 添加轨道";
         const tw: i32 = @intFromFloat(ui.font.measure(lbl));
         ui.label(lbl, bx + @divTrunc(bw - tw, 2), by + 3, ui.theme.text);
         if (hovered and ui.mouse_pressed) {
-            if (app.addMixerChannel()) |ni| {
-                app.mixer_win.selected_channel = @intCast(ni);
-                app.commitHistory("添加通道");
-            } else {
-                app.setToast("无法添加通道（内存不足）");
-            }
+            // **通道属于轨道**（一轨↔一乐器↔一通道）：加通道 = 加一条轨道
+            app.beginAddTrackWithPicker();
         }
     }
 
@@ -290,17 +286,10 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
 
     // 本窗右键菜单展开：解除全局屏蔽，让菜单项可点（同机架模式：
     // 上方控件用 hitUI 已被 menuIsOpen 屏蔽；菜单本体用裸 inRect 接收）
-    if (mw.ctx_effect != null or mw.ctx_channel != null or mw.ctx_pan != null or mw.ctx_vol != null) ui.input_blocked = false;
+    if (mw.ctx_effect != null or mw.ctx_pan != null or mw.ctx_vol != null) ui.input_blocked = false;
     // ── 效果器右键菜单 ──
     if (mw.ctx_effect) |ctx| {
         drawCtxMenu(ui, app, ctx);
-    }
-    // ── **通道本体**右键菜单：只管通道（重命名/删除/上移/下移）
-    //    音量/声像的“恢复默认值 / 自动化…”在各自控件的右键菜单里（用户拍板：两套分离）
-    if (mw.ctx_channel) |cc| {
-        const items = [_][]const u8{ "重命名", "删除通道", "上移", "下移" };
-        const ch_ok = [_]bool{ true, cc != 0, cc != 0, cc != 0 };
-        drawCtxMenuGeneric(ui, app, cc, null, &items, &ch_ok, false);
     }
     // ── 声像旋钮右键菜单（恢复默认值 / 自动化…）──
     if (mw.ctx_pan) |pc| {
@@ -376,7 +365,6 @@ fn drawStrip(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32) void
         if (util.hitUI(ui, cx, ky, knob_size, knob_size) and ui.mouse_right_pressed) {
             app.mixer_win.selected_channel = @intCast(ci);
             app.mixer_win.ctx_pan = ci;
-            app.mixer_win.ctx_channel = null;
             app.mixer_win.ctx_vol = null;
             app.mixer_win.ctx_effect = null;
             app.mixer_win.ctx_menu_x = ui.mouse_x;
@@ -385,13 +373,9 @@ fn drawStrip(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32) void
         }
         cx += knob_size + 8;
     }
-    // 通道名（**定宽**；超出裁剪——省略号待做）。自定义名优先
+    // 通道名（**与 Track 名一致**；通道 0 = 主通道）
     {
-        var nb: [24]u8 = undefined;
-        const name = if (ci < app.mixer_channels_state.items.len)
-            app.mixer_channels_state.items[ci].displayName(ci, &nb)
-        else
-            app_mod.defaultChannelName(ci, &nb);
+        const name = app.channelName(ci);
         ui.labelClipped(name, cx + 2, y + 4, name_w, if (selected) ui.theme.text else ui.theme.text_dim);
         cx += name_w + 10;
     }
@@ -414,7 +398,6 @@ fn drawStrip(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32) void
         if (util.hitUI(ui, cx, y, x + w - cx, h) and ui.mouse_right_pressed) {
             app.mixer_win.selected_channel = @intCast(ci);
             app.mixer_win.ctx_vol = ci;
-            app.mixer_win.ctx_channel = null;
             app.mixer_win.ctx_pan = null;
             app.mixer_win.ctx_effect = null;
             app.mixer_win.ctx_menu_x = ui.mouse_x;
@@ -432,20 +415,12 @@ fn drawStrip(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32) void
     if (bar_clicked and !consumed) {
         app.mixer_win.selected_channel = @intCast(ci);
     }
-    // 右键 → 通道菜单（重命名/删除/上移/下移）；控件右键菜单优先（`right_consumed`）。
-    // **所有 ctx_* 必须互斥**：曾经漏清 `ctx_vol` → 两个菜单同时挂出来（实测 bug）。
+    // 右键→ 只选中该通道（**通道本体菜单已删除**：通道名/存在与否现在都跟着 Track）
     if (!right_consumed and util.hitUI(ui, x, y, w, h) and ui.mouse_right_pressed) {
         app.mixer_win.selected_channel = @intCast(ci);
-        app.mixer_win.ctx_channel = ci;
-        app.mixer_win.ctx_vol = null;
-        app.mixer_win.ctx_effect = null;
-        app.mixer_win.ctx_pan = null;
-        app.mixer_win.ctx_menu_x = ui.mouse_x;
-        app.mixer_win.ctx_menu_y = ui.mouse_y;
     }
 }
 
-/// （已移除：通道名改由 `MixerChannel.displayName` 提供——自定义名/占位名）
 /// 右区：选中通道的效果器链（抬头 + 效果行 + 空槽 + 添加按钮）
 fn drawEffectPanel(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32) void {
     const mc = &app.mixer_channels_state.items[ci];
@@ -554,7 +529,6 @@ fn drawEffectRow(ui: *Ui, app: *App, ci: usize, si: usize, x: i32, y: i32, w: i3
     // 右键 → 删除菜单
     if (name_hovered and ui.mouse_right_pressed) {
         app.mixer_win.ctx_effect = .{ .ch = ci, .slot = si };
-        app.mixer_win.ctx_channel = null;
         app.mixer_win.ctx_pan = null;
         app.mixer_win.ctx_menu_x = ui.mouse_x;
         app.mixer_win.ctx_menu_y = ui.mouse_y;
@@ -617,27 +591,8 @@ fn drawCtxMenuGeneric(ui: *Ui, app: *App, ch: usize, slot: ?usize, items: []cons
     }
 
     if (clicked) |ci| {
-        if (slot == null) {
-            // 通道菜单：重命名 / 删除通道 / 上移 / 下移
-            switch (ci) {
-                0 => app.beginRenameMixerChannel(ch, mx + 4, my + 4),
-                1 => {
-                    if (app.removeMixerChannel(ch)) {
-                        app.commitHistory("删除通道");
-                    } else {
-                        app.setToast("至少保留一个通道");
-                    }
-                },
-                2 => {
-                    if (app.moveMixerChannel(ch, -1)) app.commitHistory("通道上移");
-                },
-                3 => {
-                    if (app.moveMixerChannel(ch, 1)) app.commitHistory("通道下移");
-                },
-
-                else => {},
-            }
-        } else if (slot) |sl| {
+        // 只剩**效果器菜单**（通道本体菜单已删除：通道名/存否都跟随 Track）
+        if (slot) |sl| {
             // 效果器菜单：[更换效果器…] [重新定位插件…?] 删除 / 上移 / 下移
             const base: usize = 1 + (if (has_relocate) @as(usize, 1) else 0);
             if (ci == 0) {
@@ -664,12 +619,10 @@ fn drawCtxMenuGeneric(ui: *Ui, app: *App, ch: usize, slot: ?usize, items: []cons
             }
         }
         mw_win.ctx_effect = null;
-        mw_win.ctx_channel = null;
         mw_win.ctx_menu_x = 0;
         mw_win.ctx_menu_y = 0;
     } else if (ui.mouse_pressed and !inside) {
         mw_win.ctx_effect = null;
-        mw_win.ctx_channel = null;
         mw_win.ctx_menu_x = 0;
         mw_win.ctx_menu_y = 0;
     }

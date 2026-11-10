@@ -317,9 +317,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             if (ui.active_id == 6000) ui.active_id = 0;
         }
         const kh = app.piano.key_h;
-        // 菜单展开中 → 琴键不响应（机架的下拉/右键菜单，以及卷帘自己的两个选单）
-        const menu_blocks = app.rack.ctx_instrument != null or
-            app.piano.inst_menu_open or app.piano.snap_menu_open;
+        // 菜单展开中 → 琴键不响应（卷帘自己的两个选单；通道机架已删除）
+        const menu_blocks = app.piano.inst_menu_open or app.piano.snap_menu_open;
         const in_keys = !menu_blocks and ui.hitRect(keys_x, lane_y, util.piano_header_w, lane_h);
         const over_other_drag = ui.active_id != 0 and ui.active_id != 6000;
         const pitch_at_mouse: i32 = 127 - @divFloor(ui.mouse_y - lane_y + app.piano.scroll, kh);

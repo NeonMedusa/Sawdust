@@ -25,6 +25,55 @@ pub fn clipXW(c: model.Clip, lane_x: i32, step_px: f32, scroll_x: i32, zoom: f32
     return .{ .x = px0, .w = @max(1, px1 - px0) };
 }
 
+/// **音频 Part 的波形**（线性化：与音符 Part 共用同一套外观，只是内部画波形）。
+/// 规则与旧片段版本一致：原生尺度（不压缩）——每像素 = (1/step_px) 步 × 每步帧数；超出音频即空。
+fn drawAudioPartWave(ui: *Ui, app: *App, pt: *const model.Part, x: i32, w: i32, ty: i32, track_h: i32, step_px: f32, zoom: f32) void {
+    const sti = pt.audio.style;
+    if (sti < 0 or @as(usize, @intCast(sti)) >= app.audio_styles.items.len) return;
+    const st = &app.audio_styles.items[@intCast(sti)];
+    const asset = app.audioStyleAsset(@intCast(sti)) orelse {
+        // 异步导入中（与旧片段一致）：斜纹占位 + 百分比；真·缺失才写“音频缺失”
+        if (app.styleImportProgress(@intCast(sti))) |p| {
+            var sx: i32 = 0;
+            while (sx < w) : (sx += 6) {
+                ui.renderer.vline(x + sx, ty + 2, @max(1, track_h - 4), ui.theme.panel_border);
+            }
+            const pct: i32 = @intFromFloat(@round(p * 100.0));
+            var pbuf: [16]u8 = undefined;
+            const ptxt = std.fmt.bufPrint(&pbuf, "载入 {d}%", .{pct}) catch "载入";
+            if (w >= 30) {
+                ui.labelClipped(ptxt, x + 6, ty + 4, w - 12, ui.theme.text_dim);
+            } else if (w >= 22) {
+                ui.labelClipped(ptxt, x + 3, ty + 3, w - 6, ui.theme.text_dim);
+            }
+        } else {
+            ui.labelClipped("（音频缺失）", x + 4, ty + 3, w - 8, ui.theme.danger);
+        }
+        return;
+    };
+    const total: i32 = @intCast(asset.data.frame_count);
+    if (total <= 0 or asset.peaks.len == 0) return;
+    const ts: i64 = pt.audio.trim_start;
+    const fps_f: f64 = @floatFromInt(app.framesPerStep());
+    const mid = ty + @divTrunc(track_h, 2);
+    const half: f32 = @as(f32, @floatFromInt(track_h)) * 0.4;
+    const peak_frames: i32 = @intCast(@max(@as(u32, 1), asset.peak_frames));
+    const spd: f64 = std.math.clamp(@as(f64, st.speed), 0.25, 4.0);
+    const pxps: f64 = @as(f64, step_px) * @as(f64, zoom);
+    var px: i32 = 0;
+    while (px < w) : (px += 1) {
+        const fr_i: i64 = @as(i64, @intFromFloat((@as(f64, @floatFromInt(ts)) + @as(f64, @floatFromInt(px)) / @max(1e-6, pxps) * fps_f * spd) * @as(f64, asset.data.ratio)));
+        if (fr_i >= total) break;
+        const fr: i32 = @intCast(fr_i);
+        const bi: usize = @min(asset.peaks.len - 1, @as(usize, @intCast(@divTrunc(fr, peak_frames))));
+        const pk = asset.peaks[bi];
+        const y0: i32 = mid - @as(i32, @intFromFloat(pk.max * half));
+        const y1: i32 = mid - @as(i32, @intFromFloat(pk.min * half));
+        ui.renderer.vline(x + px, y0, @max(1, y1 - y0), ui.theme.waveform);
+    }
+    if (w >= 30) ui.labelClipped(st.name, x + 6, ty + 4, w - 12, ui.theme.text);
+}
+
 /// 样式配色（minimap / 片段色块）：按序号在色相上分布，保证相邻样式颜色可区分。
 /// 静音视觉（浅灰）：轨道名与片段整体变灰
 /// 片段自身静音（Ctrl+M）的灰
@@ -32,6 +81,11 @@ pub const muted_gray: r_mod.Color = r_mod.rgb(150, 150, 154);
 /// **轨道静音**：比片段静音更暗（让用户一眼分辨"是自己静音了"还是"轨道静音了"）
 pub const muted_gray_track: r_mod.Color = r_mod.rgb(92, 92, 96);
 
+/// **Part 重叠层级**（与片段一致）：按左端点升序；相同起点 → 数组序（后加的在上）
+fn partLayerLess(parts: []const model.Part, a: usize, b: usize) bool {
+    if (parts[a].start != parts[b].start) return parts[a].start < parts[b].start;
+    return a < b;
+}
 pub fn patternColor(pattern: i32) r_mod.Color {
     const palette = [_]r_mod.Color{
         r_mod.rgb(90, 170, 255), // 蓝
@@ -52,7 +106,7 @@ pub fn drawTrackCtxMenu(ui: *Ui, app: *App) void {
         app.panels.ctx_track = null; // 目标已不存在（撤销等）→ 关闭
         return;
     }
-    const items = [_][]const u8{ "重命名", "上移", "下移", "清空轨道", "删除轨道" };
+    const items = [_][]const u8{ "重命名", "上移", "下移", "清空轨道", "删除轨道", "更换乐器…" };
     const menu_w: i32 = 150;
     const menu_h: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
     const mx = app.panels.ctx_trk_x;
@@ -75,7 +129,16 @@ pub fn drawTrackCtxMenu(ui: *Ui, app: *App) void {
     }
     if (clicked) |ci| {
         switch (ci) {
-            0 => app.beginRenameTrack(idx, mx + 6, my + 4),
+            0 => {
+                // **重命名 = 重命名乐器**（乐器就是轨道、轨道就是乐器）：直接复用机架的重命名逻辑，
+                // 预填当前乐器名；输入空字符串 = 不修改（`.instrument` 分支已守卫 `val.len > 0`）。
+                const ii = app.trackInstrument(idx);
+                if (ii >= 0) {
+                    app.beginRenameInstrument(@intCast(ii), mx + 6, my + 4);
+                } else {
+                    app.beginRenameTrack(idx, mx + 6, my + 4);
+                }
+            },
             1 => {
                 // 上移：与相邻行整体交换（默认名随位置，自定义名随行）
                 if (idx > 0) {
@@ -86,8 +149,12 @@ pub fn drawTrackCtxMenu(ui: *Ui, app: *App) void {
                 }
             },
             2 => {
-                app.swapTrackRows(idx, idx + 1);
-                app.commitHistory("下移轨道");
+                if (idx + 1 < app.tracks.items.len) {
+                    app.swapTrackRows(idx, idx + 1);
+                    app.commitHistory("下移轨道");
+                } else {
+                    app.setToast("已在最下一条");
+                }
             },
             3 => {
                 if (app.trackUsage(idx) == 0) {
@@ -100,13 +167,25 @@ pub fn drawTrackCtxMenu(ui: *Ui, app: *App) void {
             },
             4 => {
                 if (app.trackUsage(idx) == 0) {
-                    // 空行：直接删（下方整体上移）
+                    // 空轨：直接删（下方整体上移，**轨道实体与乐器一并移除**）
                     app.removeTrackRow(idx);
                     app.commitHistory("删除轨道");
                 } else {
                     app.modal = .track_delete;
                     app.struct_del_req = .{ .track_row = idx };
                 }
+            },
+            5 => {
+                // **更换乐器…**：打开乐器预设选择窗（选完替换该轨乐器，音符保留）
+                const ii = app.trackInstrument(idx);
+                if (ii >= 0) {
+                    app.openPresetBrowser(.{ .change_instrument = ii });
+                } else {
+                    app.beginAddTrackWithPicker();
+                }
+            },
+            6 => {
+                // （旧“+ 添加 Part”已删：Part 由网格左键单击放置）
             },
             else => {},
         }
@@ -162,7 +241,11 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 菜单展开时的点击只归菜单：屏蔽本帧其它交互（标尺/轨道区）——
     // 必须在**任何交互处理之前**算（实测 bug：点选单条目穿透命中小节标尺，
     // 游标跳到鼠标位置）。
-    const menu_click = (snap_menu_was_open or snap_clicked) and ui.mouse_pressed;
+    // **本视图是否被浮动窗口/菜单盖住**（`ui.input_blocked` 由层系统在 `beginLayer` 时算好）。
+    // 注：本视图很多命中用的是裸 `util.inRect`（不走 `ui.hitRect`），因此**必须显式参与判定**——
+    // 否则浮动窗口上的点击会穿透到 Part / 轨道头 / `+ 添加轨道`（实测 bug）。
+    const ui_blocked = ui.input_blocked;
+    const menu_click = (snap_menu_was_open or snap_clicked or ui_blocked) and ui.mouse_pressed;
 
     const header_w: i32 = util.piano_header_w; // 轨道名列宽（**与钢琴窗琴键列同宽**，用户约定）
     const ruler_h: i32 = 20; // 标尺行高 = 滚动条厚度（横条高 = 纵条宽）
@@ -211,9 +294,12 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // ── 时间轴长度与缩放下限（**同一个值**，否则会出现“滑块有行程但拖不动”）──
     // 时间轴 = 内容右缘（保底 4 小节）+ 右侧 3 小节留白。
     // 缩放下限 = 视图恰好容纳整个时间轴 → 缩到底时滑块**满宽**（无假行程）。
-    var max_end: i32 = 0; // 最右片段的结束步
+    var max_end: i32 = 0; // 最右内容（Part / 旧片段）的结束步
     for (app.clips.items) |c| {
         max_end = @max(max_end, c.start + c.len);
+    }
+    for (app.parts.items) |pt| {
+        max_end = @max(max_end, pt.start + pt.len);
     }
     const bars_right = @max(4, @divTrunc(max_end + spb - 1, spb)); // 向上取整到小节
     const timeline_w: i32 = (bars_right + 3) * bar_w;
@@ -230,19 +316,32 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         var nmini: usize = 0;
         var min_track: i32 = 127;
         var max_track: i32 = 0;
-        for (app.clips.items) |c| {
-            min_track = @min(min_track, c.track);
-            max_track = @max(max_track, c.track);
+        for (app.parts.items) |pt0| {
+            const row0 = app.trackRowByUid(pt0.track_uid) orelse continue;
+            min_track = @min(min_track, @as(i32, @intCast(row0)));
+            max_track = @max(max_track, @as(i32, @intCast(row0)));
         }
         const track_range = model.rangeMap(min_track, max_track, 8); // 保底 8 轨高
+        // minimap 内容 = **Part**（音符 Part / 音频 Part 同一套；音频用波形色区分）
+        for (app.parts.items) |pt0| {
+            if (nmini >= mini_buf.len) break;
+            const row0 = app.trackRowByUid(pt0.track_uid) orelse continue;
+            mini_buf[nmini] = .{
+                .pos = @as(i32, @intFromFloat(@as(f32, @floatFromInt(pt0.start)) * step_px)),
+                .len = @as(i32, @intFromFloat(@as(f32, @floatFromInt(pt0.len)) * step_px)),
+                .kind = .note,
+                .y = track_range.yOf(@as(i32, @intCast(row0))),
+                .color = if (pt0.kind == .audio) ui.theme.waveform else patternColor(0),
+            };
+            nmini += 1;
+        }
+        // 旧片段（历史兼容；新建工程不会有）
         for (app.clips.items) |c| {
             if (nmini >= mini_buf.len) break;
             mini_buf[nmini] = .{
-                // 步 → 内容像素（与时间轴同一尺度：step_px）
                 .pos = @as(i32, @intFromFloat(@as(f32, @floatFromInt(c.start)) * step_px)),
                 .len = @as(i32, @intFromFloat(@as(f32, @floatFromInt(c.len)) * step_px)),
                 .kind = .note,
-                // 纵向 = 轨道位置：**不反向**——播放列表是 track 0 在最上
                 .y = track_range.yOf(c.track),
                 .color = patternColor(c.pattern),
             };
@@ -319,6 +418,18 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         }
     }
 
+    // ── **`+ 轨道`**：标尺行左侧行头列那片空白（与钢琴窗同位置的“鼓组/琴键”互斥按钮对称）──
+    {
+        const bw: i32 = util.piano_header_w - 4;
+        const bh: i32 = ruler_h - 4;
+        const bx = main_x + 2;
+        const by = ruler_y + 2;
+        const hovered = !ui_blocked and util.inRect(ui.mouse_x, ui.mouse_y, bx, by, bw, bh);
+        ui.renderer.fillRect(bx, by, bw, bh, if (hovered) ui.theme.item_hover else ui.theme.toolbar);
+        ui.renderer.strokeRect(bx, by, bw, bh, if (hovered) ui.theme.accent else ui.theme.panel_border);
+        ui.labelClipped("+ 添加轨道", bx + 4, by + @divTrunc(bh - 10, 2), bw - 6, ui.theme.text);
+        if (hovered and ui.mouse_pressed) app.beginAddTrackWithPicker(); // 打开乐器预设选择窗
+    }
     ui.renderer.vline(sb_x, ruler_y, ruler_h, ui.theme.panel_border); // □ 缺口左边界
     ui.renderer.vline(lane_x, ruler_y, ruler_h, ui.theme.panel_border); // 轨道名列分界（标尺行）
     ui.renderer.hline(x + 1, tracks_y, w - 2, ui.theme.panel_border);
@@ -329,7 +440,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
 
     // 缩放下限 = 视图恰好容纳整个行轴（与横向 `dyn_zoom_min` 同构）：缩到底时行轴恰好
     // 填满视口——不露白、无假行程；只当“刹车”不反向顶大。
-    const zoom_min_h: i32 = @min(util.zoomOutFloor(util.track_h_min, util.track_h_max, tracks_h, @intCast(map_rows)), app.playlist.track_h);
+    const zoom_min_h: i32 = @min(util.zoomOutFloor(util.track_h_min, util.track_h_max, tracks_h, @intCast(@max(1, map_rows))), app.playlist.track_h);
 
     // □ 缺口：按住上下拖 = 轨道行高缩放（方块本身固定不动；视口中心内容保持不动）
     // 悬空状态下缩放：只按新地图重钳下界、**悬空量保留**（不把视口拽回地图）
@@ -350,10 +461,16 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
 
     // 几何写回（拖入文件的落点换算用；与绘制同一套坐标）
     app.playlist.geom = .{ .lane_x = lane_x, .tracks_y = tracks_y, .view_w = view_w, .tracks_h = tracks_h, .track_h = track_h };
-    // 可见行数（“行轴无限延伸”的可视化）：行照常铺到视口底——**悬空时视口下方的行
-    // 也是真行**（可放置 → 地图立即扩张）。右键菜单/重命名的边界守卫读 `view_rows` 快照。
-    const rows_draw: i32 = @max(map_rows, @divTrunc(app.playlist.scroll + tracks_h + track_h - 1, @max(1, track_h)));
-    app.playlist.view_rows = rows_draw;
+    // **P1b：行数 = 真实轨道数**。以前这里会“按视口铺满”（行轴无限延伸的旧模型），
+    // 于是 0 轨道的工程也会画出 Track 1..N（无边无际）。现在只画真实存在的轨道。
+    const rows_draw: i32 = map_rows;
+    app.playlist.view_rows = @max(1, rows_draw);
+    // 滚动钳到真实内容（否则滚轮会滚到空白）
+    {
+        const content_h = rows_draw * track_h;
+        const max_s = @max(0, content_h - tracks_h);
+        app.playlist.scroll = std.math.clamp(app.playlist.scroll, 0, max_s);
+    }
 
     // 样式音域统计（每帧一次）：片段预览的纵向映射用（避免片段循环里重复扫全量音符）。
     // **按实际样式数**复用 App 缓冲（原为 `[max_patterns]` 栈数组——上限放到十亿级后
@@ -377,6 +494,17 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         // 跳过不可能可见的行（行轴无上限，滚动很远时避免从 0 逐行空转）
         var i: usize = @intCast(@max(0, @divTrunc(app.playlist.scroll, @max(1, track_h))));
         var ty = tracks_y - app.playlist.scroll + @as(i32, @intCast(i)) * track_h;
+        // **手势目标行**（Part 手势只在这一次执行）：鼠标所在行；鼠标在轨道区外但正在拖动 → 用被拖对象所在行
+        const g_row: usize = blk_g: {
+            if (ui.mouse_y >= tracks_y and ui.mouse_y < tracks_y + tracks_h) {
+                const r = @divTrunc(ui.mouse_y - tracks_y + app.playlist.scroll, @max(1, track_h));
+                if (r >= 0 and r < rows_draw) break :blk_g @intCast(r);
+            }
+            if (app.playlist.part_drag.active and app.playlist.part_drag.idx < app.parts.items.len) {
+                if (app.trackRowByUid(app.parts.items[app.playlist.part_drag.idx].track_uid)) |rr| break :blk_g rr;
+            }
+            break :blk_g std.math.maxInt(usize); // 无手势行
+        };
         while (i < @as(usize, @intCast(rows_draw))) : (i += 1) {
             if (ty + track_h > tracks_y and ty < tracks_y + tracks_h) {
                 const selected = app.sel.track == @as(i32, @intCast(i));
@@ -387,13 +515,76 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 const btn_sz: i32 = @min(track_h - 2, @max(12, @as(i32, @intFromFloat(ui.font.lineHeight()))));
                 const btn_x: i32 = main_x + header_w - btn_sz - 4;
                 const btn_y: i32 = ty + @divTrunc(track_h - btn_sz, 2);
-                const over_mute = util.inRect(ui.mouse_x, ui.mouse_y, btn_x, btn_y, btn_sz, btn_sz);
-                if (ui.listItem(3000 + i, app.trackName(i), main_x, ty, header_w, track_h, selected, i % 2 == 1, ui.theme.bg, if (muted) muted_gray else null) and !ui.mods_ctrl and !over_mute) {
+                const over_mute = !ui_blocked and util.inRect(ui.mouse_x, ui.mouse_y, btn_x, btn_y, btn_sz, btn_sz);
+                // **插件丢失/加载失败**：乐器名标红（原机架的“标红”提示；机架已删，搬到轨道头）
+                const inst_failed = blk_f: {
+                    const ii_f = app.trackInstrument(i);
+                    if (ii_f < 0 or @as(usize, @intCast(ii_f)) >= app.instruments.items.len) break :blk_f false;
+                    break :blk_f app.instruments.items[@intCast(ii_f)].load_failed;
+                };
+                const name_col: ?u32 = if (muted)
+                    muted_gray
+                else if (inst_failed)
+                    ui.theme.danger
+                else
+                    null;
+                if (ui.listItem(3000 + i, app.trackName(i), main_x, ty, header_w, track_h, selected, i % 2 == 1, ui.theme.bg, name_col) and !ui.mods_ctrl and !over_mute) {
                     app.sel.track = @intCast(i);
+                }
+                // **Ctrl+单击轨道头 = 选中该轨全部 Part**（替换选）；
+                // **Ctrl+Shift+单击 = 把这些 Part 加到选区**（只加不减，不切换）；
+                // 两者都**不当框选起点**（否则零位移框选会把结果又抹掉）
+                if (ui.mouse_pressed and !ui_blocked and ui.mods_ctrl and !over_mute and
+                    util.inRect(ui.mouse_x, ui.mouse_y, main_x, ty, header_w, track_h))
+                {
+                    if (app.trackUidOf(i)) |tu_x| {
+                        app.sel.track = @intCast(i);
+                        if (!ui.mods_shift) {
+                            for (app.parts.items) |*ptx| ptx.selected = false;
+                        }
+                        var first_sel: ?usize = null;
+                        for (app.parts.items, 0..) |*ptx, pix| {
+                            if (ptx.track_uid != tu_x) continue;
+                            ptx.selected = true;
+                            if (first_sel == null) first_sel = pix;
+                        }
+                        if (first_sel) |fs| app.sel.part = fs;
+                    }
+                    app.playlist.suppress_marquee = true;
+                    ui.active_id = 0;
                 }
                 if (ui.toggleSquare(!muted, btn_x, btn_y, btn_sz)) { // 蓝=发声 / 灰=静音
                     app.setTrackMuted(i, !muted);
                     app.commitHistory(if (!muted) "静音轨道" else "取消静音轨道");
+                }
+                // **双击轨道头 → 打开该轨乐器的参数界面**（与机架里双击乐器完全同一套逻辑）
+                // 注：**排除静音开关**（双击静音方块不应开面板）与右侧开关列。
+                if (ui.mouse_double and !ui_blocked and !over_mute and util.inRect(ui.mouse_x, ui.mouse_y, main_x, ty, header_w - btn_sz - 8, track_h)) {
+                    const ii = app.trackInstrument(i);
+                    if (ii >= 0 and @as(usize, @intCast(ii)) < app.instruments.items.len) {
+                        app.sel.instrument = ii;
+                        if (app.instruments.items[@intCast(ii)].kind == .drumkit) {
+                            app.openDrumKit(ii); // 含同步选择/置顶
+                        } else {
+                            app.synth_win.target = .{ .instrument = ii };
+                            app.synth_win.open = true;
+                            app.bringToFront(&app.synth_win.z);
+                        }
+                    }
+                }
+                // **轨道号**（左下角小字，暗色）：轨道名已经用乐器名了，序号放这里不抢位
+                {
+                    var nb: [12]u8 = undefined;
+                    const num = std.fmt.bufPrint(&nb, "{d}", .{i + 1}) catch "";
+                    ui.labelClipped(num, main_x + 3, ty + track_h - 16, 24, ui.theme.text_dim);
+                    // **轨道类型标记**（用户定稿：轨道号右边两个小字 `乐器` / `音频`）
+                    const kind_txt: []const u8 = if (inst_failed)
+                        "插件丢失"
+                    else if (app.isAudioTrack(@intCast(i)))
+                        "音频"
+                    else
+                        "乐器";
+                    ui.labelClipped(kind_txt, main_x + 16, ty + track_h - 16, 40, if (inst_failed) ui.theme.danger else ui.theme.text_dim);
                 }
                 // 右键轨道头 → 重命名/清空菜单（位置快照；与样式右键同一模式）
                 if (ui.mouse_right_pressed and ui.hitRect(main_x, ty, header_w, track_h)) {
@@ -424,8 +615,222 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 // 行分隔线：必须在片段**之前**绘制——
                 // 否则它（画在 ty+track_h-1）会盖住片段底边的亮色描边（只有上/左/右亮、下不亮）。
                 ui.renderer.hline(main_x, ty + track_h - 1, main_w, ui.theme.panel_border);
-                // 已放置的样式片段（裁剪到轨道内容区——左滚时不会盖住轨道名列）
-                {
+                // **Part（P1c-2）**：按归属轨道 uid 匹配，画成色块
+                // ⚠️ 必须在背景/网格**之后**画（先画会被 `lane_bg` 盖掉——实测“加了 Part 看不见”）
+                if (app.trackUidOf(i)) |tu| {
+                    const saved_pt = ui.renderer.pushClip(lane_x, ty, view_w, track_h);
+                    defer ui.renderer.popClip(saved_pt);
+                    const step_ws: f32 = bar_ws / @as(f32, @floatFromInt(spb));
+                    // **重叠层级与片段一致**：按左端点升序绘制（越靠右越上层；相同 → 数组序）
+                    app.playlist.draw_order.clearRetainingCapacity();
+                    for (app.parts.items, 0..) |pt0, pi0| {
+                        if (pt0.track_uid == tu) app.playlist.draw_order.append(app.allocator, pi0) catch {};
+                    }
+                    std.mem.sort(usize, app.playlist.draw_order.items, app.parts.items, partLayerLess);
+                    for (app.playlist.draw_order.items) |pi| {
+                        const pt = &app.parts.items[pi];
+                        const x0 = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(pt.start)) * step_ws - scroll_s));
+                        const x1 = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(pt.start + pt.len)) * step_ws - scroll_s));
+                        if (x1 < lane_x or x0 > lane_x + view_w) continue;
+                        // **外观完全照抄样式片段**：
+                        // - 高度 = 整行 `track_h`（不是 track_h-6）
+                        // - 底色 = 样式色 **32% 不透明**（alpha 80，能透出后面的网格线）
+                        // - 描边 / 顶部标识 = 样式色全亮
+                        const bh: i32 = track_h;
+                        const pw2: i32 = @max(3, x1 - x0);
+                        const base = if (pt.muted) muted_gray else patternColor(0); // 静音 = 灰
+                        const fill = (@as(u32, 80) << 24) | (base & 0x00FFFFFF);
+                        ui.renderer.fillRect(x0, ty, pw2, bh, fill);
+                        ui.renderer.strokeRect(x0, ty, pw2, bh, base);
+                        // 选中：橙色叠加 + **描边也换成橙色**（与片段同一套规则）
+                        if (pt.selected) {
+                            const sel_fill = (@as(u32, 60) << 24) | (ui.theme.note_selected & 0x00FFFFFF);
+                            ui.renderer.fillRect(x0, ty, pw2, bh, sel_fill);
+                            if (pw2 > 2) ui.renderer.strokeRect(x0, ty, pw2, bh, ui.theme.note_selected);
+                        }
+                        if (pt.kind == .audio) {
+                            // **音频 Part**：画波形（原生尺度、不压缩；超出音频即空）
+                            drawAudioPartWave(ui, app, pt, x0, pw2, ty, track_h, step_px, zoom);
+                        } else {
+                            var pbuf: [24]u8 = undefined;
+                            const pname = std.fmt.bufPrint(&pbuf, "Part · {d}音符", .{pt.notes.items.len}) catch "Part";
+                            ui.labelClipped(pname, x0 + 5, ty + 3, pw2 - 8, ui.theme.text);
+                        }
+                    }
+                }
+                // ── **Part 交互：悬停↔ / 点选 / 拖动移动（跨同类轨）/ 边缘拉伸** ──
+                // **手势块只跑一次**（B1-lite）：只在本行 = 鼠标所在行时执行绘制前的手势；
+                // 拖动中鼠标可能已不在原行，此时用被拖 Part 自己的行（见下面的 `g_row` 判定）。
+                if (app.trackUidOf(i) != null and i == g_row) {
+                    const step_ws_ev: f32 = bar_ws / @as(f32, @floatFromInt(spb));
+                    const m_step = playlistMouseStepSnap(ui.mouse_x, lane_x, app.playlist.scroll_x, zoom, step_px, pl_snap);
+                    // **像素级命中**（步级 `contains` 在边缘处会漏——拉伸热区甚至落在 Part 外面）：
+                    // 返回 (part 下标, 边缘 0/±1)
+                    const hit_pt: ?struct { idx: usize, edge: i8 } = blk: {
+                        if (!util.inRect(ui.mouse_x, ui.mouse_y, lane_x, ty, view_w, track_h) or ui_blocked) break :blk null;
+                        // 重叠时按绘制层级**反序**收集候选（上层优先），供“连点循环切换”用
+                        var cand: [8]usize = undefined;
+                        var cand_e: [8]i8 = undefined;
+                        var nc: usize = 0;
+                        const hot: i32 = 5; // 边缘热区（像素）
+                        var k: usize = app.playlist.draw_order.items.len;
+                        while (k > 0 and nc < cand.len) {
+                            k -= 1;
+                            const pi2 = app.playlist.draw_order.items[k];
+                            const pt2 = &app.parts.items[pi2];
+                            if (pt2.track_uid != app.trackUidOf(i).?) continue;
+                            const x0 = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(pt2.start)) * step_ws_ev - scroll_s));
+                            const x1 = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(pt2.start + pt2.len)) * step_ws_ev - scroll_s));
+                            if (ui.mouse_x >= x0 - hot and ui.mouse_x <= x1 + hot) {
+                                cand[nc] = pi2;
+                                cand_e[nc] = if (ui.mouse_x <= x0 + hot)
+                                    -1
+                                else if (ui.mouse_x >= x1 - hot)
+                                    1
+                                else
+                                    0;
+                                nc += 1;
+                            }
+                        }
+                        if (nc == 0) break :blk null;
+                        // 与片段一致：命中就取**最上层**；真正的轮换由“沉到同起点组最底层”完成
+                        break :blk .{ .idx = cand[0], .edge = cand_e[0] };
+                    };
+                    // 悬停反馈（与样式片段一致）：边缘 → ↔，**本体 → 十字箭头**（可移动）
+                    if (hit_pt) |hp2| {
+                        ui.cursor = if (hp2.edge != 0) .resize_h else .size_all;
+                    }
+                    // 双击 **音频 Part** → 波形窗口（目标已改成 Part 下标）
+                    if (ui.mouse_double) {
+                        if (hit_pt) |hpd| {
+                            if (app.parts.items[hpd.idx].kind == .audio) {
+                                app.openWaveForPart(hpd.idx);
+                                ui.active_id = 0;
+                            }
+                        }
+                    }
+                    // 拖动中：光标由**状态**决定（鼠标甩快/移出区域都不退化——与片段同做法）
+                    if (app.playlist.part_drag.active) {
+                        ui.cursor = if (app.playlist.part_drag.resize_edge != 0) .resize_h else .size_all;
+                    }
+                    // 注：右键删除不在行循环里做——统一由下方“主流程擦除”处理
+                    //（否则一次右键会在两处各删一个：叠放时删掉两个；且会把 erase_drag 错误地点亮）
+                    // 按下：命中则选中并开始拖动/拉伸（采集偏移，不跳变）
+                    if (ui.mouse_pressed and !ui_blocked and !menu_click and !app.playlist.part_drag.active) {
+                        // **Ctrl+单击 Part = 让它成为选区（单选）**：清掉其他选中，只选它
+                        // （右键删除统一由主流程擦除处理）
+                        if (ui.mods_ctrl and !ui.mods_shift and ui.mouse_pressed and hit_pt != null) {
+                            const hp_s = hit_pt.?;
+                            for (app.parts.items) |*pp_one| pp_one.selected = false;
+                            app.parts.items[hp_s.idx].selected = true;
+                            app.sel.part = hp_s.idx;
+                            ui.active_id = 0;
+                            app.playlist.suppress_marquee = true; // 这一下不当框选起点
+                        } else if (ui.mods_ctrl and ui.mods_shift and ui.mouse_pressed and hit_pt != null) {
+                            // **Ctrl+Shift+单击 Part = 切换选中**（与片段同语义；不启动拖动/轮换）
+                            const hp_t = hit_pt.?;
+                            app.parts.items[hp_t.idx].selected = !app.parts.items[hp_t.idx].selected;
+                            ui.active_id = 0;
+                            // 注：**不**抑制框选——否则 Ctrl+Shift+拖（追加框选）就永远开不起来（实测）
+                        } else if (hit_pt) |hp2| {
+                            // **已选中的 Part + 选区 ≥ 2 → 批量移动**（不轮换：轮换会重排数组）
+                            if (app.parts.items[hp2.idx].selected and app.selectedPartCount() >= 2 and hp2.edge == 0) {
+                                app.sel.part = hp2.idx;
+                                app.sel.track = @intCast(i);
+                                app.beginPartBatchSnap();
+                                app.playlist.part_batch = true;
+                                app.playlist.batch_down_step = m_step;
+                                app.playlist.batch_down_row = @intCast(i);
+                                ui.active_id = 7802;
+                            } else {
+                                // **叠放轮换**（片段同款）：点中的沉到同起点组最底层 → 下次点到下一个
+                                const new_idx = app.sinkPartToTieBottom(hp2.idx);
+                                app.sel.part = new_idx;
+                                app.sel.track = @intCast(i);
+                                app.playlist.part_drag = .{
+                                    .active = true,
+                                    .idx = new_idx,
+                                    .grab_step = m_step - app.parts.items[new_idx].start,
+                                    .resize_edge = hp2.edge,
+                                    .orig_start = app.parts.items[new_idx].start,
+                                    .orig_track_uid = app.parts.items[new_idx].track_uid,
+                                    .orig_len = app.parts.items[new_idx].len,
+                                    .orig_trim = app.parts.items[new_idx].audio.trim_start,
+                                };
+                                ui.active_id = 7801;
+                            }
+                        } else if (!ui.mods_ctrl and !ui_blocked and util.inRect(ui.mouse_x, ui.mouse_y, lane_x, ty, view_w, track_h)) {
+                            // **点空白 → 取消选中**（Part 单选 + 框选集合都清）
+                            // 注：**Ctrl / Ctrl+Shift 下不清**——否则追加框选的快照全是 false（实测：
+                            // “Ctrl+Shift+拖”变成新建选区）
+                            app.sel.part = null;
+                            for (app.parts.items) |*ppz| ppz.selected = false;
+                        }
+                    }
+                    // 拖动：按栅格移动；纵向落到别的行 → 可能换轨
+                    if (app.playlist.part_drag.active and ui.active_id == 7801) {
+                        // **越界保护**：拖动中 Part 被删（右键擦除/撤销）→ 结束拖动，别访问野下标
+                        if (app.playlist.part_drag.idx >= app.parts.items.len) {
+                            app.playlist.part_drag.active = false;
+                            ui.active_id = 0;
+                        } else if (ui.mouse_down) {
+                            const cur_pt = &app.parts.items[app.playlist.part_drag.idx];
+                            if (app.playlist.part_drag.resize_edge != 0) {
+                                // **拉伸边缘**（最小 1 小节 / 1 步；拖动时实时改）
+                                if (app.playlist.part_drag.resize_edge < 0) {
+                                    // **左缘**：右端固定。
+                                    // 唯一差异：midi Part 无左边界；**audio Part 的左缘不能越过采样开头**
+                                    //（`trim_start` 用尽即停——切片模型的入点随左缘平移）
+                                    const old_end = cur_pt.start + cur_pt.len;
+                                    var ns = std.math.clamp(m_step, 0, old_end - 1);
+                                    if (cur_pt.kind == .audio) {
+                                        const fps: i64 = @intCast(@max(1, app.framesPerStep()));
+                                        const head_steps: i32 = @intCast(@divTrunc(@as(i64, app.playlist.part_drag.orig_trim), fps));
+                                        const min_start = app.playlist.part_drag.orig_start - head_steps;
+                                        if (ns < min_start) ns = min_start;
+                                        const d: i64 = @as(i64, ns) - @as(i64, app.playlist.part_drag.orig_start);
+                                        const nt: i64 = @as(i64, app.playlist.part_drag.orig_trim) + d * fps;
+                                        cur_pt.audio.trim_start = @intCast(@max(0, nt));
+                                    }
+                                    cur_pt.start = ns;
+                                    cur_pt.len = old_end - ns;
+                                } else {
+                                    cur_pt.len = @max(1, m_step - cur_pt.start);
+                                }
+                                app.dirty = true;
+                            } else {
+                                const want_start = m_step - app.playlist.part_drag.grab_step;
+                                // 目标行：鼠标所在行；**跨到不同类型的轨道 = 不合格落点**
+                                var target_row: ?usize = null;
+                                var over_bad = false;
+                                // **基准 = 被拖 Part 自己所在的轨道**（不是循环变量 i——
+                                // 用 i 会让判定随"当前画到哪一行"而翻转，实测禁止/十字光标反了）
+                                const base_row: usize = app.trackRowByUid(app.parts.items[app.playlist.part_drag.idx].track_uid) orelse i;
+                                if (ui.mouse_y >= tracks_y and ui.mouse_y < tracks_y + tracks_h) {
+                                    const r = @divTrunc(ui.mouse_y - tracks_y + app.playlist.scroll, @max(1, track_h));
+                                    if (r >= 0 and r != @as(i32, @intCast(base_row)) and r < @as(i32, @intCast(app.tracks.items.len))) {
+                                        const rr: usize = @intCast(r);
+                                        if (app.tracks.items[rr].kind == app.tracks.items[base_row].kind) {
+                                            target_row = rr;
+                                        } else {
+                                            over_bad = true; // 类型不匹配
+                                        }
+                                    }
+                                }
+                                app.playlist.part_drag.invalid = over_bad;
+                                if (over_bad) ui.cursor = .forbidden;
+                                // **不合格落点：不换轨，但水平方向仍然跟随鼠标**（传 null = 保持当前轨）
+                                app.movePart(app.playlist.part_drag.idx, want_start, if (over_bad) null else target_row);
+                            }
+                        } else {
+                            app.playlist.part_drag.active = false;
+                            ui.active_id = 0;
+                            app.commitHistory(if (app.playlist.part_drag.resize_edge != 0) "调整 Part 长度" else "移动 Part");
+                        }
+                    }
+                }
+                // 旧 MIDI/音频片段绘制已废弃（线性化：音频也画成 Part）
+                if (false) {
                     const saved_clips = ui.renderer.pushClip(lane_x, ty, view_w, track_h);
                     defer ui.renderer.popClip(saved_clips);
                     const row_muted = app.trackMuted(i);
@@ -666,23 +1071,24 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
 
     // **必须在轨道行之后绘制**：否则竖线会被轨道行背景盖住（实测 bug）。
     {
-        // 裁剪到「标尺行 + 轨道区」：左滚时游标 x 会变负，不裁剪会画到轨道名列/左侧面板上
-        const saved_cursor = ui.renderer.pushClip(lane_x, ruler_y, view_w, ruler_h + tracks_h);
-        defer ui.renderer.popClip(saved_cursor);
+        // 0 轨道时的空状态提示
+        if (rows_draw == 0) {
+            ui.labelClipped("点左上角「+ 添加轨道」开始吧", main_x + 8, tracks_y + @divTrunc(tracks_h, 2) - 6, main_w - 16, ui.theme.text_dim);
+        }
 
-        // **唯一游标**：PAT 且无锚（样式没有任何片段实例）时，游标在“没有歌曲
-        // 位置的 PAT 里”——播放列表不画幽灵游标（否则它凭空停在第一小节）
-        const ghost = !app.sel.song_mode and app.patOriginClip() == null;
-        if (!ghost) {
-            // **平滑小数步**（渲染帧线性滑动；音频缓冲量化被吸收——实测“游标还是抖”的终解）
+        // **播放游标（轨道区）**：标尺行倒三角 + 贯穿轨道区的竖线。
+        // 注：这里以前没有显式绘制（只有 PAT 模式下的 PAT 游标），SONG 模式下就“看不见”。
+        {
             const bar_frac: f32 = app.cursorDisplay(true) / @as(f32, @floatFromInt(spb));
             const cx = lane_x + @as(i32, @intFromFloat(bar_frac * bar_ws - scroll_s));
-            util.drawCursor(ui, cx, ruler_y, ruler_h, tracks_y + tracks_h, app.playing);
+            if (cx >= lane_x - 2 and cx <= lane_x + view_w + 2) {
+                util.drawCursor(ui, cx, ruler_y, ruler_h, tracks_y + tracks_h, app.playing);
+            }
         }
 
         // 交互（仅标尺行）：按下 → 直接设置位置并进入拖动；拖动中跟随鼠标
         // （`menu_click` 门控：点选单条目的那一帧不得穿透到标尺）
-        const in_ruler = !menu_click and ui.hitRect(lane_x, ruler_y, view_w, ruler_h);
+        const in_ruler = !menu_click and !ui_blocked and ui.hitRect(lane_x, ruler_y, view_w, ruler_h);
         // Ctrl+标尺：拖动 = 设循环区域；单击（未拖动）= 取消循环
         // （全局步；点播放列表标尺会切 SONG——见下方跳转分支）；
         // 鼠标→步**吸附到当前网格**
@@ -693,6 +1099,12 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             app.playback.loop_drag_press_x = ui.mouse_x;
             app.playback.loop_drag_moved = false;
             ui.active_id = 7501; // 循环标尺手势（播放列表版）
+            // **按下即清空选区**（不等拖动）：Ctrl+单击刻度尺 = 清空；
+            // Ctrl+拖 = 从空选区开始重选区间内的对象（实测：以前要拖起来才清，很别扭）
+            app.clearNoteSelection();
+            app.clearClipSelection();
+            app.sel.part = null;
+            for (app.parts.items) |*pp_clr| pp_clr.selected = false;
         }
         if (ui.active_id == 7501) {
             if (!ui.mouse_down) {
@@ -725,6 +1137,12 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                         const cur = playlistMouseStepSnap(ui.mouse_x, lane_x, app.playlist.scroll_x, zoom, step_px, pl_snap);
                         app.selectNotesInRegionSong(@min(df, cur), @max(df, cur));
                         app.selectClipsInRegionSong(@min(df, cur), @max(df, cur));
+                        // **同时选中区间内的 Part**（线性工作流；与框选同一套 selected 语义）
+                        const lo_p = @min(df, cur);
+                        const hi_p = @max(df, cur);
+                        for (app.parts.items) |*pp_r| {
+                            pp_r.selected = pp_r.start < hi_p and pp_r.start + pp_r.len > lo_p;
+                        }
                     }
                 }
             }
@@ -755,7 +1173,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 不再依赖“tracks_h 已经减过 auto_h”这种间接保证（实测：点面板会落到轨道行上）。
     const panel_top: i32 = list_y + list_h;
     const in_panel = ui.mouse_y >= panel_top;
-    const in_lane = !menu_click and !in_panel and ui.hitRect(lane_x, tracks_y, view_w, tracks_h);
+    const in_lane = !menu_click and !in_panel and !ui_blocked and ui.hitRect(lane_x, tracks_y, view_w, tracks_h);
     const track_i = @divFloor(ui.mouse_y - tracks_y + app.playlist.scroll, track_h);
     // 鼠标 → 内容坐标（除以 zoom）→ **全局步**（U=96）
     const mouse_cx: f32 = @as(f32, @floatFromInt(app.playlist.scroll_x)) + @as(f32, @floatFromInt(ui.mouse_x - lane_x)) / zoom;
@@ -765,47 +1183,90 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     const snap_step: i32 = @max(0, model.snapRound(step_i, snap_steps));
     const valid_track = track_i >= 0 and track_i < rows_draw;
 
-    // ── 框选（Ctrl+左键拖；Ctrl+Shift = 追加）——片段──
-    // **按行框选**：起点在**轨道名列**时切换成“整行选择”（垂直拖选轨道行、水平不限）
-    // Ctrl+Shift+**单击片段** = 切换选中（未选中 → 加入；已选中 → 剔除）——
-    // 本次按下不再启动框选（与钢琴卷帘同语义）。
-    var toggle_consumed = false;
-    if (ui.mods_ctrl and ui.mods_shift and ui.mouse_pressed and ui.active_id == 0 and in_lane and valid_track) {
-        if (model.topmostClipAt(app.clips.items, track_i, step_i)) |ci| {
-            app.clips.items[ci].selected = !app.clips.items[ci].selected;
-            toggle_consumed = true;
-        }
+    // **左键点网格区任意位置（含下方没有轨道的空白）→ 取消选中**
+    // 注：命中 Part 的路径在前面行循环里已经处理（会 set sel.part），这里只处理“没点到 Part”。
+    if (ui.mouse_pressed and !ui.mods_ctrl and !app.playlist.part_drag.active and ui.active_id == 0 and !ui_blocked and
+        ui.hitRect(main_x, tracks_y, main_w, tracks_h) and app.partAt(@max(0, track_i), step_i) == null)
+    {
+        app.sel.part = null;
+        for (app.parts.items) |*ppc| ppc.selected = false;
     }
-    if (ui.mods_ctrl and ui.mouse_pressed and ui.active_id == 0 and !toggle_consumed) {
-        const in_header = ui.hitRect(main_x, tracks_y, header_w, tracks_h);
-        if (in_lane or in_header) {
+    // ── **框选：Part**（Ctrl+左键拖；Ctrl+Shift = 追加；起点在行头列 = 按行选）──
+    // 与片段版同一套状态机，但选区落到 `Part.selected`（用 `marquee_parts` 区分）。
+    // 注：**旧的“片段框选”启动块已删除**——它与本块抢同一个 Ctrl+按下，
+    // 谁先抢到 `active_id` 谁生效（实测：Part 框选永远开不起来、框选退不出）。
+    if (ui.mods_ctrl and ui.mouse_pressed and !ui_blocked and ui.active_id == 0 and !app.playlist.suppress_marquee) {
+        const in_header_p = ui.hitRect(main_x, tracks_y, header_w, tracks_h);
+        if (in_lane or in_header_p) {
             app.playlist.marquee_active = true;
+            app.playlist.marquee_parts = true;
             app.playlist.marquee_add = ui.mods_shift;
             app.playlist.marquee_x0 = ui.mouse_x;
             app.playlist.marquee_y0 = ui.mouse_y;
-            app.playlist.row_marquee = in_header;
+            app.playlist.row_marquee = in_header_p;
             app.playlist.row_marquee_track0 = track_i;
-            ui.active_id = 7400; // 片段框选手势
-            if (!app.playlist.marquee_add) {
-                app.clearClipSelection();
-            } else {
-                // 追加模式：拍快照（每帧用“快照 ∪ 框内”重建 → 框缩回时自动回退）
-                app.allocator.free(app.playlist.marquee_snap);
-                app.playlist.marquee_snap = app.allocator.alloc(bool, app.clips.items.len) catch &.{};
-                for (app.clips.items, 0..) |cc, kk| {
-                    if (kk < app.playlist.marquee_snap.len) app.playlist.marquee_snap[kk] = cc.selected;
+            ui.active_id = 7402; // Part 框选手势（与片段的 7400 分开）
+            // 追加模式：拍快照（每帧用“快照 ∪ 框内”重建）
+            app.allocator.free(app.playlist.marquee_snap);
+            app.playlist.marquee_snap = &.{};
+            if (app.playlist.marquee_add) {
+                var snap: []bool = app.allocator.alloc(bool, app.parts.items.len) catch return;
+                for (app.parts.items, 0..) |pp0, kk| {
+                    if (kk < snap.len) snap[kk] = pp0.selected;
                 }
+                app.playlist.marquee_snap = snap;
+            } else {
+                for (app.parts.items) |*pp0| pp0.selected = false;
             }
         }
     }
-    if (ui.active_id == 7400 and !ui.mouse_down) {
-        ui.active_id = 0;
+    // **结束条件不能用 `active_id == 7402`**：行循环里的其它控件可能先把 active_id 清掉，
+    // 那样就永远进不了结束分支（实测：Ctrl+拖之后框选退不出来）。
+    // 现在只看“是否还在按左键”，并顺手把 7402 收回去。
+    app.playlist.suppress_marquee = false; // 只抑制“按下那一帧”
+    if (app.playlist.marquee_active and app.playlist.marquee_parts and !ui.mouse_down) {
+        if (ui.active_id == 7402) ui.active_id = 0;
         app.playlist.marquee_active = false;
+        app.playlist.marquee_parts = false;
+        app.playlist.marquee_add = false;
         app.playlist.row_marquee = false;
         app.allocator.free(app.playlist.marquee_snap);
         app.playlist.marquee_snap = &.{};
     }
-    if (app.playlist.marquee_active) {
+    // **按下那一帧不重算**：Ctrl+Shift+单击的“切换选中”已经在这帧生效，
+    // 若同帧再用框选重算，鼠标下的 Part 会被重新选上（实测：切换取消失效）。
+    // 另：**没真拖动（<3px）也不重算** —— 否则零尺寸矩形会把鼠标下的 Part 又选上，
+    // 表现为“取消选中后很快又变回选中”
+    const marquee_moved = @abs(ui.mouse_x - app.playlist.marquee_x0) >= 3 or @abs(ui.mouse_y - app.playlist.marquee_y0) >= 3;
+    if (app.playlist.marquee_active and app.playlist.marquee_parts and !ui.mouse_pressed and marquee_moved) {
+        const mx0 = @min(app.playlist.marquee_x0, ui.mouse_x);
+        const mx1 = @max(app.playlist.marquee_x0, ui.mouse_x);
+        const my0 = @min(app.playlist.marquee_y0, ui.mouse_y);
+        const my1 = @max(app.playlist.marquee_y0, ui.mouse_y);
+        const step_ws_q: f32 = bar_ws / @as(f32, @floatFromInt(spb));
+        const t0 = @min(app.playlist.row_marquee_track0, track_i);
+        const t1 = @max(app.playlist.row_marquee_track0, track_i);
+        for (app.parts.items, 0..) |*pp1, pi1| {
+            // 追加：先回快照；否则先清空
+            pp1.selected = if (app.playlist.marquee_add)
+                (if (pi1 < app.playlist.marquee_snap.len) app.playlist.marquee_snap[pi1] else false)
+            else
+                false;
+            // 轨道行
+            const rowi = if (app.trackRowByUid(pp1.track_uid)) |r| @as(i32, @intCast(r)) else -1;
+            if (rowi < 0) continue;
+            if (app.playlist.row_marquee) {
+                if (rowi >= t0 and rowi <= t1) pp1.selected = true;
+                continue;
+            }
+            const x0 = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(pp1.start)) * step_ws_q - scroll_s));
+            const x1 = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(pp1.start + pp1.len)) * step_ws_q - scroll_s));
+            const cy = tracks_y + rowi * track_h - app.playlist.scroll;
+            if (x1 >= mx0 and x0 <= mx1 and cy + track_h >= my0 and cy <= my1) pp1.selected = true;
+        }
+    }
+
+    if (false and app.playlist.marquee_active and !app.playlist.marquee_parts) { // 旧片段框选：已废弃
         const mx0 = @min(app.playlist.marquee_x0, ui.mouse_x);
         const mx1 = @max(app.playlist.marquee_x0, ui.mouse_x);
         const my0 = @min(app.playlist.marquee_y0, ui.mouse_y);
@@ -838,7 +1299,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 拖动/拉伸进行中不重新命中（模型位置未变，会让另一个片段"假悬停"）
     const drag_busy = app.playlist.drag_clip != null or app.playlist.resize_clip != null or
         app.playlist.drag_batch or app.playlist.batch_trim;
-    if (in_lane and valid_track and !app.playlist.marquee_active and !ui.mods_ctrl and !drag_busy) {
+    if (false and in_lane and valid_track and !app.playlist.marquee_active and !ui.mods_ctrl and !drag_busy) { // 旧片段命中：已废弃
         // 叠放（用户拍板）：命中取**最顶层**（左端越右越上；同左端取数组序最大）
         if (model.topmostClipAt(app.clips.items, track_i, step_i)) |ci| {
             const c = app.clips.items[ci];
@@ -892,34 +1353,75 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         ui.cursor = if (hit.mode == .body) .size_all else .resize_h;
     }
 
-    // 右键：**起点在片段上 → 只删这一个**（之后拖到哪都不再处理）；
-    // **起点在空白网格 → 按住拖动 = 擦除划过的一切**（划过即删；与旧行为相同）
-    // **点在空白处**（没命中片段）→ 取消选区（与左键点空白的语义一致）
-    if (ui.mouse_right_pressed and ui.hitRect(main_x, tracks_y, main_w, tracks_h)) {
-        if (clip_hit != null) {
-            app.playlist.erase_drag = false; // 起点有内容：拖动不再擦
-            if (app.eraseClipsAt(track_i, step_i, .topmost) > 0) {
-                app.playlist.drag_clip = null;
-                app.playlist.resize_clip = null;
-                app.history_pending = "擦除片段";
+    // 右键：**起点在 Part 上 → 只删这一个**；
+    // **起点在空白网格 → 按住拖动 = 擦除划过的所有 Part**（与片段同语义）
+    // 注：起点必须在**轨道内容区**（`lane_x` 起）——否则右键轨道头时 `step_i`
+    // 会被钳到 0，把紧贴行头的 Part 误删（实测 bug）
+    if (ui.mouse_right_pressed and ui.hitRect(lane_x, tracks_y, view_w, tracks_h)) {
+        var hit_top: ?usize = null;
+        if (app.trackUidOf(@intCast(track_i))) |uu| {
+            for (app.parts.items, 0..) |pt4, pi4| {
+                if (pt4.track_uid != uu or !pt4.contains(step_i)) continue;
+                // 取**最上层**：起点更靠右的在上；起点相同 → 数组序大的在上（与绘制层级一致）
+                if (hit_top) |bt| {
+                    if (pt4.start > app.parts.items[bt].start) {
+                        hit_top = pi4;
+                    } else if (pt4.start == app.parts.items[bt].start and pi4 > bt) {
+                        hit_top = pi4;
+                    }
+                } else hit_top = pi4;
             }
-            clip_hit = null; // 下标已失效，后续不要再用
+        }
+        if (hit_top) |hi4| {
+            app.playlist.erase_drag = false;
+            if (app.removePart(hi4)) {
+                app.commitHistory("删除 Part");
+                app.setToast("已删除 Part");
+            }
         } else if (!ui.mods_ctrl) {
-            app.clearClipSelection();
+            // 点空白 → 取消选中 + 起手擦除拖动（音频/音符 Part 同一套）
+            app.sel.part = null;
+            for (app.parts.items) |*ppz2| ppz2.selected = false;
             app.playlist.erase_drag = true;
         }
     }
     if (app.playlist.erase_drag) {
         if (!ui.mouse_right_down) {
             app.playlist.erase_drag = false;
-        } else if (in_lane and valid_track and !app.playlist.marquee_active and !ui.mods_ctrl and !drag_busy) {
-            // 拖动擦除：鼠标碰到的片段**全部**删（叠放也一起）
-            if (app.eraseClipsAt(track_i, step_i, .all) > 0) {
-                app.playlist.drag_clip = null;
-                app.playlist.resize_clip = null;
-                // 历史：右键擦除（含拖动划过多个）→ 松开右键时 coalesce 提交一次
-                app.history_pending = "擦除片段";
+        } else if (in_lane and valid_track and !app.playlist.marquee_active and !ui.mods_ctrl) {
+            // 拖动擦除：鼠标碰到的 Part **全部**删（叠放也一起）
+            var k5: usize = app.parts.items.len;
+            var erased: usize = 0;
+            const uid5 = app.trackUidOf(@intCast(track_i));
+            while (k5 > 0) {
+                k5 -= 1;
+                const pt5 = &app.parts.items[k5];
+                if (uid5) |uu5| {
+                    if (pt5.track_uid == uu5 and pt5.contains(step_i)) {
+                        if (app.removePart(k5)) erased += 1;
+                    }
+                }
             }
+            if (erased > 0) app.history_pending = "擦除 Part";
+        }
+    }
+    // （音频片段擦除的旧分支已移除：音频 Part 还没做，此处只处理 Part）
+
+    // ── **Part 批量拖动**（选区 ≥ 2）──
+    // 组级夹 + 不落入异类轨道：位移全部交给 `movePartBatch`（以快照为锚，幂等）
+    if (app.playlist.part_batch) {
+        if (!ui.mouse_down) {
+            app.playlist.part_batch = false;
+            if (ui.active_id == 7802) ui.active_id = 0;
+            app.commitHistory("批量移动 Part");
+        } else {
+            const d_step = model.snapRound(snap_step - app.playlist.batch_down_step, snap_steps);
+            var d_row: i32 = 0;
+            if (ui.mouse_y >= tracks_y and ui.mouse_y < tracks_y + tracks_h) {
+                const r = @divTrunc(ui.mouse_y - tracks_y + app.playlist.scroll, @max(1, track_h));
+                d_row = r - app.playlist.batch_down_row;
+            }
+            if (app.movePartBatch(d_step, d_row)) ui.cursor = .forbidden;
         }
     }
 
@@ -992,7 +1494,10 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             app.clearClipSelection();
             app.playlist.prev_click_clip = null;
             // 选中了音频样式（♪ 行，且当前在音频页）→ 放置**音频片段**
-            if (app.panels.patterns_tab_audio and app.audio_style_sel >= 0 and @as(usize, @intCast(app.audio_style_sel)) < app.audio_styles.items.len) {
+            // 注：`ui.active_id != 0` = 这次按下已被其它控件（如 **Part 拖动**）认领 → 不再放新的
+            if (ui.active_id != 0) {
+                // 已由 Part 交互处理（点中已有 Part = 拖动，不是新建）
+            } else if (app.panels.patterns_tab_audio and app.audio_style_sel >= 0 and @as(usize, @intCast(app.audio_style_sel)) < app.audio_styles.items.len) {
                 const ast = app.audio_styles.items[@intCast(app.audio_style_sel)];
                 // 异步导入中资产还没挂上 → 用文件头的引擎帧数（长度一样是对的）
                 const frames: i32 = if (app.audioStyleAsset(@intCast(app.audio_style_sel))) |d|
@@ -1001,21 +1506,25 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                     @intCast(@min(ast.frames_hint, std.math.maxInt(i32)));
                 const fps: i32 = @intCast(@max(1, app.framesPerStep()));
                 const alen: i32 = @max(1, @divTrunc(frames, fps));
-                app.addClip(.{ .track = track_i, .start = snap_step, .len = alen, .pattern = 0, .audio_style = @intCast(app.audio_style_sel), .trim_start = 0 });
-                app.commitHistory("放置音频片段"); // 原子操作：立即提交
-            } else {
-                const new_len: i32 = app.patternEffectiveLen(app.sel.pattern);
-                app.addClip(.{ .track = track_i, .start = snap_step, .len = new_len, .pattern = app.sel.pattern });
-                app.commitHistory("放置片段"); // 原子操作：立即提交
+                _ = app.addAudioPart(@intCast(track_i), snap_step, alen, @intCast(app.audio_style_sel), 0);
+                app.commitHistory("放置音频 Part"); // 原子操作：立即提交
+            } else if (!app.isAudioTrack(@intCast(track_i))) {
+                // **P1c-2：左键点空白 = 放置一个 1 小节的 Part**（替代“放样式片段”）
+                // 注：**音频轨上不放音符 Part**（一轨一类），音频轨只能通过上面的音频样式分支放音频 Part
+                // 对齐到小节起点（用户定稿：Part = 自带音符的块，不跨轨）
+                const spb_i: i32 = app.steps_per_bar;
+                const bar_start: i32 = @divTrunc(@max(0, snap_step), spb_i) * spb_i;
+                if (app.addPart(@intCast(track_i), bar_start, spb_i)) |_| {
+                    app.commitHistory("放置 Part");
+                }
             }
-            app.commitHistory("放置片段"); // 原子操作：立即提交
         }
     }
 
     // 拖动 / 拉伸更新（鼠标可移出区域；位置 clamp 到有效范围）
     if (ui.mouse_down) {
         // ── 批量拖动（选区 ≥ 2）──
-        if (app.playlist.drag_batch) {
+        if (false and app.playlist.drag_batch) { // 旧片段批量拖动：已废弃
             if (!app.playlist.drag_armed) {
                 const dx = ui.mouse_x - app.playlist.drag_down_x;
                 const dy = ui.mouse_y - app.playlist.drag_down_y;
@@ -1030,7 +1539,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             }
         }
         // ── 批量拉伸（选区 ≥ 2 边缘拖动；全组同步，与音符一致）──
-        if (app.playlist.batch_trim) {
+        if (false and app.playlist.batch_trim) { // 旧片段批量拉伸：已废弃
             if (!app.playlist.drag_armed) {
                 const dx = ui.mouse_x - app.playlist.drag_down_x;
                 const dy = ui.mouse_y - app.playlist.drag_down_y;
@@ -1056,14 +1565,20 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 if (dx * dx + dy * dy >= 3 * 3) app.playlist.drag_armed = true;
             }
         }
-        if (app.playlist.drag_armed) {
+        if (false and app.playlist.drag_armed) { // 旧片段拖动/拉伸：已废弃
             if (app.playlist.drag_clip) |ci| {
                 if (ci < app.clips.items.len) {
                     const c = app.clips.items[ci];
                     // **目标位置**吸附到网格（而非鼠标位置——抓取点不在格上时会脱格）
                     const target = @max(0, step_i - app.playlist.drag_grab);
                     const new_start = @max(0, model.snapRound(target, snap_steps));
-                    const new_track = std.math.clamp(track_i, 0, rows_draw - 1);
+                    // **音频片段只能落到音频轨**（线性化：音频 Part 限同类轨）；
+                    // 落点不是音频轨 → 保持源轨 + “禁止”光标（松手自然回到原处）
+                    var new_track = std.math.clamp(track_i, 0, @max(0, rows_draw - 1));
+                    if (new_track != c.track and !app.isAudioTrack(new_track)) {
+                        new_track = c.track;
+                        ui.cursor = .forbidden;
+                    }
                     // **只写预览**：拖动期间不动模型（音频零干扰，松手一次性提交）
                     var pc = c;
                     pc.start = new_start;
@@ -1309,6 +1824,22 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     var nmini_v: usize = 0;
     {
         const tden: f32 = @floatFromInt(@max(1, max_end));
+        // 内容 = **Part**（音频 Part 用波形色）
+        for (app.parts.items) |pt0| {
+            if (nmini_v >= mini_vbuf.len) break;
+            const row0 = app.trackRowByUid(pt0.track_uid) orelse continue;
+            const pos64: i64 = @as(i64, @intCast(row0)) * track_h;
+            if (pos64 > std.math.maxInt(i32)) continue;
+            mini_vbuf[nmini_v] = .{
+                .pos = @intCast(pos64),
+                .len = track_h,
+                .kind = .note,
+                .y = std.math.clamp(@as(f32, @floatFromInt(pt0.start)) / tden, 0, 1),
+                .color = if (pt0.kind == .audio) ui.theme.waveform else patternColor(0),
+            };
+            nmini_v += 1;
+        }
+        // 旧片段（历史兼容）
         for (app.clips.items) |c| {
             if (nmini_v >= mini_vbuf.len) break;
             if (c.track < 0) continue;
@@ -1326,181 +1857,196 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     }
     _ = ui.scrollbarVExt(9, sb_x, tracks_y, ruler_h, tracks_h, &app.playlist.scroll, map_rows * track_h, tracks_h, map_rows < util.overhang_map_limit, mini_vbuf[0..nmini_v]);
 
-    // ── 编辑快捷键执行（框选/批量；本视图处理片段相关）──
-    // Del：删除选中片段；Ctrl+A：全选片段；Ctrl+B：铺瓷砖克隆（选区转移到克隆体）；
-    // Ctrl+C/V：片段剪贴板（粘贴到**鼠标位置**：步 + 轨道）。
-    if (app.pending_edit_op) |op| {
-        switch (op) {
-            .delete_selected => {
-                const n = app.deleteSelectedClips();
-                if (n > 0) {
-                    app.setToastWith("已删除 {d} 个片段", .{n});
-                    app.commitHistory("删除片段");
-                }
-            },
-            .toggle_mute => {
-                // 收集选中的片段 → App 统一处理（释音 + 两个方向的重扫门控）
-                var scope = std.ArrayListUnmanaged(usize).empty;
-                defer scope.deinit(app.allocator);
-                for (app.clips.items, 0..) |c, ci| {
-                    if (!c.selected) continue;
-                    scope.append(app.allocator, ci) catch {};
-                }
-                const n = app.toggleClipMute(scope.items);
-                if (n > 0) {
-                    app.setToastWith("已切换 {d} 个片段的静音", .{n});
-                    app.commitHistory("片段静音");
-                }
-            },
-            .select_all => {
-                const n = app.selectAllClips();
-                if (n > 0) app.setToastWith("已全选 {d} 个片段", .{n});
-            },
-            .clone_right => {
-                const n = app.cloneSelectedClipsRight();
-                if (n > 0) {
-                    app.setToastWith("已克隆 {d} 个片段（选区已移至克隆体）", .{n});
-                    app.commitHistory("克隆片段");
-                }
-            },
-            .copy => {
-                const n = app.copySelectedClips();
-                if (n > 0) app.setToastWith("已复制 {d} 个片段", .{n});
-            },
-            .cut => {
-                // 剪切 = 先复制到剪贴板，再删除选区
-                const n = app.copySelectedClips();
-                if (n > 0) {
-                    _ = app.deleteSelectedClips();
-                    app.setToastWith("已剪切 {d} 个片段", .{n});
-                    app.commitHistory("剪切片段");
-                }
-            },
-            .paste => {
-                // 粘贴到**鼠标位置**（步吸附网格；**轨道不变**——回原轨道）
-                const n = app.pasteClips(snap_step, rows_draw);
-                if (n > 0) {
-                    app.setToastWith("已粘贴 {d} 个片段", .{n});
-                    app.commitHistory("粘贴片段");
-                }
-            },
-        }
-        app.pending_edit_op = null;
-    }
-
-    // ── **自动化面板（v0 原型）**：与钢琴窗底部**同一套布局**（`docs/automation.md` §九）──
-    // 横向只覆盖**播放列表主区**（行头列 + 剪辑区），不压左侧样式栏/右侧历史栏；
-    // 行头列位置放**目标切换按钮**（对应钢琴窗的 力度/声像 toggle2）。
-    if (auto_h >= 48) {
-        const ay = lay.panel_y;
-        const panel_w = @max(1, x + w - lane_x); // 自动化区没有滚动条 → 铺到窗口右沿
-
-        // ── **共用外壳**（底色/顶线/分隔线/竖向网格/播放游标）——与钢琴窗编辑区同一份代码 ──
-        const cur_steps: f32 = app.cursorDisplay(true);
-        const ghost = !app.sel.song_mode and app.patOriginClip() == null;
-        view_lane.drawShell(ui, .{
-            .x = main_x,
-            .y = ay,
-            .w = @max(1, x + w - main_x),
-            .h = auto_h,
-            .lane_x = lane_x,
-            .step_w = @floatFromInt(util.piano_step_w),
-            .zoom = app.playlist.zoom,
-            .scroll_x = app.playlist.scroll_x,
-            .bar_steps = app.steps_per_bar,
-            .beat_steps = @max(1, @divTrunc(app.steps_per_bar, 4)),
-            .snap_steps = model.snapSteps(app.playlist.snap),
-            .cursor_step = if (ghost) null else cur_steps,
-            .playing = app.playing,
-        });
-
-        // 横向值参考线：与钢琴窗**同一个函数**（1/8 等分；中线只画一次、正好在 50%）
-        view_lane.drawValueGrid(ui, .{ .x = lane_x, .y = ay, .w = panel_w, .h = auto_h }, auto_h >= 64);
-
-        // 行头列顶部两行：单位按钮 + 当前点数值（与钢琴窗同一份代码）
-        const cur_lane = app.autoCurve() orelse return;
-        const hh = view_lane.drawValueHeader(ui, cur_lane, main_x, ay, util.piano_header_w);
-        if (hh.value_clicked) {
-            if (cur_lane.sel_idx) |si| {
-                var vb: [24]u8 = undefined;
-                const pre = view_lane.formatValue(cur_lane.display_unit, cur_lane.points.items[si].value, &vb);
-                app.beginEditAutomationValue(-1, si, pre, hh.rect.x, hh.rect.y, hh.rect.w);
-            }
-        }
-        // ── 行头列：**曲线列表**（显示曲线名）──
-        // 左键 = 选中编辑；双击 = 重命名；右键 = 菜单（重命名 / 删除曲线）
-        {
-            const n = @min(app.auto_curves.items.len, 32);
-            var names: [32][24]u8 = undefined;
-            var shown: [32][]const u8 = undefined;
-            var entries: [32]view_lane.ListEntry = undefined;
-            for (0..n) |k| {
-                const lc = &app.auto_curves.items[k];
-                shown[k] = lc.name(&names[k]);
-                entries[k] = .{ .text = shown[k], .active = app.auto_sel == lc.id };
-            }
-            if (n == 0) {
-                entries[0] = .{ .text = "（点下方轨道右键 → 自动化…）", .active = false };
-            }
-            const list = if (n == 0) entries[0..1] else entries[0..n];
-            const lh = view_lane.drawList(ui, main_x, ay, auto_h, util.piano_header_w, 40, &app.auto_list_scroll, list);
-            if (n > 0) {
-                if (lh.index) |hi| {
-                    if (hi < n) app.auto_sel = app.auto_curves.items[hi].id;
-                }
-                if (lh.dbl) |hi| {
-                    if (hi < n) {
-                        const cid = app.auto_curves.items[hi].id;
-                        app.beginRenameAutoCurve(cid, main_x + 4, ay + 44 + 18, util.piano_header_w);
-                    }
-                }
-                // 右键 → **菜单**（不是直接删）
-                if (lh.right) |hi| {
-                    if (hi < n) {
-                        app.curve_menu = .{
-                            .open = true,
-                            .just_opened = true,
-                            .x = ui.mouse_x,
-                            .y = ui.mouse_y,
-                            .curve_id = app.auto_curves.items[hi].id,
-                        };
-                    }
-                }
-            }
-        }
-
-        // ── 曲线行右键菜单（重命名 / 删除曲线）──
-        if (app.curve_menu.open) {
-            const items = [_][]const u8{ "重命名", "删除曲线" };
-            const en = [_]bool{ true, true };
-            const bounds: @import("ui.zig").Rect = .{ .x = main_x, .y = ay, .w = @max(1, x + w - main_x), .h = auto_h };
-            if (util.menuPanel(ui, &app.curve_menu.x, &app.curve_menu.y, &app.curve_menu.open, app.curve_menu.just_opened, .{ .cursor = {} }, bounds, &items, 110, &en)) |ci| {
-                const cid = app.curve_menu.curve_id;
-                switch (ci) {
-                    0 => app.beginRenameAutoCurve(cid, main_x + 4, ay + 44 + 18, util.piano_header_w),
-                    else => {
-                        if (app.bindingCountOfCurve(cid) > 1) {
-                            app.struct_del_req = .{ .auto_curve = cid };
-                            app.modal = .delete_auto_curve;
-                            app.modal_choice = null;
-                        } else if (app.removeAutoCurve(cid)) {
-                            app.setToast("已删除曲线");
+    // ── 编辑快捷键执行（线性化：只有 Part）──
+    // Del：删除选中 Part；Ctrl+A：全选；Ctrl+C/V：Part 剪贴板（粘贴到鼠标位置，轨道保持）。
+    blk: {
+        if (app.pending_edit_op) |op| {
+            switch (op) {
+                .delete_selected => {
+                    var del_n: usize = 0;
+                    var di: usize = app.parts.items.len;
+                    while (di > 0) {
+                        di -= 1;
+                        if (app.parts.items[di].selected) {
+                            if (app.removePart(di)) del_n += 1;
                         }
-                    },
-                }
+                    }
+                    if (del_n > 0) {
+                        app.setToastWith("已删除 {d} 个 Part", .{del_n});
+                        app.commitHistory("删除 Part");
+                        app.pending_edit_op = null;
+                        break :blk;
+                    }
+                },
+                .toggle_mute => {
+                    var n: usize = 0;
+                    for (app.parts.items) |*ptm| {
+                        if (!ptm.selected) continue;
+                        ptm.muted = !ptm.muted;
+                        n += 1;
+                    }
+                    if (n > 0) {
+                        app.dirty = true;
+                        app.setToastWith("已切换 {d} 个 Part 的静音", .{n});
+                        app.commitHistory("Part 静音");
+                    }
+                },
+                .select_all => {
+                    var n: usize = 0;
+                    for (app.parts.items) |*pts| {
+                        pts.selected = true;
+                        n += 1;
+                    }
+                    if (n > 0) app.setToastWith("已全选 {d} 个 Part", .{n});
+                },
+                .copy => {
+                    const np = app.copySelectedParts();
+                    if (np > 0) {
+                        app.setToastWith("已复制 {d} 个 Part", .{np});
+                        app.pending_edit_op = null;
+                        break :blk;
+                    }
+                },
+                .cut => {
+                    const np = app.copySelectedParts();
+                    if (np > 0) {
+                        var di: usize = app.parts.items.len;
+                        while (di > 0) {
+                            di -= 1;
+                            if (app.parts.items[di].selected) _ = app.removePart(di);
+                        }
+                        app.setToastWith("已剪切 {d} 个 Part", .{np});
+                        app.commitHistory("剪切 Part");
+                    }
+                },
+                .paste => {
+                    const np = app.pasteParts(snap_step);
+                    if (np > 0) {
+                        app.setToastWith("已粘贴 {d} 个 Part", .{np});
+                        app.commitHistory("粘贴 Part");
+                        app.pending_edit_op = null;
+                        break :blk;
+                    }
+                },
+                else => {},
             }
-            app.curve_menu.just_opened = false;
+            app.pending_edit_op = null;
         }
 
-        // 值轨本体（内容层）：与剪辑区同一横坐标映射。
-        // ⚠️ **必须在这里重新解析曲线指针**：上面可能删过曲线（`removeAutoCurve` 会搬移/释放
-        // 仓库内存），沿用旧指针 = use-after-free（实测：右键删曲线后崩溃在 `view_lane.draw`）。
-        const draw_lane = app.autoCurve() orelse return;
-        view_lane.draw(ui, draw_lane, lane_x, ay, panel_w, auto_h, @floatFromInt(util.piano_step_w), app.steps_per_bar, app.playlist.scroll_x, app.playlist.zoom, app.allocator);
-    }
-    // 吸附网格下拉（在**全部内容之后** → 绘制在最上层）
-    if (app.playlist.snap_menu_open and snap_btn_x + 40 < x + w - 24) {
-        _ = util.snapSelectorMenu(ui, snap_btn_x, y + util.title_h, &app.playlist.snap, &app.playlist.snap_menu_open, snap_clicked);
+        // ── **自动化面板（v0 原型）**：与钢琴窗底部**同一套布局**（`docs/automation.md` §九）──
+        // 横向只覆盖**播放列表主区**（行头列 + 剪辑区），不压左侧样式栏/右侧历史栏；
+        // 行头列位置放**目标切换按钮**（对应钢琴窗的 力度/声像 toggle2）。
+        if (auto_h >= 48) {
+            const ay = lay.panel_y;
+            const panel_w = @max(1, x + w - lane_x); // 自动化区没有滚动条 → 铺到窗口右沿
+
+            // ── **共用外壳**（底色/顶线/分隔线/竖向网格/播放游标）——与钢琴窗编辑区同一份代码 ──
+            const cur_steps: f32 = app.cursorDisplay(true);
+            const ghost = !app.sel.song_mode and app.patOriginClip() == null;
+            view_lane.drawShell(ui, .{
+                .x = main_x,
+                .y = ay,
+                .w = @max(1, x + w - main_x),
+                .h = auto_h,
+                .lane_x = lane_x,
+                .step_w = @floatFromInt(util.piano_step_w),
+                .zoom = app.playlist.zoom,
+                .scroll_x = app.playlist.scroll_x,
+                .bar_steps = app.steps_per_bar,
+                .beat_steps = @max(1, @divTrunc(app.steps_per_bar, 4)),
+                .snap_steps = model.snapSteps(app.playlist.snap),
+                .cursor_step = if (ghost) null else cur_steps,
+                .playing = app.playing,
+            });
+
+            // 横向值参考线：与钢琴窗**同一个函数**（1/8 等分；中线只画一次、正好在 50%）
+            view_lane.drawValueGrid(ui, .{ .x = lane_x, .y = ay, .w = panel_w, .h = auto_h }, auto_h >= 64);
+
+            // 行头列顶部两行：单位按钮 + 当前点数值（与钢琴窗同一份代码）
+            const cur_lane = app.autoCurve() orelse return;
+            const hh = view_lane.drawValueHeader(ui, cur_lane, main_x, ay, util.piano_header_w);
+            if (hh.value_clicked) {
+                if (cur_lane.sel_idx) |si| {
+                    var vb: [24]u8 = undefined;
+                    const pre = view_lane.formatValue(cur_lane.display_unit, cur_lane.points.items[si].value, &vb);
+                    app.beginEditAutomationValue(-1, si, pre, hh.rect.x, hh.rect.y, hh.rect.w);
+                }
+            }
+            // ── 行头列：**曲线列表**（显示曲线名）──
+            // 左键 = 选中编辑；双击 = 重命名；右键 = 菜单（重命名 / 删除曲线）
+            {
+                const n = @min(app.auto_curves.items.len, 32);
+                var names: [32][24]u8 = undefined;
+                var shown: [32][]const u8 = undefined;
+                var entries: [32]view_lane.ListEntry = undefined;
+                for (0..n) |k| {
+                    const lc = &app.auto_curves.items[k];
+                    shown[k] = lc.name(&names[k]);
+                    entries[k] = .{ .text = shown[k], .active = app.auto_sel == lc.id };
+                }
+                if (n == 0) {
+                    entries[0] = .{ .text = "（点下方轨道右键 → 自动化…）", .active = false };
+                }
+                const list = if (n == 0) entries[0..1] else entries[0..n];
+                const lh = view_lane.drawList(ui, main_x, ay, auto_h, util.piano_header_w, 40, &app.auto_list_scroll, list);
+                if (n > 0) {
+                    if (lh.index) |hi| {
+                        if (hi < n) app.auto_sel = app.auto_curves.items[hi].id;
+                    }
+                    if (lh.dbl) |hi| {
+                        if (hi < n) {
+                            const cid = app.auto_curves.items[hi].id;
+                            app.beginRenameAutoCurve(cid, main_x + 4, ay + 44 + 18, util.piano_header_w);
+                        }
+                    }
+                    // 右键 → **菜单**（不是直接删）
+                    if (lh.right) |hi| {
+                        if (hi < n) {
+                            app.curve_menu = .{
+                                .open = true,
+                                .just_opened = true,
+                                .x = ui.mouse_x,
+                                .y = ui.mouse_y,
+                                .curve_id = app.auto_curves.items[hi].id,
+                            };
+                        }
+                    }
+                }
+            }
+
+            // ── 曲线行右键菜单（重命名 / 删除曲线）──
+            if (app.curve_menu.open) {
+                const items = [_][]const u8{ "重命名", "删除曲线" };
+                const en = [_]bool{ true, true };
+                const bounds: @import("ui.zig").Rect = .{ .x = main_x, .y = ay, .w = @max(1, x + w - main_x), .h = auto_h };
+                if (util.menuPanel(ui, &app.curve_menu.x, &app.curve_menu.y, &app.curve_menu.open, app.curve_menu.just_opened, .{ .cursor = {} }, bounds, &items, 110, &en)) |ci| {
+                    const cid = app.curve_menu.curve_id;
+                    switch (ci) {
+                        0 => app.beginRenameAutoCurve(cid, main_x + 4, ay + 44 + 18, util.piano_header_w),
+                        else => {
+                            if (app.bindingCountOfCurve(cid) > 1) {
+                                app.struct_del_req = .{ .auto_curve = cid };
+                                app.modal = .delete_auto_curve;
+                                app.modal_choice = null;
+                            } else if (app.removeAutoCurve(cid)) {
+                                app.setToast("已删除曲线");
+                            }
+                        },
+                    }
+                }
+                app.curve_menu.just_opened = false;
+            }
+
+            // 值轨本体（内容层）：与剪辑区同一横坐标映射。
+            // ⚠️ **必须在这里重新解析曲线指针**：上面可能删过曲线（`removeAutoCurve` 会搬移/释放
+            // 仓库内存），沿用旧指针 = use-after-free（实测：右键删曲线后崩溃在 `view_lane.draw`）。
+            const draw_lane = app.autoCurve() orelse return;
+            view_lane.draw(ui, draw_lane, lane_x, ay, panel_w, auto_h, @floatFromInt(util.piano_step_w), app.steps_per_bar, app.playlist.scroll_x, app.playlist.zoom, app.allocator);
+        }
+        // 吸附网格下拉（在**全部内容之后** → 绘制在最上层）
+        if (app.playlist.snap_menu_open and snap_btn_x + 40 < x + w - 24) {
+            _ = util.snapSelectorMenu(ui, snap_btn_x, y + util.title_h, &app.playlist.snap, &app.playlist.snap_menu_open, snap_clicked);
+        }
     }
 }
 

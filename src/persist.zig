@@ -89,6 +89,32 @@ pub const SavedClip = struct {
     }
 };
 
+/// 存档中的**轨道实体**（一轨 ↔ 一乐器 ↔ 一调音通道）
+pub const SavedTrack = struct {
+    uid: u32 = 0,
+    /// 0 = 乐器轨 / 1 = 音频轨
+    kind: u8 = 0,
+    /// 乐器栅位下标（-1 = 无乐器/音频轨）
+    instrument: i32 = -1,
+    muted: bool = false,
+};
+
+/// 存档中的 **Part**（自带音符；音频 Part 存样式引用 + trim）
+pub const SavedPart = struct {
+    track_uid: u32 = 0,
+    start: i32 = 0,
+    len: i32 = 1,
+    offset: i32 = 0,
+    /// 0 = 音符 Part / 1 = 音频 Part
+    kind: u8 = 0,
+    audio_style: i32 = -1,
+    trim_start: i32 = 0,
+    trim_len: i32 = 0,
+    muted: bool = false,
+    /// Part 自带音符（step 为 **Part 内局部坐标**）
+    notes: []SavedNote = &.{},
+};
+
 /// 存档中的音符
 pub const SavedNote = struct {
     step: i32,
@@ -312,6 +338,12 @@ pub const Project = struct {
     legacy_units_per_bar: i32 = model.units_per_whole,
     clips: []SavedClip = &.{},
     notes: []SavedNote = &.{},
+    /// **轨道实体**（uid/类型/乐器/静音）——与 `instruments`/`mixer` 一一对应
+    tracks: []SavedTrack = &.{},
+    /// **Part**（自带音符；音频 Part 引用 `audio_styles` 下标）
+    parts: []SavedPart = &.{},
+    /// 下一个可用轨道 uid（缺失/为 0 → 加载时按现有最大 uid+1 推导）
+    next_track_uid: u32 = 0,
     /// 音频样式（引用文件按相对工程目录的路径；片段经 `SavedClip.audio_style` 引用）
     audio_styles: []SavedAudioStyle = &.{},
     instruments: []SavedInstrument = &.{},

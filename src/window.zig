@@ -271,6 +271,7 @@ const WindowsWindow = struct {
             .resize_h => LoadCursorW(null, IDC_SIZEWE),
             .resize_v => LoadCursorW(null, IDC_SIZENS),
             .size_all => LoadCursorW(null, IDC_SIZEALL),
+            .forbidden => LoadCursorW(null, @as(?*anyopaque, @ptrFromInt(32648))), // IDC_NO
             .hidden => self.blankCursor(),
         };
         if (hcur) |h| {

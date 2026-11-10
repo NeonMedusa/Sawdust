@@ -31,6 +31,24 @@ const Target = struct {
 
 fn resolveTarget(app: *App) ?Target {
     const ww = &app.wave_win;
+    // **音频 Part**（线性化：目标已改成 Part 下标）
+    if (ww.part) |pi| {
+        if (pi >= app.parts.items.len) return null;
+        const pt = &app.parts.items[pi];
+        if (pt.kind != .audio) return null;
+        if (pt.audio.style < 0 or pt.audio.style >= @as(i32, @intCast(app.audio_styles.items.len))) return null;
+        const st = &app.audio_styles.items[@intCast(pt.audio.style)];
+        return .{
+            .asset = st.asset,
+            .trim_start = &pt.audio.trim_start,
+            .trim_len = &pt.audio.trim_len,
+            .gain = &st.gain,
+            .speed = &st.speed,
+            .channel = st.channel,
+            .channel_editable = false,
+            .name = st.name,
+        };
+    }
     if (ww.clip) |ci| {
         if (ci >= app.clips.items.len) return null;
         const c = &app.clips.items[ci];
@@ -245,7 +263,8 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         // 采样器层 = 跟随鼓组乐器 → **不画通道框、也不占行宽**）
         var cval: i32 = std.math.clamp(tgt.channel, 0, 65535);
         const n_ch: i32 = @max(1, @as(i32, @intCast(app.mixer_channels_state.items.len)));
-        if (tgt.channel_editable) {
+        // **通道不属于片段/Part**（线性化：通道跟随轨道）——不再提供通道推子
+        if (false and tgt.channel_editable) {
             ui.label("通道", gx, ctl_y + 2, ui.theme.text_dim);
             gx += 36;
             if (ui.dragNumber(9701, gx, ctl_y - 2, 52, ctl_h - 2, &cval, 0, n_ch - 1, 24)) {

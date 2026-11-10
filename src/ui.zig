@@ -14,7 +14,7 @@ const Font = @import("font.zig").Font;
 const window = @import("window.zig");
 
 /// 光标形状请求（每帧由 UI 设置，窗口层据此切换系统光标）
-pub const CursorKind = enum { arrow, resize_h, resize_v, size_all, hidden };
+pub const CursorKind = enum { arrow, resize_h, resize_v, size_all, forbidden, hidden };
 
 /// 矩形（层/区域用）
 pub const Rect = struct {

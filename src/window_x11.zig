@@ -675,6 +675,7 @@ pub const X11Window = struct {
             .resize_h => 1,
             .resize_v => 2,
             .size_all => 3,
+            .forbidden => 4,
             .hidden => unreachable,
         };
         if (self.cursors[idx] == 0) {
@@ -683,6 +684,7 @@ pub const X11Window = struct {
                 .resize_h => XC_sb_h_double_arrow,
                 .resize_v => XC_sb_v_double_arrow,
                 .size_all => XC_fleur,
+                .forbidden => 48, // XC_circle“禁止”圆斜线
                 .hidden => unreachable,
             };
             self.cursors[idx] = XCreateFontCursor(dpy, shape);

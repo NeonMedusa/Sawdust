@@ -20,6 +20,81 @@ const vst_host = @import("vst_host.zig");
 /// - `offset >= 0`：不能展开到局部第 0 步之前
 ///   （凭空往左 = 造出内容里不存在的音符位置，不对）；
 /// - 折叠右移 `offset` 增大、`len` 减小（右端不动）；展开反之。
+/// **Part（部件）**：轨道上的一块区域，**自带音符**（线性工作流里的 MIDI Part）。
+///
+/// P1c-1：先与旧模型（`Clip` + 全局 `notes` 池）**并存**，只确保“Part 能承载独立音符”；
+/// 后续 P1c-2/3 再把编辑路径与快照切过来，最终删掉样式池。
+///
+/// 坐标：`start` 是**工程全局步**（U=96）；`note.step` 是 Part **局部步**；
+/// 全局步 = `part.start + note.step - part.offset`（与旧 Clip 的折叠公式同形）。
+/// **Part 的历史快照**（扁平存储：音符展平到 `HistoryState.part_notes`）
+pub const PartSnap = struct {
+    track_uid: u32 = 0,
+    start: i32 = 0,
+    len: i32 = 1,
+    offset: i32 = 0,
+    kind: Part.Kind = .midi,
+    audio: Part.AudioRef = .{},
+    muted: bool = false,
+    notes_off: u32 = 0,
+    notes_len: u32 = 0,
+};
+
+pub const Part = struct {
+    /// 归属轨道（轨道**稳定 uid**，不是行号）
+    track_uid: u32 = 0,
+    /// 起始步（全局坐标，0 起）
+    start: i32 = 0,
+    /// 长度（步，>= 1）
+    len: i32 = 1,
+    /// 左缘对应的局部步（0 = 从第 1 步开始）
+    offset: i32 = 0,
+    /// 静音（与样式片段同语义：灰化 + 不发声）
+    muted: bool = false,
+    /// **选中**（框选/批量操作集合；与片段的 `Clip.selected` 同义）
+    selected: bool = false,
+    /// 本 Part 的音符（**独立**：改这里不影响其他 Part；`kind == .audio` 时恒空）
+    notes: std.ArrayListUnmanaged(Note) = .empty,
+
+    /// **Part 类型**：`midi`（音符）/ `audio`（音频）——交互完全共用，
+    /// **唯一差别是左边界**：midi 无限制；audio 的左缘受采样开头限制（`audio.trim_start`）。
+    kind: Kind = .midi,
+
+    /// 音频 Part 的引用（仅 `kind == .audio` 有效）：按**引用**指向 `App.audio_styles`，不复制采样。
+    audio: AudioRef = .{},
+
+    pub const Kind = enum { midi, audio };
+
+    pub const AudioRef = struct {
+        /// `App.audio_styles` 下标（-1 = 未指定）
+        style: i32 = -1,
+        /// 采样内起点（帧）
+        trim_start: i32 = 0,
+        /// 采样内可用长度（帧；0 = 不限）
+        trim_len: i32 = 0,
+    };
+
+    pub fn deinit(self: *Part, alloc: std.mem.Allocator) void {
+        self.notes.deinit(alloc);
+        self.notes = .empty;
+    }
+
+    /// 局部步 → 全局步
+    pub fn toGlobal(self: *const Part, local_step: i32) i32 {
+        return self.start + local_step - self.offset;
+    }
+
+    /// 全局步 → 局部步
+    pub fn toLocal(self: *const Part, global_step: i32) i32 {
+        return global_step - self.start + self.offset;
+    }
+
+    /// 全局步是否落在本 Part 内
+    pub fn contains(self: *const Part, global_step: i32) bool {
+        return global_step >= self.start and global_step < self.start + self.len;
+    }
+};
+
 pub const Clip = struct {
     track: i32, // 轨道序号（0 起）
     start: i32, // 起始步（全局坐标，0 起；U=96 单位）
@@ -47,6 +122,24 @@ pub const Clip = struct {
 /// step：局部步（U=96 单位，0 = 样式自身第 1 步）；
 /// pitch：MIDI 音高（0-127，越大越高）。
 /// 片段（Clip）只是样式的“窗口”（start/len/offset 决定显示哪一段），音符本身归样式。
+/// **轨道**（线性工作流：轨道 = 一条音轨；乐器/片段/自动化都挂在它上面）。
+/// P0 先只给“身份 + 类型 + 静音”，名字仍走兼容的 `track_names`（P5 收口）。
+pub const Track = struct {
+    /// **稳定身份**（0 = 未分配）：自动化/片段引用它，而不是行号
+    uid: u32 = 0,
+    kind: Kind = .instrument,
+    muted: bool = false,
+    /// 本轨的**乐器**（`App.instruments` 下标；-1 = 空轨）。线性工作流：一轨一乐器。
+    instrument: i32 = -1,
+
+    pub const Kind = enum {
+        /// 乐器轨（合成器 / 鼓组 / VSTi）
+        instrument,
+        /// 音频轨（独占一个音频文件；无乐器、无钢琴窗）
+        audio,
+    };
+};
+
 pub const Note = struct {
     step: i32, // 局部起始步（U=96 单位）
     len: i32, // 长度（步，>= 1）
