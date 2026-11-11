@@ -40,6 +40,7 @@ const rows = [_]Row{
     .{ .sec = false, .key = "Ctrl + ↑ / ↓", .desc = "音符上 / 下移动八度" },
     .{ .sec = false, .key = "Shift + ↑ / ↓", .desc = "音符上 / 下移动半音" },
     .{ .sec = false, .key = "Ctrl / Shift + ← / →", .desc = "左 / 右移动一小节 / 网格" },
+    .{ .sec = false, .key = "Alt + 拖动", .desc = "按 1 步（最细网格）拖动 / 拉伸 / 放置音符与片段" },
 
     .{ .sec = true, .key = "视图", .desc = "" },
     .{ .sec = false, .key = "Ctrl + 滚轮", .desc = "横向缩放" },
@@ -122,7 +123,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
             const hovered = util.inRect(ui.mouse_x, ui.mouse_y, lx, yy, tw, row_h);
             const color = if (hovered) ui.theme.accent else ui.theme.text_dim;
             ui.label(r.desc, lx, yy, color);
-            const baseline = yy + @as(i32, @intFromFloat(ui.font.ascent));
+            const baseline = yy + @as(i32, @intFromFloat(ui.font.ascentL()));
             ui.renderer.hline(lx, baseline + 2, tw, color);
             if (hovered and ui.mouse_pressed) window_mod.openExternalUrl(repo_open);
         } else {

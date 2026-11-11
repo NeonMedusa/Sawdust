@@ -139,9 +139,10 @@ pub const Ui = struct {
     wheel_shift: bool = false,
     /// 本帧滚轮是否按着 Alt（微调力度/声像——见 `view_pianoroll`/`view_note_lane`）
     wheel_alt: bool = false,
-    /// 本帧修饰键状态（每帧由 main 从窗口读取；框选/批量操作用）
+    /// 本帧修饰键状态（每帧由 main 从窗口读取；框选/批量操作/Alt 细拖用）
     mods_ctrl: bool = false,
     mods_shift: bool = false,
+    mods_alt: bool = false,
 
     // ── 拖动状态（跨帧保持）──
     /// 当前操控中的控件 id（**全应用唯一**——撞 id 会“串场”：拖 A 动 B）。
@@ -325,7 +326,7 @@ pub const Ui = struct {
                 i += n;
                 continue;
             };
-            const adv = if (self.font.getGlyph(cp)) |g| g.advance else self.font.size_px * 0.5;
+            const adv = self.font.advanceLogical(cp);
             if (width + adv > @as(f32, @floatFromInt(max_px))) {
                 // 留出 "…" 的空间
                 return text[0..i];
@@ -339,7 +340,7 @@ pub const Ui = struct {
     /// 绘制带裁剪的文本（超出宽度不绘制；调用方可自行加省略号）
     pub fn labelClipped(self: *Ui, text: []const u8, x: i32, y: i32, max_px: i32, color: Color) void {
         const shown = self.clipText(text, max_px);
-        self.font.draw(self.renderer, shown, @floatFromInt(x), @floatFromInt(y + @as(i32, @intFromFloat(self.font.ascent))), color);
+        self.font.draw(self.renderer, shown, @floatFromInt(x), @floatFromInt(y + @as(i32, @intFromFloat(self.font.ascentL()))), color);
     }
 
     // ── 控件 ──
@@ -350,7 +351,7 @@ pub const Ui = struct {
     /// （旧写法用 `ascent - descent`——符号反了，文字比正确位置低 |descent| 像素，
     /// 实测反馈：“按钮里文字没有垂直居中”）
     fn centeredBaselineY(self: *Ui, y: i32, h: i32) i32 {
-        return y + @divTrunc(h, 2) + @divTrunc(@as(i32, @intFromFloat(self.font.ascent + self.font.descent)), 2);
+        return y + @divTrunc(h, 2) + @divTrunc(@as(i32, @intFromFloat(self.font.ascentL() + self.font.descentL())), 2);
     }
 
     /// 按钮：返回 true = 本帧被点击
@@ -547,34 +548,18 @@ pub const Ui = struct {
         const cx = x + @divTrunc(size, 2);
         const cy = y + @divTrunc(size, 2);
         const r = @divTrunc(size, 2) - 1;
+        const ring_w: f32 = @max(1.4, @as(f32, @floatFromInt(size)) / 16.0); // 环厚（细一些更精致）
         const gap: f32 = 0.30; // 底部缺口弧度（约 17°）
         const pi: f32 = std.math.pi;
         const a0: f32 = pi / 2 + gap / 2; // 底部（屏幕 y 向下）
         const a1: f32 = pi / 2 + 2 * pi - gap / 2;
-        drawArc(self.renderer, cx, cy, r, a0, a1, self.theme.slider_track);
+        self.renderer.arcRing(cx, cy, r, ring_w, a0, a1, self.theme.slider_track);
         if (norm > 0.002) {
-            drawArc(self.renderer, cx, cy, r, a0, a0 + (a1 - a0) * norm, if (hovered or self.active_id == id) self.theme.accent else self.theme.slider_fill);
+            const col = if (hovered or self.active_id == id) self.theme.accent else self.theme.slider_fill;
+            self.renderer.arcRing(cx, cy, r, ring_w, a0, a0 + (a1 - a0) * norm, col);
         }
         self.renderer.fillRect(cx - 1, cy - 1, 2, 2, self.theme.text_dim);
         return changed;
-    }
-
-    /// 圆弧（像素级描点；2px 粗）
-    fn drawArc(ren: Renderer, cx: i32, cy: i32, r: i32, a0: f32, a1: f32, color: r_mod.Color) void {
-        const len_px: f32 = (a1 - a0) * @as(f32, @floatFromInt(r));
-        const steps: i32 = @max(1, @as(i32, @intFromFloat(len_px)));
-        var i: i32 = 0;
-        while (i <= steps) : (i += 1) {
-            const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(steps));
-            const a = a0 + (a1 - a0) * t;
-            const px: i32 = cx + @as(i32, @intFromFloat(@cos(a) * @as(f32, @floatFromInt(r))));
-            const py: i32 = cy + @as(i32, @intFromFloat(@sin(a) * @as(f32, @floatFromInt(r))));
-            ren.plot(px, py, color);
-            // 2px 粗：向内再描一点
-            const px2: i32 = cx + @as(i32, @intFromFloat(@cos(a) * @as(f32, @floatFromInt(r - 1))));
-            const py2: i32 = cy + @as(i32, @intFromFloat(@sin(a) * @as(f32, @floatFromInt(r - 1))));
-            ren.plot(px2, py2, color);
-        }
     }
 
     /// 两段式切换（如 SONG/PAT）：`left_active` 为 true 表示选中左段。
@@ -626,7 +611,7 @@ pub const Ui = struct {
     }
 
     pub fn label(self: *Ui, text: []const u8, x: i32, y: i32, color: Color) void {
-        self.font.draw(self.renderer, text, @floatFromInt(x), @floatFromInt(y + @as(i32, @intFromFloat(self.font.ascent))), color);
+        self.font.draw(self.renderer, text, @floatFromInt(x), @floatFromInt(y + @as(i32, @intFromFloat(self.font.ascentL()))), color);
     }
 
     /// 文本在矩形内**垂直居中**（与同排控件对齐用：传同一组 `(y, h)`，
@@ -698,7 +683,7 @@ pub const Ui = struct {
                 i += n;
                 continue;
             };
-            const adv = if (self.font.getGlyph(cp)) |g| g.advance else self.font.size_px * 0.5;
+            const adv = self.font.advanceLogical(cp);
             if (px < x + adv * 0.5) return i; // 点在前半 → 落在本字符之前
             x += adv;
             i += n;

@@ -525,8 +525,8 @@ pub fn snapRound(step: i32, steps: i32) i32 {
 }
 
 /// 位移（步）→ **网格倍数**（四舍五入到最近格：过半格即换一格；负数对称）。
-/// “增量式”拉伸的换算基础：网格决定长度增减的**步长**
-/// （网格 1/4 → 鼠标走约 1/4 小节，长度 ±1/4）。
+/// 拉伸/拖动现在统一用 `GridRebase`（累积位移 + 网格重锚）；保留此函数仅作
+/// “位移→格数”换算的参考实现，**不要在编辑路径重新引入网格单位**（会导致松 Alt 时跳）。
 pub fn gridSteps(delta_steps: i32, grid: i32) i32 {
     const g = @max(1, grid);
     if (g <= 1) return delta_steps; // 自由精度
@@ -535,6 +535,75 @@ pub fn gridSteps(delta_steps: i32, grid: i32) i32 {
     return -@divTrunc(-delta_steps + half, g);
 }
 
+/// **拖动网格重锚**：拖动过程中吸附网格变了（按住/松开 Alt）时，保证**结果不跳**。
+/// 语义：`生效位移 = base + snapRound(raw - anchor, g)`；
+/// 网格一变，就把“当前已生效的位移”折进 `base`、把锚点挪到当前 `raw`。
+///
+/// **为什么需要**：拖动每帧都从“按下点”重新量化。若拖动中 Alt 松开、网格从 1 变回 24，
+/// 之前攒下的半格位移会被重新四舍五入 → 位置/长度瞬间回退（实测 bug：
+/// “微调了半天，一松 Alt 就弹回去”）。重锚后位移是连续累积的，切换网格只影响**之后的**步长。
+pub const GridRebase = struct {
+    /// 已生效的位移（跨网格切换累积；0 = 从未细调过）
+    base: i32 = 0,
+    /// 上次重锚时的 `raw`
+    anchor: i32 = 0,
+    /// 上次使用的网格
+    last_g: i32 = 1,
+    /// 钳住时的**饱和点**（raw 空间）：值首次被下限/上限钳住时的鼠标位移。
+    /// 保留它 = 保留超额行程（橡皮筋）——反向拖时先把多拖的那段走回来，
+    /// 回到饱和点那一刻端点精确贴着鼠标；同时把量化锚点钉在这里，
+    /// 所以切网格不会导致格子错位（±2 问题）。
+    sat_raw: ?i32 = null,
+
+    /// 拖动开始时调用（`raw = 0` 对应当前按下点）
+    pub fn reset(self: *GridRebase, g: i32) void {
+        self.* = .{ .base = 0, .anchor = 0, .last_g = @max(1, g) };
+    }
+
+    /// 每帧取当前应生效的位移；`raw` = 鼠标相对按下点的原始步数（可为负）
+    ///
+    /// **两侧基准不同**（这是消除“反复切 Alt 漂移”的关键）：
+    /// - 切到**细调**（`g == 1`，按 Alt）：回到**按下点**对齐 → 值 = `按下时值 + 鼠标累计位移`，
+    ///   1 步/单位跟手。若沿用“保当前值 + 锚点挪到此刻”，切换时那段**未兑现的子格位移**
+    ///   会在细调下被重算一遍 → 每切一次净赚半格，反复切就能把音符拖得越来越远（实测 bug）。
+    /// - 切到**粗调**（松 Alt）：保当前值不变（不丢细调成果），锚点挪到此刻，之后按新网格整格走。
+    ///   （必须“相对”，否则松 Alt 会把值 snap 回网格 = 微调半天一回退。）
+    pub fn applied(self: *GridRebase, raw: i32, g: i32) i32 {
+        const gg = @max(1, g);
+        if (gg != self.last_g) {
+            if (gg == 1) {
+                self.base = 0; // 细调：绝对基准（按下点）
+                self.anchor = 0;
+            } else {
+                self.base += snapRound(raw - self.anchor, self.last_g); // 粗调：相对基准（此刻）
+                self.anchor = raw;
+            }
+            self.last_g = gg;
+            self.sat_raw = null; // 换网格：饱和点作废（钳住时重新记）
+        }
+        return self.base + snapRound(raw - self.anchor, gg);
+    }
+
+    /// **把“本帧期望位移 `want`”与“钳制后实际采用 `got`”反馈给重锚器**：
+    /// - 未钳住：清掉饱和记录（恢复正常跟手）；
+    /// - 钳住：把量化锚点钉在**饱和点**（首次被钳住的鼠标位置），
+    ///   但**不做饱和截断** —— 反向拖时会先把超额行程走完再跟手。
+    ///
+    /// 为什么两者都要：只保留超额行程 → 松 Alt 后格子错位（长度落在 `-14+6k`，
+    /// 永远到不了 7，用户看到“1/16 ± 2”）；只丢超额行程 → 鼠标与端点永久错位
+    /// （用户看到“鼠标在左、端点立刻跑到右”）。
+    pub fn settle(self: *GridRebase, raw: i32, g: i32, want: i32, got: i32) void {
+        if (want == got) {
+            self.sat_raw = null; // 未钳住：清掉
+            return;
+        }
+        const sat = self.sat_raw orelse (raw - (want - got));
+        self.sat_raw = sat;
+        self.base = got;
+        self.anchor = sat;
+        self.last_g = @max(1, g);
+    }
+};
 /// 拉伸下限（最小格点）：`原长 − k×格`（k >= 0）中仍 >= 1 的最小值。
 /// 例：1/8 音符（12 步）+ 1/4 格（24 步）→ 12（拖不短）；1/2 音符 → 24。
 /// 语义：只剩不足一格时**不能再减**（没有整格可减）。
@@ -544,35 +613,76 @@ pub fn trimMinGridLen(orig_len: i32, grid: i32) i32 {
     return l - @divFloor(l - 1, g) * g;
 }
 
-/// **拉伸长度（增量式）**：`长度 = 原长 + k×格`（`k = gridSteps`），钳到最小格点。
-/// 长度永远落在“原长 ± 整数格”的格点上——不会中途跳到无关的拍线/小节线。
-pub fn trimLenByGrid(orig_len: i32, delta_steps: i32, grid: i32) i32 {
-    const g = @max(1, grid);
-    const k = gridSteps(delta_steps, g);
-    return @max(trimMinGridLen(orig_len, g), orig_len + k * g);
+test "GridRebase：切换网格（按住/松开 Alt）不跳" {
+    var rb = GridRebase{};
+    rb.reset(1); // 按下时 Alt 按住 → 1 步网格
+    // 细调 +5 步
+    try std.testing.expectEqual(@as(i32, 5), rb.applied(5, 1));
+    // 松开 Alt（网格 24）：位置**保持 5**（旧行为会回退到 0）
+    try std.testing.expectEqual(@as(i32, 5), rb.applied(5, 24));
+    // 之后的步长才是粗的：鼠标再走 24 步 → +24
+    try std.testing.expectEqual(@as(i32, 29), rb.applied(29, 24));
+    // 再次按住 Alt：仍不跳，继续以 1 步递增
+    try std.testing.expectEqual(@as(i32, 29), rb.applied(29, 1));
+    try std.testing.expectEqual(@as(i32, 30), rb.applied(30, 1));
+
+    // 没按过 Alt 时：与旧行为完全一致（纯量化，不产生偏移）
+    rb.reset(24);
+    try std.testing.expectEqual(@as(i32, 24), rb.applied(13, 24));
+    try std.testing.expectEqual(@as(i32, 0), rb.applied(0, 24));
 }
 
-/// 批量缩短：长 `len` 的音符在网格 `g` 下**最多能缩短几格**。
-/// 规则（与单音符一致：缩短后长度 = 原长 − k×格，且 >= “原长减去整数格后的最小正余”）：
-/// `m = floor((len-1)/g)`——若 `len <= g` 则 m = 0（不能缩短）。
-/// 批量操作取所有选中音符的 **min(m)**（有一个不够就整体不能缩）。
-pub fn batchShortenMax(len: i32, grid: i32) i32 {
-    const g = @max(1, grid);
-    return @divFloor(@max(1, len) - 1, g);
+test "GridRebase：反复切 Alt 不能“白赚”子格位移（漂移回归）" {
+    // 网格 6 步（1/16）；按下点 raw = 0
+    var rb = GridRebase{};
+    rb.reset(6);
+    // 微微左移 3 步：粗调量化后 = 0（音符不动）
+    try std.testing.expectEqual(@as(i32, 0), rb.applied(-3, 6));
+    // **按 Alt**：细调立刻反映已走过的距离（跟手）
+    try std.testing.expectEqual(@as(i32, -3), rb.applied(-3, 1));
+    // 右移回按下点：1:1 跟随
+    try std.testing.expectEqual(@as(i32, 0), rb.applied(0, 1));
+    // **松 Alt**：保住当前值（= 0），之后按整格走
+    try std.testing.expectEqual(@as(i32, 0), rb.applied(0, 6));
+
+    // 十轮循环：旧实现每轮净赚 3（→ +30），现在必须仍为 0
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        _ = rb.applied(-3, 6);
+        try std.testing.expectEqual(@as(i32, -3), rb.applied(-3, 1));
+        _ = rb.applied(0, 1);
+        try std.testing.expectEqual(@as(i32, 0), rb.applied(0, 6));
+    }
 }
 
-/// 批量拉伸的**格数钳制**：
-/// - `requested`：鼠标位移换算的格数（正 = 加长、负 = 缩短）；
-/// - `shorten_cap`：全组最多能缩几格（= min over 组内 `batchShortenMax`，>= 0）；
-/// - `extend_cap`：全组最多能延几格（>= 0；右缘拉伸传大值，左缘传
-///   `min(step/g)`——不能越过样式开头）；
-/// 返回钳制后的格数（保持符号）。
-pub fn clampBatchK(requested: i32, shorten_cap: i32, extend_cap: i32) i32 {
-    // 注：不能用 `@max(0, x)`——Zig 会把非负结果收窄成 u31，无法取负。
-    const sc: i32 = if (shorten_cap > 0) shorten_cap else 0;
-    const ec: i32 = if (extend_cap > 0) extend_cap else 0;
-    if (requested < 0) return @max(requested, -sc);
-    return @min(requested, ec);
+test "GridRebase.settle：橡皮筋（保留超额行程）+ 格子不错位" {
+    // 场景：1/16（6 步）音符，Alt 缩到 1/96（1 步）后继续左拖到 raw = -20。
+    // want = -20（未钳），got = -5（长度 1）→ settle 把锚点钉在饱和点 raw = -5
+    var rb = GridRebase{};
+    rb.reset(1);
+    try std.testing.expectEqual(@as(i32, -20), rb.applied(-20, 1));
+    rb.settle(-20, 1, -20, -5);
+    // 继续左拖：位移随 raw 继续变大（超额行程保留，由调用方 clamp 显示）
+    try std.testing.expectEqual(@as(i32, -25), rb.applied(-25, 1));
+    // 反向拖回饱和点：位移正好回到 -5（端点跟手的位置）
+    try std.testing.expectEqual(@as(i32, -5), rb.applied(-5, 1));
+    // 松 Alt（g=6）且鼠标仍在超额区：调用方仍 clamp 到 -5（不跳）；视图会再 settle
+    rb.settle(-20, 6, -20, -5);
+    // 回到饱和点 → -5；再往右一格（6 步）→ +1 → 长度 6+1 = 7 ✓
+    try std.testing.expectEqual(@as(i32, 1), rb.applied(1, 6));
+}
+
+test "trimFloorLen：Alt 缩出的 1/96 松 Alt 后能回去" {
+    const g = 6; // 1/16 网格 = 6 步
+    // 按住 Alt：6 步音符可自由缩到 1 步
+    try std.testing.expectEqual(@as(i32, 1), trimFloorLen(6, g, true));
+    try std.testing.expectEqual(@as(i32, 1), trimFloorLen(1, g, true));
+    // 松 Alt 后拉宽一格 → 7 步；此时下限仍是 1（不是按下时的 6）
+    try std.testing.expectEqual(@as(i32, 1), trimFloorLen(7, g, false));
+    try std.testing.expectEqual(@as(i32, 1), trimFloorLen(13, g, false));
+    // 旧语义不变：12 步（2 格）→ 下限 6；6 步（1 格）→ 不能再缩
+    try std.testing.expectEqual(@as(i32, 6), trimFloorLen(12, g, false));
+    try std.testing.expectEqual(@as(i32, 6), trimFloorLen(6, g, false));
 }
 
 test "snapSteps / snapFloor / snapRound（U=96）" {
@@ -594,7 +704,7 @@ test "snapSteps / snapFloor / snapRound（U=96）" {
     try std.testing.expectEqual(@as(i32, 37), snapRound(37, 1));
 }
 
-test "gridSteps / trimMinGridLen / trimLenByGrid：增量式拉伸（网格 = 长度增减步长）" {
+test "gridSteps / trimMinGridLen：位移→格数与拉伸下限" {
     // 位移 → 格数：**四舍五入**（过半格即换一格；负数对称）；网格 = 1 步时直接跟随
     try std.testing.expectEqual(@as(i32, 0), gridSteps(11, 24)); // 不足半格：不变
     try std.testing.expectEqual(@as(i32, 1), gridSteps(12, 24)); // 半格：进一格
@@ -604,48 +714,21 @@ test "gridSteps / trimMinGridLen / trimLenByGrid：增量式拉伸（网格 = �
     try std.testing.expectEqual(@as(i32, -1), gridSteps(-35, 24));
     try std.testing.expectEqual(@as(i32, 25), gridSteps(25, 1));
 
-    // **实测手感**：1/8 音符（12 步）+ 1/4 网格（24 步）
-    try std.testing.expectEqual(@as(i32, 12), trimMinGridLen(12, 24)); // 只剩不足一格
-    try std.testing.expectEqual(@as(i32, 12), trimLenByGrid(12, 11, 24)); // 不足半格 → 不变
-    try std.testing.expectEqual(@as(i32, 36), trimLenByGrid(12, 12, 24)); // 过半格 → +1/4
-    try std.testing.expectEqual(@as(i32, 60), trimLenByGrid(12, 36, 24)); // 一格半 → +2/4
-    try std.testing.expectEqual(@as(i32, 12), trimLenByGrid(12, -12, 24)); // 拖回 → 复原
-    try std.testing.expectEqual(@as(i32, 12), trimLenByGrid(12, -96, 24)); // 再往左：不能减
-
-    // 1/2 音符（48 步）+ 1/4 网格：最低减到 1/4（24），不能更低
+    // **实测手感**：1/8 音符（12 步）+ 1/4 网格（24 步）→ 只剩不足一格 → 下限 12
+    try std.testing.expectEqual(@as(i32, 12), trimMinGridLen(12, 24));
+    // 1/2 音符（48 步）+ 1/4 网格：最低减到 1/4（24）
     try std.testing.expectEqual(@as(i32, 24), trimMinGridLen(48, 24));
-    try std.testing.expectEqual(@as(i32, 24), trimLenByGrid(48, -24, 24));
-    try std.testing.expectEqual(@as(i32, 24), trimLenByGrid(48, -999, 24));
-    // 3/8 音符（36 步）：减一格到 1/8（仍是格点）、再减被挡
-    try std.testing.expectEqual(@as(i32, 12), trimLenByGrid(36, -24, 24));
-
-    // 自由精度（网格 = 1 步）：跟随位移、下限 1
-    try std.testing.expectEqual(@as(i32, 37), trimLenByGrid(12, 25, 1));
-    try std.testing.expectEqual(@as(i32, 1), trimLenByGrid(12, -999, 1));
+    // 自由精度（网格 = 1 步）：下限 1
+    try std.testing.expectEqual(@as(i32, 1), trimMinGridLen(12, 1));
 }
 
-test "batchShortenMax / clampBatchK：批量缩短的“全组同步”规则" {
-    const g = 12; // 1/8 网格 = 12 步
-    // 四分音符（24）：最多缩 1 格（24−12=12；再缩 24−24=0 不行）
-    try std.testing.expectEqual(@as(i32, 1), batchShortenMax(24, g));
-    // 八分音符（12）：不能缩（= 一格）
-    try std.testing.expectEqual(@as(i32, 0), batchShortenMax(12, g));
-    // 更短（6）：不能缩
-    try std.testing.expectEqual(@as(i32, 0), batchShortenMax(6, g));
-    // 二分音符（48）：3 格（48→36→24→12，到一格为止）
-    try std.testing.expectEqual(@as(i32, 3), batchShortenMax(48, g));
-    // 非整格（30）：floor(29/12) = 2
-    try std.testing.expectEqual(@as(i32, 2), batchShortenMax(30, g));
-
-    // 钳制：全组 cap = min（有一个不够就整体不能缩）
-    const cap = @min(batchShortenMax(24, g), batchShortenMax(24, g));
-    try std.testing.expectEqual(@as(i32, -1), clampBatchK(-1, cap, 0));
-    try std.testing.expectEqual(@as(i32, -1), clampBatchK(-5, cap, 0)); // 超缩 → 钳到 -1
-    const cap2 = @min(batchShortenMax(24, g), batchShortenMax(12, g)); // 有一个 = 一格
-    try std.testing.expectEqual(@as(i32, 0), clampBatchK(-1, cap2, 0)); // 全组不能缩
-    // 加长：受 extend_cap（左缘“不能越过 0”）
-    try std.testing.expectEqual(@as(i32, 3), clampBatchK(10, 0, 3));
-    try std.testing.expectEqual(@as(i32, 10), clampBatchK(10, 0, 999));
+/// **单条拉伸的长度下限**（判据跟 Alt 走，锚在**当前长度**）：
+/// - `fine`（按住 Alt）：1 步（自由精度）；
+/// - 否则：从**当前长度**再剥一整格后的值（`trimMinGridLen`）——
+///   所以 Alt 缩出来的短长度在松 Alt 后能原路回去，且“凑不满一格就停止缩短”。
+pub fn trimFloorLen(cur_len: i32, grid: i32, fine: bool) i32 {
+    if (fine) return 1;
+    return trimMinGridLen(cur_len, grid);
 }
 
 /// 值域映射（minimap 的纵向压缩）：把 `[min_v, max_v]` 归一化到 `[0, 1]`。

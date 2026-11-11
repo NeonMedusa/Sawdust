@@ -104,8 +104,12 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 每小节步数由**拍号**决定（动态；App 字段）
     const spb: i32 = app.steps_per_bar;
     const bar_w = spb * util.piano_step_w;
-    // 量化/吸附格（步）——音符移动/拉伸对齐到它；网格也按它加一层。
+    // 量化/吸附格（步）——网格绘制、标尺/循环区拖动用它（**固定为配置档位**）。
     const snap_steps: i32 = model.snapSteps(app.piano.snap);
+    // **编辑吸附**：按住 **Alt** = **1 步**（最细网格，1/96 小节）。
+    // 覆盖：音符单选/选区批量移动、左/右缘拉伸、放置即拖拽、粘贴锚点。
+    // 刻意**不**影响网格绘制与标尺/循环区（否则一按 Alt 网格就变密，视觉炸开）。
+    const edit_snap: i32 = if (ui.mods_alt) 1 else snap_steps;
 
     // ── 时间轴长度与缩放下限（**同一个值**，否则会出现“滑块有行程但拖不动”）──
     // 时间轴 = 内容右缘（保底 4 小节）+ 右侧 3 小节留白。
@@ -765,8 +769,17 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 鼠标 → 内容坐标（除以 zoom）→ 步号
     const mouse_cx: i32 = app.piano.scroll_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(ui.mouse_x - lane_x)) / zoom));
     const step_i = @divFloor(mouse_cx, util.piano_step_w);
-    // 吸附后的步（放置/移动/拉伸都用它——量化到当前网格）
-    const snap_step: i32 = @max(0, model.snapRound(step_i, snap_steps));
+    // **拖动位移（步）**：用**鼠标像素位移**算，而不是“内容步相减”——
+    // 横向滚动有补间（`scroll_x` 每帧滑向 target），Ctrl+滚轮还能改 `zoom`：
+    // 这两种情况下鼠标不动、`step_i` 也会变，位移会冒出一个假初值
+    // （实测 bug：“抓右端往左拖，音符先往右长再缩”）。像素位移与它们无关。
+    const px_per_step: f32 = @as(f32, @floatFromInt(util.piano_step_w)) * zoom;
+    const drag_steps: i32 = if (px_per_step <= 0)
+        0
+    else
+        @intFromFloat(@round(@as(f32, @floatFromInt(ui.mouse_x - app.piano.drag_down_x)) / px_per_step));
+    // 吸附后的步（放置/移动/拉伸/粘贴锚点都用它——受 Alt 细拖影响）
+    const snap_step: i32 = @max(0, model.snapRound(step_i, edit_snap));
     const pitch_i = 127 - @divFloor(ui.mouse_y - lane_y + app.piano.scroll, app.piano.key_h);
 
     // ── 框选（Ctrl+左键拖；Ctrl+Shift = 追加）──
@@ -939,9 +952,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 app.beginBatchSnap();
                 app.piano.batch_trim = true;
                 app.history_pending = "批量拉伸音符"; // 松手时 coalesce 提交
-                app.piano.batch_trim_down_step = step_i;
-                app.piano.batch_trim_grid = @max(1, snap_steps);
                 app.piano.drag_note_mode = hit.mode;
+                app.piano.rebase.reset(edit_snap);
                 app.piano.drag_armed = false;
                 app.piano.drag_down_x = ui.mouse_x;
                 app.piano.drag_down_y = ui.mouse_y;
@@ -950,8 +962,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 app.beginBatchSnap();
                 app.piano.drag_batch = true;
                 app.history_pending = "批量移动音符"; // 松手时 coalesce 提交
-                app.piano.batch_down_step = step_i;
                 app.piano.batch_down_pitch = pitch_i;
+                app.piano.rebase.reset(edit_snap);
                 app.piano.drag_armed = false;
                 app.piano.drag_down_x = ui.mouse_x;
                 app.piano.drag_down_y = ui.mouse_y;
@@ -971,9 +983,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 // 增量式拉伸全程以它为锚（长度 = 原长 + k×格），避免“每帧以自身为基准”漂移
                 app.piano.drag_orig_step = n.step;
                 app.piano.drag_orig_len = n.len;
-                app.piano.drag_down_step = step_i;
+                app.piano.rebase.reset(edit_snap);
                 app.piano.rememberNote(n); // 记住：新音符放置沿用其 长度/力度/声像
-                app.piano.drag_grab_step = step_i - n.step;
                 app.piano.drag_grab_pitch = pitch_i - n.pitch;
                 // 拖动死区：先记录按下位置；超过阈值才真正编辑（防单击吸附）
                 app.piano.drag_armed = false;
@@ -993,7 +1004,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             // 注：**允许重叠**（与 MIDI 一致）——不再拦截；
             // 放置新音符时**取消选区**（符合直觉：新建 = 新焦点）
             app.clearNoteSelection();
-            const new_len: i32 = if (app.piano.last_note_len > 0) app.piano.last_note_len else @max(1, snap_steps);
+            const new_len: i32 = if (app.piano.last_note_len > 0) app.piano.last_note_len else @max(1, edit_snap);
             // 力度/声像沿用“上一个被点击/编辑音符”（无参考 → model 默认）；
             // 与长度同一交互逻辑（`rememberNote` 三件套）
             const new_vel: i32 = app.piano.last_note_velocity orelse model.default_velocity;
@@ -1007,12 +1018,10 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 // **放置即拖拽**：新音符立即进入拖动状态（按住左键可直接拖着跑）
                 app.piano.drag_note = app.notes.items.len - 1;
                 app.piano.drag_note_mode = .body;
-                app.piano.drag_grab_step = 0;
                 app.piano.drag_grab_pitch = 0;
                 app.piano.drag_orig_step = snap_step;
                 app.piano.drag_orig_len = new_len;
-                app.piano.drag_down_step = step_i;
-                // 新放置的音符视为“已拖动”（用户正按住左键）
+                app.piano.rebase.reset(edit_snap);
                 app.piano.drag_armed = true;
                 app.piano.drag_down_x = ui.mouse_x;
                 app.piano.drag_down_y = ui.mouse_y;
@@ -1035,11 +1044,14 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             }
             if (app.piano.drag_armed) {
                 // 位移吸附到网格（与单音符一致：以**最左选中音符**的起点吸附）
-                const d_step_raw = step_i - app.piano.batch_down_step;
+                const d_step_raw = drag_steps; // 鼠标像素位移（不受滚动补间/缩放影响）
                 const d_pitch = pitch_i - app.piano.batch_down_pitch;
                 // 吸附：位移 = 网格格数 × 格宽（round）
-                const d_step = model.snapRound(d_step_raw, snap_steps);
-                _ = app.moveSelectedNotes(d_step, d_pitch);
+                const d_step = app.piano.rebase.applied(d_step_raw, edit_snap);
+                // **钳住时重锚**：撞到 0/127 后继续拖的超额行程必须丢掉（否则松 Alt 会跳）
+                const d = app.clampNoteBatchDelta(d_step, d_pitch);
+                if (d.step != d_step) app.piano.rebase.settle(d_step_raw, edit_snap, d_step, d.step);
+                _ = app.moveSelectedNotes(d.step, d.pitch);
             }
         }
         // ── 批量拉伸（选区 ≥ 2 边缘拖动）──
@@ -1050,14 +1062,15 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 if (dx * dx + dy * dy >= 3 * 3) app.piano.drag_armed = true;
             }
             if (app.piano.drag_armed) {
-                const g = app.piano.batch_trim_grid;
-                // 位移 → 格数（左缘：左移为正、右缘：右移为正；与单音符增量式一致）
-                const delta = if (app.piano.drag_note_mode == .left)
-                    app.piano.batch_trim_down_step - step_i // 左缘：左移为正（加长）
+                // 累计位移（网格重锚：拖动中按住/松开 Alt 不跳）
+                const raw = if (app.piano.drag_note_mode == .left)
+                    -drag_steps // 左缘：左移为正（加长）
                 else
-                    step_i - app.piano.batch_trim_down_step; // 右缘：右移为正（加长）
-                const k = model.gridSteps(delta, g);
-                _ = app.applyBatchTrim(k, g, app.piano.drag_note_mode == .left);
+                    drag_steps; // 右缘：右移为正（加长）
+                const delta = app.piano.rebase.applied(raw, edit_snap);
+                const applied = app.applyBatchTrim(delta, edit_snap, ui.mods_alt, app.piano.drag_note_mode == .left);
+                // **钳住时重锚**：丢弃超额行程（否则松 Alt 后会跳一段）
+                app.piano.rebase.settle(raw, edit_snap, delta, applied);
             }
         }
         if (app.piano.drag_note) |ni| {
@@ -1068,13 +1081,18 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             }
             if (app.piano.drag_armed and ni < app.notes.items.len) {
                 const n = &app.notes.items[ni];
+                // 拉伸下限：**判据跟 Alt 走，锚在当前长度**——
+                // 不按 Alt：整格剥（7 步 + 网格 6 → 下限 1；而 6 步 = 一格 → 直接拒绝）
+                const min_len: i32 = model.trimFloorLen(n.len, edit_snap, ui.mods_alt);
                 switch (app.piano.drag_note_mode) {
                     .right => {
-                        // 右缘：长度 = **原长 + k×格**（网格决定增减步长：
-                        // 鼠标过半格即 ±一格，往回拖按格递减，不会跳到无关格线）
+                        // 右缘：长度 = **原长 + 累计位移**（网格只决定每帧增量）
                         // 注：允许重叠——不再拦截
-                        const delta = step_i - app.piano.drag_down_step;
-                        const new_len = model.trimLenByGrid(app.piano.drag_orig_len, delta, snap_steps);
+                        const delta = app.piano.rebase.applied(drag_steps, edit_snap);
+                        const want = app.piano.drag_orig_len + delta;
+                        const new_len = @max(min_len, want);
+                        // **钳住时重锚**：丢弃超额行程（否则松 Alt 后会跳一段）
+                        if (new_len != want) app.piano.rebase.settle(drag_steps, edit_snap, delta, new_len - app.piano.drag_orig_len);
                         if (new_len != n.len) {
                             n.len = new_len;
                             app.piano.rememberNote(n.*); // 记住编辑后的 长度/力度/声像
@@ -1083,23 +1101,33 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                     },
                     .left => {
                         // 左缘：右端固定；长度同增量式（鼠标左移 = 拉长、右移 = 缩短），
-                        // 且不能展开到样式第 1 步之前（new_step >= 0）
+                        // 且不能展开到样式第 1 步之前（new_step >= 0）。
+                        // 涨幅上限 = 当前空隙，**到边界为止不按网格取整**（与片段同规则）
                         // 注：允许重叠——不再拦截
                         const right = app.piano.drag_orig_step + app.piano.drag_orig_len;
-                        const min_len = model.trimMinGridLen(app.piano.drag_orig_len, snap_steps);
-                        const delta = app.piano.drag_down_step - step_i; // 左移为正（拉长方向）
-                        const len = @min(model.trimLenByGrid(app.piano.drag_orig_len, delta, snap_steps), right);
+                        const delta = app.piano.rebase.applied(-drag_steps, edit_snap); // 左移为正（拉长方向）
+                        const room = @max(0, n.step);
+                        const want = app.piano.drag_orig_len + delta;
+                        const len = @min(@min(@max(min_len, want), right), n.len + room);
+                        // **钳住时重锚**（同上）
+                        if (len != want) app.piano.rebase.settle(-drag_steps, edit_snap, delta, len - app.piano.drag_orig_len);
                         if (model.noteTrimLeft(n.*, right - len, right, min_len)) |nn| {
+                            if (nn.len != len) app.piano.rebase.settle(-drag_steps, edit_snap, delta, nn.len - app.piano.drag_orig_len);
                             n.* = nn;
                             app.piano.rememberNote(nn); // 记住编辑后的 长度/力度/声像
                             app.dirty = true;
                         }
                     },
                     .body => {
-                        // 中部：移动（**目标位置**吸附到网格；音高自由）
-                        // 注：吸附的是音符起点（而非鼠标），否则抓取点不在格上时会脱离网格。
-                        const target = @max(0, step_i - app.piano.drag_grab_step);
-                        const new_step = @max(0, model.snapRound(target, snap_steps));
+                        // 中部：移动——**增量式**（与批量移动完全一致）：网格 = **每次位移的步长**，
+                        // 起点 = 原起点 + 量化后的位移 → 音符相对网格的偏移被保留。
+                        // （旧写法把“结果位置”直接喂给 snapRound → 绝对值吸附：
+                        //  起点不在网格上的音符一拖就被“传送”到网格线）
+                        const d_step = app.piano.rebase.applied(drag_steps, edit_snap);
+                        const want = app.piano.drag_orig_step + d_step;
+                        const new_step = @max(0, want);
+                        // **钳住时重锚**（同上）
+                        if (new_step != want) app.piano.rebase.settle(drag_steps, edit_snap, d_step, new_step - app.piano.drag_orig_step);
                         const new_pitch = std.math.clamp(pitch_i - app.piano.drag_grab_pitch, 0, 127);
                         // 注：允许重叠——不再拦截
                         if (new_step != n.step or new_pitch != n.pitch) {

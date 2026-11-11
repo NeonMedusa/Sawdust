@@ -179,6 +179,29 @@ const WindowsWindow = struct {
         return self.drop_pt;
     }
 
+    /// **DPI 缩放**（物理像素 / 96）：我们已声明 per-monitor DPI-aware V2，
+    /// 所以必须自己把 UI 放大，否则 4K/高缩放下控件和字会显得非常小。
+    /// 取不到时返回 1.0（= 100%，即 1080p 的旧行为）。
+    pub fn dpiScale(self: *const WindowsWindow) f32 {
+        const hwnd = self.hwnd orelse return 1.0;
+        const d = GetDpiForWindow(hwnd);
+        if (d >= 48 and d <= 960) return @as(f32, @floatFromInt(d)) / 96.0;
+        return 1.0;
+    }
+
+    /// 按**逻辑尺寸**设客户端大小（物理 = 逻辑 × scale）：开机按 DPI 把初始窗口调成 1280×760 逻辑。
+    /// 再大不超出屏幕（4K@200% 下 2560×1520 还行，但 1080p+125% 就别开出屏）。
+    pub fn setClientSizeLogical(self: *WindowsWindow, w: i32, h: i32, scale: f32) void {
+        const hwnd = self.hwnd orelse return;
+        var pw: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(w)) * scale));
+        var ph: i32 = @intFromFloat(@round(@as(f32, @floatFromInt(h)) * scale));
+        const sw = GetSystemMetrics(0); // SM_CXSCREEN
+        const sh = GetSystemMetrics(1); // SM_CYSCREEN
+        if (sw > 200) pw = @min(pw, sw - 80);
+        if (sh > 200) ph = @min(ph, sh - 120);
+        _ = SetWindowPos(hwnd, null, 0, 0, pw, ph, 0x0002 | 0x0004); // SWP_NOMOVE | SWP_NOZORDER
+    }
+
     pub fn takeDropped(self: *WindowsWindow) ?[]u8 {
         if (self.dropped.items.len == 0) return null;
         const p = self.dropped.orderedRemove(0);
@@ -281,13 +304,14 @@ const WindowsWindow = struct {
         }
     }
 
-    /// 当前修饰键状态（Ctrl/Shift；每帧由 main 读取——
+    /// 当前修饰键状态（Ctrl/Shift/Alt；每帧由 main 读取——
     /// 键盘事件里只带按下瞬间的状态，而框选等手势需要“当前”状态）
     pub fn modifiers(self: *WindowsWindow) Modifiers {
         _ = self;
         const ctrl = (@as(u16, @bitCast(GetKeyState(VK_CONTROL))) & 0x8000) != 0;
         const shift = (@as(u16, @bitCast(GetKeyState(VK_SHIFT))) & 0x8000) != 0;
-        return .{ .ctrl = ctrl, .shift = shift };
+        const alt = (@as(u16, @bitCast(GetKeyState(VK_MENU))) & 0x8000) != 0;
+        return .{ .ctrl = ctrl, .shift = shift, .alt = alt };
     }
 
     /// 空白光标（1×1 全透明；懒创建一次）
@@ -741,6 +765,10 @@ extern "user32" fn DestroyCursor(*anyopaque) callconv(.winapi) i32;
 extern "user32" fn SetCapture(*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "user32" fn ReleaseCapture() callconv(.winapi) i32;
 extern "user32" fn SetProcessDpiAwarenessContext(?*anyopaque) callconv(.winapi) i32;
+/// DPI 查询：`GetDpiForWindow`（Win10 1607+）—— Win32 把"系统 DLL 里存在"的导出全部声明为 extern，
+/// 老系统上调用会失败，但**运行时只会在有窗口的 Win10+ 上被调用**；取到 0 → 退回 1.0。
+extern "user32" fn GetDpiForWindow(hwnd: ?*anyopaque) callconv(.winapi) u32;
+extern "user32" fn SetWindowPos(hwnd: ?*anyopaque, after: ?*anyopaque, x: i32, y: i32, cx: i32, cy: i32, flags: u32) callconv(.winapi) i32;
 // winmm：提升系统计时器精度（默认 15.6ms 粒度会把 sleep(8ms) 拉成 ~15.6ms）
 extern "winmm" fn timeBeginPeriod(uPeriod: u32) callconv(.winapi) u32;
 extern "winmm" fn timeEndPeriod(uPeriod: u32) callconv(.winapi) u32;
@@ -774,6 +802,12 @@ pub fn openExternalUrl(url: [:0]const u8) void {
 }
 
 const UnsupportedWindow = struct {
+    /// DPI 占位（非 Windows 后端自行实现；这里返回 1.0）
+    pub fn dpiScale(self: *const UnsupportedWindow) f32 {
+        _ = self;
+        return 1.0;
+    }
+
     pub fn init(self: *UnsupportedWindow, allocator: std.mem.Allocator, title: []const u8, width: u32, height: u32) !void {
         _ = self;
         _ = allocator;

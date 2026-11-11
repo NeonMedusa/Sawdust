@@ -75,6 +75,8 @@ scoop install sawdust
 - [ ] 更多效果器（合唱 / 失真 / 滤波器……）
 - [x] 跨平台：**Linux（X11）已支持**（在 WSLg 上开发并验证，**尚未在真机 Linux 上实测**，见 [`docs/linux.md`](docs/linux.md)）；
   macOS 未开始
+- [x] **DPI 感知的 UI 缩放**（100%~300%；高分屏/系统缩放不再“全部很小”，见 [`docs/ui-scaling.md`](docs/ui-scaling.md)；
+  `SAWDUST_UI_SCALE=1.5` 可手动指定）
 - [ ] asio支持
 
 ## 构建与运行
@@ -130,6 +132,8 @@ zig translate-c -I libs/stb       libs/stb/stb_truetype.h    > src/c/stb_truetyp
 VST3 宿主见 `docs/plugin-hosting.md`；**Zig 0.17 迁移实录**见 `docs/zig-017-migration.md`；
 **播放中编辑的调度与释音协议**见 `docs/scheduler-protocol.md`（不变量 / 事件生命期 / 重扫门控 / 诊断字段）；
 **内存 / CPU / 二进制体积账本**见 `docs/resources.md`（池化现状 / 优化 backlog / 发布口径矩阵 / `.rodata` 初值镜像坑）；
+**UI 缩放（DPI）**见 `docs/ui-scaling.md`（逻辑像素单点乘算 / 字体按 DPI 光栅化 / 环境变量覆盖）；
+**拖动 / 吸附 / Alt 细调**见 `docs/drag-snap.md`（八条不变式 / `GridRebase` 量化与重锚 / 橡皮筋与饱和点 / 八条手势路径对照）；
 **自动化（参数曲线）的模型与计划**见 `docs/automation.md`（点 + 每段插值 / 两种编辑视图 / 存取与历史纪律）。
 
 **线程模型**：UI 在主线程，音频回调在 miniaudio 的实时线程；

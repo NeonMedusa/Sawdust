@@ -4,7 +4,8 @@
 //! - 启动时加载 TTF 到内存（`stbtt_InitFont`）；
 //! - 按需光栅化字形到 8 位 alpha 位图（`stbtt_GetCodepointBitmap`），**缓存**；
 //! - 绘制 = `renderer.blitAlphaMask`（内存混合，快）；
-//! - 缓存策略：线性表 + LRU 淘汰（字形数有限，DAW 界面用字不超几百）。
+//! - 缓存策略：线性表 + **码点 → 下标哈希索引**（O(1) 命中；宽度测量是热路径），
+//!   字形**只增不淘汰**（界面用字有限，光栅化一次终身复用）。
 //!
 //! 为什么不用 SDF：起步阶段位图更简单；需要"界面缩放时字形依然锐利"时，
 //! 可换 `stbtt_GetCodepointSDF` + CPU 采样（接口不变，只换内部实现）。
@@ -38,7 +39,14 @@ pub const Font = struct {
     ascent: f32,
     descent: f32,
     line_gap: f32,
+    /// **DPI 缩放**（物理/逻辑）。字形位图按 `size_px * px_scale` 光栅化（高分屏真锐利），
+    /// 而对外的度量（`measure`/`lineHeight`/`ascentL`）统一除回去 = **逻辑像素**，
+    /// 这样上层布局代码不用关心缩放。
+    px_scale: f32 = 1.0,
     glyphs: std.ArrayListUnmanaged(Glyph) = .empty,
+    /// 码点 → `glyphs.items` 下标。`getGlyph/measure` 是每帧热路径（每个字符一次），
+    /// 线性扫在几百个字形的缓存下会变成 O(n²) —— 这里换成哈希索引。
+    glyph_index: std.AutoHashMapUnmanaged(u21, u32) = .empty,
 
     /// 从文件加载字体（`size_px` = 期望的字号像素高）
     pub fn initFromFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8, size_px: f32) !Font {
@@ -76,20 +84,42 @@ pub const Font = struct {
     pub fn deinit(self: *Font) void {
         for (self.glyphs.items) |g| self.allocator.free(g.mask);
         self.glyphs.deinit(self.allocator);
+        self.glyph_index.deinit(self.allocator);
         self.allocator.free(self.data);
     }
 
-    /// 行高（像素）
+    /// **行高**（逻辑像素；UI 布局用的就是这个）
     pub fn lineHeight(self: *const Font) f32 {
-        return self.ascent - self.descent + self.line_gap;
+        return (self.ascent - self.descent + self.line_gap) / self.px_scale;
+    }
+
+    /// 上开（逻辑像素，基线之上）
+    pub fn ascentL(self: *const Font) f32 {
+        return self.ascent / self.px_scale;
+    }
+
+    /// 下延（逻辑像素，**负值**，基线之下）
+    pub fn descentL(self: *const Font) f32 {
+        return self.descent / self.px_scale;
     }
 
     /// 取字形（无则光栅化并缓存）
     pub fn getGlyph(self: *Font, codepoint: u21) ?*const Glyph {
-        for (self.glyphs.items) |*g| {
-            if (g.codepoint == codepoint) return g;
+        if (self.glyph_index.get(codepoint)) |i| {
+            if (i < self.glyphs.items.len) return &self.glyphs.items[i];
         }
         return self.rasterize(codepoint);
+    }
+
+    /// 追加已光栅化的字形并登记索引（索引写失败只丢掉 ACCEL，不影响正确性）
+    fn addGlyph(self: *Font, g: Glyph) ?*const Glyph {
+        self.glyphs.append(self.allocator, g) catch {
+            if (g.mask.len > 0) self.allocator.free(g.mask);
+            return null;
+        };
+        const idx: u32 = @intCast(self.glyphs.items.len - 1);
+        self.glyph_index.put(self.allocator, g.codepoint, idx) catch {};
+        return &self.glyphs.items[idx];
     }
 
     fn rasterize(self: *Font, codepoint: u21) ?*const Glyph {
@@ -109,7 +139,7 @@ pub const Font = struct {
         );
         if (bitmap == null or w <= 0 or h <= 0) {
             // 空白字形（空格等）：缓存一个 0×0 条目以便重复查询快速返回
-            const empty = Glyph{
+            return self.addGlyph(.{
                 .codepoint = codepoint,
                 .mask = self.allocator.alloc(u8, 0) catch return null,
                 .w = 0,
@@ -117,12 +147,7 @@ pub const Font = struct {
                 .xoff = 0,
                 .yoff = 0,
                 .advance = self.advanceOf(codepoint),
-            };
-            self.glyphs.append(self.allocator, empty) catch {
-                self.allocator.free(empty.mask);
-                return null;
-            };
-            return &self.glyphs.items[self.glyphs.items.len - 1];
+            });
         }
         defer stb.stbtt_FreeBitmap(bitmap, null);
 
@@ -141,11 +166,7 @@ pub const Font = struct {
             .yoff = yoff,
             .advance = self.advanceOf(codepoint),
         };
-        self.glyphs.append(self.allocator, g) catch {
-            self.allocator.free(mask);
-            return null;
-        };
-        return &self.glyphs.items[self.glyphs.items.len - 1];
+        return self.addGlyph(g);
     }
 
     fn advanceOf(self: *Font, codepoint: u21) f32 {
@@ -154,30 +175,37 @@ pub const Font = struct {
         return @as(f32, @floatFromInt(adv)) * self.scale;
     }
 
-    /// 字符串宽度（像素）
+    /// 单个码点的**逻辑**前进量（字形已按 DPI 光栅化，这里除回逻辑像素）
+    pub fn advanceLogical(self: *Font, cp: u21) f32 {
+        const a = if (self.getGlyph(cp)) |g| g.advance else self.advanceOf(cp);
+        return a / self.px_scale;
+    }
+
+    /// 字符串宽度（**逻辑像素**）
     pub fn measure(self: *Font, text: []const u8) f32 {
         var width: f32 = 0;
         var iter = Utf8Iter{ .s = text };
         while (iter.next()) |cp| {
-            const adv = if (self.getGlyph(cp)) |g| g.advance else self.advanceOf(cp);
-            width += adv;
+            width += self.advanceLogical(cp);
         }
         return width;
     }
 
-    /// 绘制文字：`x`/`y` 是**基线左端**（y 向下为正）
+    /// 绘制文字：`x`/`y` 是**基线左端**（逻辑像素，y 向下为正）
     pub fn draw(self: *Font, r: Renderer, text: []const u8, x: f32, y: f32, color: Color) void {
-        var pen_x = x;
+        const s = self.px_scale;
+        var pen_x = x * s;
+        const base_y = y * s;
         var iter = Utf8Iter{ .s = text };
         while (iter.next()) |cp| {
             const g = self.getGlyph(cp) orelse continue;
             if (g.w > 0 and g.h > 0) {
-                r.blitAlphaMask(
+                r.blitAlphaMaskPhys(
                     g.mask,
                     g.w,
                     g.h,
                     @intFromFloat(pen_x + @as(f32, @floatFromInt(g.xoff))),
-                    @intFromFloat(y + @as(f32, @floatFromInt(g.yoff))),
+                    @intFromFloat(base_y + @as(f32, @floatFromInt(g.yoff))),
                     color,
                 );
             }

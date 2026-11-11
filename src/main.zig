@@ -83,14 +83,30 @@ pub fn main(init: std.process.Init) !u8 {
     defer if (picker) |*pk| pk.deinit();
 
     var win: window.Window = undefined;
+    // **UI 缩放（DPI）**：环境变量 `SAWDUST_UI_SCALE` 可强制覆盖（无 DPI 的环境 / WSLg /
+    // 系统 DPI 探测不准时想手动指定——包括 `=1` 强制关掉自动缩放）。
+    // 启动时采样一次；改缩放需重开程序。
+    const env_scale: ?f32 = blk: {
+        if (std.c.getenv("SAWDUST_UI_SCALE")) |sv| {
+            if (std.fmt.parseFloat(f32, std.mem.span(sv))) |v| {
+                if (v >= 0.75 and v <= 4.0) break :blk v;
+            } else |_| {}
+        }
+        break :blk null;
+    };
     try win.init(allocator, "Sawdust — Simple Audio Workstation", 1280, 760);
     defer win.deinit();
-
-    var font = loadFont(allocator, io) catch |e| {
+    // 未显式指定 → 按后端 DPI 推导（Windows: GetDpiForWindow；X11: Xft.dpi / 屏幕尺寸）
+    const scale: f32 = env_scale orelse std.math.clamp(win.dpiScale(), 1.0, 3.0);
+    // 字体按缩放后字号加载（字形位图一次到位，避免位图放大发糊）
+    var font = loadFont(allocator, io, scale) catch |e| {
         std.debug.print("字体加载失败（{s}）\n", .{@errorName(e)});
         return 1;
     };
     defer font.deinit();
+    // 初始窗口按**逻辑尺寸** 1280×760 重新落地（物理尺寸由后端按 scale 换算，并夹到屏幕内）：
+    // 建窗前还不知道真实 DPI，所以先开一个“物理 1280×760”，拿到 scale 后再校正。
+    win.setClientSizeLogical(1280, 760, scale);
 
     var app = App{ .allocator = allocator };
     app.attachIo(io); // 0.17：异步导入的 worker 用 futex 等活，需要进程 Io
@@ -359,6 +375,7 @@ pub fn main(init: std.process.Init) !u8 {
             const m = win.modifiers();
             ui_input.mods_ctrl = m.ctrl;
             ui_input.mods_shift = m.shift;
+            ui_input.mods_alt = m.alt;
         }
         for (events) |ev| {
             // 内置选择器开着：模态吞输入——但**鼠标/滚轮状态必须照常喂给 UI**（否则选择器
@@ -673,22 +690,25 @@ pub fn main(init: std.process.Init) !u8 {
         // - 点在框内：定位光标；按住拖动 = 框选（光标跟随鼠标，可拖出框外）
         if (app.text_input.active) {
             const ti = &app.text_input;
-            const in_box = ui_input.mouse_x >= ti.x and ui_input.mouse_x < ti.x + ti.w and
-                ui_input.mouse_y >= ti.y and ui_input.mouse_y < ti.y + text_input_h;
+            // 输入框几何是**逻辑像素** → 鼠标先换算
+            const mx_l = i2l(ui_input.mouse_x, scale);
+            const my_l = i2l(ui_input.mouse_y, scale);
+            const in_box = mx_l >= ti.x and mx_l < ti.x + ti.w and
+                my_l >= ti.y and my_l < ti.y + text_input_h;
             if (ui_input.mouse_pressed) {
                 if (!in_box) {
                     app.textInputCommit();
                     ui_input.mouse_down = false; // 防拖动启动
                 } else {
                     // 框内：拖动 → 框选（锚点 = 击点）；单击 → 仅定位光标
-                    const local: f32 = @floatFromInt(ui_input.mouse_x - (ti.x + 4) + ti.view_off);
+                    const local: f32 = @floatFromInt(mx_l - (ti.x + 4) + ti.view_off);
                     app.textInputPointerDown(ui.textIndexAtX(ti.text(), local));
                 }
                 ui_input.mouse_pressed = false;
                 ui_input.mouse_double = false;
             } else if (app.text_input.drag_active) {
                 if (ui_input.mouse_down) {
-                    const local: f32 = @floatFromInt(ui_input.mouse_x - (ti.x + 4) + ti.view_off);
+                    const local: f32 = @floatFromInt(i2l(ui_input.mouse_x, scale) - (ti.x + 4) + ti.view_off);
                     app.textInputPointerMove(ui.textIndexAtX(ti.text(), local));
                 } else {
                     app.textInputPointerUp();
@@ -893,8 +913,9 @@ pub fn main(init: std.process.Init) !u8 {
         app.params.steps_per_beat.store(@intCast(model.stepsPerBeat(app.time_den)), .monotonic);
 
         ui.renderer = r_mod.Renderer.init(&win.fb);
-        ui.mouse_x = ui_input.mouse_x;
-        ui.mouse_y = ui_input.mouse_y;
+        ui.renderer.scale = scale; // **DPI 缩放**：所有图元在 renderer 内部乘 scale
+        ui.mouse_x = i2l(ui_input.mouse_x, scale);
+        ui.mouse_y = i2l(ui_input.mouse_y, scale);
         ui.mouse_down = ui_input.mouse_down;
         ui.mouse_pressed = ui_input.mouse_pressed;
         ui.mouse_released = ui_input.mouse_released;
@@ -912,6 +933,7 @@ pub fn main(init: std.process.Init) !u8 {
         ui.wheel_shift = ui_input.wheel_shift;
         ui.mods_ctrl = ui_input.mods_ctrl;
         ui.mods_shift = ui_input.mods_shift;
+        ui.mods_alt = ui_input.mods_alt;
 
         // 内置选择器开着：**背景 UI 看不到输入**（否则点击会穿透到播放列表放片段），
         // 但选择器自己要能点 → 先把输入暂存，画到选择器时再恢复。
@@ -936,10 +958,10 @@ pub fn main(init: std.process.Init) !u8 {
         } else {
             win.endMouseCapture();
         }
-        ui.frozen_dy = win.frozenDeltaY();
+        ui.frozen_dy = i2l(win.frozenDeltaY(), scale);
 
         ui.beginFrame();
-        drawApp(&ui, &app, @intCast(win.fb.width), @intCast(win.fb.height));
+        drawApp(&ui, &app, ui.renderer.logicalWidth(), ui.renderer.logicalHeight());
         // 文件菜单：在 UI 之后、endFrame **之前**（endFrame 会清 mouse_pressed——
         // 放在之后则菜单永远收不到点击，实测“点菜单没反应”）
         if (app.file_menu_open) drawFileMenu(&ui, &app);
@@ -949,7 +971,7 @@ pub fn main(init: std.process.Init) !u8 {
         // 轨道右键菜单（最外层同上——在浮动窗口之后）
         if (app.panels.ctx_track != null) view_playlist.drawTrackCtxMenu(&ui, &app);
         // 预设浏览器（模态；同上——浮动窗口之后）
-        if (app.preset_browser.open) view_presets.draw(&ui, &app, @intCast(win.fb.width), @intCast(win.fb.height));
+        if (app.preset_browser.open) view_presets.draw(&ui, &app, ui.renderer.logicalWidth(), ui.renderer.logicalHeight());
         // 模态确认框（最上层；自绘——避开系统 MessageBox 把鼠标吸到默认按钮）
         if (app.modal != null) {
             // 注：裁切覆盖矩形由各对话框**按自身矩形**登记（不是全屏）——全屏裁掉会让
@@ -984,7 +1006,7 @@ pub fn main(init: std.process.Init) !u8 {
             ui.mouse_middle_down = modal_input.mouse_middle_down;
             ui.mouse_double = modal_input.mouse_double;
             ui.wheel = modal_input.wheel;
-            switch (file_picker.draw(&ui, pk, @intCast(win.fb.width), @intCast(win.fb.height))) {
+            switch (file_picker.draw(&ui, pk, ui.renderer.logicalWidth(), ui.renderer.logicalHeight())) {
                 .pending => {},
                 .cancelled => {
                     if (filedialog.supported()) app.setToast(pk.cancel_text);
@@ -1094,7 +1116,7 @@ pub fn main(init: std.process.Init) !u8 {
         if (font_info.reload_requested) {
             font_info.reload_requested = false;
             // 先加载新的，成功后再换（失败就继续用旧的，不让 UI 变空）
-            if (loadFont(allocator, io)) |nf| {
+            if (loadFont(allocator, io, scale)) |nf| {
                 font.deinit();
                 font = nf;
             } else |_| {}
@@ -1133,7 +1155,10 @@ pub fn main(init: std.process.Init) !u8 {
         // 我们收不到 mousemove，`ui.mouse_x/y` 是**旧的**（实测：片段落在离松手处很远的地方）。
         {
             const dp = win.dropPoint();
-            handleDroppedFiles(&app, &win, if (dp) |p| p.x else ui.mouse_x, if (dp) |p| p.y else ui.mouse_y);
+            // 拖放坐标是**物理像素** → 转成逻辑像素再参与命中
+            const dp_lx: ?i32 = if (dp) |p| i2l(p.x, scale) else null;
+            const dp_ly: ?i32 = if (dp) |p| i2l(p.y, scale) else null;
+            handleDroppedFiles(&app, &win, dp_lx orelse ui.mouse_x, dp_ly orelse ui.mouse_y);
         }
         if (app.pending_load_sample) |pls| {
             app.pending_load_sample = null;
@@ -1176,7 +1201,7 @@ pub fn main(init: std.process.Init) !u8 {
             app.engine.resumeDevice();
         }
         // 4.4e) VST3 插件界面嵌入同步（面板 → 子窗口；遮挡→隐藏；见函数注释）
-        syncPluginEditors(&app, &ui, @intCast(win.fb.width), @intCast(win.fb.height));
+        syncPluginEditors(&app, &ui, ui.renderer.logicalWidth(), ui.renderer.logicalHeight());
         // X11：把插件编辑器窗口的事件抽干（Windows 由系统消息泵处理，这里是空操作）
         _ = vst_host.pumpEditorEvents();
 
@@ -2385,6 +2410,7 @@ const InputState = struct {
     wheel_shift: bool = false,
     mods_ctrl: bool = false,
     mods_shift: bool = false,
+    mods_alt: bool = false,
 };
 
 // ── 主界面组装 ──
@@ -3256,6 +3282,8 @@ fn rectsOverlap(ax: i32, ay: i32, aw: i32, ah: i32, bx: i32, by: i32, bw: i32, b
 /// （主窗口 client 坐标；`setEditorClip` 区域裁切用）。与绘制**同源**（`win_draw_info`）。
 /// 上限 24 = 窗口 ≤7 + 遮罩 ≤16，不会溢出。
 fn collectEditorCovers(app: *App, ui: *const Ui, panel: app_mod.WinKind, cx: i32, cy: i32, cw: i32, ch: i32, out: []vst_host.EditClipRect) usize {
+    // `cx/cy/cw/ch` 是**物理像素**（子窗口坐标），`win_draw_info` / `overlay_rects` 是逻辑像素
+    const sc = ui.renderer.scale;
     var n: usize = 0;
     var start: usize = app.win_draw_n; // 未找到自身（理论不会）：只减弹层（安全侧）
     for (app.win_draw_info[0..app.win_draw_n], 0..) |wnd, wi| {
@@ -3266,14 +3294,14 @@ fn collectEditorCovers(app: *App, ui: *const Ui, panel: app_mod.WinKind, cx: i32
     }
     for (app.win_draw_info[start..app.win_draw_n]) |wnd| {
         if (n >= out.len) break;
-        if (intersectRect(wnd.x, wnd.y, wnd.w, wnd.h, cx, cy, cw, ch)) |r| {
+        if (intersectRect(ppx(wnd.x, sc), ppx(wnd.y, sc), ppx(wnd.w, sc), ppx(wnd.h, sc), cx, cy, cw, ch)) |r| {
             out[n] = r;
             n += 1;
         }
     }
     for (ui.overlay_rects[0..ui.overlay_n]) |r0| {
         if (n >= out.len) break;
-        if (intersectRect(r0.x, r0.y, r0.w, r0.h, cx, cy, cw, ch)) |r| {
+        if (intersectRect(ppx(r0.x, sc), ppx(r0.y, sc), ppx(r0.w, sc), ppx(r0.h, sc), cx, cy, cw, ch)) |r| {
             out[n] = r;
             n += 1;
         }
@@ -3355,6 +3383,40 @@ fn collectEditorPresents(app: *App, win: *window.Window) void {
             }
         }
     }
+}
+
+/// 插件编辑器是**子窗口**（坐标/尺寸为物理像素），面板 chrome 是自绘的**逻辑像素**：
+/// 这里做双向换算 + 保险钳制 + 遮挡裁切 + 输入闸门。
+/// （乐器面板 / 效果面板共用；`wnd` 只需有 `x/y/w/h` 字段，`chrome_h` = 面板顶部控制行高）
+fn syncEmbeddedEditor(
+    app: *App,
+    ui: *Ui,
+    pl: *vst_host.Plugin,
+    wnd: anytype,
+    chrome_h: i32,
+    panel: app_mod.WinKind,
+    fw: i32,
+    fh: i32,
+) void {
+    const sc = ui.renderer.scale;
+    const ew_l = lpx(pl.editor_w, sc); // 插件物理尺寸 → 位置所佔的逻辑尺寸
+    const eh_l = lpx(pl.editor_h, sc);
+    wnd.w = ew_l + 2;
+    wnd.h = eh_l + chrome_h + 1;
+    // 保险钳制：拖拽途中面板 x/y 可能瞬时未钳制（顶部 clamp 下帧才生效）——
+    // 子窗口绝不能比面板 chrome 更早跑出去（实测“插件 UI 跑出去”）
+    const cx_l = std.math.clamp(wnd.x + 1, 0, @max(0, fw - ew_l - 1));
+    const cy_l = std.math.clamp(wnd.y + chrome_h, 0, @max(0, fh - eh_l - 1));
+    // 子窗口坐标回到物理像素
+    const cx = ppx(cx_l, sc);
+    const cy = ppx(cy_l, sc);
+    pl.syncEditorRect(cx, cy);
+    // 区域裁切（见 `setEditorClip`）：减去所有画在面板之上的窗口/弹层矩形
+    var covers: [24]vst_host.EditClipRect = undefined;
+    const nc = collectEditorCovers(app, ui, panel, cx, cy, pl.editor_w, pl.editor_h, &covers);
+    pl.setEditorClip(covers[0..nc]);
+    // 输入闸门：模态框/菜单展开期间禁用子窗口（点击不落到插件上）
+    pl.setEditorEnabled(app.modal == null and ui.overlay_n == 0);
 }
 
 fn syncPluginEditors(app: *App, ui: *Ui, fw: i32, fh: i32) void {
@@ -3450,19 +3512,7 @@ fn syncPluginEditors(app: *App, ui: *Ui, fw: i32, fh: i32) void {
             }
             pl.setEditorEnabled(app.modal == null and ui.overlay_n == 0);
         } else if (pl.view != null) {
-            app.synth_win.w = pl.editor_w + 2;
-            app.synth_win.h = pl.editor_h + vst_panel_title_h + 1;
-            // 保险钳制：拖拽途中面板 x/y 可能瞬时未钳制（顶部 clamp 下帧才生效）——
-            // 子窗口绝不能比面板 chrome 更早跑出去（用户实测“插件 UI 跑出去”）
-            const cx = std.math.clamp(app.synth_win.x + 1, 0, @max(0, fw - pl.editor_w - 1));
-            const cy = std.math.clamp(app.synth_win.y + vst_panel_title_h, 0, @max(0, fh - pl.editor_h - 1));
-            pl.syncEditorRect(cx, cy);
-            // 区域裁切（见 `setEditorClip`）：减去所有画在面板之上的窗口/弹层矩形
-            var covers: [24]vst_host.EditClipRect = undefined;
-            const nc = collectEditorCovers(app, ui, .synth, cx, cy, pl.editor_w, pl.editor_h, &covers);
-            pl.setEditorClip(covers[0..nc]);
-            // 输入闸门：模态框/菜单展开期间禁用子窗口（点击不落到插件上）
-            pl.setEditorEnabled(app.modal == null and ui.overlay_n == 0);
+            syncEmbeddedEditor(app, ui, pl, &app.synth_win, vst_panel_title_h, .synth, fw, fh);
         }
     }
 
@@ -3487,18 +3537,7 @@ fn syncPluginEditors(app: *App, ui: *Ui, fw: i32, fh: i32) void {
             }
             pl.setEditorEnabled(app.modal == null and ui.overlay_n == 0);
         } else if (pl.view != null) {
-            app.effect_win.w = pl.editor_w + 2;
-            app.effect_win.h = pl.editor_h + vst_fx_row_h + 1;
-            // 保险钳制（同乐器侧）
-            const cx = std.math.clamp(app.effect_win.x + 1, 0, @max(0, fw - pl.editor_w - 1));
-            const cy = std.math.clamp(app.effect_win.y + vst_fx_row_h, 0, @max(0, fh - pl.editor_h - 1));
-            pl.syncEditorRect(cx, cy);
-            // 区域裁切（见 `setEditorClip`）：减去所有画在面板之上的窗口/弹层矩形
-            var covers: [24]vst_host.EditClipRect = undefined;
-            const nc = collectEditorCovers(app, ui, .effect, cx, cy, pl.editor_w, pl.editor_h, &covers);
-            pl.setEditorClip(covers[0..nc]);
-            // 输入闸门：模态框/菜单展开期间禁用子窗口（点击不落到插件上）
-            pl.setEditorEnabled(app.modal == null and ui.overlay_n == 0);
+            syncEmbeddedEditor(app, ui, pl, &app.effect_win, vst_fx_row_h, .effect, fw, fh);
         }
     }
 }
@@ -4714,8 +4753,8 @@ fn drawExportOptionsDialog(ui: *Ui, app: *App) void {
 fn drawExportDialog(ui: *Ui, app: *App, io: std.Io) void {
     const ww: i32 = 430;
     const hh: i32 = 118;
-    const win_w = @as(i32, @intCast(ui.renderer.fb.width));
-    const win_h = @as(i32, @intCast(ui.renderer.fb.height));
+    const win_w = ui.renderer.logicalWidth();
+    const win_h = ui.renderer.logicalHeight();
     const ew = &app.export_win;
     if (ew.x == -100000) { // 首帧：居中偏上
         ew.x = @divTrunc(win_w - ww, 2);
@@ -4801,8 +4840,8 @@ fn drawExportDialog(ui: *Ui, app: *App, io: std.Io) void {
 /// 且受系统设置 `SnapToDefaultButton` 影响）。
 fn drawModal(ui: *Ui, app: *App) void {
     const kind = app.modal orelse return;
-    const w = @as(i32, @intCast(ui.renderer.fb.width));
-    const h = @as(i32, @intCast(ui.renderer.fb.height));
+    const w = ui.renderer.logicalWidth();
+    const h = ui.renderer.logicalHeight();
 
     // 半透明遮罩（提亮对比）
     ui.renderer.fillRect(0, 0, w, h, (@as(u32, 110) << 24) | 0x000000);
@@ -5071,9 +5110,12 @@ fn probeFontconfig(io: std.Io, exe_dir: []const u8, out: []u8) ?[]const u8 {
     return out[0..t.len];
 }
 
+/// **字体物理像素高**（= 16 × UI 缩放；仅 `loadFont` 入口写入）
+var font_px: f32 = 16;
+
 /// 记录实际生效的字体并加载（统一出口，顺带把路径报给设置页）
 fn useFont(allocator: std.mem.Allocator, io: std.Io, p: []const u8) !Font {
-    const f = try Font.initFromFile(allocator, io, p, 16);
+    const f = try Font.initFromFile(allocator, io, p, font_px);
     font_info.setActive(p);
     return f;
 }
@@ -5102,10 +5144,41 @@ fn findFontInDir(io: std.Io, dir_path: []const u8, depth: u8, out: []u8) ?[]cons
     return null;
 }
 
+/// 物理像素 → 逻辑像素（四舍五入；scale==1 时恒等）
+inline fn i2l(v: i32, scale: f32) i32 {
+    if (scale == 1.0) return v;
+    return @intFromFloat(@round(@as(f32, @floatFromInt(v)) / scale));
+}
+
+/// 逻辑像素 → 物理像素（四舍五入；scale==1 时恒等）
+inline fn ppx(v: i32, scale: f32) i32 {
+    if (scale == 1.0) return v;
+    return @intFromFloat(@round(@as(f32, @floatFromInt(v)) * scale));
+}
+
+/// 物理像素量 → 逻辑像素量（尺寸，至少 1）
+inline fn lpx(v: i32, scale: f32) i32 {
+    if (scale == 1.0) return v;
+    return @max(1, @as(i32, @intFromFloat(@round(@as(f32, @floatFromInt(v)) / scale))));
+}
+
+/// 按 **UI 缩放**加载字体（基准 16px **逻辑**）：字形位图直接按 `16*scale` 光栅化，
+/// 比“小字号绘制后整体放大”清晰得多；同时把 `px_scale` 写进去，
+/// 让 `measure/lineHeight` 等度量除回逻辑像素。
+/// **所有字体加载都必须走这里**（包括设置页的热重载）——
+/// 否则字形是物理尺寸、度量却按逻辑算 → 缩放后文字排版全错位。
+fn loadFont(allocator: std.mem.Allocator, io: std.Io, scale: f32) !Font {
+    const s = std.math.clamp(scale, 0.75, 4.0);
+    font_px = 16.0 * s;
+    var f = try loadFontRaw(allocator, io);
+    f.px_scale = s;
+    return f;
+}
+
 /// 字体解析顺序（见 `docs/linux.md` §1.1）：
 /// 0 `data/font.txt`（用户自选）→ 1 fontconfig（尊重用户配置）→ 2 系统名单
 /// → 3 `<exe>/data/fonts/` → 4 任意一种系统字体 → 报错
-fn loadFont(allocator: std.mem.Allocator, io: std.Io) !Font {
+fn loadFontRaw(allocator: std.mem.Allocator, io: std.Io) !Font {
     var ebuf: [1024]u8 = undefined;
     const exe_dir = exeDir(allocator, io, &ebuf);
 
