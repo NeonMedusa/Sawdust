@@ -11,6 +11,7 @@ pub const Format = enum {
     mp3,
     flac,
     ogg,
+    opus,
 
     pub fn label(self: Format) []const u8 {
         return switch (self) {
@@ -18,6 +19,7 @@ pub const Format = enum {
             .mp3 => "MP3",
             .flac => "FLAC",
             .ogg => "OGG Vorbis",
+            .opus => "Opus",
         };
     }
 
@@ -27,6 +29,7 @@ pub const Format = enum {
             .mp3 => ".mp3",
             .flac => ".flac",
             .ogg => ".ogg",
+            .opus => ".opus",
         };
     }
 
@@ -37,7 +40,7 @@ pub const Format = enum {
 
 pub const Options = struct {
     format: Format = .wav,
-    /// MP3 / OGG 的目标恒定码率（kbps）。
+    /// MP3 / OGG / Opus 的目标恒定码率（kbps）。
     bitrate_kbps: u16 = 192,
     /// FLAC 压缩等级 0…12；只影响编码速度/文件体积，不损失音质。
     flac_compression: u8 = 5,
@@ -56,8 +59,40 @@ pub fn targetPath(allocator: std.mem.Allocator, picked_path: []const u8, format:
     return std.fmt.allocPrint(allocator, "{s}{s}", .{ picked_path[0 .. picked_path.len - old.len], wanted });
 }
 
+/// 探测结果缓存（文件级单例；仅在面板打开 / 用户点击置灰按钮时刷新）
+var ffmpeg_cached: ?bool = null;
+
+/// **FFmpeg 是否可用**（用缓存；从未探测过才真跑一次）。
+pub fn ffmpegAvailable(allocator: std.mem.Allocator, io: std.Io) bool {
+    if (ffmpeg_cached) |v| return v;
+    return refreshFfmpeg(allocator, io);
+}
+
+/// **强制重新探测**（面板打开 / 用户点了置灰的格式按钮时调用）并更新缓存。
+/// 为何需要：用户可能在程序运行期间安装/卸载 ffmpeg；永久缓存会让“装好却仍灰”
+/// 只能靠重启解决。探测 = 拉一个 `ffmpeg -version` 子进程（实测热 53ms / 冷 171ms），
+/// 因此只在上述时机做，不每帧做。
+pub fn refreshFfmpeg(allocator: std.mem.Allocator, io: std.Io) bool {
+    var ok = false;
+    if (std.process.run(allocator, io, .{
+        .argv = &.{ "ffmpeg", "-version" },
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(4096),
+    })) |result| {
+        defer allocator.free(result.stdout);
+        defer allocator.free(result.stderr);
+        ok = switch (result.term) {
+            .exited => |code| code == 0,
+            else => false,
+        };
+    } else |_| {
+        ok = false; // 含 FileNotFound：PATH 上没有 ffmpeg
+    }
+    ffmpeg_cached = ok;
+    return ok;
+}
+
 /// 把已经写完的 WAV 编码为目标格式。
-///
 /// FFmpeg 不存在、编解码器缺失或编码器报错都会返回错误；调用方负责删临时 WAV 和
 /// 可能生成的半成品。`std.process.run` 在 Windows 默认 `CREATE_NO_WINDOW`，不会弹黑框。
 pub fn encodeFromWav(allocator: std.mem.Allocator, io: std.Io, wav_path: []const u8, target_path: []const u8, options: Options) !void {
@@ -71,6 +106,7 @@ pub fn encodeFromWav(allocator: std.mem.Allocator, io: std.Io, wav_path: []const
         .mp3 => &.{ "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error", "-i", wav_path, "-c:a", "libmp3lame", "-b:a", bitrate, target_path },
         .flac => &.{ "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error", "-i", wav_path, "-c:a", "flac", "-compression_level", compression, target_path },
         .ogg => &.{ "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error", "-i", wav_path, "-c:a", "libvorbis", "-b:a", bitrate, target_path },
+        .opus => &.{ "ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error", "-i", wav_path, "-c:a", "libopus", "-b:a", bitrate, target_path },
     };
     const result = std.process.run(allocator, io, .{
         .argv = argv,
@@ -93,27 +129,47 @@ test "音频导出格式：扩展名和编码器需求" {
     const testing = std.testing;
     try testing.expectEqualStrings(".wav", Format.wav.extension());
     try testing.expectEqualStrings(".mp3", Format.mp3.extension());
+    try testing.expectEqualStrings(".opus", Format.opus.extension());
     try testing.expect(!Format.wav.needsEncoder());
     try testing.expect(Format.flac.needsEncoder());
+    try testing.expect(Format.opus.needsEncoder());
     const path = try targetPath(testing.allocator, "tmp/song.wav", .ogg);
     defer testing.allocator.free(path);
     try testing.expectEqualStrings("tmp/song.ogg", path);
 }
 
-test "音频导出：FFmpeg 可写 MP3/FLAC/OGG" {
+test "音频导出：FFmpeg 可写 MP3/FLAC/OGG/Opus" {
     const io = std.testing.io;
     const a = std.testing.allocator;
     const source = "tmp/audio_export_fixture.wav";
     std.Io.Dir.cwd().createDirPath(io, "tmp") catch {};
     defer std.Io.Dir.cwd().deleteFile(io, source) catch {};
     var writer = try wav.Writer.create(io, source, 48000, 2);
-    try writer.writeFrames(&.{ 0.0, 0.0, 0.25, -0.25, -0.5, 0.5, 0.0, 0.0 });
+    // fixture 必须“够长”：只写 4 帧（≈0.00008s）时 mp3/ogg 能忍，但 **FLAC 编码器会拒收**
+    // （ffmpeg 9 实测：`[flac] invalid block size: 10` → 退出码 -22 → EncoderFailed）。
+    // 这里写 ~0.1 秒（50 × 96 帧），只为验证“ffmpeg 能写这三种格式”。
+    var fi: usize = 0;
+    while (fi < 50) : (fi += 1) {
+        try writer.writeFrames(&.{ 0.0, 0.0, 0.25, -0.25, -0.5, 0.5, 0.0, 0.0 });
+        try writer.writeFrames(&.{ 0.1, -0.1, 0.2, -0.2, 0.3, -0.3, 0.4, -0.4 });
+        try writer.writeFrames(&.{ 0.5, -0.5, 0.25, -0.25, 0.0, 0.0, -0.5, 0.5 });
+        try writer.writeFrames(&.{ -0.25, 0.25, -0.1, 0.1, 0.0, 0.0, 0.1, -0.1 });
+        try writer.writeFrames(&.{ 0.2, -0.2, 0.3, -0.3, 0.4, -0.4, 0.5, -0.5 });
+        try writer.writeFrames(&.{ -0.5, 0.5, -0.4, 0.4, -0.3, 0.3, -0.2, 0.2 });
+        try writer.writeFrames(&.{ 0.0, 0.0, 0.1, -0.1, 0.2, -0.2, 0.3, -0.3 });
+        try writer.writeFrames(&.{ 0.4, -0.4, 0.5, -0.5, 0.0, 0.0, -0.1, 0.1 });
+        try writer.writeFrames(&.{ -0.2, 0.2, -0.3, 0.3, -0.4, 0.4, -0.5, 0.5 });
+        try writer.writeFrames(&.{ 0.0, 0.0, 0.25, -0.25, 0.5, -0.5, 0.0, 0.0 });
+        try writer.writeFrames(&.{ 0.1, -0.1, 0.0, 0.0, -0.1, 0.1, 0.2, -0.2 });
+        try writer.writeFrames(&.{ 0.3, -0.3, 0.4, -0.4, 0.0, 0.0, 0.5, -0.5 });
+    }
     try writer.finish();
 
     const cases = [_]Options{
         .{ .format = .mp3, .bitrate_kbps = 128 },
         .{ .format = .flac, .flac_compression = 8 },
         .{ .format = .ogg, .bitrate_kbps = 128 },
+        .{ .format = .opus, .bitrate_kbps = 128 },
     };
     for (cases) |options| {
         const target = try std.fmt.allocPrint(a, "tmp/audio_export_fixture{s}", .{options.format.extension()});

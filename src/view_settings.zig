@@ -139,7 +139,8 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     yy += 50;
 
     // ── 输出设备：当前后端的播放设备列表（含“系统默认”）──
-    ui.label("输出设备（重启生效）", x + 14, yy, ui.theme.text_dim);
+    // 设备切换**立即生效**（同一后端内）；只有切换后端才需要重启
+    ui.label("输出设备（立即生效；切换时声音会中断一瞬）", x + 14, yy, ui.theme.text_dim);
     const list_x = x + 14;
     const list_y = yy + 16;
     const list_w = ww - 28;
@@ -178,10 +179,13 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         }
     }
     if (has_scroll) _ = ui.scrollbarV(9526, list_x + list_w - sb_w, list_y, sb_w, list_h, &sw.audio_device_scroll, content_h, list_h);
-    yy += list_h + 8;
+    // 下一行从**列表底部**算起（原写法 `yy += list_h + 8` 漏了标题行那 16px，
+    // “当前：…”会压在列表最下面一行上）
+    yy = list_y + list_h + 8;
 
     if (audio_pref.saved) {
-        ui.label("已保存，重启后生效", x + 14, yy, ui.theme.text);
+        // 只有**后端**变更会走到这里（设备变更已立即生效）
+        ui.label("已保存，后端切换重启后生效", x + 14, yy, ui.theme.text);
     } else {
         var cb: [320]u8 = undefined;
         const selection = audio_pref.shown();

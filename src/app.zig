@@ -1144,6 +1144,16 @@ pub const PickRequest = struct {
         };
     }
 };
+/// 导出日志开关（`SAWDUST_EXPORT_LOG=1`）：默认关闭——`.log` 是当初排障用的，
+/// 平时写它只会往用户目录里丢垃圾。
+var export_log_env: ?bool = null;
+fn exportLogOn() bool {
+    if (export_log_env) |v| return v;
+    const on = std.c.getenv("SAWDUST_EXPORT_LOG") != null;
+    export_log_env = on;
+    return on;
+}
+
 /// 导出进行中的状态（`App.export_wav`）——生命周期：`exportAudioBegin` → 每帧
 /// `exportWavFrame` 分块推进 → 完成/取消/失败统一收尾清理。
 pub const ExportWav = struct {
@@ -1171,8 +1181,10 @@ pub const ExportWav = struct {
     /// 导出诊断：已渲染块数 / 开始时的派发事件计数
     blocks: u64 = 0,
     dbg0: u64 = 0,
-    /// 导出日志（纯文本；完成时写成 `<wav>.log`——现场排障用）
+    /// 导出日志（纯文本；**仅 `SAWDUST_EXPORT_LOG` 启动时才收集/写出**——现场排障用）
     log_buf: std.ArrayListUnmanaged(u8) = .empty,
+    /// 离线渲染是否已经完整写完 WAV（编码失败时据此**保留**这份成果）
+    render_complete: bool = false,
     /// 开始时间（纳秒；预留剩余时间估算）
     t0_ns: i64,
     /// 取消请求（对话框按钮 / Esc 置位；下一帧步进时清理）
@@ -1194,6 +1206,10 @@ pub const ExportWindow = struct {
 pub const ExportOptionsWindow = struct {
     open: bool = false,
     options: audio_export.Options = .{},
+    /// 请求**重新探测 FFmpeg**（打开面板时 / 点了置灰的格式按钮时置位）——
+    /// 探测本身要拉一个子进程（实测 53ms 热 / 171ms 冷），所以只在这些时机做一次，
+    /// 而不是每帧。
+    probe_req: bool = false,
 };
 
 /// 导出尾音时长（秒）：内容末尾后再渲染这么久，让混响/延迟/释音自然衰减
@@ -8767,7 +8783,7 @@ pub const App = struct {
             try ew.writer.writeFrames(obuf[0 .. n * 2]);
             ew.done += n;
             ew.blocks += 1;
-            if (ew.blocks % 32 == 0) {
+            if (ew.blocks % 32 == 0 and exportLogOn()) {
                 var lb: [192]u8 = undefined;
                 const ls = std.fmt.bufPrint(&lb, "blk={d} fp={d} stash={d} disp={d} peak={d:.3} pl={}", .{
                     ew.blocks,                             self.params.frames_played.load(.monotonic),
@@ -8783,6 +8799,7 @@ pub const App = struct {
             }
         }
         try ew.writer.finish();
+        ew.render_complete = true; // WAV 已完整落地（编码失败时保留它）
         // WAV 已经完成；压缩格式在主线程做一次外部编码（FFmpeg），期间设备仍暂停，
         // 所以插件状态不会被实时回调推进。编码失败由统一失败路径清理两份半成品。
         if (ew.options.format.needsEncoder()) {
@@ -8795,11 +8812,13 @@ pub const App = struct {
     /// 完成：toast → 恢复快照/设备 → 释放（状态机消费）。
     fn exportWavDone(self: *App, io: std.Io) void {
         const ev_n = self.engine.dbg_dispatched -| self.export_wav.?.dbg0;
-        // 落盘导出日志（<wav>.log——现场排障用）
-        if (self.export_wav) |*ew| {
-            var pb: [1080]u8 = undefined;
-            if (std.fmt.bufPrint(&pb, "{s}.log", .{ew.path}) catch null) |lp| {
-                std.Io.Dir.cwd().writeFile(io, .{ .sub_path = lp, .data = ew.log_buf.items }) catch {};
+        // 落盘导出日志（`<wav>.log`）——**仅 `SAWDUST_EXPORT_LOG` 启动时**（排障用）
+        if (exportLogOn()) {
+            if (self.export_wav) |*ew| {
+                var pb: [1080]u8 = undefined;
+                if (std.fmt.bufPrint(&pb, "{s}.log", .{ew.path}) catch null) |lp| {
+                    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = lp, .data = ew.log_buf.items }) catch {};
+                }
             }
         }
         self.setToastWith("已导出（块 {d} · 事件 {d}）：{s}", .{ self.export_wav.?.blocks, ev_n, self.export_wav.?.path });
@@ -8816,13 +8835,34 @@ pub const App = struct {
         self.exportWavFree();
     }
 
-    /// 失败：丢半成品 → 恢复快照/设备 → 释放（toast 报错）。
+    /// 失败：恢复快照/设备 → 释放（toast 报错）。
+    /// **渲染已完成的话保留那份 WAV**（好不容易渲染好的；编码失败不应该连带毁掉它），
+    /// 并在提示里告诉用户路径。
     fn exportWavFail(self: *App, io: std.Io, err: anyerror) void {
         if (self.export_wav == null) return;
-        self.export_wav.?.writer.abandon();
-        std.Io.Dir.cwd().deleteFile(io, self.export_wav.?.render_path) catch {};
-        if (!self.export_wav.?.render_is_target) std.Io.Dir.cwd().deleteFile(io, self.export_wav.?.path) catch {};
-        self.setToastWith("导出失败：{s}", .{@errorName(err)});
+        const ew = &self.export_wav.?;
+        const keep_wav = ew.render_complete and !ew.render_is_target;
+        ew.writer.abandon();
+        if (!keep_wav) std.Io.Dir.cwd().deleteFile(io, ew.render_path) catch {};
+        if (!ew.render_is_target) std.Io.Dir.cwd().deleteFile(io, ew.path) catch {};
+        // 友好提示：原始错误名对用户无意义（尤其“EncoderFailed”根本不知道要装什么）
+        const what: []const u8 = switch (err) {
+            error.FfmpegNotFound => "未找到 FFmpeg（请安装并加入 PATH，或改用 WAV 导出）",
+            error.EncoderFailed => "FFmpeg 编码失败（可能缺少 libmp3lame / libvorbis / libopus 编码器）",
+            else => "",
+        };
+        if (keep_wav) {
+            var tb: [640]u8 = undefined;
+            const text = if (what.len > 0)
+                std.fmt.bufPrint(&tb, "导出失败：{s}；渲染好的 WAV 已保留：{s}", .{ what, ew.render_path }) catch what
+            else
+                std.fmt.bufPrint(&tb, "导出失败：{s}；渲染好的 WAV 已保留：{s}", .{ @errorName(err), ew.render_path }) catch @errorName(err);
+            self.setToast(text);
+        } else if (what.len > 0) {
+            self.setToastWith("导出失败：{s}", .{what});
+        } else {
+            self.setToastWith("导出失败：{s}", .{@errorName(err)});
+        }
         self.exportWavRestore();
         self.exportWavFree();
     }

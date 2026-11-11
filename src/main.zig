@@ -980,7 +980,7 @@ pub fn main(init: std.process.Init) !u8 {
             drawModal(&ui, &app);
         }
         // 导出格式面板（模态；文件选择前先选格式与质量）
-        if (app.export_options_win.open) drawExportOptionsDialog(&ui, &app);
+        if (app.export_options_win.open) drawExportOptionsDialog(&ui, &app, io);
         // 导出进度窗（模态；置于最上层——导出期间其余元素均不可操作）
         if (app.export_wav != null) drawExportDialog(&ui, &app, io);
         // 文本输入框（最顶层——跨窗口/菜单，重命名乐器/通道用）
@@ -1082,7 +1082,10 @@ pub fn main(init: std.process.Init) !u8 {
                 .save_as => saveProject(&app, &win, io, true),
                 .import_midi => importMidiWithDialog(&app, &win, io),
                 .export_midi => exportMidiWithDialog(&app, &win, io),
-                .export_wav => app.export_options_win.open = true,
+                .export_wav => {
+                    app.export_options_win.open = true;
+                    app.export_options_win.probe_req = true; // 打开面板时重新探测 FFmpeg
+                },
                 .import_json => importJsonWithDialog(&app, &win, io),
                 .export_json => exportJsonWithDialog(&app, &win, io),
             }
@@ -1104,12 +1107,29 @@ pub fn main(init: std.process.Init) !u8 {
         }
 
         // 4.4) 设置落盘（脏 → 写 settings.json；IO 在帧末）
-        // 4.25) 音频输出偏好落盘（设置页刚改；**重启生效**）
+        // 4.25) 音频输出偏好落盘（**设备变更立即生效**；后端变更仍需重启）
         if (audio_pref.pending) |pb| {
-            audio_pref.pending = null;
-            audio_pref.current = pb;
-            audio_pref.save(io, app.dataRoot());
-            audio_pref.saved = true;
+            if (pb.backend != audio_pref.current.backend) {
+                // 换后端 = 重建 ma_context：仍按“重启后生效”
+                audio_pref.pending = null;
+                audio_pref.current = pb;
+                audio_pref.save(io, app.dataRoot());
+                audio_pref.saved = true;
+            } else if (app.export_wav != null) {
+                // 导出期间设备被独占停用：保留 pending，导出结束后再切
+            } else {
+                audio_pref.pending = null;
+                if (app.engine.switchPlaybackDevice(pb.deviceName())) |_| {
+                    audio_pref.current = pb;
+                    audio_pref.save(io, app.dataRoot());
+                    audio_pref.saved = false; // 已立即生效，不再显示“重启后生效”
+                    app.setToastWith("已切换输出设备：{s}", .{if (pb.deviceName().len == 0) "系统默认" else pb.deviceName()});
+                } else |e| {
+                    // 引擎已回滚到原设备；不落盘、不改 current（UI 仍显示实际在用的设备）
+                    audio_pref.saved = false;
+                    app.setToastWith("切换输出设备失败：{s}（仍在使用当前设备）", .{@errorName(e)});
+                }
+            }
         }
 
         // 4.3) 字体重载'（设置页点“重新加载字体”；装完新字体不必重启）
@@ -2697,6 +2717,8 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
                 app.bringToFront(&app.rack.z); // 刚打开：置顶（否则可能被别的窗口盖住）
             } else if (i == 1) {
                 app.settings_win.open = true;
+                // 打开设置页时重新枚举播放设备：运行中新插/拔的设备立刻反映到列表
+                app.engine.refreshPlaybackDevices();
                 app.bringToFront(&app.settings_win.z);
             } else if (i == 0) {
                 app.file_menu_open = !app.file_menu_open;
@@ -2855,7 +2877,7 @@ fn drawFileMenu(ui: *Ui, app: *App) void {
         .{ .label = "另存为...", .shortcut = "Ctrl+Shift+S" },
         .{ .label = "导入 MIDI...", .shortcut = "" },
         .{ .label = "导出 MIDI...", .shortcut = "" },
-        .{ .label = "导出音频 (WAV)...", .shortcut = "" },
+        .{ .label = "导出音频...", .shortcut = "" },
     };
     const item_h: i32 = 22;
     const menu_x = app.file_menu_x;
@@ -4671,14 +4693,24 @@ fn exportWavToPath(app: *App, io: std.Io, path: []const u8) void {
 }
 
 /// 导出设置窗（格式 + 码率/压缩级）。保存框只负责路径，避免“靠扩展名猜格式”。
-fn drawExportOptionsDialog(ui: *Ui, app: *App) void {
-    const ww: i32 = 460;
+/// 需要编码器的格式（MP3/FLAC/OGG）依赖系统 FFmpeg：**没探测到就置灰**，
+/// 并把当前选择回退到 WAV（不让用户走到最后一步才发现失败）。
+fn drawExportOptionsDialog(ui: *Ui, app: *App, io: std.Io) void {
+    const ww: i32 = 530;
     const hh: i32 = 222;
     const win_w = @as(i32, @intCast(ui.renderer.fb.width));
     const win_h = @as(i32, @intCast(ui.renderer.fb.height));
     const x = @divTrunc(win_w - ww, 2);
     const y = @divTrunc(win_h - hh, 3);
     const state = &app.export_options_win;
+    // FFmpeg 探测：**只在打开面板 / 用户点置灰按钮时真跑**（53ms 热 / 171ms 冷）；
+    // 其余帧走缓存。这样运行期装了 ffmpeg 也能立刻用（不必重启）。
+    if (state.probe_req) {
+        state.probe_req = false;
+        _ = audio_export.refreshFfmpeg(app.allocator, io);
+    }
+    const ffmpeg_ok = audio_export.ffmpegAvailable(app.allocator, io);
+    if (!ffmpeg_ok and state.options.format.needsEncoder()) state.options.format = .wav;
 
     ui.renderer.fillRect(0, 0, win_w, win_h, (@as(u32, 110) << 24) | 0x000000);
     ui.noteOverlayRect(x, y, ww, hh);
@@ -4688,23 +4720,35 @@ fn drawExportOptionsDialog(ui: *Ui, app: *App) void {
     ui.label("导出音频", x + 12, y + 7, ui.theme.text);
 
     ui.label("格式", x + 14, y + 36, ui.theme.text_dim);
-    const formats = [_]audio_export.Format{ .wav, .mp3, .flac, .ogg };
-    const fw: i32 = 102;
+    const formats = [_]audio_export.Format{ .wav, .mp3, .flac, .ogg, .opus };
+    const fw: i32 = 100;
     for (formats, 0..) |format, i| {
         const bx = x + 14 + @as(i32, @intCast(i)) * fw;
         const selected = state.options.format == format;
-        const hovered = util.hitUI(ui, bx, y + 52, fw - 4, 24);
-        ui.renderer.fillRect(bx, y + 52, fw - 4, 24, if (selected) ui.theme.accent else if (hovered) ui.theme.item_hover else ui.theme.slider_track);
+        // 需要 FFmpeg 但没探测到 → 置灰且不可点
+        const disabled = format.needsEncoder() and !ffmpeg_ok;
+        const hovered = !disabled and util.hitUI(ui, bx, y + 52, fw - 4, 24);
+        ui.renderer.fillRect(bx, y + 52, fw - 4, 24, if (selected and !disabled) ui.theme.accent else if (hovered) ui.theme.item_hover else ui.theme.slider_track);
         ui.renderer.strokeRect(bx, y + 52, fw - 4, 24, ui.theme.panel_border);
         const text = switch (format) {
             .wav => "WAV",
             .mp3 => "MP3",
             .flac => "FLAC",
             .ogg => "OGG",
+            .opus => "Opus",
         };
         const tw: i32 = @intFromFloat(ui.font.measure(text));
-        ui.label(text, bx + @divTrunc(fw - 4 - tw, 2), y + 59, if (selected) r_mod.rgb(240, 244, 250) else ui.theme.text);
+        const txt_col = if (disabled) ui.theme.text_dim else if (selected) r_mod.rgb(240, 244, 250) else ui.theme.text;
+        ui.label(text, bx + @divTrunc(fw - 4 - tw, 2), y + 59, txt_col);
         if (hovered and ui.mouse_pressed) state.options.format = format;
+        // 点“置灰”的按钮 = 重新探测一次（用户刚装完 ffmpeg 时最自然的动作）
+        if (disabled and util.hitUI(ui, bx, y + 52, fw - 4, 24) and ui.mouse_pressed) state.probe_req = true;
+    }
+    if (!ffmpeg_ok) {
+        // 重新探测一次就能刷新的情况（典型：scoop/winget 装到已在 PATH 上的目录）；
+        // 但 PATH 本身是**启动时快照**——若装到了新目录，仍需重启软件。
+        ui.label("未检测到 FFmpeg：MP3 / FLAC / OGG / Opus 已禁用（点它们或重开本面板可重新检测）", x + 14, y + 152, ui.theme.text_dim);
+        ui.label("若 ffmpeg 装在新的 PATH 目录，需重启软件后才生效", x + 14, y + 170, ui.theme.text_dim);
     }
 
     const format = state.options.format;
