@@ -8,6 +8,9 @@
 >
 > 复杂控件的设计文档：`docs/timeline-scrollbar.md`（横向时间轴滚动条——
 > 改这块之前务必先读：手势、不变量、快照语义、物理下限都有说明）。
+> 改**播放域 / 游标 / 模式切换 / 锚片段 / 幽灵游标**（`sel.song_mode`、`song_step`、
+> `piano_step`、`piano.origin`、`switchSongModePreserving`）之前，**先读 `docs/song-pat.md`**
+> —— 它是这套设计的唯一真源（两个域 / 锚片段规则 / 两个方向的切换映射表 / 快照必须重建）。
 > 要动**大数组/静态缓冲/环形队列**或**发布体积/出包口径**时，先读 `docs/resources.md` 第六节
 > （字段默认值会材料化进 `.rodata`；比体积必须同口径 + 同工具链）。
 

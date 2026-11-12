@@ -555,11 +555,11 @@ pub const KeyMode = model.KeyMode;
 pub const PianoState = struct {
     /// 当前编辑的样式序号（null = 在播放列表视图）
     pattern: ?i32 = null,
-    /// 锚片段（PAT ⇄ SONG 位置映射）——规则：
-    /// 1) 双击片段打开 → 该片段的值快照；
-    /// 2) 点样式/换样式打开 → **离游标最近的该样式片段**（v2“窗随游标”；无片段 → null）；
-    /// 3) 关窗再开（同一样式）→ 保留原快照（游标停原位）；
-    /// 无锚 → 映射退化为 0；失效快照自动退化（见 `patOriginClip`）。
+    /// 锚片段（PAT ⇄ SONG 位置映射的“**参照实例**”——规则全在 `docs/song-pat.md` §5–§6）：
+    /// 单击/双击片段 → 该片段的值快照；换样式 → 离游标最近的该样式片段；
+    /// 关窗再开（同一样式）→ 保留；被拖动/拉伸/批量改长 → `anchorFollow` 跟随；
+    /// 快照失效 → 退化到该样式**最左片段**（`patOriginClip`）；
+    /// 该样式无任何片段 → `null`（PAT 里就是“幽灵游标”态，播放列表不画游标）。
     origin: ?model.Clip = null,
     /// 音高行高（像素；□ 缺口缩放）——默认 16：视口内行数较少、内容更大
     key_h: i32 = 16,
@@ -713,13 +713,12 @@ pub const RackState = struct {
     ctx_pan: ?usize = null,
 };
 
-/// 播放状态（游标 + 传输）——设计原则：
-/// **单一真源是 `song_step`（全局步）**：
-/// - SONG 模式：游标就是它；
-/// - PAT 模式：游标 = `piano_step`（自由设置，独立存储）；
-/// - **模式切换统一走 `switchSongModePreserving`**（工具栏与状态栏两处按钮共用）：
-///   按锚片段把当前位置换算到目标模式——两个位置始终是“同一音乐时刻”的两种坐标；
-///   无锚（样式无片段）时 PAT 侧归 0。标尺点击仍是“显式放置”（写当前模式的坐标）。
+/// 播放状态（游标 + 传输）——**设计与完整规则见 `docs/song-pat.md`**（唯一真源）。
+/// 要点：
+/// - `song_step`（全局步）与 `piano_step`（当前样式内的局部步）是**两个独立位置**，
+///   各自持久；切换时能诚实换算就换算（锚片段映射），否则**保留各自的旧位置**。
+/// - **模式切换统一走 `switchSongModePreserving`**（工具栏/状态栏两处按钮共用）；
+///   标尺点击是“显式放置”，直接写当前模式的坐标。
 /// - 播放推进由**音频采样时钟**（frames_played）驱动，不由渲染驱动。
 pub const Playback = struct {
     /// 全局播放位置（步；0 = 第 1 小节第 1 步）
@@ -1371,7 +1370,10 @@ pub const App = struct {
             self.snap_retired.items[i].frames -= 1;
             i += 1;
         }
-        if (!self.snap_dirty) return;
+        // **快照的输入**：播放域（SONG/PAT）与选中样式。它们变化也必须重建——
+        // 否则切到 PAT 后播的还是 SONG 的时间轴（实测：钢琴窗显示样式2、响的是样式1）。
+        const stale_scope = self.snap_mode != self.sel.song_mode or self.snap_pattern != self.sel.pattern;
+        if (!self.snap_dirty and !stale_scope) return;
         self.snap_dirty = false;
 
         // 先退役“当前活动”的旧快照（音频可能还在读它 → 30 帧后释放）
@@ -1401,6 +1403,8 @@ pub const App = struct {
         };
         self.snap_slots[slot] = built;
         self.snap_active = @intCast(slot);
+        self.snap_mode = self.sel.song_mode; // 记下这份快照烘的是哪个域/样式
+        self.snap_pattern = self.sel.pattern; // （构建失败则不记 → 下一帧因不一致自然重试）
         self.snap_insts = if (self.snap_slots[slot]) |*s| s.instCount() else 0;
         const sp = if (self.snap_slots[slot]) |*s| @intFromPtr(s) else 0;
         // **A3a**：代递增必须在发布之后——音频看到新代就知道 stash 里的事件是旧数据的，
@@ -1490,6 +1494,15 @@ pub const App = struct {
     snap_slots: [2]?snapshot.Snapshot = .{ null, null },
     snap_active: u8 = 0,
     snap_dirty: bool = true,
+    /// 当前快照是**用哪个播放域/哪个样式**构建的（`sel.song_mode` / `sel.pattern`）。
+    /// 它们是快照的**输入**（SONG = 展开全部片段时间轴；PAT = 只取一个样式的音符），
+    /// 但**不属于“编辑”**——所有编辑路径靠 `snap_dirty` 标脏，这两者却没人标。
+    /// 实测 bug：双击样式2的片段 → 切 PAT → 钢琴窗显示样式2、响的却是样式1
+    /// （快照仍是 SONG 时间轴，PAT 从局部 30 步开始播放 → 正好落在第 1 小节的片段里）。
+    /// 故这里记下“快照里的域/样式”，`pollSnapshotRebuild` 发现不一致就重建——
+    /// 无论哪条 UI 路径改了选择，都不可能忘。
+    snap_mode: bool = false,
+    snap_pattern: i32 = -1,
     snap_retired: std.ArrayListUnmanaged(RetiredSnap) = .empty,
     /// 影子对拍统计（最近一次发布时的实例数，便于对照）
     snap_insts: usize = 0,
@@ -1880,8 +1893,10 @@ pub const App = struct {
             const ns = snap.step + d.step;
             const ntr = snap.pitch + d.track;
             if (ns != c.start or ntr != c.track) {
+                const before = c.*;
                 c.start = ns;
                 c.track = ntr;
+                self.anchorFollow(before, c.*); // 锚在组里 → 跟着走（否则白环跳回“最左片段”）
                 changed = true;
             }
         }
@@ -1964,14 +1979,18 @@ pub const App = struct {
                 // offset 同步平移（clipTrimLeft 的规则：offset += delta）
                 const no = snap.offset + (ns - snap.step);
                 if (ns != c.start or nl != c.len or no != c.offset) {
+                    const before = c.*;
                     c.start = ns;
                     c.len = nl;
                     c.offset = no;
+                    self.anchorFollow(before, c.*); // 锚在组里 → 跟着拉伸
                     changed = true;
                 }
             } else {
                 if (new_len != c.len) {
+                    const before = c.*;
                     c.len = new_len;
+                    self.anchorFollow(before, c.*);
                     changed = true;
                 }
             }
@@ -7497,6 +7516,7 @@ pub const App = struct {
                     const move_track = pc.track != old.track;
                     if (move_pos or move_track) {
                         self.clips.items[pi] = pc;
+                        self.anchorFollow(old, pc); // 锚跟着被拖/拉伸的片段走
                         self.dirty = true;
                         if (self.playing and self.sel.song_mode) {
                             _ = move_pos and self.syncDragSnaps();
@@ -9045,6 +9065,19 @@ pub const App = struct {
         }
     }
 
+    /// 锚片段**跟随编辑**：`before` = 片段被改之前的值，`after` = 改之后的值。
+    /// 若当前锚正指着它（五字段全等）→ 把锚推进到新值。
+    /// **为什么必须跟随**：锚是**值快照**（`model.Clip` 没有 uid），片段一被拖动/拉伸/
+    /// 批量改长，快照就失效了 → `patOriginClip()` 退回“该样式最左片段”→ 白环跳到
+    /// 另一个片段上（用户实测：“移动或拉伸之后反而选中了另一个片段”）。
+    pub fn anchorFollow(self: *App, before: model.Clip, after: model.Clip) void {
+        if (after.isAudio()) return; // 音频片段不参与 PAT ⇄ SONG 映射
+        const o = self.piano.origin orelse return;
+        if (o.track != before.track or o.start != before.start or o.len != before.len or
+            o.offset != before.offset or o.pattern != before.pattern) return;
+        self.piano.origin = after;
+    }
+
     /// 当前锚片段（PAT ⇄ SONG 位置映射用；规则见 `PianoState.origin`）：
     /// 快照仍在（同值片段存在）→ 用它；被改/删 → 退化到动态最左片段；都没有 → null。
     /// **按 `sel.pattern` 而非 `piano.pattern`**——PAT 播放的驱动是选中样式，
@@ -9053,8 +9086,14 @@ pub const App = struct {
         const pat = self.sel.pattern;
         if (self.piano.origin) |o| {
             if (o.pattern == pat) {
-                for (self.clips.items) |c| {
-                    if (c.track == o.track and c.start == o.start and c.len == o.len and c.offset == o.offset and c.pattern == o.pattern) return o;
+                // **比的是“有效值”（拖动/拉伸预览优先）**：拖动中模型还没变，
+                // 只看模型的话锚快照永远对不上 → 白环掉到“最左片段”（用户实测的
+                // “拖完/拖着反而选中了另一个片段”）。返回的也是有效值，
+                // 所以映射/白环在拖动过程中都跟着预览走。
+                for (self.clips.items, 0..) |c, i| {
+                    const eff = self.previewClipAt(i) orelse c;
+                    if (eff.track == o.track and eff.start == o.start and eff.len == o.len and
+                        eff.offset == o.offset and eff.pattern == o.pattern) return eff;
                 }
             }
         }
@@ -9085,12 +9124,36 @@ pub const App = struct {
     }
 
     /// 切到 PAT 时的目标局部步（SONG→PAT 反向）：song 游标在锚窗口内 → 映射；
-    /// 窗口外/无锚 → 0（“切到样式从头播”——没有诚实的对应点）。
+    /// 窗口外 → **锚片段起点**（局部 = `offset`）——与“点片段把游标带进片段”
+    /// （`patCursorIntoClip`）**同一条规则的另一个入口**：游标永远落在你指向的
+    /// 那个片段里，不落在“样式开头”那种跟谁都对不上的位置。无锚 → 0。
     pub fn patTargetLocalStep(self: *const App) i32 {
         const o = self.patOriginClip() orelse return 0;
         const s = self.playback.song_step;
-        if (s < o.start or s >= o.start + o.len) return 0;
+        if (s < o.start or s >= o.start + o.len) return o.offset; // 窗外：落到片段开头
         return o.offset + (s - o.start);
+    }
+
+    /// **点片段 → PAT 游标进入该片段**（用户拍板的规则）：
+    /// - 点击前的**显示位置**已在片段窗口内 → **原地保持**（反算新锚下的局部步，
+    ///   画面一动不动）；
+    /// - 否则 → 片段开头（局部 = `c.offset`）。
+    ///
+    /// 不参与：SONG 模式（游标归标尺管，点片段只选中/设锚）、音频片段（无样式时间轴）。
+    /// **必须在改 `sel.pattern` / `piano.origin` 之前调用**：
+    /// “本来在不在窗口里”要用**旧锚**推算（`patVirtualSongStepFrac` 依赖它们）。
+    pub fn patCursorIntoClip(self: *App, c: model.Clip) void {
+        if (c.isAudio()) return;
+        if (self.sel.song_mode) return;
+        const cur: f32 = self.patVirtualSongStepFrac(); // 旧锚下的显示位置
+        const start_f: f32 = @floatFromInt(c.start);
+        const end_f: f32 = @floatFromInt(c.start + c.len);
+        const in_window = cur >= start_f and cur < end_f;
+        const target: i32 = if (in_window)
+            @as(i32, @intFromFloat(@round(cur))) - c.start + c.offset
+        else
+            c.offset;
+        self.jumpPlaybackCursor(@max(0, target));
     }
 
     /// 模式切换（**保位无缝**，用户拍板）：按锚片段映射换算目标步、原地换坐标。
@@ -9102,20 +9165,30 @@ pub const App = struct {
     /// （gen 重置、声部释放）。
     pub fn switchSongModePreserving(self: *App) void {
         if (self.sel.song_mode) {
-            // SONG → PAT：锚窗口内 → 映射（保位）；窗外/无锚 → 0（真跳位）
+            // SONG → PAT：锚窗口内 → 映射（保位）；窗外 → **锚片段起点**；无锚 → 0
+            // （全表见 docs/song-pat.md §7）
             const o = self.patOriginClip();
             const s = self.playback.song_step;
             const in_window = if (o) |a| (s >= a.start and s < a.start + a.len) else false;
             const target = self.patTargetLocalStep();
             self.sel.song_mode = false;
+            // **快照必须当帧就位**：快照烘了域与样式（SONG = 片段时间轴 / PAT = 单个样式）。
+            // 等帧末重建的话，切掉后的头一个音频块还是旧域的事件（实测：切到 PAT 头一下
+            // 响的是第 1 小节的样式1）。发布顺序与“编辑重扫”一致：先换快照，再动 gen/基准。
+            self.snap_dirty = true;
+            self.pollSnapshotRebuild();
             if (self.playing and in_window) {
                 self.seamlessSwitchPlayback(target);
             } else {
                 self.jumpPlaybackCursor(target);
             }
         } else {
-            // PAT → SONG：局部位置在锚窗口内 → 直接映射（保位）；否则回绕进窗口（跳位）
-            var target: i32 = @intFromFloat(@max(0, self.patVirtualSongStepFrac()));
+            // PAT → SONG：局部位置在锚窗口内 → 直接映射（保位）；否则回绕进窗口（跳位）。
+            // **无锚（该样式没有任何片段实例）→ 不动 `song_step`**：此刻 PAT 里连游标
+            // 都不画（幽灵游标，见 `view_playlist`），根本不存在“诚实的对应点”——
+            // 把 SONG 的游标拽到第 1 小节等于白扔用户上一次在 SONG 里的位置。
+            // SONG 自己那个游标一直是存在的，直接留着就行（用户拍板：仅隐藏，切回 SONG 原地再现）。
+            var target: i32 = self.playback.song_step;
             var preserved = false;
             if (self.patOriginClip()) |a| {
                 if (a.len > 0) {
@@ -9125,6 +9198,8 @@ pub const App = struct {
                 }
             }
             self.sel.song_mode = true;
+            self.snap_dirty = true; // 同上：换域后立即重建（PAT→SONG = 要含全部片段）
+            self.pollSnapshotRebuild();
             if (self.playing and preserved) {
                 self.seamlessSwitchPlayback(target);
             } else {
@@ -9210,6 +9285,13 @@ pub const App = struct {
 
     /// 打开钢琴卷帘（**从片段双击**）——记录锚片段（PAT ⇄ SONG 位置映射，规则 1）
     pub fn openPianoFromClip(self: *App, c: model.Clip) void {
+        // **不变量：钢琴窗显示的样式 == 选中样式（`sel.pattern`）**。
+        // PAT 播放、锚片段校验（`patOriginClip`）、状态栏都看 `sel.pattern`，
+        // 而钢琴窗画的是 `piano.pattern`——两者一变一不变就会出现
+        // “看到的样式2 / 响的样式1”（实测 bug）的根。
+        // 注：播放列表点片段本身也会设 `sel.pattern`；这里再设一次是让**本函数自给自足**
+        // （任何新入口调它都不会漏）。
+        self.sel.pattern = c.pattern;
         self.openPiano(c.pattern);
         self.piano.origin = c;
     }
@@ -11227,6 +11309,170 @@ test "app: 播放中编辑 → 快照重建即可发声；撤销不停播（替�
         const n = snap.gatherRaw(&evs, 0, 9, 1) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(@as(usize, 0), n); // 撤销后音符没了 → 快照里也没有
     }
+}
+test "app: 切 SONG/PAT 与换样式 → 快照必须重建（否则听到的还是旧内容）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(2);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    // 样式1：音高 60（片段在 0）；样式2：音高 72（片段在 96）
+    app.addNote(.{ .step = 0, .len = 8, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.addNote(.{ .step = 0, .len = 8, .pitch = 72, .pattern = 1, .instrument = 0 });
+    app.addClip(.{ .track = 0, .start = 0, .len = 96, .pattern = 0 });
+    app.addClip(.{ .track = 0, .start = 96, .len = 96, .pattern = 1 });
+    app.sel.pattern = 0;
+    app.sel.song_mode = true;
+    app.pollSnapshotRebuild(); // SONG：两个样式的音符都在
+    try std.testing.expectEqual(@as(usize, 2), app.snap_slots[app.snap_active].?.insts.len);
+
+    // 双击样式2的片段（真实手势链：点片段 → 选中该样式；双击 → 开钢琴窗）
+    app.sel.pattern = app.clips.items[1].pattern;
+    app.openPianoFromClip(app.clips.items[1]);
+    try std.testing.expectEqual(@as(?i32, app.sel.pattern), app.piano.pattern);
+
+    // 切 PAT：游标映射到片段内局部 30；快照必须换成 PAT（只含样式2的音符）
+    app.playback.song_step = 96 + 30;
+    app.switchSongModePreserving();
+    try std.testing.expectEqual(@as(i32, 30), app.playback.piano_step);
+    app.pollSnapshotRebuild();
+    try std.testing.expectEqual(@as(usize, 1), app.snap_slots[app.snap_active].?.insts.len);
+    try std.testing.expectEqual(@as(u8, 72), app.snap_slots[app.snap_active].?.insts[0].pitch);
+
+    // PAT 内换样式（点样式行）：快照同样跟随
+    app.sel.pattern = 0;
+    app.pollSnapshotRebuild();
+    try std.testing.expectEqual(@as(usize, 1), app.snap_slots[app.snap_active].?.insts.len);
+    try std.testing.expectEqual(@as(u8, 60), app.snap_slots[app.snap_active].?.insts[0].pitch);
+
+    // 切回 SONG：快照又是两个样式的完整时间轴
+    app.switchSongModePreserving();
+    app.pollSnapshotRebuild();
+    try std.testing.expectEqual(@as(usize, 2), app.snap_slots[app.snap_active].?.insts.len);
+
+    // 用户的另一条期望：SONG 游标**不在**锚片段上 → 切 PAT 落回开头
+    app.sel.pattern = 1; // 回到样式2（锚仍是它那个片段）
+    app.playback.song_step = 10; // 第 1 小节（样式1 的片段里，不在锚窗口内）
+    app.switchSongModePreserving();
+    try std.testing.expectEqual(@as(i32, 0), app.playback.piano_step);
+}
+test "app: 拖动/拉伸/批量移动后 锚片段跟随（白环不跳到别的片段）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    // 同样式两个片段：0 与 96（“最左片段”永远是 0——一旦锚失效就会看到跳过去）
+    app.addClip(.{ .track = 0, .start = 0, .len = 96, .pattern = 0 });
+    app.addClip(.{ .track = 0, .start = 96, .len = 96, .pattern = 0 });
+    app.sel.pattern = 0;
+    app.piano.origin = app.clips.items[1]; // 单击第 2 个片段 → 锚是它
+    try std.testing.expectEqual(@as(i32, 96), app.patOriginClip().?.start);
+
+    // ① 单个拖动：预览 → 松手提交（锚必须跟到 192，不能退回最左片段 0）
+    app.playlist.preview_idx = 1;
+    var pc = app.clips.items[1];
+    pc.start = 192;
+    app.playlist.preview_clip = pc;
+    app.commitDragPreview();
+    try std.testing.expectEqual(@as(i32, 192), app.piano.origin.?.start);
+    try std.testing.expectEqual(@as(i32, 192), app.patOriginClip().?.start);
+
+    // ② 批量移动：锚在组里 → 跟着走
+    app.clips.items[0].selected = true;
+    app.clips.items[1].selected = true;
+    app.beginClipBatchSnap();
+    _ = app.moveSelectedClips(24, 0);
+    try std.testing.expectEqual(@as(i32, 216), app.piano.origin.?.start);
+
+    // ③ 批量改长（右缘）：锚片段的长度跟着变
+    app.beginClipBatchSnap();
+    _ = app.applyClipBatchTrim(12, 1, false, false);
+    try std.testing.expectEqual(@as(i32, 108), app.piano.origin.?.len);
+}
+test "app: PAT 点片段——不在游标下 → 片段开头；本来就里面 → 原地不动" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    // A(0,96,off 0) / B(192,96,off 0) / C(480,48,off 48)——C 是“窗口片段”
+    app.addClip(.{ .track = 0, .start = 0, .len = 96, .pattern = 0 });
+    app.addClip(.{ .track = 0, .start = 192, .len = 96, .pattern = 0 });
+    app.addClip(.{ .track = 0, .start = 480, .len = 48, .pattern = 0, .offset = 48 });
+    app.sel.pattern = 0;
+    app.sel.song_mode = false; // PAT
+    app.piano.origin = app.clips.items[0];
+    app.playback.piano_step = 30; // 显示位置 = 30（在 A 里）
+
+    // ① 点 B（游标不在它下面）→ 游标到 B 开头（局部 = offset = 0）
+    app.patCursorIntoClip(app.clips.items[1]);
+    try std.testing.expectEqual(@as(i32, 0), app.playback.piano_step);
+    app.piano.origin = app.clips.items[1]; // 模拟按下时设锚
+    try std.testing.expectApproxEqAbs(@as(f32, 192), app.patVirtualSongStepFrac(), 0.01);
+
+    // ② 游标已在 B 里 → 再点 B 不动
+    app.playback.piano_step = 40;
+    app.patCursorIntoClip(app.clips.items[1]);
+    try std.testing.expectEqual(@as(i32, 40), app.playback.piano_step);
+
+    // ③ 点 C（窗口片段，游标不在它下面）→ 局部 = C.offset = 48，显示位置 = 480
+    app.patCursorIntoClip(app.clips.items[2]);
+    try std.testing.expectEqual(@as(i32, 48), app.playback.piano_step);
+    app.piano.origin = app.clips.items[2];
+    try std.testing.expectApproxEqAbs(@as(f32, 480), app.patVirtualSongStepFrac(), 0.01);
+
+    // ④ 游标已在 C 里（显示 500）→ 点 C 画面不动（局部步反算、值不变）
+    app.playback.piano_step = 68; // 480 + 68 − 48 = 500
+    app.patCursorIntoClip(app.clips.items[2]);
+    try std.testing.expectEqual(@as(i32, 68), app.playback.piano_step);
+    try std.testing.expectApproxEqAbs(@as(f32, 500), app.patVirtualSongStepFrac(), 0.01);
+
+    // ⑤ SONG 模式：点片段**不动**游标（游标归标尺管）
+    app.sel.song_mode = true;
+    app.playback.song_step = 200;
+    app.patCursorIntoClip(app.clips.items[0]);
+    try std.testing.expectEqual(@as(i32, 200), app.playback.song_step);
+
+    // ⑥ SONG→PAT：窗口外 → 落**锚片段起点**（而不是样式开头 0）
+    app.sel.pattern = 0;
+    app.piano.origin = app.clips.items[2]; // C：start 480, offset 48
+    app.playback.song_step = 5000; // 窗外
+    app.switchSongModePreserving();
+    try std.testing.expectEqual(@as(i32, 48), app.playback.piano_step);
+}
+test "app: PAT 样式无片段 → 切 SONG 保留 SONG 游标（不跳回第 1 小节）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(2);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    // 只有样式1 有片段；样式2 一个实例都没有
+    app.addClip(.{ .track = 0, .start = 480, .len = 96, .pattern = 0 });
+    app.sel.song_mode = true;
+    app.playback.song_step = 500; // 用户上一次在 SONG 里的位置
+    app.sel.pattern = 1; // 在样式栏里切到无片段的样式2
+    app.piano.origin = null;
+    try std.testing.expect(app.patOriginClip() == null);
+
+    // 切 PAT：无锚 → 局部 0（从样式开头播，既有语义不变）；播放列表里游标=幽灵（不画）
+    app.switchSongModePreserving();
+    try std.testing.expect(!app.sel.song_mode);
+    try std.testing.expectEqual(@as(i32, 0), app.playback.piano_step);
+    try std.testing.expect(app.patOriginClip() == null); // = view_playlist 的 ghost 判据
+
+    // 切回 SONG：**song_step 原封不动**（以前会被拽到 0 = 第 1 小节）
+    app.switchSongModePreserving();
+    try std.testing.expect(app.sel.song_mode);
+    try std.testing.expectEqual(@as(i32, 500), app.playback.song_step);
 }
 test "app: 上移/下移乐器进历史 + 标脏 + 可撤销" {
     // 顺序是**存档字段**（`instrument_order`，且决定 MIDI 导出通道）→ 必须进历史并标脏；

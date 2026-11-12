@@ -554,12 +554,25 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                         // 极窄的片段描边会把填充完全包成灰色。
                         if (clip_w > 2) ui.renderer.strokeRect(clip_x, ty, clip_w, track_h, base);
                         if (clip.selected and clip_w > 2) ui.renderer.strokeRect(clip_x, ty, clip_w, track_h, ui.theme.note_selected);
-                        // PAT 模式：锚片段高亮（“你正在播的就是它”——游标位置的解释；
-                        // 按 sel.pattern——PAT 播放的驱动样式）
-                        if (!app.sel.song_mode and !thin and clip.pattern == app.sel.pattern) {
+                        // **锚片段高亮：SONG 与 PAT 都画**——它回答“切到 PAT 后游标会以
+                        // 哪个片段为参照”（游标在它里面 → 保位；不在 → 回样式开头）。
+                        // 只在 PAT 画的话，用户切模式前无从预判（用户提出）。
+                        // 规则：锚 = “该样式最近点/双击的片段”（无快照 → 该样式最左）；
+                        // 颜色用近白（`theme.text`）、且内缩 1px，原因两个：
+                        // 1) `theme.accent` 与样式1 的片段色是**同一个蓝**（`patternColor(0)`）
+                        //    → 画在蓝片段上等于没画（用户反馈：“和本来就是蓝色的片段叠
+                        //    在一起根本看不出来”）；
+                        // 2) 它原先与选中环**同一个矩形**且后画 → 把橙色选中环整个盖掉，
+                        //    于是“选中”在 PAT 模式里没有任何可见反馈。
+                        // 现在：外圈橙 = 选中，内圈白 = 锚，两个同时可见。
+                        // SONG 模式只在**用户真的点过/双击过片段**（有锚快照）时才画——
+                        // 否则它只是“该样式最左片段”的默认落点，启动时就凭空多一圈没来由的白环。
+                        // （PAT 模式总是画：那里的默认落点就是真实映射目标。）
+                        const draw_anchor = !app.sel.song_mode or app.piano.origin != null;
+                        if (draw_anchor and !thin and clip.pattern == app.sel.pattern) {
                             if (app.patOriginClip()) |o| {
                                 if (o.track == clip.track and o.start == clip.start and o.len == clip.len and o.offset == clip.offset) {
-                                    ui.renderer.strokeRect(clip_x, ty, clip_w, track_h, ui.theme.accent);
+                                    ui.renderer.strokeRect(clip_x + 1, ty + 1, clip_w - 2, track_h - 2, ui.theme.text);
                                 }
                             }
                         }
@@ -914,7 +927,17 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             const hit = .{ .index = app.sinkClipToTieBottom(hit0.index), .mode = hit0.mode };
             app.playlist.prev_click_clip = hit.index;
             const c = app.clips.items[hit.index];
+            // **PAT：点片段把游标带进它**（在“在里面则保持、否则落到片段开头”）——
+            // 必须在改锚/样式**之前**调（“本来在不在窗口里”得用旧锚推算）。
+            // SONG 模式 / 音频片段由本函数内部跳过。
+            app.patCursorIntoClip(c);
             app.sel.pattern = c.pattern;
+            // **单击也更新锚片段**（以前只有双击更新）：锚环现在在 SONG 模式也画，
+            // 若点击不更新，刚点的片段在旁边、白圈却留在“该样式最左的片段”上——
+            // 那圈白环就成了谎。语义统一为“**最近点/双击的片段就是 PAT 的锚**”，
+            // 双击只是额外把钢琴卷帘打开。
+            // （音频片段不参与 PAT ⇄ SONG 映射，不设）
+            if (!c.isAudio()) app.piano.origin = c;
             // 拉伸基准（**按下时快照**）：原起点/原长/按下步——增量式拉伸的锚
             app.playlist.resize_orig_start = c.start;
             app.playlist.resize_orig_len = c.len;
@@ -1010,6 +1033,12 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 // **只更新预览**，松手才真正移动（拖动期间调度器看到的仍是旧位置）
                 app.playlist.preview_batch_step = d.step;
                 app.playlist.preview_batch_track = d.track;
+                // 锚环跟着**按下的那个**片段走（否则拖动中白环闪掉、或留在原地）
+                if (app.playlist.prev_click_clip) |pi| {
+                    if (app.previewClipAt(pi)) |pv| {
+                        if (!pv.isAudio()) app.piano.origin = pv;
+                    }
+                }
             }
         }
         // ── 批量拉伸（选区 ≥ 2 边缘拖动；全组同步，与音符一致）──
@@ -1061,6 +1090,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                     pc.track = new_track;
                     app.playlist.preview_idx = ci;
                     app.playlist.preview_clip = pc;
+                    // 锚环跟着预览走（拖动中也不丢；松手提交后锚已就位）
+                    if (!pc.isAudio()) app.piano.origin = pc;
                 }
             }
             if (app.playlist.resize_clip) |ci| {
@@ -1121,6 +1152,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                             // **无条件写预览**：拖回“原值”那一帧也要写，否则画面停在上一帧（拉不动/跳两格）
                             app.playlist.preview_idx = ci;
                             app.playlist.preview_clip = nc;
+                            app.piano.origin = nc; // 锚环跟着左缘拉伸
                         }
                     } else {
                         // 右缘：长度 = **原长 + 累计位移**（网格只决定每帧增量）
@@ -1136,6 +1168,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                             pc.len = new_len;
                             app.playlist.preview_idx = ci;
                             app.playlist.preview_clip = pc;
+                            app.piano.origin = pc; // 锚环跟着右缘拉伸
                         }
                     }
                 }
