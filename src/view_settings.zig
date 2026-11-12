@@ -12,7 +12,7 @@ const audio_pref = @import("audio_pref.zig");
 
 const title_h: i32 = 22;
 const min_w: i32 = 360;
-const min_h: i32 = 280;
+const min_h: i32 = 560;
 
 /// 返回 true = 鼠标被窗口消费
 pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
@@ -110,7 +110,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     ui.label("自动顺序：fontconfig → 微软雅黑/文泉驿微米黑等 → data/fonts/ → 任意系统字体。", x + 14, yy + 78, ui.theme.text_dim);
     yy += 100;
 
-    // ── 音频后端（改完重启生效；Windows 只有 WASAPI）──
+    // ── 音频输出（改完重启生效）──
     // 分段控件：选中段用强调色（同设置页“打开上次工程/新建工程”与工具栏标签的观感）
     ui.label("音频后端（重启生效）", x + 14, yy, ui.theme.text_dim);
     {
@@ -123,7 +123,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         ui.renderer.strokeRect(x + 14, sy, total, seg_h, ui.theme.panel_border);
         for (audio_pref.options, 0..) |opt, oi| {
             const sx = x + 14 + seg_w * @as(i32, @intCast(oi));
-            const on = audio_pref.current == opt;
+            const on = audio_pref.shown().backend == opt;
             const hovered = ui.hitRect(sx, sy, seg_w, seg_h);
             const bg = if (on) ui.theme.accent else if (hovered and ui.mouse_down) r_mod.rgb(70, 130, 200) else if (hovered) r_mod.rgb(60, 66, 76) else ui.theme.panel;
             ui.renderer.fillRect(sx, sy, seg_w, seg_h, bg);
@@ -132,16 +132,65 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
             const tw: i32 = @intFromFloat(ui.font.measure(audio_pref.label(opt)));
             ui.labelCentered(audio_pref.label(opt), sx + @divTrunc(seg_w - tw, 2), sy, seg_h, if (on) r_mod.rgb(240, 244, 250) else ui.theme.text);
             if (ui.hitRect(sx, sy, seg_w, seg_h) and ui.mouse_pressed) {
-                audio_pref.pending = opt;
-                audio_pref.saved = false;
+                audio_pref.requestBackend(opt);
             }
         }
     }
+    yy += 50;
+
+    // ── 输出设备：当前后端的播放设备列表（含“系统默认”）──
+    // 设备切换**立即生效**（同一后端内）；只有切换后端才需要重启
+    ui.label("输出设备（立即生效；切换时声音会中断一瞬）", x + 14, yy, ui.theme.text_dim);
+    const list_x = x + 14;
+    const list_y = yy + 16;
+    const list_w = ww - 28;
+    const list_h: i32 = 104;
+    const row_h: i32 = 22;
+    const devices = app.engine.playbackDevices();
+    const content_h: i32 = @intCast((devices.len + 1) * @as(usize, @intCast(row_h)));
+    const max_scroll = @max(0, content_h - list_h);
+    sw.audio_device_scroll = std.math.clamp(sw.audio_device_scroll, 0, max_scroll);
+    if (util.hitUI(ui, list_x, list_y, list_w, list_h)) {
+        sw.audio_device_scroll = std.math.clamp(sw.audio_device_scroll - ui.wheel * row_h, 0, max_scroll);
+    }
+    ui.renderer.fillRect(list_x, list_y, list_w, list_h, ui.theme.bg);
+    ui.renderer.strokeRect(list_x, list_y, list_w, list_h, ui.theme.panel_border);
+    const has_scroll = content_h > list_h;
+    const sb_w: i32 = if (has_scroll) 6 else 0;
+    {
+        const saved = ui.renderer.pushClip(list_x + 1, list_y + 1, list_w - 2 - sb_w, list_h - 2);
+        defer ui.renderer.popClip(saved);
+        var row: usize = 0;
+        while (row < devices.len + 1) : (row += 1) {
+            const ry = list_y + @as(i32, @intCast(row)) * row_h - sw.audio_device_scroll;
+            if (ry + row_h <= list_y or ry >= list_y + list_h) continue;
+            const device_name: []const u8 = if (row == 0) "系统默认（由后端决定）" else devices[row - 1].label();
+            const selected = std.mem.eql(u8, audio_pref.shown().deviceName(), if (row == 0) "" else device_name);
+            const hovered = util.hitUI(ui, list_x + 1, ry, list_w - 2 - sb_w, row_h);
+            const bg = if (selected) ui.theme.accent else if (hovered) ui.theme.item_hover else ui.theme.bg;
+            ui.renderer.fillRect(list_x + 1, ry, list_w - 2 - sb_w, row_h, bg);
+            var label_buf: [320]u8 = undefined;
+            const label = if (row > 0 and devices[row - 1].is_default)
+                std.fmt.bufPrint(&label_buf, "{s}（系统默认）", .{device_name}) catch device_name
+            else
+                device_name;
+            ui.labelClipped(label, list_x + 8, ry + 4, list_w - 16 - sb_w, if (selected) r_mod.rgb(240, 244, 250) else ui.theme.text);
+            if (hovered and ui.mouse_pressed) audio_pref.requestDevice(if (row == 0) "" else device_name);
+        }
+    }
+    if (has_scroll) _ = ui.scrollbarV(9526, list_x + list_w - sb_w, list_y, sb_w, list_h, &sw.audio_device_scroll, content_h, list_h);
+    // 下一行从**列表底部**算起（原写法 `yy += list_h + 8` 漏了标题行那 16px，
+    // “当前：…”会压在列表最下面一行上）
+    yy = list_y + list_h + 8;
+
     if (audio_pref.saved) {
-        ui.label("已保存，重启后生效", x + 14, yy + 42, ui.theme.text);
+        // 只有**后端**变更会走到这里（设备变更已立即生效）
+        ui.label("已保存，后端切换重启后生效", x + 14, yy, ui.theme.text);
     } else {
-        var cb: [64]u8 = undefined;
-        ui.label(std.fmt.bufPrint(&cb, "当前：{s}", .{audio_pref.label(audio_pref.current)}) catch "", x + 14, yy + 42, ui.theme.text_dim);
+        var cb: [320]u8 = undefined;
+        const selection = audio_pref.shown();
+        const device = if (selection.deviceName().len == 0) "系统默认" else selection.deviceName();
+        ui.label(std.fmt.bufPrint(&cb, "当前：{s} · {s}", .{ audio_pref.label(selection.backend), device }) catch "", x + 14, yy, ui.theme.text_dim);
     }
 
     return util.inRect(ui.mouse_x, ui.mouse_y, x, y, ww, hh);

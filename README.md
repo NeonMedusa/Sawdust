@@ -54,6 +54,8 @@ scoop install sawdust
 - **预设库**：合成器 / 效果器参数的扫描、保存、删除与覆盖确认
 - **MIDI 导入 / 导出**：导入（多轨合并；通道声像映射到乐器、音符声像居中）；
   导出（轨首 CC10 = 乐器声像）；单测覆盖解析 / 写出的往返
+- **音频输出 / 导出**：设置页可选择后端与播放设备（重启生效）；离线导出 WAV、MP3、
+  FLAC、OGG，MP3/OGG 可选码率、FLAC 可选压缩等级（压缩格式需系统 FFmpeg）
 - **工程**：`.saw`（JSON）保存 / 加载、打开 / 新建（空）的未保存提醒、
   **操作历史**（面板跳转 / Ctrl+Z / Ctrl+Alt+Z；播放中撤销不中断播放）
 
@@ -64,16 +66,21 @@ scoop install sawdust
   多输出 VSTi（SFLT）/ 扫描管理器 + 预设浏览器）
 - [x] 音频文件（WAV/MP3）加载与波形缓存（音频样式 / 音频片段 / 波形窗 / 采样器层，
   见 `docs/audio-files.md`）
+- [ ] 自动化曲线（声像、音量、颤音、bpm变速等等等，还有 MIDI 通道声像的完整还原）
+  —— 🚧 正在 `automation` 分支上开发（未同步到 main）
+- [ ] 更多效果器（合唱 / 失真 / 滤波器……）
+- [ ] 将自带的减法合成器升级成更强大的波表合成器，用合成器捏出一整套midi标准乐器音色
+- [ ] 音频录制（麦克风 / 线路输入 → 采样层与音频片段）
+- [ ] asio支持
+- [ ] MIDI 键盘/控制器输入与音符录制（设备枚举与热插拔 / 实时 thru 试听 /
+  播放中录音符：量化、力度、声像 / 循环叠录）
 - [ ] 音频内存：**P3a** i16 / 保留单声道存储（2~4×）+ 字节预算闸门；
   （流式播放与热集 LRU 已评估，**延后**；峰值懒算已作废——详见 `docs/audio-files.md` §8）
 - [ ] 性能打磨（长工程滚动、打开/保存耗时、内存峰值）
-- [ ] 自动化曲线（声像、音量、颤音、bpm变速等等等，还有 MIDI 通道声像的完整还原）
-- [ ] 音频、音符录制
-- [ ] 将自带的减法合成器升级成更强大的波表合成器
-- [ ] 更多效果器（合唱 / 失真 / 滤波器……）
 - [x] 跨平台：**Linux（X11）已支持**（在 WSLg 上开发并验证，**尚未在真机 Linux 上实测**，见 [`docs/linux.md`](docs/linux.md)）；
   macOS 未开始
-- [ ] asio支持
+- [x] **DPI 感知的 UI 缩放**（100%~300%；高分屏/系统缩放不再“全部很小”，见 [`docs/ui-scaling.md`](docs/ui-scaling.md)；
+  `SAWDUST_UI_SCALE=1.5` 可手动指定）
 
 ## 构建与运行
 
@@ -102,6 +109,32 @@ zig translate-c -I libs/stb       libs/stb/stb_truetype.h    > src/c/stb_truetyp
 `zig-vst3/src/root.zig`），**不跑它的 `build.zig`**——这样既不碰网络，也不受它自身
 构建 API 与 Zig 版本同步的影响。
 
+## 开发约定（提交代码前请读）
+
+**只使用 Zig。** 第三方库可以是 C 语言实现，但必须按下面这套既有方式引入：
+
+- 头文件用 `zig translate-c` **预生成绑定并入库**（`src/c/*.zig`；构建期零网络、零翻译步骤）；
+- C 实现走 `addCSourceFile`（`libs/*/*_impl.c`）；
+- 参考样例：miniaudio → `src/c/miniaudio*.zig`、stb_truetype → `src/c/stb_truetype.zig`
+  （生成命令见上面「构建与运行」）。
+
+**克隆即可离线编译，产物是单个二进制。** 干净克隆（`--recursive`）后，
+只要本机装有**对应版本的 Zig** 就能完整构建并运行，**构建期不需要联网**：
+不在 `build.zig` 里拉依赖包、不跑子项目的 `build.zig`、不调外部命令生成代码
+（第三方源码与 `zig translate-c` 预生成绑定一律入库）。
+
+编译产物必须是**单个可直接运行的可执行文件**（Windows 为 `Sawdust.exe`）：
+不引入需要随程序分发的 DLL / 资源文件 / 解释器 / 运行时（Linux 仅依赖系统自带的
+动态库，如 X11，见 `docs/linux.md`）。首次运行会在 exe 同目录自动创建 `data/`
+（设置 / 预设 / 日志）——那是**运行期数据**，不是构建产物。
+
+**运行期数据只允许落在 `data/`。** 设置、预设、日志、缓存、插件扫描结果……
+一切运行时写入都必须放在 `<exe 同目录>/data/` 下，**不允许写到工作目录、用户主目录
+或系统其它位置**。唯一例外是**用户自己选择的路径**（导出音频、保存/打开工程、导入采样）。
+
+**临时文件放进被忽略的目录：** `tmp/` 与 `workspace/` 已被 `.gitignore` 排除，
+草稿、生成物、调试数据、导出的音频都往这两处放，不要污染工作树。
+
 ## 架构
 
 | 文件 | 职责 |
@@ -128,6 +161,8 @@ zig translate-c -I libs/stb       libs/stb/stb_truetype.h    > src/c/stb_truetyp
 VST3 宿主见 `docs/plugin-hosting.md`；**Zig 0.17 迁移实录**见 `docs/zig-017-migration.md`；
 **播放中编辑的调度与释音协议**见 `docs/scheduler-protocol.md`（不变量 / 事件生命期 / 重扫门控 / 诊断字段）；
 **内存 / CPU / 二进制体积账本**见 `docs/resources.md`（池化现状 / 优化 backlog / 发布口径矩阵 / `.rodata` 初值镜像坑）；
+**UI 缩放（DPI）**见 `docs/ui-scaling.md`（逻辑像素单点乘算 / 字体按 DPI 光栅化 / 环境变量覆盖）；
+**拖动 / 吸附 / Alt 细调**见 `docs/drag-snap.md`（八条不变式 / `GridRebase` 量化与重锚 / 橡皮筋与饱和点 / 八条手势路径对照）；
 **自动化（参数曲线）的模型与计划**见 `docs/automation.md`（点 + 每段插值 / 两种编辑视图 / 存取与历史纪律）。
 **线性工作流改造（轨道 + 片段，线性 DAW 风格）的设计稿**见 `docs/linear-refactor.md`。
 
@@ -161,3 +196,7 @@ VST3 宿主见 `docs/plugin-hosting.md`；**Zig 0.17 迁移实录**见 `docs/zig
 ## 许可证
 
 MIT
+
+## 交流
+
+**Sawdust 编作曲交流群（QQ）：1130996634** —— 使用问题、报 bug、提需求、交流编曲都可以在这里（虽然群主经常失踪，但交流依然会比提issues更即时一些）。

@@ -95,7 +95,7 @@ zig build -Dcpu=baseline -Doptimize=ReleaseFast # 日常用这个：明显更流
 |---|---|
 | **Wayland 桌面上的 XWayland**（主流发行版默认开启） | ✅ 能用：窗口/输入/剪贴板/拖放/插件编辑器全走 X11 路径；MIT-SHM 零拷贝也正常（同机同 IPC 命名空间） |
 | **中文输入（XIM）** | ❌ XWayland 不为裸 XIM 客户端做输入法桥接（GTK/Qt 走 `text-input` 协议），所以 Wayland 桌面下 XIM 多半仍不可用 |
-| HiDPI / 分数缩放 | ⚠️ 只能跟着 XWayland 的整数缩放 |
+| HiDPI / 分数缩放 | ✅ 已支持：UI 按 DPI 自动放大（`Xft.dpi` → 物理尺寸估算），分数字号也能手动指定 `SAWDUST_UI_SCALE=1.5`；详见 [`ui-scaling.md`](ui-scaling.md) |
 | 插件编辑器 | ⚠️ Linux 插件（JUCE 等）本来就是 X11 嵌入 → 即使主窗口做成原生 Wayland，插件仍要 XWayland |
 
 **结论**：Wayland 桌面**现在就能用**（经 XWayland），不急做原生后端。
@@ -103,13 +103,14 @@ zig build -Dcpu=baseline -Doptimize=ReleaseFast # 日常用这个：明显更流
 但收益仅限主窗口（插件仍需 XWayland），优先级排在 IME 与音频之后。
 
 ### 音频后端
-- 当前调用是 `ma_device_init(null, …)` → miniaudio 按内置优先级选：
-  **pulseaudio → alsa → jack**（见 `libs/miniaudio/miniaudio.h` 的后端优先级表）。
+- 设置页已可选**自动 / PulseAudio / ALSA / JACK**，并列出该后端枚举到的全部播放
+  设备；选择保存后在下次启动用对应设备初始化。设备暂时不存在时安全回退系统默认。
+- 自动模式由 miniaudio 按内置优先级选：**pulseaudio → alsa → jack**
+  （见 `libs/miniaudio/miniaudio.h` 的后端优先级表）。
 - **JACK 已经是运行时 `dlopen`**（绑定里是 `jack_client_open: ma_proc = null`），
   所以**编译期不需要 jack 头文件/库**，机器上装了 libjack 或 `pipewire-jack` 就能用。
 - PipeWire 现在就能用（`pipewire-pulse` 模拟 Pulse）；想要原生低延迟需走 JACK 接口（pipewire-jack）。
-- 待做：**设置里选后端**（自动 / PulseAudio / ALSA / JACK）+ 采样率/缓冲自适应
-  （JACK 的周期由服务端决定，`ma_device_init` 后要读回实际值）。
+- 待做：采样率/缓冲自适应（JACK 的周期由服务端决定，`ma_device_init` 后要读回实际值）。
 
 ## 4. 已实现能力（按子系统）
 
@@ -194,6 +195,8 @@ zig build test --summary all
 
 ## 7. 测试要点（改动后自查）
 
+0. **HiDPI / 缩放**：`xrandr --dpi 192` 或 `SAWDUST_UI_SCALE=2` 重开程序——工具栏/状态栏/行高/
+   字号物理尺寸应与 100% 一致、文字不糊、点击位置准确（详见 [`ui-scaling.md`](ui-scaling.md)）；
 1. 缩放窗口 / 最大化 / 中文标题；
 2. 推子（BPM、缩放）拖动是否匀速跟手；旋钮是否正常；
 3. 滚轮：播放列表 / 混音台 / 效果器列表；Ctrl+滚轮、Shift+滚轮；

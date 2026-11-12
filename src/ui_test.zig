@@ -32,6 +32,31 @@ test "ui: 自绘下拉箭头——逐行收窄、不越界（替代缺字的 ▾
     try std.testing.expect(buf[6 * 20 + 2] != col); // 不越到第 5 行以下
 }
 
+test "ui: 旋钮圆弧跟随 UI 缩放（DPI）——不能画到左上角原位" {
+    var buf: [80 * 80]u32 = undefined;
+    @memset(&buf, 0);
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 80, .height = 80 };
+    var ui = makeUi(&fb);
+    ui.renderer.scale = 2.0;
+    var v: f32 = 0.5;
+    // 逻辑 (20,20) 尺寸 20 → 物理 (40,40)-(79,79) 内
+    _ = ui.knob(1, &v, 20, 20, 20);
+    var phys: usize = 0;
+    var stray: usize = 0;
+    for (buf, 0..) |c, i| {
+        if (c == 0) continue;
+        const x = i % 80;
+        const y = i / 80;
+        if (x < 40 or y < 40) {
+            stray += 1;
+        } else {
+            phys += 1;
+        }
+    }
+    try std.testing.expect(stray == 0); // 旧 bug：逐点描点漏乘 scale → 全落在左上角
+    try std.testing.expect(phys > 40); // 圆弧 + 中心点确实画了
+}
+
 test "view_util: 网格标签不带 ▾（字体缺字；箭头自绘）" {
     var buf: [24]u8 = undefined;
     try std.testing.expectEqualStrings("网格 1/2", view_util.snapLabel(&buf, 1));

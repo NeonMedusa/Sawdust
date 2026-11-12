@@ -189,6 +189,26 @@ var x_error_count: u32 = 0;
 extern "X11" fn XOpenDisplay(name: ?[*:0]const u8) ?*Display;
 extern "X11" fn XCloseDisplay(dpy: ?*Display) c_int;
 extern "X11" fn XDefaultScreen(dpy: ?*Display) c_int;
+extern "X11" fn XResizeWindow(dpy: ?*Display, win: c_ulong, w: c_uint, h: c_uint) c_int;
+extern "X11" fn XDisplayWidth(dpy: ?*Display, screen: c_int) c_int;
+extern "X11" fn XDisplayWidthMM(dpy: ?*Display, screen: c_int) c_int;
+extern "X11" fn XDisplayHeight(dpy: ?*Display, screen: c_int) c_int;
+extern "X11" fn XResourceManagerString(dpy: ?*Display) ?[*:0]const u8;
+extern "X11" fn XrmGetStringDatabase(data: [*:0]const u8) ?*anyopaque;
+extern "X11" fn XrmDestroyDatabase(db: *anyopaque) void;
+extern "X11" fn XrmGetResource(db: *anyopaque, name: [*:0]const u8, cls: [*:0]const u8, out_type: *?[*:0]const u8, out_val: *?[*:0]const u8) c_int;
+
+/// 从 X 资源里取 `Xft.dpi`（没有 → null）。X 资源串形如 `Xft.dpi:\t144\n...`
+fn xrmGetDpi(dpy: ?*Display) ?f32 {
+    const res = XResourceManagerString(dpy) orelse return null;
+    const db = XrmGetStringDatabase(res) orelse return null;
+    defer XrmDestroyDatabase(db);
+    var vtype: ?[*:0]const u8 = null;
+    var val: ?[*:0]const u8 = null;
+    if (XrmGetResource(db, "Xft.dpi", "Xft.Dpi", &vtype, &val) == 0) return null;
+    const s = val orelse return null;
+    return std.fmt.parseFloat(f32, std.mem.span(s)) catch null;
+}
 extern "X11" fn XDefaultVisual(dpy: ?*Display, screen: c_int) ?*Visual;
 extern "X11" fn XDefaultDepth(dpy: ?*Display, screen: c_int) c_int;
 extern "X11" fn XRootWindow(dpy: ?*Display, screen: c_int) XWindow;
@@ -527,8 +547,44 @@ pub const X11Window = struct {
         return s;
     }
 
+    /// 按**逻辑尺寸**设客户端大小（物理 = 逻辑 × scale）：开机按 DPI 把初始窗口调成 1280×760 逻辑。
+    pub fn setClientSizeLogical(self: *X11Window, w: i32, h: i32, scale: f32) void {
+        const dpy = self.dpy orelse return;
+        var pw: u32 = @intFromFloat(@round(@as(f32, @floatFromInt(w)) * scale));
+        var ph: u32 = @intFromFloat(@round(@as(f32, @floatFromInt(h)) * scale));
+        // 不出屏（缩放很高的真 HiDPI 屏幕上 1280×760 逻辑可能超过可用区域）
+        const screen = XDefaultScreen(dpy);
+        const sw: u32 = @intCast(@max(320, XDisplayWidth(dpy, screen) - 80));
+        const sh: u32 = @intCast(@max(240, XDisplayHeight(dpy, screen) - 120));
+        pw = @min(pw, sw);
+        ph = @min(ph, sh);
+        _ = XResizeWindow(dpy, self.win, pw, ph);
+        _ = XFlush(dpy);
+    }
+
     pub fn dropPoint(self: *X11Window) ?types.DropPoint {
         return self.drop_pt;
+    }
+
+    /// **DPI 缩放**（物理像素 / 96）。X11 没有统一的 DPI API，按优先级：
+    /// 1. `Xft.dpi` 资源（Xsettings 常见做法，整数或浮点都见过）；
+    /// 2. 显示器像素宽 / 物理毫米宽估算；
+    /// 3. 1.0（= 1080p 的旧行为）。
+    pub fn dpiScale(self: *const X11Window) f32 {
+        const dpy = self.dpy orelse return 1.0;
+        // ① Xft.dpi
+        if (xrmGetDpi(dpy)) |dpi| {
+            if (dpi >= 48.0 and dpi <= 960.0) return dpi / 96.0;
+        }
+        // ② 用屏幕物理尺寸估算
+        const screen = XDefaultScreen(dpy);
+        const px_w: i32 = @intCast(XDisplayWidth(dpy, screen));
+        const mm_w: i32 = @intCast(XDisplayWidthMM(dpy, screen));
+        if (px_w > 0 and mm_w > 0) {
+            const dpi = @as(f32, @floatFromInt(px_w)) * 25.4 / @as(f32, @floatFromInt(mm_w));
+            if (dpi >= 48.0 and dpi <= 960.0) return dpi / 96.0;
+        }
+        return 1.0;
     }
 
     pub fn takeDropped(self: *X11Window) ?[]u8 {
@@ -712,6 +768,7 @@ pub const X11Window = struct {
         return .{
             .ctrl = (self.last_mask & ControlMask) != 0,
             .shift = (self.last_mask & ShiftMask) != 0,
+            .alt = (self.last_mask & Mod1Mask) != 0,
         };
     }
 

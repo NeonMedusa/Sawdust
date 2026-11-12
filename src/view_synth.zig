@@ -78,7 +78,6 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         sw.open = false;
         return true;
     };
-
     // 阴影 + 背景 + 边框
     ui.renderer.fillRect(x + 3, y + 3, ww, hh, r_mod.rgb(10, 11, 13));
     ui.renderer.fillRect(x, y, ww, hh, ui.theme.panel);

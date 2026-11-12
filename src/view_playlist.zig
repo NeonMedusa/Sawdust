@@ -760,8 +760,18 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 鼠标 → 内容坐标（除以 zoom）→ **全局步**（U=96）
     const mouse_cx: f32 = @as(f32, @floatFromInt(app.playlist.scroll_x)) + @as(f32, @floatFromInt(ui.mouse_x - lane_x)) / zoom;
     const step_i: i32 = @max(0, @as(i32, @intFromFloat(mouse_cx / step_px)));
-    // 量化/吸附格（步）——片段移动/拉伸对齐到它
-    const snap_steps: i32 = model.snapSteps(app.playlist.snap);
+    // **拖动位移（步）**：用**鼠标像素位移**算，而不是“内容步相减”——
+    // 横向滚动有补间（`scroll_x` 每帧滑向 target）、Ctrl+滚轮还能改 `zoom`：
+    // 此时鼠标不动 `step_i` 也会变，位移会冒假初值（实测：“抓右端往左拖，片段先拉长再缩”）。
+    const px_per_step: f32 = step_px * zoom;
+    const drag_steps: i32 = if (px_per_step <= 0)
+        0
+    else
+        @intFromFloat(@round(@as(f32, @floatFromInt(ui.mouse_x - app.playlist.drag_down_x)) / px_per_step));
+    // 量化/吸附格（步）——**片段移动/拉伸/放置**对齐到它；
+    // 按住 **Alt** = **1 步**（最细网格，1/96 小节）——单选/选区批量/放置即拖拽均生效。
+    // （只影响编辑，不影响网格绘制——否则一按 Alt 网格就变密，视觉炸开）
+    const snap_steps: i32 = if (ui.mods_alt) 1 else model.snapSteps(app.playlist.snap);
     const snap_step: i32 = @max(0, model.snapRound(step_i, snap_steps));
     const valid_track = track_i >= 0 and track_i < rows_draw;
 
@@ -939,7 +949,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             app.playlist.resize_orig_start = c.start;
             app.playlist.resize_orig_len = c.len;
             app.playlist.resize_orig_trim = c.trim_start;
-            app.playlist.resize_down_step = step_i;
+            app.playlist.rebase.reset(snap_steps);
             // 拖动死区：先记录按下位置；超过阈值才真正编辑（防单击吸附）
             app.playlist.drag_armed = false;
             app.playlist.drag_down_x = ui.mouse_x;
@@ -951,16 +961,13 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 app.beginClipBatchSnap();
                 app.beginDragSnaps(null); // 批量移动：记下所有选中片段的旧位置
                 app.playlist.drag_batch = true;
-                app.playlist.batch_down_step = step_i;
                 app.playlist.batch_down_track = track_i;
-                app.playlist.preview_rows = rows_draw;
+                app.playlist.rebase.reset(snap_steps);
                 app.history_pending = "批量移动片段"; // 松手时 coalesce 提交
             } else if (batch_sel) {
                 app.beginClipBatchSnap();
                 app.beginDragSnaps(null); // 批量拉伸：同上
                 app.playlist.batch_trim = true;
-                app.playlist.batch_trim_down_step = step_i;
-                app.playlist.batch_trim_grid = @max(1, snap_steps);
                 app.playlist.resize_left = hit.mode == .left;
                 app.history_pending = "批量拉伸片段";
             } else {
@@ -984,7 +991,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                     .body => {
                         app.playlist.drag_clip = hit.index;
                         app.beginDragSnaps(hit.index);
-                        app.playlist.drag_grab = step_i - c.start;
+                        app.playlist.rebase.reset(snap_steps);
                     },
                 }
             }
@@ -1022,11 +1029,17 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 if (dx * dx + dy * dy >= 3 * 3) app.playlist.drag_armed = true;
             }
             if (app.playlist.drag_armed) {
-                const d_step = model.snapRound(step_i - app.playlist.batch_down_step, snap_steps);
-                const d_track = track_i - app.playlist.batch_down_track;
+                const d_raw = app.playlist.rebase.applied(drag_steps, snap_steps);
+                const d_trk_raw = track_i - app.playlist.batch_down_track;
+                // **组级钳制**（与松手提交同源）：最左片段撞轨道头时全组一起停，保持相对位置
+                // （与音符批量拖动的设计一致）。纵向只钳上界 0——行轴向下无限延伸。
+                // 旧写法把**未钳制**的原始位移存进预览，而绘制时逐片段 `@max(0, …)` → 压扁成一堆。
+                const d = app.clampClipBatchDelta(d_raw, d_trk_raw);
+                // **钳住时重锚**：撞到轨道头后继续拖的超额行程必须丢掉（否则松 Alt 会跳）
+                if (d.step != d_raw) app.playlist.rebase.settle(drag_steps, snap_steps, d_raw, d.step);
                 // **只更新预览**，松手才真正移动（拖动期间调度器看到的仍是旧位置）
-                app.playlist.preview_batch_step = d_step;
-                app.playlist.preview_batch_track = d_track;
+                app.playlist.preview_batch_step = d.step;
+                app.playlist.preview_batch_track = d.track;
             }
         }
         // ── 批量拉伸（选区 ≥ 2 边缘拖动；全组同步，与音符一致）──
@@ -1037,14 +1050,15 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 if (dx * dx + dy * dy >= 3 * 3) app.playlist.drag_armed = true;
             }
             if (app.playlist.drag_armed) {
-                const g = app.playlist.batch_trim_grid;
-                // 位移 → 格数（左缘：左移为正、右缘：右移为正；与单片段增量式一致）
-                const delta = if (app.playlist.resize_left)
-                    app.playlist.batch_trim_down_step - step_i // 左缘：左移为正（加长）
+                // 累计位移（网格重锚：拖动中按住/松开 Alt 不跳）
+                const raw = if (app.playlist.resize_left)
+                    -drag_steps // 左缘：左移为正（加长）
                 else
-                    step_i - app.playlist.batch_trim_down_step; // 右缘：右移为正（加长）
-                const k = model.gridSteps(delta, g);
-                _ = app.applyClipBatchTrim(k, g, app.playlist.resize_left);
+                    drag_steps; // 右缘：右移为正（加长）
+                const delta = app.playlist.rebase.applied(raw, snap_steps);
+                const applied = app.applyClipBatchTrim(delta, snap_steps, ui.mods_alt, app.playlist.resize_left);
+                // **钳住时重锚**：丢弃超额行程（否则松 Alt 后会跳一段）
+                app.playlist.rebase.settle(raw, snap_steps, delta, applied);
                 _ = app.syncDragSnaps(); // 播放中改时间 → 旧实例释音 + 重扫
             }
         }
@@ -1060,10 +1074,17 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             if (app.playlist.drag_clip) |ci| {
                 if (ci < app.clips.items.len) {
                     const c = app.clips.items[ci];
-                    // **目标位置**吸附到网格（而非鼠标位置——抓取点不在格上时会脱格）
-                    const target = @max(0, step_i - app.playlist.drag_grab);
-                    const new_start = @max(0, model.snapRound(target, snap_steps));
-                    const new_track = std.math.clamp(track_i, 0, rows_draw - 1);
+                    // **增量式**（与批量拖动完全一致）：网格 = **每次位移的步长**，
+                    // 起点 = 原起点 + 量化后的位移 → 片段相对网格的偏移被保留。
+                    // （旧写法把“结果位置”直接喂给 snapRound → 绝对值吸附：
+                    //  起点不在网格上的片段一拖就被“传送”到网格线，实测 bug）
+                    const d_step = app.playlist.rebase.applied(drag_steps, snap_steps);
+                    const want = c.start + d_step;
+                    const new_start = @max(0, want);
+                    // **钳住时重锚**（同上）
+                    if (new_start != want) app.playlist.rebase.settle(drag_steps, snap_steps, d_step, new_start - c.start);
+                    // 轨道：向上到 0 为止；**向下不限**（行轴无限延伸，放下去地图就长）
+                    const new_track = @max(0, track_i);
                     // **只写预览**：拖动期间不动模型（音频零干扰，松手一次性提交）
                     var pc = c;
                     pc.start = new_start;
@@ -1075,27 +1096,47 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             if (app.playlist.resize_clip) |ci| {
                 if (ci < app.clips.items.len) {
                     const c = app.clips.items[ci];
-                    const min_len = model.trimMinGridLen(app.playlist.resize_orig_len, snap_steps);
+                    // 当前预览值（片段是预览式，模型未变）——拉伸判据的锚点
+                    const cur = if (app.playlist.preview_idx == ci) (app.playlist.preview_clip orelse c) else c;
+                    // 拉伸下限：**判据跟 Alt 走，锚在当前长度**——
+                    // 不按 Alt：整格剥；按 Alt：自由到 1 步。
+                    const min_len: i32 = model.trimFloorLen(cur.len, snap_steps, ui.mods_alt);
+                    // 左缘能往外拉多少：**到“硬边界”为止，不按网格取整**——
+                    // 边界 = 时间轴 0 与**内容开头**（样式片段看 `offset`，音频看 trim 头）的最小值。
+                    // 为什么不能取整：取整后如果剩余空隙不足一格，就永远拉不到“片段开头”
+                    // （用户实测：想要不按 Alt 也能拉出完整的头）。
+                    // 量化仍按网格走（位移是格），超额时由这个上限**截停在边界上**。
+                    const head_room: i32 = if (c.isAudio())
+                        @intCast(@divTrunc(@as(i64, cur.trim_start), @as(i64, @intCast(app.framesPerStep()))))
+                    else
+                        cur.offset;
+                    const room: i32 = @max(0, @min(cur.start, head_room));
                     if (app.playlist.resize_left) {
                         // 左缘：右端固定；长度增量式（鼠标左移 = 拉长）
                         const right = app.playlist.resize_orig_start + app.playlist.resize_orig_len;
-                        const delta = app.playlist.resize_down_step - step_i; // 左移为正（拉长）
-                        const len = @min(model.trimLenByGrid(app.playlist.resize_orig_len, delta, snap_steps), right);
+                        const delta = app.playlist.rebase.applied(-drag_steps, snap_steps); // 左移为正（拉长）
+                        const want = app.playlist.resize_orig_len + delta;
+                        const len_cap = @min(right, cur.len + room);
+                        const len = @min(@max(min_len, want), len_cap);
+                        // **钳住时重锚**：丢弃超额行程（否则松 Alt 后会跳一段）
+                        if (len != want) app.playlist.rebase.settle(-drag_steps, snap_steps, delta, len - app.playlist.resize_orig_len);
                         if (c.isAudio()) {
                             // 音频片段：**整个音频的一个切片**（用户拍板）——
                             // 左缘拖动 = 采样内起点（入点）；到音频开头即不能再往左
                             // （len 增长受 trim_start 余量限制；波形不压缩、被裁）
-                            const delta2 = app.playlist.resize_down_step - step_i; // 左移为正（拉长）
-                            var alen = model.trimLenByGrid(app.playlist.resize_orig_len, delta2, snap_steps);
+                            var alen = @max(min_len, want);
                             const fps: i64 = @intCast(app.framesPerStep());
                             const head_steps: i32 = @intCast(@divTrunc(@as(i64, app.playlist.resize_orig_trim), fps));
                             const max_len = app.playlist.resize_orig_len + head_steps;
                             if (alen > max_len) alen = max_len;
-                            alen = @min(alen, right);
+                            alen = @min(alen, len_cap);
+                            if (alen != want) app.playlist.rebase.settle(-drag_steps, snap_steps, delta, alen - app.playlist.resize_orig_len);
                             const new_start = right - alen;
                             const dsteps: i64 = @as(i64, new_start) - @as(i64, app.playlist.resize_orig_start);
                             const nts = std.math.clamp(@as(i64, app.playlist.resize_orig_trim) + dsteps * fps, 0, @max(0, @as(i64, if (app.clipAudioData(c)) |d| @as(i32, @intCast(d.engFrames())) else 1) - 1));
-                            if (nts != c.trim_start or new_start != c.start or alen != c.len) {
+                            // **无条件写预览**（即使等于原值）——否则“拖回原值”那一帧不写，
+                            // 屏幕/`cur` 会停在上一帧的值上 → “拉一格不动、拉两格跳两格”。
+                            {
                                 var pc = c;
                                 pc.trim_start = @intCast(nts);
                                 pc.start = new_start;
@@ -1106,17 +1147,21 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                             }
                         } else if (model.clipTrimLeft(c, right - len, min_len)) |nc| {
                             // 叠放实验：不再拦截重叠
-                            if (nc.start != c.start or nc.len != c.len or nc.offset != c.offset) {
-                                app.playlist.preview_idx = ci;
-                                app.playlist.preview_clip = nc;
-                            }
+                            if (nc.len != want) app.playlist.rebase.settle(-drag_steps, snap_steps, delta, nc.len - app.playlist.resize_orig_len);
+                            // **无条件写预览**：拖回“原值”那一帧也要写，否则画面停在上一帧（拉不动/跳两格）
+                            app.playlist.preview_idx = ci;
+                            app.playlist.preview_clip = nc;
                         }
                     } else {
-                        // 右缘：长度 = **原长 + k×格**（网格决定增减步长）
+                        // 右缘：长度 = **原长 + 累计位移**（网格只决定每帧增量）
                         // 叠放实验：不再限“同轨下一片段之前”，也不再拦截重叠
-                        const delta = step_i - app.playlist.resize_down_step;
-                        const new_len = @max(min_len, model.trimLenByGrid(app.playlist.resize_orig_len, delta, snap_steps));
-                        if (new_len != c.len) {
+                        const delta = app.playlist.rebase.applied(drag_steps, snap_steps);
+                        const want = app.playlist.resize_orig_len + delta;
+                        const new_len = @max(min_len, want);
+                        // **钳住时重锚**（同上）
+                        if (new_len != want) app.playlist.rebase.settle(drag_steps, snap_steps, delta, new_len - app.playlist.resize_orig_len);
+                        // **无条件写预览**（拖回原值那一帧也要写）——否则画面/`cur` 会停在上一帧
+                        {
                             var pc = c;
                             pc.len = new_len;
                             app.playlist.preview_idx = ci;
@@ -1377,8 +1422,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 }
             },
             .paste => {
-                // 粘贴到**鼠标位置**（步吸附网格；**轨道不变**——回原轨道）
-                const n = app.pasteClips(snap_step, rows_draw);
+                // 粘贴到**鼠标位置**（步吸附网格；**轨道原样恢复**，行轴向下无限延伸）
+                const n = app.pasteClips(snap_step);
                 if (n > 0) {
                     app.setToastWith("已粘贴 {d} 个片段", .{n});
                     app.commitHistory("粘贴片段");

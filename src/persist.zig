@@ -267,7 +267,7 @@ pub const SavedInstrument = struct {
     mixer: i32 = 0,
     /// MIDI 通道（0-15；-1 = 无；旧存档缺失 → -1）
     midi_channel: i32 = -1,
-    /// 乐器类型（0 = synth / 1 = drumkit；旧存档缺失 → 0）
+    /// 乐器类型（0 = synth / 1 = drumkit / 2 = VST3；旧存档缺失 → 0）
     kind: u32 = 0,
     /// 键盘列模式（0 = 钢琴/1 = 鼓组；每乐器独立；旧存档缺失 → 0）
     key_mode: u32 = 0,
@@ -282,7 +282,7 @@ pub const SavedInstrument = struct {
     plugin_cid: []const u8 = "",
     /// 鼓组数据（`kind == 1` 时有效；空 = 无）
     kit: SavedDrumKit = .{},
-    /// 合成器参数（synth 类型用；鼓组类型的“本体”不使用）
+    /// 合成器参数（减法合成器使用；鼓组类型的“本体”不使用）
     synth: SavedSynth = .{},
 };
 

@@ -38,10 +38,12 @@ pub const MouseButton = enum { left, right, middle };
 /// 所以“当前鼠标位置”是陈的——必须用拖放协议自己给的坐标（X11: XdndPosition / Win32: DragQueryPoint）。
 pub const DropPoint = struct { x: i32, y: i32 };
 
-/// 修饰键状态（每帧由 main 从窗口读取；框选/批量操作用）
+/// 修饰键状态（每帧由 main 从窗口读取；框选/批量操作/Alt 细拖用）
 pub const Modifiers = struct {
     ctrl: bool = false,
     shift: bool = false,
+    /// Alt（Windows: VK_MENU；X11: Mod1）
+    alt: bool = false,
 };
 
 /// 帧缓冲：BGRA 像素（与 Win32 的 32 位 DIB 格式一致，可直接 blit）

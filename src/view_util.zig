@@ -519,7 +519,7 @@ pub fn middleEllipsis(ui: *Ui, buf: []u8, text: []const u8, max_px: i32) []const
         const j = @min(i + cl, text.len);
         const cp = std.unicode.utf8Decode(text[i..j]) catch 0xFFFD;
         offs[n] = i;
-        wid[n] = if (ui.font.getGlyph(cp)) |g| g.advance else ui.font.size_px * 0.5;
+        wid[n] = ui.font.advanceLogical(cp);
         n += 1;
         i = j;
     }

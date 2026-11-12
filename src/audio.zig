@@ -42,6 +42,20 @@ const audio_pref = @import("audio_pref.zig");
 /// 每乐器每个分段发送给 VSTi 的事件上限（超出的丢弃；宁可丢事件也不分配）
 pub const vsti_batch_max = 256;
 
+/// 设置页展示的播放设备。ID 只在当前 miniaudio context 的生存期内使用，偏好层只保存名称。
+pub const PlaybackDevice = struct {
+    id: ma.ma_device_id = std.mem.zeroes(ma.ma_device_id),
+    name: [256]u8 = @splat(0),
+    name_len: usize = 0,
+    is_default: bool = false,
+
+    pub fn label(self: *const PlaybackDevice) []const u8 {
+        return self.name[0..self.name_len];
+    }
+};
+
+const playback_device_cap = 64;
+
 /// 一个“发声时长”记录：某个（乐器, 音高）从 start 一直响到 start+len 步。
 /// `hung` = 超过看门狗阈值（只是**标记**，默认不会强制释音）。
 pub const LongRec = struct {
@@ -735,6 +749,13 @@ pub const Engine = struct {
     allocator: std.mem.Allocator = undefined,
     sample_rate: u32 = 0,
     initialized: bool = false,
+    /// **当前实际在用的**播放设备名（"" = 系统默认）：
+    /// 热切换失败时用它回滚；与 `audio_pref.current` 可能不同（存的设备找不到时）
+    active_device: [audio_pref.device_name_cap]u8 = @splat(0),
+    active_device_len: usize = 0,
+    /// 当前后端枚举到的播放设备；给设置页读，ID 仅在 `ctx` 有效期间传入初始化配置。
+    playback_devices: [playback_device_cap]PlaybackDevice = @splat(.{}),
+    playback_device_n: usize = 0,
     /// 每乐器一个声部池（**仅音频线程访问**；堆分配——32 池 × 256 声部体积可观）
     synths: []synth.Synth = &.{},
     /// **乐器级增益/声像的块率平滑值**（仅音频线程读写）：
@@ -857,34 +878,154 @@ pub const Engine = struct {
         // 调音台缓冲 / EQ 阵列：**已在 setCapacity 里按 cc/sc 分配（含旧帧状态拷贝）**，
         // 这里不再重复分配（那是历史上泄漏 1 MB + 280 KB 的根源）。
 
-        var config = ma.ma_device_config_init(ma.ma_device_type_playback);
-        config.playback.format = ma.ma_format_f32;
-        config.playback.channels = 2;
-        config.sampleRate = 0; // 0 = 用设备默认
-        config.dataCallback = dataCallback;
-        config.pUserData = self; // 引擎实例（回调里取 params + synths）
-
-        // 后端：显式选中时建 context（失败自动回退默认）；`.auto` 走 null 让 miniaudio 自己挑
+        // 无论是否手选后端都建立 context：既让 miniaudio 选默认后端，又能枚举播放设备。
+        // 设备列表在启动时枚举一次，之后**打开设置页时**会再刷新（热插拔能看到）。
         var ctx_ptr: ?*ma.ma_context = null;
-        if (audio_pref.maBackend(audio_pref.current)) |mb| {
+        if (audio_pref.maBackend(audio_pref.current.backend)) |mb| {
             var backends = [_]c_uint{mb};
             if (ma.ma_context_init(&backends, 1, null, &self.ctx) == ma.MA_SUCCESS) {
                 self.ctx_ok = true;
                 ctx_ptr = &self.ctx;
             } else {
-                std.debug.print("[audio] 后端 {s} 不可用 -> 回退自动\n", .{audio_pref.label(audio_pref.current)});
+                std.debug.print("[audio] 后端 {s} 不可用 -> 回退自动\n", .{audio_pref.label(audio_pref.current.backend)});
             }
         }
-        if (ma.ma_device_init(ctx_ptr, &config, &self.device) != ma.MA_SUCCESS) {
-            return error.AudioInitFailed;
+        if (ctx_ptr == null and ma.ma_context_init(null, 0, null, &self.ctx) == ma.MA_SUCCESS) {
+            self.ctx_ok = true;
+            ctx_ptr = &self.ctx;
         }
+        var device_i: ?usize = null;
+        if (ctx_ptr) |_| {
+            self.refreshPlaybackDevices();
+            device_i = self.preferredPlaybackDevice();
+            if (device_i == null and audio_pref.current.deviceName().len > 0) {
+                std.debug.print("[audio] 输出设备“{s}”未找到 -> 回退系统默认\n", .{audio_pref.current.deviceName()});
+            }
+        }
+        // 启动时 `sample_rate = 0` ＝ 用设备默认；之后热切换会锁定它（见 switchPlaybackDevice）
+        self.startDeviceOn(device_i, 0) catch |e| {
+            if (self.ctx_ok) {
+                _ = ma.ma_context_uninit(&self.ctx);
+                self.ctx_ok = false;
+            }
+            return e;
+        };
         self.sample_rate = self.device.sampleRate;
         params.sample_rate = self.device.sampleRate; // UI 读取用（帧 → 步换算）
+    }
+
+    /// 返回设置页可展示的播放设备快照（**打开设置页时刷新**：运行中新插的设备也能出现）。
+    pub fn playbackDevices(self: *const Engine) []const PlaybackDevice {
+        return self.playback_devices[0..self.playback_device_n];
+    }
+
+    /// 重新枚举当前 context 的播放设备（设备 ID 仅在当次 context 有效）。
+    pub fn refreshPlaybackDevices(self: *Engine) void {
+        self.playback_device_n = 0;
+        var infos: [*c]ma.ma_device_info = null;
+        var count: ma.ma_uint32 = 0;
+        if (ma.ma_context_get_devices(&self.ctx, &infos, &count, null, null) != ma.MA_SUCCESS or infos == null) return;
+        const n: usize = @min(@as(usize, @intCast(count)), playback_device_cap);
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const info = infos[i];
+            const name_len = std.mem.indexOfScalar(u8, &info.name, 0) orelse info.name.len;
+            self.playback_devices[i] = .{
+                .id = info.id,
+                .name = info.name,
+                .name_len = name_len,
+                .is_default = info.isDefault != 0,
+            };
+        }
+        self.playback_device_n = n;
+    }
+
+    fn preferredPlaybackDevice(self: *const Engine) ?usize {
+        return self.findPlaybackDevice(audio_pref.current.deviceName());
+    }
+
+    /// 按名称找设备下标（`name.len == 0` 或找不到 → null = 系统默认）
+    fn findPlaybackDevice(self: *const Engine, name: []const u8) ?usize {
+        if (name.len == 0) return null;
+        for (self.playbackDevices(), 0..) |device, i| {
+            if (std.mem.eql(u8, name, device.label())) return i;
+        }
+        return null;
+    }
+
+    /// 构造播放设备配置（`init` 与热切换**共用**，保证两条路径参数一致）。
+    /// `sample_rate = 0` → 用设备默认（仅首次启动）；热切换传当前值以**锁定采样率**。
+    fn playbackConfig(self: *Engine, device: ?usize, sample_rate: u32) ma.ma_device_config {
+        var config = ma.ma_device_config_init(ma.ma_device_type_playback);
+        config.playback.format = ma.ma_format_f32;
+        config.playback.channels = 2;
+        config.sampleRate = sample_rate;
+        config.dataCallback = dataCallback;
+        config.pUserData = self; // 引擎实例（回调里取 params + synths）
+        if (device) |i| config.playback.pDeviceID = &self.playback_devices[i].id;
+        return config;
+    }
+
+    /// 在指定设备上初始化并启动 `ma_device`（失败时把设备资源清干净）。
+    fn startDeviceOn(self: *Engine, device: ?usize, sample_rate: u32) !void {
+        var config = self.playbackConfig(device, sample_rate);
+        if (ma.ma_device_init(&self.ctx, &config, &self.device) != ma.MA_SUCCESS) return error.AudioInitFailed;
+        // 锁定的采样率必须被采纳：否则音高/速度会整体跑偏（插件与效果器都按它初始化）
+        if (sample_rate != 0 and self.device.sampleRate != sample_rate) {
+            ma.ma_device_uninit(&self.device);
+            return error.SampleRateMismatch;
+        }
         if (ma.ma_device_start(&self.device) != ma.MA_SUCCESS) {
             ma.ma_device_uninit(&self.device);
             return error.AudioStartFailed;
         }
         self.initialized = true;
+        self.setActiveDevice(if (device != null) self.playback_devices[device.?].label() else "");
+    }
+
+    /// 记录“实际在用的设备名”（回滚与提示用）
+    fn setActiveDevice(self: *Engine, name: []const u8) void {
+        self.active_device_len = 0;
+        for (name) |c| {
+            if (self.active_device_len >= self.active_device.len) break;
+            self.active_device[self.active_device_len] = c;
+            self.active_device_len += 1;
+        }
+    }
+
+    pub fn activeDevice(self: *const Engine) []const u8 {
+        return self.active_device[0..self.active_device_len];
+    }
+
+    /// **热切换输出设备**（同一后端内）：锁定当前采样率重建 `ma_device`，
+    /// 引擎/插件/效果器状态一概不动（它们全按当前 sr 初始化）。
+    /// - `name.len == 0` → 系统默认设备；名字找不到也当默认（与启动时一致）；
+    /// - 失败自动回滚到原设备并把错误抛给调用方（UI 提示）；
+    /// - 新设备给不出当前采样率 / 启动失败 → 视为失败（不默默换 sr）。
+    pub fn switchPlaybackDevice(self: *Engine, name: []const u8) !void {
+        if (!self.initialized or !self.ctx_ok) return error.NotInitialized;
+        const prev_len = self.active_device_len;
+        var prev: [audio_pref.device_name_cap]u8 = @splat(0);
+        @memcpy(prev[0..prev_len], self.active_device[0..prev_len]);
+
+        self.refreshPlaybackDevices();
+        const target = self.findPlaybackDevice(name);
+
+        // 停旧设备（回调退出后才返回——`pauseDevice/resumeDevice` 已在导出路径验证）
+        _ = ma.ma_device_stop(&self.device);
+        ma.ma_device_uninit(&self.device);
+        self.initialized = false;
+
+        self.startDeviceOn(target, self.sample_rate) catch |e| {
+            // 回滚到原设备（同一个锁定采样率）
+            const back = self.findPlaybackDevice(prev[0..prev_len]);
+            self.startDeviceOn(back, self.sample_rate) catch {
+                std.debug.print("[audio] 切换设备失败（{s}）且回滚失败：将静音直至重启\n", .{@errorName(e)});
+                return error.AudioInitFailed;
+            };
+            std.debug.print("[audio] 切换设备失败（{s}）：已回滚到“{s}”\n", .{ @errorName(e), self.activeDevice() });
+            return e;
+        };
     }
 
     /// 暂停/恢复音频设备（离线导出用：期间实时回调完全停走，渲染由导出循环独占）。

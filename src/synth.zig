@@ -58,6 +58,8 @@ pub const Waveform = enum(u8) {
     }
 };
 
+/// 波形种类数。读取端一律 `% waveform_count`（`render` / `view_synth`）：
+/// `OscParams.waveform` 是裸 `u8`（可直接写 JSON/原子量），取模是唯一的边界检查。
 pub const waveform_count: u8 = 5;
 
 /// 振荡器数量（2×2 布局）
@@ -521,7 +523,8 @@ pub fn renderBalanced(
 
     // 包络参数（每块读一次）
     const a_sec = mapTime(params.attack.load(.monotonic));
-    const d_sec = mapTime(params.decay.load(.monotonic));
+    const decay_param = std.math.clamp(params.decay.load(.monotonic), 0, 1);
+    const d_sec = mapTime(decay_param);
     const r_sec = mapTime(params.release.load(.monotonic));
     const sustain = std.math.clamp(params.sustain.load(.monotonic), 0, 1);
 
