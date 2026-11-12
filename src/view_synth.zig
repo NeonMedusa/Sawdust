@@ -78,11 +78,6 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         sw.open = false;
         return true;
     };
-    const piano_target = switch (sw.target) {
-        .instrument => |ii| ii >= 0 and ii < @as(i32, @intCast(app.instruments.items.len)) and app.instruments.items[@intCast(ii)].kind == .piano,
-        .kit_layer_replace => false,
-    };
-
     // 阴影 + 背景 + 边框
     ui.renderer.fillRect(x + 3, y + 3, ww, hh, r_mod.rgb(10, 11, 13));
     ui.renderer.fillRect(x, y, ww, hh, ui.theme.panel);
@@ -98,7 +93,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
             else
                 null;
             const iname: []const u8 = if (inst_ptr) |it| it.name else "（无乐器）";
-            const kind_label: []const u8 = if (inst_ptr != null and inst_ptr.?.kind == .vst3) "VST3 乐器" else if (inst_ptr != null and inst_ptr.?.kind == .piano) "钢琴" else "减法合成器";
+            const kind_label: []const u8 = if (inst_ptr != null and inst_ptr.?.kind == .vst3) "VST3 乐器" else "减法合成器";
             break :blk std.fmt.bufPrint(&tbuf, "{s} — {s}", .{ kind_label, iname }) catch "乐器";
         },
         .kit_layer_replace => |ref| blk: {
@@ -250,29 +245,6 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
                     drawVst3Body(ui, app, ly.plugin, disp, ly.pluginPath(), ly.load_failed, .{ .kind = .kit_layer, .a = @intCast(@max(0, ref.instrument)), .b = slot }, 9800 + @as(u64, slot), &sw.param_scroll, x, y, ww, hh);
                 }
             },
-        }
-        return util.inRect(ui.mouse_x, ui.mouse_y, x, y, ww, hh);
-    }
-
-    if (piano_target) {
-        ui.label("钢琴音色", x + 12, body_y + 12, ui.theme.text_dim);
-        ui.label("弦振动 · 击弦起音 · 自然衰减", x + 12, body_y + 38, ui.theme.text);
-        const labels = [_][]const u8{ "起音", "衰减", "松键余音" };
-        const knobs = [_]*std.atomic.Value(f32){ &p.attack, &p.decay, &p.release };
-        const kw = @divTrunc(ww - 40, 3);
-        for (labels, 0..) |label_text, ki| {
-            const kx = x + 20 + @as(i32, @intCast(ki)) * kw;
-            const ky = body_y + 86;
-            var v = knobs[ki].load(.monotonic);
-            if (ui.knob(5300 + @as(u64, ki), &v, kx + @divTrunc(kw - knob_size, 2), ky, knob_size)) {
-                knobs[ki].store(v, .monotonic);
-                app.history_pending = "调整钢琴音色";
-            }
-            ui.label(label_text, kx + 4, ky + knob_size + 6, ui.theme.text_dim);
-            var vb: [16]u8 = undefined;
-            const vt = fmtSeconds(&vb, synth.mapTime(v));
-            const vw: i32 = @intFromFloat(ui.font.measure(vt));
-            ui.label(vt, kx + @divTrunc(kw - vw, 2), ky + knob_size + 18, ui.theme.text_dim);
         }
         return util.inRect(ui.mouse_x, ui.mouse_y, x, y, ww, hh);
     }

@@ -18,7 +18,6 @@ pub const extension = ".sawpreset";
 /// 当前唯一支持预设的插件类型（将来的内置合成器/第三方各有自己的）
 pub const plugin_subtractive = "subtractive";
 pub const plugin_drumkit = "drumkit";
-pub const plugin_piano = "piano";
 
 /// 内建效果器的预设分类 id（单效果预设；EQ/混响/延迟/压缩）
 pub const plugin_fx_eq = "fx_eq";
@@ -51,7 +50,6 @@ pub fn vst3CidFromCategory(id: []const u8) ?[]const u8 {
 pub fn pluginDisplayName(id: []const u8) []const u8 {
     if (std.mem.eql(u8, id, plugin_subtractive)) return "减法合成器";
     if (std.mem.eql(u8, id, plugin_drumkit)) return "鼓组";
-    if (std.mem.eql(u8, id, plugin_piano)) return "钢琴";
     if (std.mem.eql(u8, id, plugin_fx_eq)) return "EQ 参量均衡";
     if (std.mem.eql(u8, id, plugin_fx_reverb)) return "混响";
     if (std.mem.eql(u8, id, plugin_fx_delay)) return "延迟";
@@ -71,7 +69,6 @@ pub fn nameFromSource(src: []const u8) []const u8 {
 pub fn defaultPresetLabel(plugin: []const u8) []const u8 {
     if (std.mem.eql(u8, plugin, plugin_subtractive)) return "（默认音色）";
     if (std.mem.eql(u8, plugin, plugin_drumkit)) return "（默认套鼓）";
-    if (std.mem.eql(u8, plugin, plugin_piano)) return "（默认钢琴）";
     if (std.mem.startsWith(u8, plugin, vst3_prefix)) return "（默认音色）";
     if (std.mem.eql(u8, plugin, plugin_fx_eq) or std.mem.eql(u8, plugin, plugin_fx_reverb) or
         std.mem.eql(u8, plugin, plugin_fx_delay) or std.mem.eql(u8, plugin, plugin_fx_compressor)) return "（默认参数）";
@@ -79,7 +76,7 @@ pub fn defaultPresetLabel(plugin: []const u8) []const u8 {
 }
 /// 首次运行创建的分类骨架（仅作提示；实际以扫描到的目录为准）
 /// 注：VST3 分类由扫描缓存合成（`vst3_<cid>`），不再建 "vst3" 占位目录
-pub const skeleton_dirs = [_][]const u8{ plugin_subtractive, "drumkit", plugin_piano, plugin_fx_eq, plugin_fx_reverb, plugin_fx_delay, plugin_fx_compressor };
+pub const skeleton_dirs = [_][]const u8{ plugin_subtractive, "drumkit", plugin_fx_eq, plugin_fx_reverb, plugin_fx_delay, plugin_fx_compressor };
 /// 名字长度上限（字节）
 pub const max_name_len = 64;
 

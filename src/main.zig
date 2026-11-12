@@ -1928,8 +1928,7 @@ fn applyFxParams(es: *app_mod.EffectSlot, file: ?*const preset_mod.File) void {
 fn applyInstrumentChoice(app: *App, ii: i32, plugin: []const u8, file: ?*const preset_mod.File, patch_name: []const u8) void {
     if (ii < 0 or ii >= @as(i32, @intCast(app.instruments.items.len))) return;
     const is_kit = std.mem.eql(u8, plugin, preset_mod.plugin_drumkit);
-    const is_piano = std.mem.eql(u8, plugin, preset_mod.plugin_piano);
-    const kind: model.InstrumentKind = if (is_kit) .drumkit else if (is_piano) .piano else .synth;
+    const kind: model.InstrumentKind = if (is_kit) .drumkit else .synth;
     const kind_changed = app.changeInstrumentKind(@intCast(ii), kind, false);
     if (is_kit) {
         if (file) |f| {
@@ -1953,24 +1952,6 @@ fn applyInstrumentChoice(app: *App, ii: i32, plugin: []const u8, file: ?*const p
             app.commitHistory("重置音色");
             app.setToast("已重置为空套鼓（可撤销）");
         }
-        return;
-    }
-    if (is_piano) {
-        const inst = &app.instruments.items[@intCast(ii)];
-        if (file) |f| {
-            persist.importSynth(&f.synth, inst.synth);
-            inst.synth.piano_mode.store(true, .monotonic);
-            _ = app.setInstrumentPresetName(@intCast(ii), patch_name);
-        } else {
-            _ = app.setInstrumentPresetName(@intCast(ii), "");
-            inst.synth.piano_mode.store(true, .monotonic);
-            inst.synth.attack.store(0.02, .monotonic);
-            inst.synth.decay.store(0.80, .monotonic);
-            inst.synth.sustain.store(0.0, .monotonic);
-            inst.synth.release.store(0.18, .monotonic);
-        }
-        app.commitHistory(if (kind_changed) "更换乐器" else "重置音色");
-        app.setToast("已切换为钢琴");
         return;
     }
     // 减法：应用音色（文件）或默认基准
@@ -1998,19 +1979,6 @@ fn applyInstrumentChoice(app: *App, ii: i32, plugin: []const u8, file: ?*const p
 
 /// 新建乐器（机架「＋ 添加乐器」）
 fn createInstrumentChoice(app: *App, plugin: []const u8, file: ?*const preset_mod.File, patch_name: []const u8) void {
-    if (std.mem.eql(u8, plugin, preset_mod.plugin_piano)) {
-        const ni = app.addPianoInstrument();
-        if (ni >= 0) {
-            if (file) |f| {
-                persist.importSynth(&f.synth, app.instruments.items[@intCast(ni)].synth);
-                app.instruments.items[@intCast(ni)].synth.piano_mode.store(true, .monotonic);
-                _ = app.setInstrumentPresetName(@intCast(ni), patch_name);
-            }
-        }
-        app.commitHistory("添加乐器");
-        app.setToast("已添加钢琴");
-        return;
-    }
     if (std.mem.eql(u8, plugin, preset_mod.plugin_drumkit)) {
         const ni = app.addDrumkit("鼓组");
         if (ni >= 0) {

@@ -153,7 +153,7 @@ pub const Instrument = struct {
 pub const KeyMode = enum(u8) { piano = 0, drum = 1 };
 
 /// 乐器类型
-pub const InstrumentKind = enum(u8) { synth = 0, drumkit = 1, vst3 = 2, piano = 3 };
+pub const InstrumentKind = enum(u8) { synth = 0, drumkit = 1, vst3 = 2 };
 
 /// 鼓组层的乐器类型（层 = 乐器槽）：减法合成器 / VST3 乐器；
 /// 采样器/FM 将来实装。**不含鼓组**——禁止自嵌套（`docs/drumkit.md` §7）。

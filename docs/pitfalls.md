@@ -1325,6 +1325,22 @@ const names = if (total == 1) first.? else
   不是代码里的版本号。未提交、未发布、无外部文件的版本 = 零兼容义务，可直接改形。
 - **完整约定**见 AGENTS.md《版本与兼容纪律》；当前实例见 docs/save-format.md
   《v4 未发布——定型自由度》。
+
+### 存档里的枚举值：读取端必须取模/回退（不靠枚举收窄）
+
+**事实**：`OscParams.waveform` 与 `SavedInstrument.kind` 存的都是**裸整数**
+（`u8` / `u32`，可直接原子读写/写 JSON）。这类字段的取值可能来自**旧文件、旧预设、
+手改过的 JSON**，所以：
+
+1. **波形**：读取端（`synth.render` / `view_synth`）一律 `% waveform_count`。
+   **绝不要直接 `@fromBackingInt(u8)`**——越界枚举在 ReleaseFast 下是未定义行为
+   （可能直接干出越界下标）。
+2. **乐器类型**：保持 `u32`，未知值落 `else` → 按减法合成器处理。
+   **不要**改成枚举去“显式报错”：
+   能静默打开 > 报一个用户无法修复的错。
+
+**教训**：增删枚举成员的真正成本不在枚举自己，而在**所有“存档 → 枚举”的入口**——
+改动前先 `git grep` 一遍 `.load(.monotonic)` / `importSynth`。
 ## Linux / X11（WSLg 实测踩坑）
 
 > 背景：Linux 移植（X11 后端 + 自绘选择器 + VST3 宿主）期间的实测教训。

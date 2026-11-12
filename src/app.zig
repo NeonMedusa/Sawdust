@@ -2855,12 +2855,6 @@ pub const App = struct {
             }
             self.importDrumKit(&si.kit, target.kit.?, self.instrumentIndexOf(target), prev_idx, target_idx);
             target.kind = .drumkit;
-        } else if (si.kind == 3) {
-            if (target.kit) |kit| {
-                self.deinitDrumKit(kit);
-                target.kit = null;
-            }
-            target.kind = .piano;
         } else {
             if (target.kit) |kit| {
                 self.deinitDrumKit(kit);
@@ -2999,20 +2993,6 @@ pub const App = struct {
         inst.kind = .drumkit;
         inst.key_mode = .drum; // 鼓组默认键列就是鼓名（用户可切回）
         self.ensureKitPool(@intCast(idx)); // 惰性池：创建即分配（试听立即可用）
-        return idx;
-    }
-
-    /// 新建独立钢琴乐器，参数不影响减法合成器的默认音色。
-    pub fn addPianoInstrument(self: *App) i32 {
-        const idx = self.addInstrument("钢琴");
-        if (idx < 0) return idx;
-        const inst = &self.instruments.items[@intCast(idx)];
-        inst.kind = .piano;
-        inst.synth.piano_mode.store(true, .monotonic);
-        inst.synth.attack.store(0.02, .monotonic);
-        inst.synth.decay.store(0.80, .monotonic);
-        inst.synth.sustain.store(0.0, .monotonic);
-        inst.synth.release.store(0.18, .monotonic);
         return idx;
     }
 
@@ -4312,7 +4292,6 @@ pub const App = struct {
                     .drumkit => preset_mod.plugin_drumkit,
                     .vst3 => self.vst3InstrumentCategory(inst),
                     .synth => preset_mod.plugin_subtractive,
-                    .piano => preset_mod.plugin_piano,
                 };
             },
         };
@@ -4342,11 +4321,10 @@ pub const App = struct {
     }
 
     /// 该插件是否可作为**乐器本体**（新建/更换/预设面板选中 → 建或换）：
-    /// 减法合成器 / 鼓组（已实装）；FM/VST3 将来。
+    /// 减法合成器 / 鼓组（已实装）；VST3 走插件分类。
     pub fn pluginSupportedAsInstrument(plugin: []const u8) bool {
         return std.mem.eql(u8, plugin, preset_mod.plugin_subtractive) or
-            std.mem.eql(u8, plugin, preset_mod.plugin_drumkit) or
-            std.mem.eql(u8, plugin, preset_mod.plugin_piano);
+            std.mem.eql(u8, plugin, preset_mod.plugin_drumkit);
     }
 
     /// 该插件是否可作为**鼓垫层**：减法合成器 + VST3 乐器分类
@@ -4915,7 +4893,6 @@ pub const App = struct {
                     inst.kit = null;
                 }
                 inst.kind = .synth;
-                inst.synth.piano_mode.store(false, .monotonic);
                 inst.key_mode = .piano; // 键列模式随类型回默认（与下方 .drumkit 对称）
             },
             .drumkit => {
@@ -4926,19 +4903,6 @@ pub const App = struct {
                 }
                 inst.kind = .drumkit;
                 inst.key_mode = .drum;
-            },
-            .piano => {
-                if (inst.kit) |kit| {
-                    self.deinitDrumKit(kit);
-                    inst.kit = null;
-                }
-                inst.kind = .piano;
-                inst.key_mode = .piano;
-                inst.synth.piano_mode.store(true, .monotonic);
-                inst.synth.attack.store(0.02, .monotonic);
-                inst.synth.decay.store(0.80, .monotonic);
-                inst.synth.sustain.store(0.0, .monotonic);
-                inst.synth.release.store(0.18, .monotonic);
             },
             .vst3 => return false, // 换入 VST3 走预设面板的插件分类（或插件管理加单文件）
         }
@@ -12759,10 +12723,9 @@ test "app: 预设面板分类可选性——统一面板（任意入口可选任
     try std.testing.expect(app.presetCategorySelectable(.{ .replace = .{ .kit_layer_replace = layer_ref } }, preset_mod.plugin_subtractive));
     try std.testing.expect(!app.presetCategorySelectable(.{ .replace = .{ .kit_layer_replace = layer_ref } }, preset_mod.plugin_drumkit));
 
-    // 新建/更换乐器：减法 + 鼓组 + 钢琴；unknown/vst3 不可选
+    // 新建/更换乐器：减法 + 鼓组；unknown/vst3 不可选
     try std.testing.expect(app.presetCategorySelectable(.create_instrument, preset_mod.plugin_subtractive));
     try std.testing.expect(app.presetCategorySelectable(.create_instrument, preset_mod.plugin_drumkit));
-    try std.testing.expect(app.presetCategorySelectable(.create_instrument, preset_mod.plugin_piano));
     try std.testing.expect(!app.presetCategorySelectable(.create_instrument, "future_synth"));
     try std.testing.expect(!app.presetCategorySelectable(.{ .change_instrument = syn }, "vst3"));
 
@@ -12827,25 +12790,6 @@ test "app: 更换乐器——synth⇄鼓组（保留属性、可撤销/重做）
         try std.testing.expectEqual(model.InstrumentKind.drumkit, it.kind);
         try std.testing.expectEqual(@as(usize, 1), it.kit.?.totalLayers());
     }
-}
-
-test "app: 新建钢琴使用独立音色，不改变合成器默认值" {
-    var app = App{ .allocator = std.testing.allocator };
-    defer app.clips.deinit(app.allocator);
-    defer app.notes.deinit(app.allocator);
-    defer app.deinitAll();
-    app.resetPatterns(1);
-    app.resetMixerChannels(default_mixer_channels);
-    const syn = app.addInstrument("减法合成器");
-    const piano = app.addPianoInstrument();
-    try std.testing.expect(syn >= 0 and piano >= 0);
-    try std.testing.expectEqual(model.InstrumentKind.synth, app.instruments.items[@intCast(syn)].kind);
-    try std.testing.expectEqual(@as(u8, 0), app.instruments.items[@intCast(syn)].synth.osc[0].waveform.load(.monotonic));
-    const p = app.instruments.items[@intCast(piano)].synth;
-    try std.testing.expectEqual(model.InstrumentKind.piano, app.instruments.items[@intCast(piano)].kind);
-    try std.testing.expect(p.piano_mode.load(.monotonic));
-    try std.testing.expectEqual(@as(u8, 0), p.osc[0].waveform.load(.monotonic));
-    try std.testing.expectEqual(@as(f32, 0.0), p.sustain.load(.monotonic));
 }
 
 test "app: 鼓组——清空后的无名空垫自动移除（有名垫保留）；蓝点/强调条语义" {
