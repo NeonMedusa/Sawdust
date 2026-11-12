@@ -450,7 +450,7 @@ const Snapshot = struct {
 ### 11.4 风险清单
 
 1. **快照回收 UAF** → 退役队列 + 断言（沿用 `retired_plugins` 那套“30 帧后回收”）；
-2. **循环/跳转/SONG↔PAT 切换**的语义（现在的 `switchMode` 差分）→ 用“gen + start_step”在新模型里重新表达，并保位不释音；
+2. **循环/跳转/SONG↔PAT 切换**的语义（旧 `switchMode` 差分）→ 已用“gen + start_step”在新模型里重新表达并保位不释音——**设计与规则见 [`docs/song-pat.md`](song-pat.md)**（该栈分工：本文只讲调度协议）；
 3. **VSTi / CC 事件的逐采样定时** → 从快照生成参数事件时保持 sample-accurate；
 4. **长工程内存** → 桶数组分页，不整曲分配；
 5. **音频线程零分配** → block 内只用栈/预分配缓冲。
