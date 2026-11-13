@@ -20,6 +20,51 @@ const view_lane = @import("view_lane.zig");
 const view_note_lane = @import("view_note_lane.zig");
 const KeyMode = @import("app.zig").KeyMode;
 
+/// 命中容差（像素）。
+///
+/// **为什么需要**：1 步在 `zoom ≤ 8` 时不足/恰为 1px，而“像素→步”的命中
+/// （`topmostNoteAt(pattern, instrument, pitch, step)`）要求步号**精确相等**——
+/// 棋盘上能算出的步号在 zoom 1 时只能是 8 的倍数，于是 1 步音符 7/8 的位置
+/// 永远点不中（实测：同一画面里有的能点、有的不能；框选却能选中）。
+/// 现在 hover / 按下 / 拖动 / 右键擦除**全部**走这里的像素邻近判据。
+const note_hit_tol_px: f32 = 4.0;
+
+/// 鼠标处的音符命中（像素邻近）：取**中心最近**者，等距取数组序更大者（= 顶层，
+/// 与 `topmostNoteAt` 的“叠放取顶层”一致）。命中窗口 = 音符本体（至少 1px）±容差。
+fn noteAtMousePx(
+    app: *const App,
+    mx: i32,
+    my: i32,
+    lane_x: i32,
+    lane_y: i32,
+    step_ws: f32,
+    scroll_s: f32,
+    kh: i32,
+    scroll: i32,
+    pattern: i32,
+) ?usize {
+    if (kh <= 0 or step_ws <= 0) return null;
+    const pitch: i32 = 127 - @divFloor(my - lane_y + scroll, kh);
+    if (pitch < 0 or pitch > 127) return null;
+    const mx_f: f32 = @as(f32, @floatFromInt(mx - lane_x));
+    var best: ?usize = null;
+    var best_d: f32 = std.math.floatMax(f32);
+    for (app.notes.items, 0..) |n, i| {
+        if (n.pattern != pattern or n.instrument != app.sel.instrument or n.pitch != pitch) continue;
+        const x0: f32 = @as(f32, @floatFromInt(n.step)) * step_ws - scroll_s;
+        const x1: f32 = @as(f32, @floatFromInt(n.step + n.len)) * step_ws - scroll_s;
+        const lo: f32 = @min(x0, x1);
+        const hi: f32 = @max(@max(x0, x1), lo + 1.0); // 本体至少 1px（与绘制一致）
+        if (mx_f < lo - note_hit_tol_px or mx_f > hi + note_hit_tol_px) continue;
+        const d: f32 = @abs(mx_f - (lo + hi) * 0.5);
+        if (d <= best_d) {
+            best_d = d;
+            best = i;
+        }
+    }
+    return best;
+}
+
 pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     const pattern = app.piano.pattern orelse return;
     var title_buf: [64]u8 = undefined;
@@ -97,7 +142,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     const lane_h = lay.content_h; // 音符区高度
     // 每小节步数由**拍号**决定（动态；App 字段）
     const spb: i32 = app.steps_per_bar;
-    const bar_w = spb * util.piano_step_w;
+    const bar_w = util.barPx(spb);
     // 量化/吸附格（步）——网格绘制、标尺/循环区拖动用它（**固定为配置档位**）。
     const snap_steps: i32 = model.snapSteps(app.piano.snap);
     // **编辑吸附**：按住 **Alt** = **1 步**（最细网格，1/96 小节）。
@@ -144,8 +189,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 if (nmini >= mini_buf.len) break;
                 if (n.pattern != pattern or n.instrument != app.sel.instrument) continue;
                 mini_buf[nmini] = .{
-                    .pos = n.step * util.piano_step_w,
-                    .len = @max(util.piano_step_w, n.len * util.piano_step_w),
+                    .pos = @intFromFloat(@round(@as(f32, @floatFromInt(n.step)) * util.pianoStepPx())),
+                    .len = @max(1, @as(i32, @intFromFloat(@round(@as(f32, @floatFromInt(n.len)) * util.pianoStepPx())))),
                     .kind = .note,
                     .y = 1.0 - range.yOf(n.pitch),
                     .color = ui.theme.waveform,
@@ -154,7 +199,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             }
         }
         // 防误触：滑块外单击 / 滚动条上滚轮 = 移动"一个当前网格"（Ctrl+单击才是直接定位）
-        ui.scrollbar_nudge = model.snapSteps(app.piano.snap) * util.piano_step_w;
+        // 注：步进像素不能为 0（最细网格 1 步 = 0.125 px）→ 兜底 4px，否则"点一下没反应"
+        ui.scrollbar_nudge = @max(4, @as(i32, @intFromFloat(@round(@as(f32, @floatFromInt(model.snapSteps(app.piano.snap))) * util.pianoStepPx()))));
         ui.scrollbar_target = &app.piano.scroll_x_target; // 步进走补间（拖动仍直接写 scroll_x）
         _ = ui.scrollbarTimelineEx(10, x + 1, hsb_y, w - 2, ruler_h, &app.piano.scroll_x, min_content, &app.piano.zoom, view_w, dyn_zoom_min, 8.0, bars_right < util.overhang_map_limit, mini_buf[0..nmini]);
     }
@@ -165,7 +211,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 横向滚动**帧首快照**：网格/编辑区共用一个口径（本帧横向缩放补间在绘制之后——
     // 若编辑区现读 `app.piano.scroll_x` 会领先一帧：左缘网格线闪动，实测“没有补间”感）
     const scroll_x0: i32 = app.piano.scroll_x;
-    const step_ws: f32 = @as(f32, @floatFromInt(util.piano_step_w)) * zoom; // 屏幕上的步宽
+    const step_ws: f32 = util.pianoStepPx() * zoom; // 屏幕上的步宽
     const bar_ws: f32 = @as(f32, @floatFromInt(bar_w)) * zoom; // 屏幕上的小节宽
     const scroll_s: f32 = @as(f32, @floatFromInt(app.piano.scroll_x)) * zoom; // 屏幕上的滚动量
 
@@ -202,7 +248,12 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     const mouseLocalStepSnap = struct {
         fn f(mx: i32, lx: i32, scroll_x: i32, zm: f32, spb_v: i32, bar_w_v: i32, snap: i32) i32 {
             const cpx: i32 = scroll_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(mx - lx)) / zm));
-            const raw: i32 = @max(0, @divFloor(cpx * spb_v, bar_w_v));
+            // **i64 中间值 + 安全上限**：缩得很小时 `cpx`（内容像素）可达数十万，× `spb`（3840）直接
+            // 冲出 i32（实测：缩到上万小节后乱画 → integer overflow panic）。
+            // 上限取 2^28 步（≈ 7 万小节）——留够余量给 `snapRound` 里的 `+ 半格` 与后续相加。
+            const step_cap: i64 = 1 << 28;
+            const raw64: i64 = @divFloor(@as(i64, @max(0, cpx)) * @as(i64, spb_v), @as(i64, @max(1, bar_w_v)));
+            const raw: i32 = @intCast(std.math.clamp(raw64, 0, step_cap));
             return @max(0, model.snapRound(raw, snap));
         }
     }.f;
@@ -214,7 +265,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         defer ui.renderer.popClip(saved);
         var bar: i32 = @divFloor(app.piano.scroll_x, bar_w) + 1;
         // 小节数字**分级渲染**（1-2-5 系列）：标签太密时只显 1、2、5、10… 的切点
-        const label_step: i32 = util.barLabelStep(bar_ws, 40);
+        const label_step: i32 = util.barLabelEveryBars(bar_ws);
         while (true) : (bar += 1) {
             const bx = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(bar - 1)) * bar_ws - scroll_s));
             if (bx > main_x + main_w) break;
@@ -425,9 +476,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             ui.renderer.hline(lane_x, py, view_w, if (@mod(p, 12) == 0) ui.theme.panel_border else ui.theme.grid);
         }
 
-        // 时间轴网格（与播放列表共用 `util.drawTimelineGrid`；U=96 对齐）。
+        // 时间轴网格（与播放列表共用 `util.drawTimelineGrid`）。
         // 该函数内部自行裁剪到音符区；网格层 = 当前量化档位（非固定步线），
-        // 拍线/小节线常显（各自按密度门槛降级）。
+        // 拍线/小节线常显；太密集时按“密度减半”分级（见 `drawLayer`）。
         util.drawTimelineGrid(
             &ui.renderer,
             &ui.theme,
@@ -438,7 +489,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             lane_x,
             scroll_x0,
             zoom,
-            @floatFromInt(util.piano_step_w),
+            util.pianoStepPx(), // 一步的**内容像素宽**（0.125；传整小节像素会把网格画到屏外）
             spb,
             model.stepsPerBeat(app.time_den),
             snap_steps,
@@ -762,16 +813,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     const in_lane = !menu_click and ui.hitRect(lane_x, lane_y, view_w, lane_h - 3);
     // 鼠标 → 内容坐标（除以 zoom）→ 步号
     const mouse_cx: i32 = app.piano.scroll_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(ui.mouse_x - lane_x)) / zoom));
-    const step_i = @divFloor(mouse_cx, util.piano_step_w);
-    // **拖动位移（步）**：用**鼠标像素位移**算，而不是“内容步相减”——
-    // 横向滚动有补间（`scroll_x` 每帧滑向 target），Ctrl+滚轮还能改 `zoom`：
-    // 这两种情况下鼠标不动、`step_i` 也会变，位移会冒出一个假初值
-    // （实测 bug：“抓右端往左拖，音符先往右长再缩”）。像素位移与它们无关。
-    const px_per_step: f32 = @as(f32, @floatFromInt(util.piano_step_w)) * zoom;
-    const drag_steps: i32 = if (px_per_step <= 0)
-        0
-    else
-        @intFromFloat(@round(@as(f32, @floatFromInt(ui.mouse_x - app.piano.drag_down_x)) / px_per_step));
+    const step_i: i32 = @intFromFloat(@floor(@as(f32, @floatFromInt(mouse_cx)) / util.pianoStepPx()));
     // 吸附后的步（放置/移动/拉伸/粘贴锚点都用它——受 Alt 细拖影响）
     const snap_step: i32 = @max(0, model.snapRound(step_i, edit_snap));
     const pitch_i = 127 - @divFloor(ui.mouse_y - lane_y + app.piano.scroll, app.piano.key_h);
@@ -858,9 +900,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 注：框选手势期间不命中（框选优先）
     var note_hit: ?struct { index: usize, mode: model.NoteHitMode } = null;
     if (in_lane and !app.piano.marquee_active and !ui.mods_ctrl) {
-        // 叠放（与片段同规则，用户拍板）：命中取**最顶层**
-        // （左端越右越上；同左端取数组序最大）
-        if (model.topmostNoteAt(app.notes.items, pattern, app.sel.instrument, pitch_i, step_i)) |ni| {
+        // **像素邻近命中**（见 `noteAtMousePx`）：旧版按 (音高,步) 精确匹配，
+        // 1 步音符在 zoom≤8 时大部分位置永远命中不到（实测：hover/拖动/擦除均失效）。
+        if (noteAtMousePx(app, ui.mouse_x, ui.mouse_y, lane_x, lane_y, step_ws, scroll_s, app.piano.key_h, app.piano.scroll, pattern)) |ni| {
             const n = app.notes.items[ni];
             const nx = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(n.step)) * step_ws - scroll_s));
             const nw = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(n.len)) * step_ws)));
@@ -901,9 +943,12 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // **起点在空白鼓面 → 按住拖动 = 擦除划过的一切**（与旧行为相同）
     // **点在空白处**（没命中音符）→ 取消选区（与左键点空白的语义一致）
     if (!menu_click and ui.mouse_right_pressed and ui.hitRect(main_x, lane_y, main_w, lane_h)) {
-        if (note_hit != null) {
+        if (note_hit) |nht| {
             app.playlist.erase_drag = false; // 起点有内容：拖动不再擦
-            if (app.eraseNotesAt(pattern, app.sel.instrument, pitch_i, step_i, .topmost) > 0) {
+            // 用**命中音符自己的 (音高,步)** 去套叠放擦除——像素命中只负责“指向哪个格”，
+            // 格的叠放语义（`.topmost` / `.all`）仍由 `eraseNotesAt` 提供。
+            const nh = app.notes.items[nht.index];
+            if (app.eraseNotesAt(pattern, app.sel.instrument, nh.pitch, nh.step, .topmost) > 0) {
                 app.piano.drag_note = null;
                 app.history_pending = "擦除音符";
             }
@@ -917,11 +962,14 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         if (!ui.mouse_right_down) {
             app.playlist.erase_drag = false;
         } else if (in_lane and pitch_i >= 0 and pitch_i <= 127 and !app.piano.marquee_active and !ui.mods_ctrl) {
-            // 拖动擦除：鼠标碰到的音符**全部**删（叠放也一起）
-            if (app.eraseNotesAt(pattern, app.sel.instrument, pitch_i, step_i, .all) > 0) {
-                app.piano.drag_note = null;
-                // 历史：右键擦除（含拖动划过多个）→ 松开右键时 coalesce 提交一次
-                app.history_pending = "擦除音符";
+            // 拖动擦除：鼠标碰到的音符**全部**删（叠放也一起）；命中同样走像素邻近
+            if (noteAtMousePx(app, ui.mouse_x, ui.mouse_y, lane_x, lane_y, step_ws, scroll_s, app.piano.key_h, app.piano.scroll, pattern)) |hi| {
+                const nh = app.notes.items[hi];
+                if (app.eraseNotesAt(pattern, app.sel.instrument, nh.pitch, nh.step, .all) > 0) {
+                    app.piano.drag_note = null;
+                    // 历史：右键擦除（含拖动划过多个）→ 松开右键时 coalesce 提交一次
+                    app.history_pending = "擦除音符";
+                }
             }
         }
     }
@@ -1028,6 +1076,14 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
 
     // 拖动 / 拉伸更新（带**死区**：位移超过 3px 才真正编辑——
     // 否则单击音符会在按下当帧被吸附，位置/长度跳变）
+    // **拖动位移必须在按下处理之后再算**：`drag_down_x/y` 是按下时写的，
+    // 若在按下分支**之前**算，放置音符那一帧会用**上一次手势的旧锚点** →
+    // 新音符先被挪到几格/一整小节之外（写进模型 → minimap 也跟错），下一帧才被拉回（实测“瞬移”）。
+    const px_per_step: f32 = util.pianoStepPx() * zoom;
+    const drag_steps: i32 = if (px_per_step <= 0)
+        0
+    else
+        @intFromFloat(@round(@as(f32, @floatFromInt(ui.mouse_x - app.piano.drag_down_x)) / px_per_step));
     if (ui.mouse_down) {
         // ── 批量拖动（选区 ≥ 2 中部拖动）──
         if (app.piano.drag_batch) {
@@ -1306,7 +1362,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         // 主动操作优先（纯即时：宽限/桥接已删）：中键/滚动条按住暂停，松手当帧恢复
         if (cur_step) |st| {
             if (app.playlist.follow_playhead and app.playing and !nav) {
-                const cur_px: f32 = st * @as(f32, @floatFromInt(util.piano_step_w));
+                const cur_px: f32 = st * util.pianoStepPx();
                 // 锚点口径 = **内容区（网格区）**（用户确认以网格区为准）
                 const off_screen: f32 = util.follow_anchor_frac * @as(f32, @floatFromInt(view_w));
                 const vcw_f: f32 = @as(f32, @floatFromInt(view_w)) / p.zoom;

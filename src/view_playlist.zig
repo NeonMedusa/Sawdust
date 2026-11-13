@@ -125,7 +125,7 @@ pub fn hitAt(app: *const App, px: i32, py: i32) ?struct { track: i32, step: i32 
     if (py < g.tracks_y or py >= g.tracks_y + g.tracks_h) return null;
     const track = @divFloor(py - g.tracks_y + app.playlist.scroll, g.track_h);
     if (track < 0) return null;
-    const step_px: f32 = @floatFromInt(util.piano_step_w);
+    const step_px: f32 = util.pianoStepPx();
     const mouse_cx: f32 = @as(f32, @floatFromInt(app.playlist.scroll_x)) + @as(f32, @floatFromInt(px - g.lane_x)) / app.playlist.zoom;
     const step_i: i32 = @max(0, @as(i32, @intFromFloat(mouse_cx / step_px)));
     const snap_steps: i32 = model.snapSteps(app.playlist.snap);
@@ -202,11 +202,11 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     }
     const lane_x = main_x + header_w;
     const view_w = @max(1, main_w - header_w); // 轨道内容可视宽度
-    // 时间轴尺寸（与钢琴卷帘统一）：步 = U=96 单位；
-    // 每步内容像素宽固定（`piano_step_w`）→ 一小节的像素宽随拍号变化。
+    // 时间轴尺寸（与钢琴卷帘统一）：步 = `model.units_per_whole` 单位；
+    // 像素尺度由**全音符像素**（`piano_whole_note_px`）派生 → 一小节宽随拍号变化。
     const spb: i32 = app.steps_per_bar;
-    const step_px: f32 = @floatFromInt(util.piano_step_w);
-    const bar_w: i32 = spb * util.piano_step_w; // 一小节的像素宽（未含 zoom）
+    const step_px: f32 = util.pianoStepPx();
+    const bar_w: i32 = util.barPx(spb); // 一小节的像素宽（未含 zoom）
 
     // ── 时间轴长度与缩放下限（**同一个值**，否则会出现“滑块有行程但拖不动”）──
     // 时间轴 = 内容右缘（保底 4 小节）+ 右侧 3 小节留白。
@@ -249,7 +249,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             nmini += 1;
         }
         // 防误触：滑块外的单击 / 滚动条上的滚轮 = 移动"一个当前网格"（Ctrl+单击才是直接定位）
-        ui.scrollbar_nudge = model.snapSteps(app.playlist.snap) * util.piano_step_w;
+        // 注：步进像素不可为 0（最细网格 1 步 = 0.125 px）→ 兜底 4px
+        ui.scrollbar_nudge = @max(4, @as(i32, @intFromFloat(@round(@as(f32, @floatFromInt(model.snapSteps(app.playlist.snap))) * util.pianoStepPx()))));
         ui.scrollbar_target = &app.playlist.scroll_x_target; // 步进走补间（拖动仍直接写 scroll_x）
         _ = ui.scrollbarTimelineEx(8, x + 1, hsb_y, w - 2, ruler_h, &app.playlist.scroll_x, min_content, &app.playlist.zoom, view_w, dyn_zoom_min, 8.0, bars_right < util.overhang_map_limit, mini_buf[0..nmini]);
     }
@@ -278,7 +279,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         defer ui.renderer.popClip(saved);
         var bar: i32 = @divFloor(app.playlist.scroll_x, bar_w) + 1;
         // 小节数字**分级渲染**（1-2-5 系列）：标签太密时只显 1、2、5、10… 的切点
-        const label_step: i32 = util.barLabelStep(bar_ws, 40);
+        const label_step: i32 = util.barLabelEveryBars(bar_ws);
         while (true) : (bar += 1) {
             const bx = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(bar - 1)) * bar_ws - scroll_s));
             if (bx > main_x + main_w) break;
@@ -553,7 +554,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                             if (!thin and clip.pattern >= 0 and pi < pat_stat.len and pat_stat[pi].has_notes) {
                                 const range = model.rangeMap(pat_stat[pi].min_pitch, pat_stat[pi].max_pitch, 12);
                                 const win_lo = clip.offset;
-                                const win_steps = clip.len;
+                                const win_steps: i32 = @max(1, clip.len);
                                 // 画**全部**乐器、全部音符（**不做“画满 N 个就停”的截断**）。
                                 // 实测 bug：旧版有 `drawn >= 64` 截断——多乐器共用一个大样式时，
                                 // 数组顺序靠前的那个乐器往往就占满 64 个名额（实测工程：样式 3578 个
@@ -567,8 +568,11 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                                     if (rel >= win_steps or rel + n.len <= 0) continue; // 不在可见窗口
                                     const s = @max(0, rel);
                                     const e = @min(win_steps, rel + n.len);
-                                    const nx = inner_x + @divTrunc(s * inner_w, win_steps);
-                                    const nw = @max(1, @divTrunc((e - s) * inner_w, win_steps));
+                                    // **用 i64 做乘法**：`s`（步）× `inner_w`（像素）
+                                    // 在 U=3840 下可以到 15 万 × 15 万 → i32 直接溢出（实测 panic）；
+                                    // 本函数其他坐标换算早就走 f32/f64，只有这里漏了。
+                                    const nx = inner_x + @as(i32, @intCast(@divTrunc(@as(i64, s) * @as(i64, inner_w), @as(i64, win_steps))));
+                                    const nw = @max(1, @as(i32, @intCast(@divTrunc(@as(i64, e - s) * @as(i64, inner_w), @as(i64, win_steps)))));
                                     const y_norm = range.yOf(n.pitch);
                                     const ny = inner_y + inner_h - 2 - @as(i32, @intFromFloat(y_norm * @as(f32, @floatFromInt(inner_h - 2))));
                                     ui.renderer.fillRect(nx, ny, nw, 2, inner_col);
@@ -1366,7 +1370,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         // 幽灵游标（PAT 无锚）不跟随：否则视角会追着第一小节的幻影跑
         const ghost = !app.sel.song_mode and app.patOriginClip() == null;
         if (pl.follow_playhead and app.playing and !nav and !ghost) {
-            const cur_px: f32 = app.cursorDisplay(true) * @as(f32, @floatFromInt(util.piano_step_w)); // 平滑小数步（同游标绘制）
+            const cur_px: f32 = app.cursorDisplay(true) * util.pianoStepPx(); // 平滑小数步（同游标绘制）
             // 锚点口径 = **内容区（网格区）**（用户确认以网格区为准）
             const off_screen: f32 = util.follow_anchor_frac * @as(f32, @floatFromInt(view_w));
             const vcw_f: f32 = @as(f32, @floatFromInt(view_w)) / pl.zoom;
@@ -1482,7 +1486,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             .w = @max(1, x + w - main_x),
             .h = auto_h,
             .lane_x = lane_x,
-            .step_w = @floatFromInt(util.piano_step_w),
+            .step_w = util.pianoStepPx(),
             .zoom = app.playlist.zoom,
             .scroll_x = app.playlist.scroll_x,
             .bar_steps = app.steps_per_bar,
@@ -1574,7 +1578,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         // ⚠️ **必须在这里重新解析曲线指针**：上面可能删过曲线（`removeAutoCurve` 会搬移/释放
         // 仓库内存），沿用旧指针 = use-after-free（实测：右键删曲线后崩溃在 `view_lane.draw`）。
         const draw_lane = app.autoCurve() orelse return;
-        view_lane.draw(ui, draw_lane, lane_x, ay, panel_w, auto_h, @floatFromInt(util.piano_step_w), app.steps_per_bar, app.playlist.scroll_x, app.playlist.zoom, app.allocator);
+        view_lane.draw(ui, draw_lane, lane_x, ay, panel_w, auto_h, util.pianoStepPx(), app.steps_per_bar, app.playlist.scroll_x, app.playlist.zoom, app.allocator);
     }
     // 吸附网格下拉（在**全部内容之后** → 绘制在最上层）
     if (app.playlist.snap_menu_open and snap_btn_x + 40 < x + w - 24) {
@@ -1593,28 +1597,31 @@ test "playlist: hitAt——落点换算（轨道行/吸附/缩放/滚动；区�
     app.playlist.zoom = 1.0;
     app.playlist.scroll = 0;
     app.playlist.scroll_x = 0;
-    app.playlist.snap = 11; // 1/96 → snapSteps = 1（不吸附，便于精确断言）
+    app.playlist.snap = 17; // 1/3840 → snapSteps = 1（不吸附，便于精确断言）
+    const pxs: f32 = util.pianoStepPx(); // 每步内容像素（U=3840 → 0.125）
 
     // 轨道行：第 2 行（0 起）→ py = 50 + 24*2 + 10
-    const h = hitAt(&app, 100 + 5 * 5, 50 + 24 * 2 + 10).?;
+    const off200: i32 = @intFromFloat(@round(200.0 * pxs)); // 200 步
+    const h = hitAt(&app, 100 + off200, 50 + 24 * 2 + 10).?;
     try std.testing.expectEqual(@as(i32, 2), h.track);
-    try std.testing.expectEqual(@as(i32, 5), h.step); // 每步 5px：x 偏移 25px → 第 5 步
+    try std.testing.expectEqual(@as(i32, 200), h.step);
 
     // 纵向滚动：滚过 1 行 → 同一个 py 命中第 3 行
     app.playlist.scroll = 24;
     try std.testing.expectEqual(@as(i32, 3), hitAt(&app, 100, 50 + 24 * 2 + 10).?.track);
     app.playlist.scroll = 0;
 
-    // 横向滚动 + 缩放：scroll_x=10 步、zoom=2 → 屏幕 25px = 内容 12.5px = 2.5 步
-    app.playlist.scroll_x = 10 * 5;
+    // 横向滚动 + 缩放：scroll_x = 1600 步的内容像素、zoom=2 →
+    // 屏幕 25px = 内容 12.5px = 100 步 → 1600 + 100 = 1700
+    app.playlist.scroll_x = @intFromFloat(@round(1600.0 * pxs));
     app.playlist.zoom = 2.0;
-    try std.testing.expectEqual(@as(i32, 12), hitAt(&app, 100 + 25, 60).?.step);
+    try std.testing.expectEqual(@as(i32, 1700), hitAt(&app, 100 + 25, 60).?.step);
     app.playlist.zoom = 1.0;
     app.playlist.scroll_x = 0;
 
-    // 吸附：1/4（24 步）→ 第 13 步吸到 24
+    // 吸附：1/4（起 U/4 步）→ 屏幕 125px（zoom 1）= 1000 步 → 吸到 U/4
     app.playlist.snap = 2;
-    try std.testing.expectEqual(@as(i32, 24), hitAt(&app, 100 + 13 * 5, 60).?.step);
+    try std.testing.expectEqual(@divTrunc(model.units_per_whole, 4), hitAt(&app, 100 + 125, 60).?.step);
     app.playlist.snap = 0;
 
     // 区域外：轨道名列 / 标题 / 下方空白

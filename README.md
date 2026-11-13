@@ -148,7 +148,7 @@ zig translate-c -I libs/stb       libs/stb/stb_truetype.h    > src/c/stb_truetyp
 | `src/synth.zig` | 减法合成器 + 鼓组层声部（复音管理/ADSR/滤波） |
 | `src/eq.zig` / `src/effects.zig` | 效果器 DSP：参数 EQ / 混响 / 延迟 / 压缩（含频谱分析） |
 | `src/sequencer.zig` | 音序器：事件调度、编辑重扫（播放中编辑水位线） |
-| `src/model.zig` | 数据模型：音符 / 片段 / 乐器 / 鼓组（U=96 步长单位） |
+| `src/model.zig` | 数据模型：音符 / 片段 / 乐器 / 鼓组（`U = 3840` = 960 PPQN 的步长单位） |
 | `src/midi.zig` | MIDI 导入/导出（SMF 解析 + 写出；纯逻辑可单测） |
 | `src/persist.zig` | 工程保存/加载（JSON `.saw`；版本迁移） |
 | `src/preset.zig` | 预设库（扫描 / 读写 / 分类） |

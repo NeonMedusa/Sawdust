@@ -326,12 +326,19 @@ pub fn routedInstrumentNames(insts: []const Instrument, ch: usize, buf: []u8) []
 }
 
 /// **每全音符的份数**（分辨率 `U`）：数据层的时间单位。
-/// `96 = 2⁵ × 3`——可精确表示的分母 = 96 的约数：
-/// {1,2,3,4,6,8,12,16,24,32,48,96}——涵盖二进制细分与三连音体系。
-/// `Note.step`、`Clip.start/len/offset` 均以它为单位。
-pub const units_per_whole: i32 = 96;
+/// `3840 = 2⁸ × 3 × 5`（= **960 PPQN**，主流 DAW 的常见上限档）。
+/// 可精确表示的分母 = 3840 的约数：二进制细分到 1/3840、三连音全系、
+/// **五连音**（3840/5 = 768）；7 / 11 连音为亚毫秒近似（主流 DAW 同样做不到整数 tick）。
+/// `Note.step`、`Clip.start/len/offset` 均以它为单位；120 BPM 下 1 步 ≈ 0.52 ms。
+///
+/// 迁移（U=96 → 3840）的完整清单与验收见 `docs/units-3840.md`；
+/// 旧存档在小节/步域字段上 ×40（`persist` 读入时按版本换算）。
+pub const units_per_whole: i32 = 3840;
 
-/// 默认每小节步数（4/4 → 96 步；实际用 `App.steps_per_bar`）
+/// 旧单位（U=96）与新单位的比值 = 存档迁移的乘数
+pub const unit_migration_scale: i32 = units_per_whole / 96; // = 40
+
+/// 默认每小节步数（4/4 → 3840 步；实际用 `App.steps_per_bar`）
 pub const steps_per_bar: i32 = units_per_whole;
 
 /// 样式数量上限（样式列表动态增长，但不超过此值）。
@@ -367,20 +374,24 @@ pub fn stepsPerBeat(denominator: i32) i32 {
     return @max(1, @divTrunc(units_per_whole, std.math.clamp(denominator, 1, units_per_whole)));
 }
 
-test "stepsPerBarFor / stepsPerBeat：常用拍号（U=96）" {
-    // 4/4 = 96 步；每拍 24
-    try std.testing.expectEqual(@as(i32, 96), stepsPerBarFor(4, 4));
-    try std.testing.expectEqual(@as(i32, 24), stepsPerBeat(4));
-    // 3/4 = 72 步；每拍 24
-    try std.testing.expectEqual(@as(i32, 72), stepsPerBarFor(3, 4));
-    // 6/8 = 6 × 12 = 72 步（= 3/4 的小节长度，正确的等价关系）
-    try std.testing.expectEqual(@as(i32, 72), stepsPerBarFor(6, 8));
-    try std.testing.expectEqual(@as(i32, 12), stepsPerBeat(8));
-    // 2/4 = 48；每拍 24
-    try std.testing.expectEqual(@as(i32, 48), stepsPerBarFor(2, 4));
-    // 4/2 = 192；每拍 48
-    try std.testing.expectEqual(@as(i32, 192), stepsPerBarFor(4, 2));
-    try std.testing.expectEqual(@as(i32, 48), stepsPerBeat(2));
+test "stepsPerBarFor / stepsPerBeat：常用拍号（以 `units_per_whole` 为基准）" {
+    const U = units_per_whole;
+    // 4/4 = U 步；每拍 U/4
+    try std.testing.expectEqual(U, stepsPerBarFor(4, 4));
+    try std.testing.expectEqual(@divTrunc(U, 4), stepsPerBeat(4));
+    // 3/4 = 3×U/4
+    try std.testing.expectEqual(@divTrunc(3 * U, 4), stepsPerBarFor(3, 4));
+    try std.testing.expectEqual(@divTrunc(U, 4), stepsPerBeat(4));
+    // 6/8 = 6 × U/8（= 3/4 的小节长度，正确的等价关系）
+    try std.testing.expectEqual(@divTrunc(6 * U, 8), stepsPerBarFor(6, 8));
+    try std.testing.expectEqual(@divTrunc(U, 8), stepsPerBeat(8));
+    // 2/4 = U/2；每拍 U/4
+    try std.testing.expectEqual(@divTrunc(U, 2), stepsPerBarFor(2, 4));
+    // 4/2 = 2U；每拍 U/2
+    try std.testing.expectEqual(2 * U, stepsPerBarFor(4, 2));
+    try std.testing.expectEqual(@divTrunc(U, 2), stepsPerBeat(2));
+    // 6/8 与 3/4 长度相等（拍号等价关系不随 U 变）
+    try std.testing.expectEqual(stepsPerBarFor(6, 8), stepsPerBarFor(3, 4));
 }
 
 /// 找该样式**最靠左**的片段（无则为 null）。
@@ -502,16 +513,23 @@ test "游标换算：最左片段 / 全局↔局部 / 折叠截断" {
     }
 }
 
-/// **量化/吸附网格**：分母（1/1 … 1/96）→ 步数（U=96 单位）。
-/// 只列可整除 U 的分母（1/64 不可整除故不含）。
+/// **量化/吸附网格**：分母（1/1 … 1/3840）→ 步数（`U` 单位）。
+/// 只列可整除 U 的分母；**早期 12 项的顺序保持不变**（`snap` 下标是会话态，
+/// 但改旧下标含义会改变默认网格），新档位一律**追加**在后面：
+/// 先行更细的二进制细分，再接五连音。
 /// 0 = 关闭吸附（自由精度）。
-pub const snap_denoms = [_]i32{ 1, 2, 4, 8, 16, 32, 3, 6, 12, 24, 48, 96 };
+pub const snap_denoms = [_]i32{
+    1, 2, 4, 8, 16, 32, // 二进制
+    3, 6, 12, 24, 48, 96, // 三连音系
+    64, 128, 192, 384, 960, 3840, // 更细的二进制细分（U=3840 才做得出来：1/64 以前不可整除）
+    5,  10,  20,  40,  80,   160, // 五连音系（3840 = 2⁸·3·5）
+};
 
 /// 档位下标 → 步数（每格多少步）
 pub fn snapSteps(idx: i32) i32 {
     if (idx < 0 or idx >= snap_denoms.len) return 1;
     const d = snap_denoms[@intCast(idx)];
-    return @max(1, @divTrunc(units_per_whole, d)); // 96/d：1/96→1 步、1/1→96 步
+    return @max(1, @divTrunc(units_per_whole, d)); // U/d：1/3840 → 1 步、1/1 → U 步
 }
 
 /// 把步对齐到网格（向下取整）；`steps` = 网格步数
@@ -687,20 +705,28 @@ test "trimFloorLen：Alt 缩出的 1/96 松 Alt 后能回去" {
     try std.testing.expectEqual(@as(i32, 6), trimFloorLen(6, g, false));
 }
 
-test "snapSteps / snapFloor / snapRound（U=96）" {
-    // 档位 → 步数：1/1 = 96、1/4 = 24、1/8 = 12、1/3 = 32、1/12 = 8、1/96 = 1
-    try std.testing.expectEqual(@as(i32, 96), snapSteps(0)); // 1/1
-    try std.testing.expectEqual(@as(i32, 24), snapSteps(2)); // 1/4
-    try std.testing.expectEqual(@as(i32, 12), snapSteps(3)); // 1/8
-    try std.testing.expectEqual(@as(i32, 32), snapSteps(6)); // 1/3（三连音）
-    try std.testing.expectEqual(@as(i32, 8), snapSteps(8)); // 1/12
-    try std.testing.expectEqual(@as(i32, 1), snapSteps(11)); // 1/96
+test "snapSteps / snapFloor / snapRound（以 `units_per_whole` 为基准）" {
+    const U = units_per_whole;
+    // 档位 → 步数：1/1 = U、1/4 = U/4、1/8 = U/8、1/3 = U/3、1/12 = U/12、
+    // 1/96 = U/96；新增的 1/64 / 1/128 / 1/384 / 1/3840 与五连音各占一档
+    try std.testing.expectEqual(U, snapSteps(0)); // 1/1
+    try std.testing.expectEqual(@divTrunc(U, 4), snapSteps(2)); // 1/4
+    try std.testing.expectEqual(@divTrunc(U, 8), snapSteps(3)); // 1/8
+    try std.testing.expectEqual(@divTrunc(U, 3), snapSteps(6)); // 1/3（三连音）
+    try std.testing.expectEqual(@divTrunc(U, 12), snapSteps(8)); // 1/12
+    try std.testing.expectEqual(@divTrunc(U, 96), snapSteps(11)); // 1/96
+    try std.testing.expectEqual(@divTrunc(U, 64), snapSteps(12)); // 1/64（U=3840 才能整除）
+    try std.testing.expectEqual(@divTrunc(U, 128), snapSteps(13)); // 1/128
+    try std.testing.expectEqual(@divTrunc(U, 384), snapSteps(15)); // 1/384
+    try std.testing.expectEqual(@as(i32, 1), snapSteps(17)); // 1/3840 = 1 步
+    try std.testing.expectEqual(@divTrunc(U, 5), snapSteps(18)); // 1/5（五连音，精确）
 
-    // 对齐：1/4 网格（24 步）
-    try std.testing.expectEqual(@as(i32, 0), snapFloor(5, 24));
-    try std.testing.expectEqual(@as(i32, 24), snapFloor(30, 24));
-    try std.testing.expectEqual(@as(i32, 24), snapRound(30, 24));
-    try std.testing.expectEqual(@as(i32, 48), snapRound(40, 24));
+    // 对齐：1/4 网格（U/4 步）
+    const g = @divTrunc(U, 4);
+    try std.testing.expectEqual(@as(i32, 0), snapFloor(5, g));
+    try std.testing.expectEqual(g, snapFloor(g + 6, g));
+    try std.testing.expectEqual(g, snapRound(g + 6, g));
+    try std.testing.expectEqual(2 * g, snapRound(g + g / 2, g));
     // 网格 = 1 步时不改动
     try std.testing.expectEqual(@as(i32, 37), snapFloor(37, 1));
     try std.testing.expectEqual(@as(i32, 37), snapRound(37, 1));

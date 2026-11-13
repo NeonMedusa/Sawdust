@@ -1739,10 +1739,10 @@ pub const App = struct {
     /// 拍号分子（每小节拍数；工具栏可拖动）
     time_num: i32 = 4,
     /// 拍号分母（以几分音符为一拍；工具栏可拖动）——**只允许 2 的幂**
-    /// （1/2/4/8/16；配 U=96 时可精确表示）
+    /// （1/2/4/8/16；配 `U` 时可精确表示）
     time_den: i32 = 4,
-    /// 每小节步数（由拍号派生：`model.stepsPerBarFor`；拍号变更时同步）
-    steps_per_bar: i32 = 96,
+    /// 每小节步数（**派生量**：`model.stepsPerBarFor(time_num, time_den)`；不信任存档值）
+    steps_per_bar: i32 = model.units_per_whole,
     playing: bool = false,
     /// 录制武装（工具栏红点按钮）——目前只切换视觉状态（录音写入未实现）；
     /// **不进入存档**（会话态；重开工程回到未武装）
@@ -3326,7 +3326,11 @@ pub const App = struct {
     /// 注：这里取**整数**（长度估算/存档用）；播放位置推进走音频侧的 f64 积分器，不会因取整漂移。
     pub fn framesPerStep(self: *const App) u64 {
         const sr: u32 = if (self.params.sample_rate > 0) @intCast(self.params.sample_rate) else @intCast(audio_fallback_rate);
-        const fps = audio.stepFramesOf(@floatFromInt(sr), self.bpm, self.params.steps_per_beat.load(.monotonic));
+        // **用 model 推导的每拍步数**（不读 `params.steps_per_beat`）：那是给音频线程的镜象，
+        // 由 `main` 每帧同步；UI 侧直接用它对路，且与 `audioClipAdd` 等处的换算一致。
+        // （实测：U=3840 后两者短暂不一致 → 占位片段的长度与断言差 40 倍。）
+        const spb: u32 = @intCast(@max(1, model.stepsPerBeat(self.time_den)));
+        const fps = audio.stepFramesOf(@floatFromInt(sr), self.bpm, spb);
         return @max(1, @as(u64, @intFromFloat(@round(fps))));
     }
 
@@ -7493,7 +7497,8 @@ pub const App = struct {
         self.bpm = st.bpm;
         self.time_num = st.time_num;
         self.time_den = st.time_den;
-        self.steps_per_bar = st.steps_per_bar;
+        // 同上：由拍号推导（撤销/重做也不信任快照里的冗余字段）
+        self.steps_per_bar = model.stepsPerBarFor(st.time_num, st.time_den);
         // 调音台通道（含效果链）。来向条目 + 双向下标 = 逐槽状态应用计划依据
         self.importMixerChannels(
             st.mixer,
@@ -8729,7 +8734,10 @@ pub const App = struct {
         self.params.volume.store(self.volume, .monotonic); // 立即同步到音频线程
         self.time_num = p.time_num;
         self.time_den = p.time_den;
-        self.steps_per_bar = p.steps_per_bar;
+        // `steps_per_bar` 是**冗余字段**（拍号才是真源）：**一律由拍号推导**。
+        // 不读存档里的值——旧档存的是 U=96 时代的历史值（ 96/72/… ），任何漏换一次乘数
+        // 都会让整张时间轴的像素尺度错 40 倍（实测：启动后一屏看到 70 小节而不是 7 小节）。
+        self.steps_per_bar = model.stepsPerBarFor(p.time_num, p.time_den);
         // 调音台通道：**动态数量**（旧存档无此字段 → 保持默认 2 个）——共用 `importMixerChannels`
         self.importMixerChannels(p.mixer, null, 0, 0);
         // 样式列表：优先按名字恢复（含自定义名）；旧存档无名字 → 按数量重建默认名
@@ -9200,9 +9208,13 @@ pub const App = struct {
         const sr: u64 = self.params.sample_rate;
         const bpm: f64 = @max(20.0, @as(f64, std.math.clamp(self.bpm, 20.0, 999.0)));
         const spb_per_beat: f64 = @floatFromInt(@max(1, model.stepsPerBeat(self.time_den)));
-        const step_frames: u64 = @max(1, @as(u64, @intFromFloat(@round(@as(f64, @floatFromInt(sr)) * 60.0 / (bpm * spb_per_beat)))));
+        // **帧/步用 f64 保留小数**（U=3840 下每步可能只有十几帧，
+        // 四舍五入到整数会在几百步后累积成百分之几的时长误差 → 导出被截短）。
+        const step_frames_f: f64 = @as(f64, @floatFromInt(sr)) * 60.0 / (bpm * spb_per_beat);
         const end_step: u64 = @intCast(@max(0, self.clipsEndStep()));
-        const total_frames: u64 = end_step * step_frames + sr * export_tail_sec;
+        // 先乘再取整（不是“每步取整后 × 步数”）
+        const total_frames: u64 = @as(u64, @intFromFloat(@round(@as(f64, @floatFromInt(end_step)) * step_frames_f))) + sr * export_tail_sec;
+        const step_frames: u64 = @intFromFloat(@round(step_frames_f));
 
         // 渲染器先建：失败时设备/传输都还没动，直接返回。压缩格式先落临时 WAV。
         const writer = try wav.Writer.create(io, render_path, @intCast(sr), 2);
@@ -11181,13 +11193,13 @@ test "app: cursorStepFrac——子步精度（播放中 = 起始步 + 已播放�
     _ = app.addInstrument("减法合成器");
     app.resetHistory("初始状态");
 
-    // 48000Hz、120BPM、4/4（每拍 96/4 = 24 步）→ 1000 帧/步
-    app.bpm = 120;
+    // 48000Hz、150BPM、4/4（每拍 U/4 步）→ 每步恰好 20 帧（偶数，方便取半）
+    app.bpm = 150;
     app.time_den = 4;
     app.params.sample_rate = 48_000;
     app.playback.start_frame = 1000;
     app.playback.start_step = 10;
-    app.params.frames_played.store(1000 + 3500, .monotonic); // 已过 3.5 步
+    app.params.frames_played.store(1000 + 70, .monotonic); // 已过 3.5 步（70 帧 / 20）
 
     app.sel.song_mode = true;
     app.playing = true;
@@ -11719,12 +11731,14 @@ test "app: 游标平滑——前馈+收敛（渲染帧下线性；缓冲量化�
 
     app.bpm = 120;
     app.time_den = 4;
-    app.params.sample_rate = 48_000; // 1000 帧/步 → 48 步/秒
+    app.params.sample_rate = 48_000; // 每步 25 帧（= 48000×60/(120×960)）
     app.playback.start_frame = 0;
     app.playback.start_step = 0;
-    app.frame_dt_ns = 8_333_333; // ≈120fps：每帧 400 帧音频 ≈ 0.4 步
+    app.frame_dt_ns = 8_333_333; // ≈120fps：每帧 400 帧音频 ≈ 16 步
     app.sel.song_mode = true;
     app.playing = true;
+    // 每个渲染帧推进的步数（后面所有阀值都从这里派生，不写死）
+    const st_per_ui_frame: f32 = 400.0 / 25.0;
 
     var frames: u64 = 0;
     var prev: f32 = -1;
@@ -11737,8 +11751,8 @@ test "app: 游标平滑——前馈+收敛（渲染帧下线性；缓冲量化�
         if (i > 20) {
             const mv = d - prev;
             try std.testing.expect(mv >= -0.001); // 单调不回退
-            try std.testing.expect(mv <= 0.45); // ≈0.4 步/帧，无跳变
-            try std.testing.expect(@abs(d - app.cursorStepFrac(true)) <= 0.45); // 贴近真值（≤ 一个缓冲脉宽）
+            try std.testing.expect(mv <= st_per_ui_frame * 1.15); // 无跳变
+            try std.testing.expect(@abs(d - app.cursorStepFrac(true)) <= st_per_ui_frame * 1.15); // 贴近真值
         }
         prev = d;
     }
@@ -11770,8 +11784,8 @@ test "app: 导出 WAV——离线渲染整曲（长度 = 内容 + 2s 尾；有�
     app.params.sample_rate = 48_000;
     app.params.volume.store(1.0, .monotonic);
     app.sel.song_mode = true;
-    app.addNote(.{ .step = 0, .len = 8, .pitch = 60, .pattern = 0, .instrument = 0 });
-    app.clips.append(app.allocator, .{ .track = 0, .start = 0, .len = 96, .pattern = 0, .offset = 0 }) catch {};
+    app.addNote(.{ .step = 0, .len = @divTrunc(model.units_per_whole, 12), .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.clips.append(app.allocator, .{ .track = 0, .start = 0, .len = model.units_per_whole, .pattern = 0, .offset = 0 }) catch {};
 
     // 最小离线引擎（无设备；容量数组由 setCapacity 建立）——生命周期由本测试负责
     app.params.events = &app.events;
@@ -11796,9 +11810,9 @@ test "app: 导出 WAV——离线渲染整曲（长度 = 内容 + 2s 尾；有�
     try std.testing.expectEqual(@as(u16, 2), std.mem.readInt(u16, data[22..24], .little));
     try std.testing.expectEqual(@as(u32, 48_000), std.mem.readInt(u32, data[24..28], .little));
     try std.testing.expectEqual(@as(u16, 24), std.mem.readInt(u16, data[34..36], .little));
-    // 长度 = 内容（96 步 × 500 帧/步）+ 2s 尾（48000×2）
-    const step_frames: u64 = 48_000 * 60 / (240 * 24);
-    const total_frames: u64 = 96 * step_frames + 48_000 * 2;
+    // 长度 = 内容（U 步 × 帧/步，f64 乘积后取整）+ 2s 尾（48000×2）
+    const step_frames_f: f64 = 48_000.0 * 60.0 / (@as(f64, 240.0) * @as(f64, @floatFromInt(model.stepsPerBeat(4))));
+    const total_frames: u64 = @as(u64, @intFromFloat(@round(@as(f64, @floatFromInt(model.units_per_whole)) * step_frames_f))) + 48_000 * 2;
     try std.testing.expectEqual(@as(usize, @intCast(44 + total_frames * 6)), data.len);
     try std.testing.expectEqual(@as(u32, @intCast(total_frames * 6)), std.mem.readInt(u32, data[40..44], .little));
     // 有实际声音（前 1 秒数据段存在非零字节）
@@ -12675,11 +12689,14 @@ test "bpm: 小数 BPM 生效（步宽变化）+ tempo 绑定默认深度 20% + �
     _ = app.addInstrument("减法合成器");
     app.params.sample_rate = 48000;
 
-    app.bpm = 120.0;
-    const f_120 = app.framesPerStep();
-    app.bpm = 120.5;
-    const f_120h = app.framesPerStep();
-    try std.testing.expect(f_120 != f_120h); // 小数速度真的进了步宽
+    // 小数 BPM 真的进了步宽：比**未取整的 f64 帧/步**（`framesPerStep` 会 rounded 到整数帧，
+    // U=3840 后 25 帧/步的量级下 120 vs 120.5 的差不足半帧，取整后就看不出来了）
+    const spb: u32 = @intCast(@max(1, model.stepsPerBeat(4)));
+    const f_120 = audio.stepFramesOf(48000.0, 120.0, spb);
+    const f_120h = audio.stepFramesOf(48000.0, 120.5, spb);
+    try std.testing.expect(f_120 != f_120h);
+    // 实际步宽（整数帧）仍应可算且 > 0
+    try std.testing.expect(app.framesPerStep() > 0);
 
     // 归一化端点：0 → 20，1 → 999
     try std.testing.expectApproxEqAbs(@as(f32, 20.0), view_lane.Target.bpmFromNorm(0.0), 1e-4);
@@ -14038,10 +14055,10 @@ test "app: 键盘微调选中音符——半音/八度/网格/小节 + 整组钳
     try std.testing.expect(!app.nudgeSelectedNotes(-8, 0));
     try std.testing.expectEqual(@as(i32, 0), app.notes.items[0].step);
 
-    // 右移一小节（96 步）无上限
+    // 右移一小节（U 步）无上限
     try std.testing.expect(app.nudgeSelectedNotes(model.units_per_whole, 0));
-    try std.testing.expectEqual(@as(i32, 96), app.notes.items[0].step);
-    try std.testing.expectEqual(@as(i32, 99), app.notes.items[1].step);
+    try std.testing.expectEqual(model.units_per_whole, app.notes.items[0].step);
+    try std.testing.expectEqual(model.units_per_whole + 3, app.notes.items[1].step);
 }
 
 test "app: 键盘粗移（Ctrl：全有或全无）——拍位/级数不漂移" {
@@ -14052,27 +14069,28 @@ test "app: 键盘粗移（Ctrl：全有或全无）——拍位/级数不漂移"
     app.resetPatterns(1);
     app.resetMixerChannels(default_mixer_channels);
 
-    // 用户场景：最左音在第一小节**第三拍**（step 48）——Ctrl+左（一小节）
+    // 用户场景：最左音在第一小节**第三拍**（step U/2）——Ctrl+左（一小节）
     // 会把它压到 0（第一拍）→ 必须**整组拒不动**
-    try app.notes.append(app.allocator, .{ .step = 48, .len = 4, .pitch = 60, .pattern = 0, .selected = true });
-    try app.notes.append(app.allocator, .{ .step = 60, .len = 4, .pitch = 64, .pattern = 0, .selected = true });
+    const U = model.units_per_whole;
+    try app.notes.append(app.allocator, .{ .step = @divTrunc(U, 2), .len = 4, .pitch = 60, .pattern = 0, .selected = true });
+    try app.notes.append(app.allocator, .{ .step = @divTrunc(5 * U, 8), .len = 4, .pitch = 64, .pattern = 0, .selected = true });
     try std.testing.expect(!app.nudgeSelectedNotesExact(-model.units_per_whole, 0));
-    try std.testing.expectEqual(@as(i32, 48), app.notes.items[0].step);
-    try std.testing.expectEqual(@as(i32, 60), app.notes.items[1].step);
+    try std.testing.expectEqual(@divTrunc(U, 2), app.notes.items[0].step);
+    try std.testing.expectEqual(@divTrunc(5 * U, 8), app.notes.items[1].step);
 
     // 整体绰绰有余（≥ 一小节）→ 完整位移
-    app.notes.items[0].step = 100;
-    app.notes.items[1].step = 120;
+    app.notes.items[0].step = U + @divTrunc(U, 24);
+    app.notes.items[1].step = U + @divTrunc(U, 4);
     try std.testing.expect(app.nudgeSelectedNotesExact(-model.units_per_whole, 0));
-    try std.testing.expectEqual(@as(i32, 4), app.notes.items[0].step);
-    try std.testing.expectEqual(@as(i32, 24), app.notes.items[1].step);
+    try std.testing.expectEqual(@divTrunc(U, 24), app.notes.items[0].step);
+    try std.testing.expectEqual(@divTrunc(U, 4), app.notes.items[1].step);
     // 再左移一小节 → 抭不动 → 拒（4/24 保持拍内位置）
     try std.testing.expect(!app.nudgeSelectedNotesExact(-model.units_per_whole, 0));
-    try std.testing.expectEqual(@as(i32, 4), app.notes.items[0].step);
+    try std.testing.expectEqual(@divTrunc(U, 24), app.notes.items[0].step);
 
     // 右移一小节无上限
     try std.testing.expect(app.nudgeSelectedNotesExact(model.units_per_whole, 0));
-    try std.testing.expectEqual(@as(i32, 100), app.notes.items[0].step);
+    try std.testing.expectEqual(U + @divTrunc(U, 24), app.notes.items[0].step);
 
     // 八度同理：高音 120 + 12 = 132 越顶 → **整组拒**（部分鉗制会变成 +7——非整八度，级数漂移）
     app.notes.items[0].pitch = 108;

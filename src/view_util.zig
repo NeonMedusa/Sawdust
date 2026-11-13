@@ -131,13 +131,40 @@ pub fn viewSwitchButton(ui: *Ui, x: i32, y: i32, bar_h: i32) bool {
 }
 
 // ── 钢琴卷帘常量 ──
-/// 每步宽（像素）——步的单位为 1/96 全音符（`model.units_per_whole`）。
-/// 4/4 时每小节 96 步；为保证视觉密度与手感，默认缩放下调到 5px/步
-/// （效果 ≈ 旧值 20px × 每小节 16 步；缩放范围 0.2-8 仍然可用）。
-pub const piano_step_w: i32 = 5;
+/// **每全音符的内容像素宽**（视觉尺度基准）。
+/// 旧时代是 `96 × 5 = 480`，U 改到 3840 后**不能再按“每步几 px”写**——
+/// 那样一小节会变成 19200 px（一屏只看得到 1/40 小节）。
+/// 所有几何从这里派生：屏上步宽 = `pianoStepPx() × zoom`。
+pub const piano_whole_note_px: i32 = 480;
+
+/// 每步的内容像素宽（**浮点**：U=3840 → 0.125 px/步）
+pub inline fn pianoStepPx() f32 {
+    return @as(f32, @floatFromInt(piano_whole_note_px)) / @as(f32, @floatFromInt(model.units_per_whole));
+}
+
+/// 一小节的**整数**像素宽（无舍入误差）：`spb` = 该拍号下每小节步数。
+/// 旧写法 `spb * 5` 在 U=3840 下会溢出视觉尺度（一小节 19200 px）；
+/// 拍号分母是 2 的幂 → `spb × 480 / U` 必为整数。
+pub inline fn barPx(spb: i32) i32 {
+    return @divTrunc(spb * piano_whole_note_px, model.units_per_whole);
+}
+
 pub const piano_header_w: i32 = 90; // 琴键列宽（与播放列表轨道列对齐）
-/// 每小节步数（**默认 4/4**；实际用 `App.steps_per_bar`）
-pub const piano_steps_per_bar: i32 = 96;
+
+// ── 网格分级（密度门槛，单位 = **屏幕像素**；值越大 → 同一缩放下网格越稀）──
+// 三条层（细 → 粗）：网格（当前档位） → 拍线 → 小节线。
+// **层级关系（铁律）**：每一层只能比上一层**更细**；减半到越过上一层的步长时
+// **不画**（那条线归上一层负责）——避免“两套小节线各画各的”。
+// 注：当前值（36）是**调优中**的临时值（原为 4/6/3，用户实测太密）。
+/// 网格层（= 当前量化档位）
+pub const grid_min_px_snap: f32 = 36.0;
+/// 拍线
+pub const grid_min_px_beat: f32 = 36.0;
+/// 小节线（**权威层**）：按 **2 的幂 × 小节** 变稀（1/2/4/8/16…，乐句感）
+pub const grid_min_px_bar: f32 = 36.0;
+/// **小节号（刻度尺数字）的最小间距**。数字 = 线梯子的整数倍（可再抽稀一倍）、
+/// 但**绝不独立分级**——保证每个数字下面正好有一条小节线。
+pub const ruler_label_min_px: f32 = 40.0;
 pub const piano_key_h_min: i32 = 6; // 音高行高范围（□ 缩放）
 pub const piano_key_h_max: i32 = 40;
 
@@ -149,29 +176,45 @@ pub const track_h_max: i32 = 120;
 /// 滚轮不受此限（用户口径：滚轮任何时候都可出图）
 pub const overhang_map_limit: i32 = 10_000;
 
-/// 小节数字的**分级步长**（1-2-5 系列：1、2、5、10、20、50、…）：
-/// 返回满足 `步长 × 小节屏幕宽 ≥ min_spacing` 的**最小**档——标签太密时逐级降级；
-/// 号码按 `(bar − 1) % 步长 == 0` 切点渲染（锚定第 1 小节，即 1、1+步长、…）。
-pub fn barLabelStep(bar_ws: f32, min_spacing: f32) i32 {
-    const marks = [_]i32{ 1, 2, 5 };
-    var mult: i32 = 1;
-    var i: usize = 0;
-    while (true) : (i += 1) {
-        const step: i32 = marks[i % 3] * mult;
-        if (@as(f32, @floatFromInt(step)) * bar_ws >= min_spacing) return step;
-        if (i % 3 == 2) mult *= 10;
-        if (mult > 100_000_000) return step; // 防呆（远处小节号码超 i32 量级，不可达）
-    }
+/// 小节线的梯子（单位 = **小节**）：**2 的幂**（1/2/4/8/16/32…，乐句感），
+/// 直到 `档位 × 小节屏幕宽 ≥ grid_min_px_bar`。这是**权威层**——其他层不得到它这一级。
+pub fn barLineEveryBars(bar_ws: f32) i32 {
+    var step: i32 = 1;
+    while (@as(f32, @floatFromInt(step)) * bar_ws < grid_min_px_bar and step < (1 << 24)) step *= 2;
+    return step;
 }
 
-test "view_util: 小节数字分级步长（1-2-5）：太密逐级降" {
-    try std.testing.expectEqual(@as(i32, 1), barLabelStep(192.0, 40)); // 足足宽
-    try std.testing.expectEqual(@as(i32, 2), barLabelStep(30.0, 40)); // 1×30<40 → 2
-    try std.testing.expectEqual(@as(i32, 2), barLabelStep(20.0, 40)); // 2×20=40
-    try std.testing.expectEqual(@as(i32, 5), barLabelStep(18.0, 40)); // 2×18<40 → 5
-    try std.testing.expectEqual(@as(i32, 10), barLabelStep(7.0, 40)); // 5×7<40 → 10
-    try std.testing.expectEqual(@as(i32, 20), barLabelStep(3.9, 40)); // 10×3.9<40 → 20
-    try std.testing.expectEqual(@as(i32, 50), barLabelStep(1.0, 40));
+/// 小节号（刻度尺数字）的梯子（单位 = **小节**）：从小节线梯子再乘 2 的幂，
+/// 直到 `步长 × 小节屏幕宽 ≥ ruler_label_min_px`。
+/// **必为线梯子的整数倍** → 数字只会出现在有小节线的位置上。
+/// 号码按 `(bar − 1) % 步长 == 0` 切点渲染（锚定第 1 小节）。
+pub fn barLabelEveryBars(bar_ws: f32) i32 {
+    var step: i32 = barLineEveryBars(bar_ws);
+    while (@as(f32, @floatFromInt(step)) * bar_ws < ruler_label_min_px and step < (1 << 24)) step *= 2;
+    return step;
+}
+
+test "view_util: 小节线/数字梯子的关系（数字 = 线梯子的整数倍）" {
+    // 小节够宽（192px）：线=1、数字=1
+    try std.testing.expectEqual(@as(i32, 1), barLineEveryBars(192.0));
+    try std.testing.expectEqual(@as(i32, 1), barLabelEveryBars(192.0));
+    // 30px：线 2（60px）；数字 2（60px ≥ 40）
+    try std.testing.expectEqual(@as(i32, 2), barLineEveryBars(30.0));
+    try std.testing.expectEqual(@as(i32, 2), barLabelEveryBars(30.0));
+    // 10px：线 4（40px ≥ 36）；数字 4（40px ≥ 40）
+    try std.testing.expectEqual(@as(i32, 4), barLineEveryBars(10.0));
+    try std.testing.expectEqual(@as(i32, 4), barLabelEveryBars(10.0));
+    // 3px：线 16（48px）；数字 16（48px ≥ 40）
+    try std.testing.expectEqual(@as(i32, 16), barLineEveryBars(3.0));
+    try std.testing.expectEqual(@as(i32, 16), barLabelEveryBars(3.0));
+    // 不变量：数字总是线的整数倍（每个数字下面都有线）
+    const widths = [_]f32{ 200, 50, 20, 10, 5, 2, 1, 0.5 };
+    for (widths) |w| {
+        const line = barLineEveryBars(w);
+        const label = barLabelEveryBars(w);
+        try std.testing.expect(@mod(label, line) == 0);
+        try std.testing.expect(label >= line);
+    }
 }
 
 /// 垂直缩放的“缩到底”有效下限（□ 拖拽 / Shift+滚轮共用）：不允许缩过
@@ -390,8 +433,12 @@ pub fn drawTimelineGrid(
     defer ren.popClip(saved);
 
     // 画某一层：`every` = 每几步一条线（<=0 = 不画）；
-    // `min_px` = 密度门槛（屏上间距低于它 → 该层整体跳过）；
-    // `thick`/`col` = 线宽与颜色。从滚动位置之后的第一条线开始（迭代量 ≤ 视宽/间距）。
+    // `min_px` = 密度门槛；`thick`/`col` = 线宽与颜色。
+    //
+    // **分级显示（密度减半）**：屏上间距 < `min_px` 时**不是整层跳过**，而是
+    // `every *= 2` 直到能看清（每 2/4/8… 条画一条）→ 任何缩放下都有一层可读的网格，
+    // 不会“要么全无、要么突然全部冒出来”，也不会糊成实心白墙
+    // （1/3840、1/1920 这类超密集档位因此永远不会被**完整**画出来）。
     const drawLayer = struct {
         fn f(
             r: *r_mod.Renderer,
@@ -405,13 +452,25 @@ pub fn drawTimelineGrid(
             h_: i32,
             every: i32,
             min_px: f32,
+            /// 上层（更粗）的步长：减半后 ≥ 它就不画（层级钳制）
+            limit_steps: i32,
             thick: i32,
             col: r_mod.Color,
         ) void {
-            if (every <= 0) return;
-            const ws = step_ws_ * @as(f32, @floatFromInt(every)); // 屏上间距
+            if (every <= 0 or step_ws_ <= 0) return;
+            var e: i32 = every;
+            var ws: f32 = step_ws_ * @as(f32, @floatFromInt(e));
+            // 减半直到间距达标（上限 2^20 步：纯防呆）
+            while (ws < min_px and e < (1 << 20)) {
+                e *= 2;
+                ws = step_ws_ * @as(f32, @floatFromInt(e));
+            }
+            // **层级钳制**：减半后已到达/超过上一层（更粗）的步长 → 不画。
+            // 否则细层会在“小节位置”上画出一套**另一条梯子**的线（实测：
+            // 缩小时网格减半到 4 小节、小节线在 5 小节 → 两层小节线各画各的）。
+            if (limit_steps > 0 and e >= limit_steps) return;
             if (ws < min_px) return;
-            var k: i32 = @divFloor(@max(0, scroll_steps_), every) + 1;
+            var k: i32 = @divFloor(@max(0, scroll_steps_), e) + 1;
             while (true) : (k += 1) {
                 const gx = lane_x_ + @as(i32, @intFromFloat(@as(f32, @floatFromInt(k)) * ws - scroll_s_));
                 if (gx > clip_x_ + view_w_) break;
@@ -420,12 +479,23 @@ pub fn drawTimelineGrid(
         }
     }.f;
 
-    // 1) 网格层（= 当前量化档位；最暗、1px——1/96 时即“步线”）
-    drawLayer(ren, clip_x, view_w, lane_x, scroll_s, scroll_steps, step_ws, y, h, snap_steps, 4.0, 1, theme.grid_snap);
-    // 2) 拍线（亮一档、1px）
-    drawLayer(ren, clip_x, view_w, lane_x, scroll_s, scroll_steps, step_ws, y, h, beat_steps, 6.0, 1, theme.grid_beat);
-    // 3) 小节线（最亮、常显；当前 1px——纯靠明暗与拍/网格区分）
-    drawLayer(ren, clip_x, view_w, lane_x, scroll_s, scroll_steps, step_ws, y, h, steps_per_bar, 3.0, 1, theme.grid_bar);
+    // ── 层级：网格（细） → 拍线 → 小节线（粗，权威层）──
+    // 小节线：**2 的幂 × 小节**（`barLineEveryBars`）——乐句感，也是其他层不得越过的上限。
+    const bar_ws_screen: f32 = step_ws * @as(f32, @floatFromInt(steps_per_bar));
+    const bar_steps: i32 = @max(1, barLineEveryBars(bar_ws_screen) * steps_per_bar);
+    // 1) 网格层（= 当前量化档位；最暗、1px）：不得越过拍线层
+    // 2) 拍线（亮一档）：不得越过小节层
+    var beat_limit: i32 = bar_steps;
+    // 先算拍线的**有效**步长（用于钳制网格层）
+    {
+        var e: i32 = @max(1, beat_steps);
+        while (step_ws * @as(f32, @floatFromInt(e)) < grid_min_px_beat and e < (1 << 20)) e *= 2;
+        if (e < bar_steps) beat_limit = e;
+    }
+    drawLayer(ren, clip_x, view_w, lane_x, scroll_s, scroll_steps, step_ws, y, h, snap_steps, grid_min_px_snap, beat_limit, 1, theme.grid_snap);
+    drawLayer(ren, clip_x, view_w, lane_x, scroll_s, scroll_steps, step_ws, y, h, beat_steps, grid_min_px_beat, bar_steps, 1, theme.grid_beat);
+    // 3) 小节线（最亮、权威层）：不参与减半（梯子已经是 2 的幂 × 小节）
+    drawLayer(ren, clip_x, view_w, lane_x, scroll_s, scroll_steps, step_ws, y, h, bar_steps, 0.0, 0, 1, theme.grid_bar);
 }
 
 /// 网格选择器按钮文本（"网格 1/4"；`buf` 由调用方提供——栈上格式化）。
@@ -736,11 +806,22 @@ pub fn drawCursor(ui: *Ui, x: i32, ruler_y: i32, ruler_h: i32, bottom_y: i32, pl
 
 // ── 测试 ──
 
-/// 测试辅助：网格绘制到干净画布（4/4：每小节 96 步、每拍 24 步；lane_x = 0）。
+/// 测试辅助：网格绘制到干净画布。
+/// **合成刻度**（小节 96 步 / 拍 24 步）是故意的：这些用例验证的是
+/// “按**像素间距**决定是否跳层”的绘制规则（与真实 U 无关），
+/// 用合成刻度才能保持 96px 一小节的像素断言稳定。
 fn gridTestRow(fb: *r_mod.Framebuffer, theme: *const Theme, snap_steps: i32, step_w: f32, zoom: f32) void {
     var ren = r_mod.Renderer.init(fb);
     @memset(fb.pixels, theme.bg);
     drawTimelineGrid(&ren, theme, 0, @intCast(fb.width), 0, @intCast(fb.height), 0, 0, zoom, step_w, 96, 24, snap_steps);
+}
+
+/// 测试辅助：某层在该缩放下**实际生效的步长**（按 `min_px` 门槛减半；与 `drawLayer` 同规则）。
+/// 用它写的断言不会因为门槛被调优而失效。
+fn effectiveEvery(every: i32, step_px: f32, min_px: f32) i32 {
+    var e: i32 = every;
+    while (min_px > 0 and step_px * @as(f32, @floatFromInt(e)) < min_px and e < (1 << 20)) e *= 2;
+    return e;
 }
 
 test "网格：只画所选档位（不再常显步线）；拍线/小节线常显" {
@@ -748,45 +829,52 @@ test "网格：只画所选档位（不再常显步线）；拍线/小节线常�
     var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 200, .height = 4 };
     const theme = Theme{};
 
-    // 每步 1px；网格 1/96（每步）间距 1px < 4 → 网格层整层跳过
+    // 每步 1px：网格（1 步）必然过密 → 按门槛**密度减半**（不是整层消失）。
     gridTestRow(&fb, &theme, 1, 1.0, 1.0);
-    try std.testing.expectEqual(theme.bg, buf[1]); // 步位置：无网格线（旧行为会常显）
-    try std.testing.expectEqual(theme.grid_beat, buf[24]); // 拍线常显
-    try std.testing.expectEqual(theme.grid_bar, buf[96]); // 小节线常显
+    const e_snap = effectiveEvery(1, 1.0, grid_min_px_snap);
+    const e_beat = effectiveEvery(24, 1.0, grid_min_px_beat);
+    try std.testing.expect(e_snap > 1); // 1px 间距必然被减半
+    try std.testing.expectEqual(theme.bg, buf[1]); // 最细档不再逐步常显
+    try std.testing.expectEqual(theme.grid_beat, buf[@intCast(e_beat)]); // 拍线按门槛变稀但仍在
+    try std.testing.expectEqual(theme.grid_bar, buf[96]); // 小节线（数字每 1 小节）
 
-    // 放大到每步 24px：网格 1/96 间距 24px ≥ 4 → 网格层画出（此时它 = 步线）
-    gridTestRow(&fb, &theme, 1, 1.0, 24.0);
-    try std.testing.expectEqual(theme.grid_snap, buf[24]); // step 1 → x=24
+    // 放到很大（每步 100px）：网格层不再被减半 → 逐步都画
+    gridTestRow(&fb, &theme, 1, 1.0, 100.0);
+    try std.testing.expectEqual(@as(i32, 1), effectiveEvery(1, 100.0, grid_min_px_snap));
+    try std.testing.expectEqual(theme.grid_snap, buf[100]); // step 1 → x=100
 }
 
 test "网格：与拍/小节线重合时显示粗层（覆盖式，无洞）" {
-    var buf: [100 * 4]u32 = undefined;
-    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 100, .height = 4 };
+    var buf: [512 * 4]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 512, .height = 4 };
     const theme = Theme{};
 
-    // 每步 0.5px；网格 1/4（24 步）与拍线完全重合
-    gridTestRow(&fb, &theme, 24, 1.0, 0.5);
-    try std.testing.expectEqual(theme.grid_beat, buf[12]); // step 24：拍线覆盖网格
-    try std.testing.expectEqual(theme.grid_bar, buf[48]); // step 96：小节线覆盖
-    try std.testing.expectEqual(theme.bg, buf[6]); // step 12：非网格点
+    // 每步 4px：网格 1/4（24 步）与拍线完全重合 → 拍线覆盖网格
+    gridTestRow(&fb, &theme, 24, 1.0, 4.0);
+    try std.testing.expectEqual(@as(i32, 24), effectiveEvery(24, 4.0, grid_min_px_beat));
+    try std.testing.expectEqual(theme.grid_beat, buf[96]); // step 24 → x=96：拍线覆盖网格
+    try std.testing.expectEqual(theme.grid_bar, buf[384]); // step 96 → x=384：小节线覆盖
+    try std.testing.expectEqual(theme.bg, buf[48]); // step 12：既非网格也非拍
 
-    // 网格 1/8（12 步）：非拍位置也有网格线
-    gridTestRow(&fb, &theme, 12, 1.0, 0.5);
-    try std.testing.expectEqual(theme.grid_snap, buf[6]); // step 12：网格点（非拍）
-    try std.testing.expectEqual(theme.grid_beat, buf[12]); // step 24：拍线覆盖
+    // 网格 1/8（12 步）：非拍位置也有网格线（且不与拍线打架）
+    gridTestRow(&fb, &theme, 12, 1.0, 4.0);
+    try std.testing.expectEqual(@as(i32, 12), effectiveEvery(12, 4.0, grid_min_px_snap));
+    try std.testing.expectEqual(theme.grid_snap, buf[48]); // step 12：网格点（非拍）
+    try std.testing.expectEqual(theme.grid_beat, buf[96]); // step 24：拍线覆盖
 }
 
-test "网格：拍线因太密隐藏时，拍位置上的网格线仍画（不留洞）" {
-    var buf: [40 * 4]u32 = undefined;
-    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 40, .height = 4 };
+test "网格：过密时**密度减半**（不是整层消失，也不画成实心墙）" {
+    var buf: [400 * 4]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 400, .height = 4 };
     const theme = Theme{};
 
-    // 每步 0.1px：网格 1/2（48 步）间距 4.8px ≥ 4 → 画；
-    // 拍线间距 2.4px < 6 → 整层跳过；小节线 9.6px ≥ 3 → 画。
-    // step 48 是拍位置（拍线层没画）——网格线必须补上（若用“跳过”逻辑会是洞）。
-    gridTestRow(&fb, &theme, 48, 1.0, 0.1);
-    try std.testing.expectEqual(theme.grid_snap, buf[4]); // step 48 → x=4.8→4：网格线补上
-    try std.testing.expectEqual(theme.grid_bar, buf[9]); // step 96 → x=9.6→9：小节线
+    // 每步 1px、网格 5 步 → 必然过密 → 减半到 e 步（e 由门槛推导，不写死）
+    gridTestRow(&fb, &theme, 5, 1.0, 1.0);
+    const e = effectiveEvery(5, 1.0, grid_min_px_snap);
+    try std.testing.expect(e > 5);
+    try std.testing.expect(@as(f32, @floatFromInt(e)) >= grid_min_px_snap); // 减到能看清为止
+    try std.testing.expectEqual(theme.grid_snap, buf[@intCast(e)]); // 留下的线
+    try std.testing.expectEqual(theme.bg, buf[5]); // 被减掉的那条
 }
 
 test "中略：放得下不省略、超宽省略中间保留两边、太窄返回 null" {

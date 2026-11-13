@@ -11,11 +11,14 @@
 const std = @import("std");
 const model = @import("model.zig");
 
-/// 每四分音符的步数（U=96 → 每四分音符 24 步）
+/// 每四分音符的步数（U=3840 → 每四分音符 960 步，即 960 PPQN）
 pub const steps_per_quarter: i32 = @divTrunc(model.units_per_whole, 4);
 
-/// 导出用的每四分音符 tick 数（480 = 最常见值；480/24 = 20 tick/步，整除）
-pub const export_tpq: i32 = 480;
+/// 导出用的每四分音符 tick 数（**960**：与 `steps_per_quarter` 持平，1 step = 1 tick，
+/// 导出无损；同时 960 也是 MIDI 文件里常见的分辨率）。
+/// 注：U=96 时代这里写死 480（480/24 = 20 tick/步）；若仍用 480，新单位下
+/// 1 step = 0.5 tick → 导出反而丢一半精度（见 `docs/units-3840.md` §2.1）。
+pub const export_tpq: i32 = 960;
 
 /// tick → 步（**就近取整**：每个事件独立换算，不会像增量累加那样漂移）。
 /// `tpq` = 该文件的每四分音符 tick 数（每个 MIDI 文件自带头块声明，常见 96/192/384/480）。
@@ -445,19 +448,22 @@ test "midi: VLQ 编解码（边界值）" {
 }
 
 test "midi: tick ↔ 步换算（就近取整；常见 tpq）" {
-    // 每四分音符 = 24 步
-    try std.testing.expectEqual(@as(i32, 24), tickToStep(96, 96));
-    try std.testing.expectEqual(@as(i32, 24), tickToStep(480, 480));
-    try std.testing.expectEqual(@as(i32, 24), tickToStep(192, 192));
+    // 每四分音符 = `steps_per_quarter`（U=3840 → 960）
+    const q = steps_per_quarter;
+    try std.testing.expectEqual(q, tickToStep(96, 96));
+    try std.testing.expectEqual(q, tickToStep(480, 480));
+    try std.testing.expectEqual(q, tickToStep(192, 192));
     try std.testing.expectEqual(@as(i32, 0), tickToStep(0, 480));
-    // 就近取整：490/480 四分音符 ≈ 24.5 步 → 25
-    try std.testing.expectEqual(@as(i32, 25), tickToStep(490, 480));
-    // 半分以下舍去：485 → 24.25 → 24
-    try std.testing.expectEqual(@as(i32, 24), tickToStep(485, 480));
-    // 反向
-    try std.testing.expectEqual(@as(i64, 480), stepToTick(24, 480));
-    try std.testing.expectEqual(@as(i64, 96), stepToTick(24, 96));
-    try std.testing.expectEqual(@as(i64, 20), stepToTick(1, 480)); // 1 步 = 480/24 tick
+    // 就近取整：tpq 不整除时——1 tick @ 640ppq = 1.5 步 → 2
+    try std.testing.expectEqual(@as(i32, 2), tickToStep(1, 640));
+    try std.testing.expectEqual(@as(i32, 8), tickToStep(5, 640)); // 7.5 → 8
+    // 半分以下舍去：1 tick @ 2000ppq = 0.48 步 → 0
+    try std.testing.expectEqual(@as(i32, 0), tickToStep(1, 2000));
+    // 反向：四分音符 → tpq tick
+    try std.testing.expectEqual(@as(i64, 480), stepToTick(q, 480));
+    try std.testing.expectEqual(@as(i64, 96), stepToTick(q, 96));
+    try std.testing.expectEqual(@as(i64, 1), stepToTick(2, 480)); // 2 步 = 1 tick @480
+    try std.testing.expectEqual(@as(i64, export_tpq), stepToTick(q, export_tpq)); // 导出分辨率 1:1
 }
 
 test "midi: 解析最小文件（running status + vel=0 off + 未配对收尾）" {
@@ -536,23 +542,24 @@ test "midi: 同音高重叠——note-off FIFO 配对最早的一个" {
 
 test "midi: 导出 → 解析往返（音高/时值/通道）" {
     const allocator = std.testing.allocator;
+    const q = steps_per_quarter;
     const notes = [_]ExportNote{
-        .{ .start_step = 0, .len_steps = 24, .pitch = 60, .channel = 0 }, // 四分音符
-        .{ .start_step = 24, .len_steps = 12, .pitch = 64, .channel = 0 },
-        .{ .start_step = 0, .len_steps = 96, .pitch = 48, .channel = 3 }, // 另一通道
-        .{ .start_step = 48, .len_steps = 1, .pitch = 72, .channel = 15 }, // 最短
+        .{ .start_step = 0, .len_steps = q, .pitch = 60, .channel = 0 }, // 四分音符
+        .{ .start_step = q, .len_steps = @divTrunc(q, 2), .pitch = 64, .channel = 0 },
+        .{ .start_step = 0, .len_steps = 4 * q, .pitch = 48, .channel = 3 }, // 另一通道
+        .{ .start_step = 2 * q, .len_steps = 1, .pitch = 72, .channel = 15 }, // 最短
     };
     const bytes = try write(allocator, .{ .bpm = 140, .time_num = 3, .time_den = 4, .notes = &notes });
     defer allocator.free(bytes);
 
-    // 头块自检
+    // 头块自检（导出分辨率 = `export_tpq`）
     try std.testing.expectEqualStrings("MThd", bytes[0..4]);
     try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, bytes[8..10], .big)); // format 1
-    try std.testing.expectEqual(@as(u16, 480), std.mem.readInt(u16, bytes[12..14], .big));
+    try std.testing.expectEqual(@as(u16, @intCast(export_tpq)), std.mem.readInt(u16, bytes[12..14], .big));
 
     var parsed = try parse(allocator, bytes);
     defer parsed.deinit(allocator);
-    try std.testing.expectEqual(@as(i32, 480), parsed.ticks_per_quarter);
+    try std.testing.expectEqual(export_tpq, parsed.ticks_per_quarter);
     try std.testing.expectEqual(@as(usize, 4), parsed.notes.len);
 
     // 每个音符都能精确还原成步坐标（tpq 480 → tick = step × 20，整除无误差）

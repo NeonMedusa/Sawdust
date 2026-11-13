@@ -5519,11 +5519,12 @@ test "main: 旧版二进制 v5 → performUpgrade 备份并改写为当前版本
     const bak_bytes = try std.Io.Dir.cwd().readFileAlloc(io, bak_path, alloc, .unlimited);
     defer alloc.free(bak_bytes);
     try std.testing.expectEqual(@as(u8, 5), bak_bytes[4]);
-    // 3) 内容完整：片段数量/轨道/起点保留
+    // 3) 内容完整：片段数量/轨道/起点保留（v5 = 旧单位 → 读入时已 ×40）
+    const sc = @import("model.zig").unit_migration_scale;
     try std.testing.expectEqual(@as(usize, 1), app.clips.items.len);
     try std.testing.expectEqual(@as(i32, 1), app.clips.items[0].track);
-    try std.testing.expectEqual(@as(i32, 4), app.clips.items[0].start);
-    try std.testing.expectEqual(@as(i32, 8), app.clips.items[0].len);
+    try std.testing.expectEqual(@as(i32, 4 * sc), app.clips.items[0].start);
+    try std.testing.expectEqual(@as(i32, 8 * sc), app.clips.items[0].len);
     // 4) 升级后是“已保存”状态，且待升级标记已清
     try std.testing.expect(app.pending_upgrade_path == null);
     try std.testing.expect(!app.dirty);
