@@ -1597,7 +1597,7 @@ test "playlist: hitAt——落点换算（轨道行/吸附/缩放/滚动；区�
     app.playlist.zoom = 1.0;
     app.playlist.scroll = 0;
     app.playlist.scroll_x = 0;
-    app.playlist.snap = 17; // 1/3840 → snapSteps = 1（不吸附，便于精确断言）
+    app.playlist.snap = model.snapIndex(3840); // 1/3840 → snapSteps = 1（不吸附，便于精确断言）
     const pxs: f32 = util.pianoStepPx(); // 每步内容像素（U=3840 → 0.125）
 
     // 轨道行：第 2 行（0 起）→ py = 50 + 24*2 + 10

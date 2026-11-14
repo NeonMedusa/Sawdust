@@ -514,15 +514,39 @@ test "游标换算：最左片段 / 全局↔局部 / 折叠截断" {
 }
 
 /// **量化/吸附网格**：分母（1/1 … 1/3840）→ 步数（`U` 单位）。
-/// 只列可整除 U 的分母；**早期 12 项的顺序保持不变**（`snap` 下标是会话态，
-/// 但改旧下标含义会改变默认网格），新档位一律**追加**在后面：
-/// 先行更细的二进制细分，再接五连音。
-/// 0 = 关闭吸附（自由精度）。
+///
+/// 分**四个族**，同族内是干净的 ×2 阶梯（见 `snap_groups`；菜单按族分列显示）：
+///   · 二等分 `2^a`：1/1、1/2、1/4、1/8…（最常用）
+///   · 三连音 `3·2^a`：1/3、1/6、1/12…（半拍三等分后继续二等分）
+///   · 五连音 `5·2^a`：1/5、1/10、1/20…（五等分后继续二等分）
+///   · 其他：复合 `15·2^a`（1/960）与逐 tick（1/3840）
+///
+/// 三族的分母形态互不相同（`2^a` / `3·2^a` / `5·2^a` **永不相等**）→ 档位不会重复。
+/// 每族都取到 `U = 3840 = 2⁸·3·5` 能**整除**的最细一档：
+/// 1/256（15 步）、1/768（5 步）、1/1280（3 步）；再细一档就是 7.5 / 2.5 / 1.5 步。
 pub const snap_denoms = [_]i32{
-    1, 2, 4, 8, 16, 32, // 二进制
-    3, 6, 12, 24, 48, 96, // 三连音系
-    64, 128, 192, 384, 960, 3840, // 更细的二进制细分（U=3840 才做得出来：1/64 以前不可整除）
-    5,  10,  20,  40,  80,   160, // 五连音系（3840 = 2⁸·3·5）
+    // 二等分（下标 0-8；下标 4 = 1/16 是两个 `snap` 默认值）
+    1, 2, 4, 8, 16, 32, 64, 128, 256,
+    // 三连音
+    3, 6, 12, 24, 48, 96, 192, 384, 768,
+    // 五连音
+    5, 10, 20, 40, 80, 160, 320, 640, 1280,
+    // 其他（不是“另一种连音”，而是两家叠起来 / 逐 tick）
+    960, 3840,
+};
+
+/// 网格族的菜单分组：`start/len` 必须**无缝隙地铺满** `snap_denoms`（有测试钉住）。
+pub const SnapGroup = struct {
+    title: []const u8,
+    start: usize,
+    len: usize,
+};
+
+pub const snap_groups = [_]SnapGroup{
+    .{ .title = "二等分", .start = 0, .len = 9 },
+    .{ .title = "三连音", .start = 9, .len = 9 },
+    .{ .title = "五连音", .start = 18, .len = 9 },
+    .{ .title = "其他", .start = 27, .len = 2 },
 };
 
 /// 档位下标 → 步数（每格多少步）
@@ -530,6 +554,15 @@ pub fn snapSteps(idx: i32) i32 {
     if (idx < 0 or idx >= snap_denoms.len) return 1;
     const d = snap_denoms[@intCast(idx)];
     return @max(1, @divTrunc(units_per_whole, d)); // U/d：1/3840 → 1 步、1/1 → U 步
+}
+
+/// 分母 → 档位下标（找不到返回 -1）。
+/// **代码/测试里不要写死档位下标**：族重排或加档就会静默变义（实测踩过）。
+pub fn snapIndex(denom: i32) i32 {
+    for (snap_denoms, 0..) |d, i| {
+        if (d == denom) return @intCast(i);
+    }
+    return -1;
 }
 
 /// 把步对齐到网格（向下取整）；`steps` = 网格步数
@@ -707,19 +740,24 @@ test "trimFloorLen：Alt 缩出的 1/96 松 Alt 后能回去" {
 
 test "snapSteps / snapFloor / snapRound（以 `units_per_whole` 为基准）" {
     const U = units_per_whole;
-    // 档位 → 步数：1/1 = U、1/4 = U/4、1/8 = U/8、1/3 = U/3、1/12 = U/12、
-    // 1/96 = U/96；新增的 1/64 / 1/128 / 1/384 / 1/3840 与五连音各占一档
-    try std.testing.expectEqual(U, snapSteps(0)); // 1/1
-    try std.testing.expectEqual(@divTrunc(U, 4), snapSteps(2)); // 1/4
-    try std.testing.expectEqual(@divTrunc(U, 8), snapSteps(3)); // 1/8
-    try std.testing.expectEqual(@divTrunc(U, 3), snapSteps(6)); // 1/3（三连音）
-    try std.testing.expectEqual(@divTrunc(U, 12), snapSteps(8)); // 1/12
-    try std.testing.expectEqual(@divTrunc(U, 96), snapSteps(11)); // 1/96
-    try std.testing.expectEqual(@divTrunc(U, 64), snapSteps(12)); // 1/64（U=3840 才能整除）
-    try std.testing.expectEqual(@divTrunc(U, 128), snapSteps(13)); // 1/128
-    try std.testing.expectEqual(@divTrunc(U, 384), snapSteps(15)); // 1/384
-    try std.testing.expectEqual(@as(i32, 1), snapSteps(17)); // 1/3840 = 1 步
-    try std.testing.expectEqual(@divTrunc(U, 5), snapSteps(18)); // 1/5（五连音，精确）
+    // 按**分母**查下标 → 步长（不写死下标：族重排/加档不会弄红测试）
+    const idxOf = snapIndex;
+    try std.testing.expectEqual(U, snapSteps(idxOf(1))); // 1/1
+    try std.testing.expectEqual(@divTrunc(U, 4), snapSteps(idxOf(4))); // 1/4
+    try std.testing.expectEqual(@divTrunc(U, 8), snapSteps(idxOf(8))); // 1/8
+    try std.testing.expectEqual(@divTrunc(U, 3), snapSteps(idxOf(3))); // 1/3（三连音）
+    try std.testing.expectEqual(@divTrunc(U, 12), snapSteps(idxOf(12))); // 1/12
+    try std.testing.expectEqual(@divTrunc(U, 96), snapSteps(idxOf(96))); // 1/96
+    try std.testing.expectEqual(@divTrunc(U, 64), snapSteps(idxOf(64))); // 1/64（U=3840 才能整除）
+    try std.testing.expectEqual(@divTrunc(U, 128), snapSteps(idxOf(128))); // 1/128
+    try std.testing.expectEqual(@divTrunc(U, 384), snapSteps(idxOf(384))); // 1/384
+    try std.testing.expectEqual(@as(i32, 1), snapSteps(idxOf(3840))); // 1/3840 = 1 步
+    try std.testing.expectEqual(@divTrunc(U, 5), snapSteps(idxOf(5))); // 1/5（五连音，精确）
+    // 越界/负数：当作 1 步（不 panic）
+    try std.testing.expectEqual(@as(i32, 1), snapSteps(-1));
+    try std.testing.expectEqual(@as(i32, 1), snapSteps(999));
+    // 默认档位（`app.piano.snap` / 量化 `snap` = 4）必须是 1/16
+    try std.testing.expectEqual(@as(i32, 16), snap_denoms[4]);
 
     // 对齐：1/4 网格（U/4 步）
     const g = @divTrunc(U, 4);
@@ -730,6 +768,37 @@ test "snapSteps / snapFloor / snapRound（以 `units_per_whole` 为基准）" {
     // 网格 = 1 步时不改动
     try std.testing.expectEqual(@as(i32, 37), snapFloor(37, 1));
     try std.testing.expectEqual(@as(i32, 37), snapRound(37, 1));
+}
+
+test "网格族：三族 ×2 阶梯 + 「其他」，无缺档/无重复/全整除 U" {
+    const U = units_per_whole;
+    // 1) 分组必须**无缝隙铺满**整个数组（菜单按下标分列，错位会点错档）
+    var next: usize = 0;
+    for (snap_groups) |gr| {
+        try std.testing.expectEqual(next, gr.start);
+        next += gr.len;
+    }
+    try std.testing.expectEqual(snap_denoms.len, next);
+
+    // 2) 三个主族：首项 1/2/3/5，之后逐项 ×2；末项是 U 能整除的**最细**一档
+    const bases = [_]i32{ 1, 3, 5 };
+    for (bases, 0..) |base, gi| {
+        const gr = snap_groups[gi];
+        try std.testing.expectEqual(base, snap_denoms[gr.start]);
+        for (0..gr.len) |k| {
+            try std.testing.expectEqual(base * (@as(i32, 1) << @intCast(k)), snap_denoms[gr.start + k]);
+        }
+        const last = snap_denoms[gr.start + gr.len - 1];
+        try std.testing.expectEqual(@as(i32, 0), @mod(U, last)); // 本档整除
+        try std.testing.expect(@mod(U, last * 2) != 0); // 再细一档就不整除了（到顶了）
+    }
+
+    // 3) 全表：每档都整除 U，且**无重复**（三家分母形态 2^a / 3·2^a / 5·2^a 永不相等）
+    for (snap_denoms, 0..) |d, i| {
+        try std.testing.expect(d > 0);
+        try std.testing.expectEqual(@as(i32, 0), @mod(U, d));
+        for (snap_denoms[i + 1 ..]) |d2| try std.testing.expect(d != d2);
+    }
 }
 
 test "gridSteps / trimMinGridLen：位移→格数与拉伸下限" {

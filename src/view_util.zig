@@ -692,7 +692,9 @@ pub fn titleSelectorMenu(
     return consumed;
 }
 
-/// 吸附网格下拉（= `titleSelectorMenu` + 网格档位条目 "1/N"）
+/// 吸附网格下拉：**按族分列**（二等分 / 三连音 / 五连音 / 其他），
+/// 每列 = 族标题 + 该族的 ×2 阶梯。
+/// 不分列的话 29 档 × 20px ≈ 660px，在小窗口上会超出屏幕（而这是最常开的下拉）。
 pub fn snapSelectorMenu(ui: *Ui, btn_x: i32, below_y: i32, snap: *i32, open: *bool, skip_close: bool) bool {
     if (!open.*) return false;
     var bufs: [model.snap_denoms.len][16]u8 = undefined;
@@ -700,7 +702,57 @@ pub fn snapSelectorMenu(ui: *Ui, btn_x: i32, below_y: i32, snap: *i32, open: *bo
     for (model.snap_denoms, 0..) |d, i| {
         items[i] = std.fmt.bufPrint(&bufs[i], "1/{d}", .{d}) catch "";
     }
-    return titleSelectorMenu(ui, btn_x, below_y, &items, snap, open, skip_close, 96);
+
+    // 每列宽：族标题与该族最宽条目取大（+ 左右内边距）
+    const groups = model.snap_groups;
+    var col_w: [groups.len]i32 = undefined;
+    var rows_max: i32 = 0;
+    for (groups, 0..) |gr, gi| {
+        var w = titleSelectorButtonWidth(ui, gr.title);
+        for (items[gr.start .. gr.start + gr.len]) |it| w = @max(w, titleSelectorButtonWidth(ui, it));
+        col_w[gi] = w + 18;
+        rows_max = @max(rows_max, @as(i32, @intCast(gr.len)));
+    }
+    var mw: i32 = 2;
+    for (col_w) |w| mw += w;
+    const mh: i32 = (rows_max + 1) * menu_item_h + 4; // +1 = 族标题行
+
+    // 位置：默认贴按钮下方；靠右/靠下时夹回窗口内（分列菜单更宽，必须夹）
+    const win_w = ui.renderer.logicalWidth();
+    const win_h = ui.renderer.logicalHeight();
+    const mx: i32 = std.math.clamp(btn_x, 2, @max(2, win_w - mw - 2));
+    const my: i32 = std.math.clamp(below_y, 2, @max(2, win_h - mh - 2));
+
+    ui.renderer.fillRect(mx, my, mw, mh, ui.theme.panel);
+    ui.renderer.strokeRect(mx, my, mw, mh, ui.theme.accent);
+    ui.noteOverlayRect(mx, my, mw, mh); // 遮挡插件子窗口
+
+    var consumed = false;
+    var cx: i32 = mx + 1;
+    for (groups, 0..) |gr, gi| {
+        if (gi > 0) ui.renderer.fillRect(cx - 1, my + 3, 1, mh - 6, ui.theme.accent); // 列分隔线
+        // 族标题（暗色、不可点）
+        ui.labelClipped(gr.title, cx + 8, my + 4, col_w[gi] - 12, ui.theme.text_dim);
+        for (items[gr.start .. gr.start + gr.len], 0..) |it, k| {
+            const iy = my + 2 + (1 + @as(i32, @intCast(k))) * menu_item_h;
+            const idx: i32 = @intCast(gr.start + k);
+            const ih = inRect(ui.mouse_x, ui.mouse_y, cx, iy, col_w[gi] - 2, menu_item_h);
+            if (ih) ui.renderer.fillRect(cx, iy, col_w[gi] - 2, menu_item_h, ui.theme.item_hover);
+            const sel = snap.* == idx;
+            ui.labelClipped(it, cx + 8, iy + 2, col_w[gi] - 12, if (sel) ui.theme.accent else ui.theme.text);
+            if (ih) consumed = true;
+            if (ih and ui.mouse_pressed) {
+                snap.* = idx;
+                open.* = false;
+            }
+        }
+        cx += col_w[gi];
+    }
+    // 点外部关闭（跳过“刚点按钮打开菜单”那一帧）
+    if (!skip_close and ui.mouse_pressed and !inRect(ui.mouse_x, ui.mouse_y, mx, my, mw, mh)) {
+        open.* = false;
+    }
+    return consumed;
 }
 
 /// 滚轮增量 → 像素（30px/格；全局列表与时间轴共用同一速度）

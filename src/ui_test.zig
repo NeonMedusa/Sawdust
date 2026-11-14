@@ -7,6 +7,7 @@ const Ui = @import("ui.zig").Ui;
 const HBarMode = @import("ui.zig").HBarMode;
 const Font = @import("font.zig").Font;
 const view_util = @import("view_util.zig");
+const model = @import("model.zig");
 
 /// 构造一个"假 UI"（无字体依赖的控件测试用；slider 不需要字体）
 fn makeUi(fb: *r_mod.Framebuffer) Ui {
@@ -60,7 +61,7 @@ test "ui: 旋钮圆弧跟随 UI 缩放（DPI）——不能画到左上角原位
 test "view_util: 网格标签不带 ▾（字体缺字；箭头自绘）" {
     var buf: [24]u8 = undefined;
     try std.testing.expectEqualStrings("网格 1/2", view_util.snapLabel(&buf, 1));
-    try std.testing.expectEqualStrings("网格 1/12", view_util.snapLabel(&buf, 8));
+    try std.testing.expectEqualStrings("网格 1/12", view_util.snapLabel(&buf, model.snapIndex(12)));
     try std.testing.expect(std.mem.indexOf(u8, view_util.snapLabel(&buf, 3), "▾") == null);
 }
 
