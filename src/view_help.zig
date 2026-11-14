@@ -37,6 +37,7 @@ const rows = [_]Row{
     .{ .sec = false, .key = "Ctrl + C / Ctrl + V", .desc = "复制 / 粘贴到鼠标位置" },
     .{ .sec = false, .key = "Ctrl + X", .desc = "剪切选中内容" },
     .{ .sec = false, .key = "Ctrl + M", .desc = "静音 / 取消静音选中音符或片段" },
+    .{ .sec = false, .key = "Ctrl + Q", .desc = "量化选中音符 / 片段（两端上当前网格）" },
     .{ .sec = false, .key = "Ctrl + ↑ / ↓", .desc = "音符上 / 下移动八度" },
     .{ .sec = false, .key = "Shift + ↑ / ↓", .desc = "音符上 / 下移动半音" },
     .{ .sec = false, .key = "Ctrl / Shift + ← / →", .desc = "左 / 右移动一小节 / 网格" },

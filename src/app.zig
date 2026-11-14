@@ -65,7 +65,7 @@ pub const Layout = struct {
 pub const FileAction = enum { new, open, save, save_as, import_midi, export_midi, export_wav, import_json, export_json };
 
 /// 编辑操作（框选/批量操作快捷键 → 由**当前视图**在帧内按上下文执行）
-pub const EditOp = enum { delete_selected, clone_right, copy, cut, paste, select_all, toggle_mute };
+pub const EditOp = enum { delete_selected, clone_right, copy, cut, paste, select_all, toggle_mute, quantize };
 
 /// 键盘移动选中音符的请求（Shift/Ctrl+方向键；main 登记、音符视图消费）
 pub const MoveReq = struct {
@@ -2100,6 +2100,50 @@ pub const App = struct {
         const cloned = to_clone.items.len;
         if (cloned > 0) self.dirty = true;
         return cloned;
+    }
+
+    /// **绝对量化：选中音符**（Ctrl+Q；grid = 视图给的网格步数，钢琴窗 = `snapSteps(app.piano.snap)`）。
+    /// 只动 `step`/`len`（两端对齐 + 长度至少一格，见 `model.quantizeSpan`），
+    /// 力度/声像/静音一概不碰。`pattern`/`instrument` 由视图传入——与框选、Del、Ctrl+M 的收窄口径一致。
+    /// 返回改动个数（0 = 选区已全在网格上）。
+    pub fn quantizeSelectedNotes(self: *App, pattern: i32, instrument: i32, grid: i32) usize {
+        var n: usize = 0;
+        for (self.notes.items) |*nt| {
+            if (!nt.selected or nt.pattern != pattern or nt.instrument != instrument) continue;
+            const q = model.quantizeSpan(nt.step, nt.len, grid);
+            if (q.start == nt.step and q.len == nt.len) continue;
+            nt.step = q.start;
+            nt.len = q.len;
+            n += 1;
+        }
+        if (n > 0) self.dirty = true;
+        return n;
+    }
+
+    /// **绝对量化：选中片段**（Ctrl+Q；grid = `snapSteps(app.playlist.snap)`）。
+    /// 两步语义（见 `model.quantizeClipWindow`）：先**整块搬**到左端上网格，
+    /// 再对齐右端 → 长度整格（至少一格）。`offset` / `trim_start` **一概不动**
+    /// → “左端 ↔ 内部内容”的映射不变，内容跟着片段一起走。
+    /// 音频允许长出静音尾巴（`audio.clipSpan` 按素材长度截断，不会越界读）。
+    /// 返回改动个数（0 = 选区已全在网格上）。
+    ///
+    /// 调用方（播放列表视图）负责：`beginDragSnaps(null)` → 本函数 → `syncDragSnaps()`
+    /// → `commitHistory("量化片段")`（否则播放中旧窗口的实例不释音，见 `commitDragPreview`）。
+    pub fn quantizeSelectedClips(self: *App, grid: i32) usize {
+        const g: i32 = @max(1, grid);
+        var n: usize = 0;
+        for (self.clips.items) |*c| {
+            if (!c.selected) continue;
+            const q = model.quantizeClipWindow(c.start, c.len, g);
+            if (q.start == c.start and q.len == c.len) continue;
+            const before = c.*;
+            c.start = q.start;
+            c.len = q.len; // `offset` / `trim_start` 不动：左端与内容的映射保持不变
+            self.anchorFollow(before, c.*); // 锚在选区里 → 跟着走
+            n += 1;
+        }
+        if (n > 0) self.dirty = true;
+        return n;
     }
 
     /// 删除全部选中音符（返回删除数）
@@ -13123,6 +13167,84 @@ test "app: 片段批量操作——框选删除 + 批量移动（幂等、轨道
     try std.testing.expectEqual(@as(usize, 2), app.deleteSelectedClips());
     try std.testing.expectEqual(@as(usize, 1), app.clips.items.len);
     try std.testing.expectEqual(@as(usize, 0), app.selectedClipCount());
+}
+
+test "app: Ctrl+Q 量化音符（两端上网格 + 长度至少一格 + 只动当前样式/乐器的选中项）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(2);
+
+    // 选中：起点 100、长 500（网格 1/16 = 240 步）
+    app.notes.append(app.allocator, .{ .step = 100, .len = 500, .pitch = 60, .pattern = 0, .instrument = 0, .selected = true }) catch {};
+    // 未选中 → 不动
+    app.notes.append(app.allocator, .{ .step = 100, .len = 500, .pitch = 62, .pattern = 0, .instrument = 0 }) catch {};
+    // 别的样式 / 别的乐器（虽然 selected）→ 不动（与框选/Del 同一收窄口径）
+    app.notes.append(app.allocator, .{ .step = 100, .len = 500, .pitch = 64, .pattern = 1, .instrument = 0, .selected = true }) catch {};
+    app.notes.append(app.allocator, .{ .step = 100, .len = 500, .pitch = 65, .pattern = 0, .instrument = 1, .selected = true }) catch {};
+
+    const g: i32 = model.snapSteps(model.snapIndex(16));
+    try std.testing.expectEqual(@as(i32, 240), g); // 1/16 = 240 步（U=3840）
+    try std.testing.expectEqual(@as(usize, 1), app.quantizeSelectedNotes(0, 0, g));
+    try std.testing.expectEqual(@as(i32, 0), app.notes.items[0].step); // 100 → 0
+    try std.testing.expectEqual(@as(i32, 720), app.notes.items[0].len); // 右端 600 → 720
+    // 其余三个一字未动
+    try std.testing.expectEqual(@as(i32, 100), app.notes.items[1].step);
+    try std.testing.expectEqual(@as(i32, 500), app.notes.items[1].len);
+    try std.testing.expectEqual(@as(i32, 100), app.notes.items[2].step);
+    try std.testing.expectEqual(@as(i32, 500), app.notes.items[2].len);
+    try std.testing.expectEqual(@as(i32, 100), app.notes.items[3].step);
+    // 幂等：再按一次返回 0（已在网格上）
+    try std.testing.expectEqual(@as(usize, 0), app.quantizeSelectedNotes(0, 0, g));
+
+    // 极短音符（1 步）在粗网格上：两端会重合 → 长度拉到**一格**，长度不为 0
+    app.notes.items[1].selected = true;
+    app.notes.items[1].len = 1;
+    app.notes.items[1].step = 100;
+    try std.testing.expectEqual(@as(usize, 1), app.quantizeSelectedNotes(0, 0, g));
+    try std.testing.expectEqual(@as(i32, 0), app.notes.items[1].step);
+    try std.testing.expectEqual(g, app.notes.items[1].len);
+}
+
+test "app: Ctrl+Q 量化片段（先整块搬左端上网格、再对齐右端；offset/trim_start 不动）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+
+    // ① 样式片段（offset 400）：整块搬到 0，右端看搬完后的 500 → 480；offset **不动**
+    app.clips.append(app.allocator, .{ .track = 0, .start = 100, .len = 500, .pattern = 0, .offset = 400, .selected = true }) catch {};
+    // ② 样式片段（offset 0，贴住素材开头）：与 ① 同一规则（没有特例）
+    app.clips.append(app.allocator, .{ .track = 1, .start = 100, .len = 500, .pattern = 1, .offset = 0, .selected = true }) catch {};
+    // ③ 未选中 → 不动
+    app.clips.append(app.allocator, .{ .track = 2, .start = 100, .len = 500, .pattern = 2, .offset = 400 }) catch {};
+
+    const g: i32 = model.snapSteps(model.snapIndex(16));
+    try std.testing.expectEqual(@as(usize, 2), app.quantizeSelectedClips(g));
+
+    // ①②：左端 100 → 0，长度 500 → 480，左端↔内容的映射不变（offset 原封不动）
+    try std.testing.expectEqual(@as(i32, 0), app.clips.items[0].start);
+    try std.testing.expectEqual(@as(i32, 480), app.clips.items[0].len);
+    try std.testing.expectEqual(@as(i32, 400), app.clips.items[0].offset);
+    try std.testing.expectEqual(@as(i32, 0), app.clips.items[1].start);
+    try std.testing.expectEqual(@as(i32, 480), app.clips.items[1].len);
+    try std.testing.expectEqual(@as(i32, 0), app.clips.items[1].offset);
+    // ③ 未选中一字未动
+    try std.testing.expectEqual(@as(i32, 100), app.clips.items[2].start);
+    try std.testing.expectEqual(@as(i32, 400), app.clips.items[2].offset);
+    // 幂等
+    try std.testing.expectEqual(@as(usize, 0), app.quantizeSelectedClips(g));
+
+    // ④ 音频片段：同样只动 start/len，trim_start（入点）**不动** → 映射不变
+    app.clips.append(app.allocator, .{ .track = 3, .start = 700, .len = 500, .pattern = 0, .audio_style = 0, .trim_start = 1000, .selected = true }) catch {};
+    try std.testing.expectEqual(@as(usize, 1), app.quantizeSelectedClips(g));
+    const ac = app.clips.items[3];
+    try std.testing.expectEqual(@as(i32, 720), ac.start); // 700 → 720（就近）
+    try std.testing.expectEqual(@as(i32, 480), ac.len); // 右端 720+500=1220 → 1200
+    try std.testing.expectEqual(@as(i32, 1000), ac.trim_start); // 入点不动
+    try std.testing.expectEqual(@as(i32, 0), @mod(ac.start + ac.len, g)); // 右端上网格
+    try std.testing.expect(ac.len >= g);
 }
 
 test "app: 样式——删除（音符/片段随删、序号前移、选择/钢琴卷帘/菜单跟随）" {

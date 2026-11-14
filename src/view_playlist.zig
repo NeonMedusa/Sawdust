@@ -1466,6 +1466,27 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                     app.commitHistory("粘贴片段");
                 }
             },
+            .quantize => {
+                // **绝对量化**：先整块搬左端上网格、再对齐右端（`offset`/`trim_start` 不动）
+                // （见 `model.quantizeClipWindow` / `App.quantizeSelectedClips`）。
+                if (app.selectedClipCount() == 0) {
+                    app.setToast("先用 Ctrl+拖框选要量化的片段");
+                } else {
+                    // 播放中：先记下旧窗口（改完要释掉不再命中的实例，口径同拖动）
+                    app.beginDragSnaps(null);
+                    const n = app.quantizeSelectedClips(snap_steps);
+                    const rescanned = app.syncDragSnaps();
+                    var qb: [24]u8 = undefined;
+                    if (n == 0) {
+                        app.playlist.drag_snaps.clearRetainingCapacity();
+                        app.setToastWith("选区已在网格上（{s}）", .{util.snapLabel(&qb, app.playlist.snap)});
+                    } else {
+                        if (rescanned) app.skip_next_edit_rescan = true;
+                        app.setToastWith("已量化 {d} 个片段（{s}）", .{ n, util.snapLabel(&qb, app.playlist.snap) });
+                        app.commitHistory("量化片段");
+                    }
+                }
+            },
         }
         app.pending_edit_op = null;
     }

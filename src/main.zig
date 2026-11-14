@@ -665,6 +665,8 @@ pub fn main(init: std.process.Init) !u8 {
                     if (k.ctrl and (k.code == 'V' or k.code == 'v')) app.pending_edit_op = .paste;
                     if (k.ctrl and (k.code == 'A' or k.code == 'a')) app.pending_edit_op = .select_all;
                     if (k.ctrl and (k.code == 'M' or k.code == 'm')) app.pending_edit_op = .toggle_mute;
+                    // Ctrl+Q：绝对量化（钢琴窗 → 选中音符；播放列表 → 选中片段）
+                    if (k.ctrl and (k.code == 'Q' or k.code == 'q')) app.pending_edit_op = .quantize;
                     // ── 撤销/重做 ──
                     // Ctrl+Z 撤销；Ctrl+Alt+Z（或 Ctrl+Shift+Z）重做
                     if (k.ctrl and (k.code == 'Z' or k.code == 'z')) {

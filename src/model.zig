@@ -577,6 +577,46 @@ pub fn snapRound(step: i32, steps: i32) i32 {
     return @divFloor(step + @divTrunc(steps, 2), steps) * steps;
 }
 
+/// 一次**绝对量化**的结果（两端各自就近对齐网格）。
+pub const QuantizedSpan = struct {
+    start: i32,
+    len: i32,
+};
+
+/// **绝对量化**（Ctrl+Q）：把 `[start, start+len)` 的**两端**各自对齐到最近的网格线。
+/// 规则（用户拍定）：
+///   · 左端与右端**都要落在网格线上**；
+///   · 长度至少**一格**（两端重合会得到 0 长度 → 拉到一格）；
+///   · 起点不为负（0 是任何网格的网格点）。
+/// 与拖动（增量量化：只走整格位移、保留对象相对网格的偏移）**故意相反**——
+/// 后者是“拖动不传送”的铁律（见 `docs/drag-snap.md`），前者才是“量化”二字的含义。
+pub fn quantizeSpan(start: i32, len: i32, grid: i32) QuantizedSpan {
+    const g: i32 = @max(1, grid);
+    const s0: i32 = @max(0, start);
+    const s: i32 = snapRound(s0, g);
+    const e: i32 = snapRound(s0 + @max(1, len), g); // 右端看**原**右端（不是对齐后的起点）
+    return .{ .start = s, .len = @max(g, e - s) };
+}
+
+/// 片段窗口量化结果（步）。
+pub const QuantizedClipWin = struct {
+    start: i32,
+    len: i32,
+};
+
+/// 量化**片段窗口**（Ctrl+Q；用户拍定的**两步**语义）：
+///   ① **整块移动**片段 → 左端点对齐网格 —— `offset` / `trim_start` **一概不动**，
+///      所以“左端 ↔ 内部内容”的映射不变，内容跟着片段一起在时间轴上走；
+///   ② 再把**右端点**对齐网格（相对“搬完后的右端”= `s + len`）→ 长度变成整格（至少一格）。
+/// 唯一硬边界是时间轴 0（而 0 是任何网格的网格点 → 对齐不会被破坏）。
+pub fn quantizeClipWindow(start: i32, len: i32, grid: i32) QuantizedClipWin {
+    const g: i32 = @max(1, grid);
+    const s0: i32 = @max(0, start);
+    const s: i32 = snapRound(s0, g); // ① 整块搬家：左端上网格
+    const e: i32 = snapRound(s + @max(1, len), g); // ② 右端上网格（看**搬完后**的右端）
+    return .{ .start = s, .len = @max(g, e - s) };
+}
+
 /// 位移（步）→ **网格倍数**（四舍五入到最近格：过半格即换一格；负数对称）。
 /// 拉伸/拖动现在统一用 `GridRebase`（累积位移 + 网格重锚）；保留此函数仅作
 /// “位移→格数”换算的参考实现，**不要在编辑路径重新引入网格单位**（会导致松 Alt 时跳）。
@@ -798,6 +838,102 @@ test "网格族：三族 ×2 阶梯 + 「其他」，无缺档/无重复/全整�
         try std.testing.expect(d > 0);
         try std.testing.expectEqual(@as(i32, 0), @mod(U, d));
         for (snap_denoms[i + 1 ..]) |d2| try std.testing.expect(d != d2);
+    }
+}
+
+test "quantizeSpan（绝对量化：两端上网格 + 长度至少一格）" {
+    const g: i32 = 240; // 1/16
+    // 两端各自就近：100 → 0，100+500=600 → 720（600/240=2.5 → 进到 3 格）
+    {
+        const q = quantizeSpan(100, 500, g);
+        try std.testing.expectEqual(@as(i32, 0), q.start);
+        try std.testing.expectEqual(@as(i32, 720), q.len);
+    }
+    // 已在网格上 → 不变（幂等）
+    {
+        const q = quantizeSpan(480, 720, g);
+        try std.testing.expectEqual(@as(i32, 480), q.start);
+        try std.testing.expectEqual(@as(i32, 720), q.len);
+        const q2 = quantizeSpan(q.start, q.len, g);
+        try std.testing.expectEqual(q.start, q2.start);
+        try std.testing.expectEqual(q.len, q2.len);
+    }
+    // 极短音符（1 步）落在粗网格上：两端会重合成 0 长 → 拉到**一格**
+    {
+        const q = quantizeSpan(100, 1, g);
+        try std.testing.expectEqual(@as(i32, 0), q.start);
+        try std.testing.expectEqual(g, q.len);
+    }
+    // 两端都在网格上 + 长度 > 0（不变里）——跨多档网格验一遍
+    const grids = [_]i32{ 15, 30, 45, 60, 240, 960, 3840 };
+    for (grids) |gg| {
+        var s: i32 = 0;
+        while (s < 4 * 3840) : (s += 337) {
+            var l: i32 = 1;
+            while (l < 3 * 3840) : (l = l * 3 + 7) {
+                const q = quantizeSpan(s, l, gg);
+                try std.testing.expectEqual(@as(i32, 0), @mod(q.start, gg));
+                try std.testing.expectEqual(@as(i32, 0), @mod(q.start + q.len, gg));
+                try std.testing.expect(q.len >= gg);
+                try std.testing.expect(q.start >= 0);
+                // 幂等：量化后的结果再量化一次不变
+                const q2 = quantizeSpan(q.start, q.len, gg);
+                try std.testing.expectEqual(q.start, q2.start);
+                try std.testing.expectEqual(q.len, q2.len);
+            }
+        }
+    }
+}
+
+test "quantizeClipWindow（先整块搬左端上网格，再把右端上网格；长度至少一格）" {
+    const g: i32 = 240;
+    // ① 整块搬：100 → 0；右端看**搬完后**的右端（0+500=500）+就近 → 480
+    {
+        const q = quantizeClipWindow(100, 500, g);
+        try std.testing.expectEqual(@as(i32, 0), q.start);
+        try std.testing.expectEqual(@as(i32, 480), q.len);
+    }
+    // 两步语义的证据：搬完后再看右端（0+300=300 → 240），而不是数“原右端 400”
+    {
+        const q = quantizeClipWindow(100, 300, g);
+        try std.testing.expectEqual(@as(i32, 0), q.start);
+        try std.testing.expectEqual(@as(i32, 240), q.len);
+    }
+    // 已在网格上 → 完全不变（幂等）
+    {
+        const q = quantizeClipWindow(480, 960, g);
+        try std.testing.expectEqual(@as(i32, 480), q.start);
+        try std.testing.expectEqual(@as(i32, 960), q.len);
+    }
+    // 超短片段：长度拉到一格
+    {
+        const q = quantizeClipWindow(0, 5, g);
+        try std.testing.expectEqual(@as(i32, 0), q.start);
+        try std.testing.expectEqual(g, q.len);
+    }
+    // 时间轴 0：向左就近不会越界，且仍然在网格上
+    {
+        const q = quantizeClipWindow(37, 500, g);
+        try std.testing.expectEqual(@as(i32, 0), q.start);
+        try std.testing.expectEqual(@as(i32, 480), q.len);
+    }
+    // 不变里：两端都在网格上 + 长度≥一格 + 幂等
+    const grids = [_]i32{ 15, 30, 45, 60, 240, 960, 3840 };
+    for (grids) |gg| {
+        var s: i32 = 0;
+        while (s < 4 * 3840) : (s += 337) {
+            var l: i32 = 1;
+            while (l < 3 * 3840) : (l = l * 3 + 7) {
+                const q = quantizeClipWindow(s, l, gg);
+                try std.testing.expectEqual(@as(i32, 0), @mod(q.start, gg));
+                try std.testing.expectEqual(@as(i32, 0), @mod(q.start + q.len, gg));
+                try std.testing.expect(q.len >= gg);
+                try std.testing.expect(q.start >= 0);
+                const q2 = quantizeClipWindow(q.start, q.len, gg);
+                try std.testing.expectEqual(q.start, q2.start);
+                try std.testing.expectEqual(q.len, q2.len);
+            }
+        }
     }
 }
 

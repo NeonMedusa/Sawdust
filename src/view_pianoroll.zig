@@ -1446,6 +1446,26 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 const n = app.selectAllNotes(pattern, app.sel.instrument);
                 if (n > 0) app.setToastWith("已全选 {d} 个音符", .{n});
             },
+            .quantize => {
+                // **绝对量化**：两端上网格 + 长度至少一格（见 `model.quantizeSpan`）。
+                // 只动框选中的、且属于当前样式 + 当前乐器的音符（与框选/Del 同一收窄口径）。
+                var sel: usize = 0;
+                for (app.notes.items) |nt| {
+                    if (nt.selected and nt.pattern == pattern and nt.instrument == app.sel.instrument) sel += 1;
+                }
+                if (sel == 0) {
+                    app.setToast("先用 Ctrl+拖框选要量化的音符");
+                } else {
+                    const n = app.quantizeSelectedNotes(pattern, app.sel.instrument, snap_steps);
+                    var qb: [24]u8 = undefined;
+                    if (n > 0) {
+                        app.setToastWith("已量化 {d} 个音符（{s}）", .{ n, util.snapLabel(&qb, app.piano.snap) });
+                        app.commitHistory("量化音符");
+                    } else {
+                        app.setToastWith("选区已在网格上（{s}）", .{util.snapLabel(&qb, app.piano.snap)});
+                    }
+                }
+            },
         }
         app.pending_edit_op = null;
     }
