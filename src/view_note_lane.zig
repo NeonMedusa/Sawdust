@@ -214,7 +214,10 @@ pub fn draw(
             }
             break :blk "—";
         };
-        ui.labelClipped(text, head_x + 2, y + 22, util.piano_header_w - 4, ui.theme.text_dim);
+        // 读数固定行在列表**上方**（`drawList` 的 `top_row` = 22 就是给它留的位置）：
+        // y+5 起画（字体行高 ~13）→ 到 y+18 结束，不会压到第一行项（y+26 起）。
+        // 旧版写的 `y + 22` 直接和“音符力度”那一行叠在一起（实测重叠）。
+        ui.labelClipped(text, head_x + 2, y + 5, util.piano_header_w - 4, ui.theme.text_dim);
     }
     {
         // 横向参考线：与包络视图**同一个函数**（1/8 等分；中线只画一次）

@@ -20,6 +20,22 @@ pub const splitter_w: i32 = 4; // 分隔条宽度（视觉厚度；命中区另�
 pub const min_pane_w: i32 = 100; // 每栏最小宽度
 pub const title_h: i32 = 24; // 面板标题栏高度
 
+/// 浮动窗口标题栏的**关闭按钮**（全项目统一）：右缘 22px 处、`20 × (标题高−4)`、
+/// 悬停变红（`danger`），字形用 `×`（U+00D7）——不是 ASCII  `x`。
+/// 返回 true = 本帧被点击（**调用方负责关闭窗口**，因为各窗口的收尾动作不同）。
+/// 坐标参数是**窗口矩形 + 标题栏高**（各窗口标题高不同：`util.title_h` / `win_title_h` / `rack_title_h`）。
+pub fn titleCloseButton(ui: *Ui, x: i32, y: i32, w: i32, title_h_: i32) bool {
+    const bw: i32 = 20;
+    const bh: i32 = title_h_ - 4;
+    const bx: i32 = x + w - 22;
+    const by: i32 = y + 2;
+    const hovered = hitUI(ui, bx, by, bw, bh);
+    ui.renderer.fillRect(bx, by, bw, bh, if (hovered) ui.theme.danger else ui.theme.panel);
+    const tw: i32 = @intFromFloat(ui.font.measure("×"));
+    ui.labelCentered("×", bx + @divTrunc(bw - tw, 2), by, bh, ui.theme.text);
+    return hovered and ui.mouse_pressed;
+}
+
 /// VST3 插件参数列表（拖动编辑 / 双击恢复默认；滚轮滚动）——效果面板与
 /// “无界面插件”的乐器面板共用。`list_top` 为列表顶；底部留 14px 提示行。
 /// `id_base` 区分不同面板的拖动 id（避免两面板同时打开时拖拽串台）。
@@ -157,11 +173,11 @@ pub const piano_header_w: i32 = 90; // 琴键列宽（与播放列表轨道列�
 // **不画**（那条线归上一层负责）——避免“两套小节线各画各的”。
 // 注：当前值（36）是**调优中**的临时值（原为 4/6/3，用户实测太密）。
 /// 网格层（= 当前量化档位）
-pub const grid_min_px_snap: f32 = 36.0;
+pub const grid_min_px_snap: f32 = 24.0;
 /// 拍线
-pub const grid_min_px_beat: f32 = 36.0;
+pub const grid_min_px_beat: f32 = 24.0;
 /// 小节线（**权威层**）：按 **2 的幂 × 小节** 变稀（1/2/4/8/16…，乐句感）
-pub const grid_min_px_bar: f32 = 36.0;
+pub const grid_min_px_bar: f32 = 24.0;
 /// **小节号（刻度尺数字）的最小间距**。数字 = 线梯子的整数倍（可再抽稀一倍）、
 /// 但**绝不独立分级**——保证每个数字下面正好有一条小节线。
 pub const ruler_label_min_px: f32 = 40.0;
@@ -195,26 +211,26 @@ pub fn barLabelEveryBars(bar_ws: f32) i32 {
 }
 
 test "view_util: 小节线/数字梯子的关系（数字 = 线梯子的整数倍）" {
-    // 小节够宽（192px）：线=1、数字=1
-    try std.testing.expectEqual(@as(i32, 1), barLineEveryBars(192.0));
-    try std.testing.expectEqual(@as(i32, 1), barLabelEveryBars(192.0));
-    // 30px：线 2（60px）；数字 2（60px ≥ 40）
-    try std.testing.expectEqual(@as(i32, 2), barLineEveryBars(30.0));
-    try std.testing.expectEqual(@as(i32, 2), barLabelEveryBars(30.0));
-    // 10px：线 4（40px ≥ 36）；数字 4（40px ≥ 40）
-    try std.testing.expectEqual(@as(i32, 4), barLineEveryBars(10.0));
-    try std.testing.expectEqual(@as(i32, 4), barLabelEveryBars(10.0));
-    // 3px：线 16（48px）；数字 16（48px ≥ 40）
-    try std.testing.expectEqual(@as(i32, 16), barLineEveryBars(3.0));
-    try std.testing.expectEqual(@as(i32, 16), barLabelEveryBars(3.0));
-    // 不变量：数字总是线的整数倍（每个数字下面都有线）
-    const widths = [_]f32{ 200, 50, 20, 10, 5, 2, 1, 0.5 };
+    // **不写死具体档位**：`grid_min_px_bar` / `ruler_label_min_px` 是调优参数
+    // （36→24 这类改动会让“2 小节一线”变成“1 小节一线”），这里断言的是**规则**：
+    // 1. 线/数字梯子都是 2 的幂；
+    // 2. 数字是线的整数倍（每个数字下面都有线）；
+    // 3. 梯子刚好够宽：`步长 × 小节宽 ≥ 门槛`，且（除最细 1）再稀一半就不够。
+    const widths = [_]f32{ 200, 50, 30, 20, 10, 5, 3, 2, 1, 0.5 };
     for (widths) |w| {
         const line = barLineEveryBars(w);
         const label = barLabelEveryBars(w);
         try std.testing.expect(@mod(label, line) == 0);
         try std.testing.expect(label >= line);
+        try std.testing.expect(std.math.isPowerOfTwo(@as(u32, @intCast(line))));
+        try std.testing.expect(std.math.isPowerOfTwo(@as(u32, @intCast(label))));
+        try std.testing.expect(@as(f32, @floatFromInt(line)) * w >= grid_min_px_bar);
+        if (line > 1) try std.testing.expect(@as(f32, @floatFromInt(@divTrunc(line, 2))) * w < grid_min_px_bar);
+        try std.testing.expect(@as(f32, @floatFromInt(label)) * w >= ruler_label_min_px);
     }
+    // 小节足够宽（192px = 任何门槛都不触发）→ 线=1、数字=1
+    try std.testing.expectEqual(@as(i32, 1), barLineEveryBars(192.0));
+    try std.testing.expectEqual(@as(i32, 1), barLabelEveryBars(192.0));
 }
 
 /// 垂直缩放的“缩到底”有效下限（□ 拖拽 / Shift+滚轮共用）：不允许缩过
@@ -920,7 +936,10 @@ test "网格：过密时**密度减半**（不是整层消失，也不画成实�
     const e = effectiveEvery(5, 1.0, grid_min_px_snap);
     try std.testing.expect(e > 5);
     try std.testing.expect(@as(f32, @floatFromInt(e)) >= grid_min_px_snap); // 减到能看清为止
-    try std.testing.expectEqual(theme.grid_snap, buf[@intCast(e)]); // 留下的线
+    // **层级钳制**：减半后已到/超过拍线层的步长 → 网格层**整层不画**（有意的规则）。
+    // 门槛一变（如 `grid_min_px_*` 调优）两层可能正好撑到一起，此时没有网格线可查。
+    const e_beat = effectiveEvery(24, 1.0, grid_min_px_beat);
+    if (e < e_beat) try std.testing.expectEqual(theme.grid_snap, buf[@intCast(e)]); // 留下的线
     try std.testing.expectEqual(theme.bg, buf[5]); // 被减掉的那条
 }
 

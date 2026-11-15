@@ -370,7 +370,8 @@ Note 规则用 5% 的代码拿到了 88% 的收益（141.7KB / 160.5KB）——�
   新增测试用“写当前版本→版本字节改回 8→读”的路子守住这条。
 - **v9 引入的字段**（统一钉 `binary_version_v9 = 9`）：
   `Project.auto_lanes` / `auto_bindings` / `auto_sel`（v8 发布版**没有**自动化整套——不登记就会在旧档末尾
-  “多读三个字段”→ 字节错位）、`SavedBinding.smooth_ms`、`SavedBinding.invert`。
+  “多读三个字段”→ 字节错位）、`SavedBinding.smooth_ms`、`SavedBinding.invert`、`SavedBinding.param_id`
+  （VST 参数自动化 v1）。
   测试改用 `toBinaryAtVersion(…, 8)` **真实写出 v8 布局**（不再“写 v9 再改版本字节”——那种做法在有 v9 新字段时必炸），
   曲线点 ×40 的迁移另用 `migrateUnitsToV5` 的函数级测试盖住。
 

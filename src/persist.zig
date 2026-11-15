@@ -133,6 +133,8 @@ pub const SavedBinding = struct {
     enabled: bool = true,
     /// **反向**（与 `bipolar` 独立；v9 引入）：贡献取负
     invert: bool = false,
+    /// **`vst_param` 专用**：VST3 参数 ID（其他 target 恒 0）
+    param_id: u32 = 0,
     /// **极点追赶的平滑时间常数**（毫秒；0 = 不平滑；缺省 = v9 之前的默认 15ms）
     smooth_ms: f32 = 15.0,
 };
@@ -576,9 +578,10 @@ fn introducedVersion(comptime T: type, comptime name: []const u8) ?u8 {
         return null;
     }
     if (comptime std.mem.endsWith(u8, tn, "SavedBinding")) {
-        // 极点平滑时间常数 / 反向——均为 v9
+        // 极点平滑时间常数 / 反向 / 插件参数 ID——均为 v9
         if (comptime std.mem.eql(u8, name, "smooth_ms")) return binary_version_v9;
         if (comptime std.mem.eql(u8, name, "invert")) return binary_version_v9;
+        if (comptime std.mem.eql(u8, name, "param_id")) return binary_version_v9;
         return null;
     }
     if (comptime std.mem.endsWith(u8, tn, "Project")) {

@@ -58,11 +58,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
     ui.renderer.fillRect(x + 1, title_y + 1, ww - 2, util.rack_title_h - 1, ui.theme.toolbar);
     ui.label("乐器（通道机架）", x + 8, title_y + 4, ui.theme.text);
     // 关闭按钮（右上角 ×）
-    const close_x = x + ww - 22;
-    const close_hovered = util.hitUI(ui, close_x, title_y + 2, 20, util.rack_title_h - 4);
-    ui.renderer.fillRect(close_x, title_y + 2, 20, util.rack_title_h - 4, if (close_hovered) ui.theme.danger else ui.theme.panel);
-    ui.label("×", close_x + 6, title_y + 4, ui.theme.text);
-    if (close_hovered and ui.mouse_pressed) {
+    if (util.titleCloseButton(ui, x, title_y, ww, util.rack_title_h)) {
         rk.open = false;
         app.rack.ctx_instrument = null;
         return true;

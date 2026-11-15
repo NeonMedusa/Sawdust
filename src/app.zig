@@ -280,7 +280,10 @@ pub const PresetTarget = union(enum) {
 
 /// 预设浏览器弹窗状态（**统一的插件+预设选择器**；见 `docs/drumkit.md` §5.2）
 /// 浮动窗口种类（绘制序列表与插件子窗口裁切共用）
-pub const WinKind = enum { rack, synth, mixer, effect, drumkit, help, settings, plugin_mgr, auto };
+pub const WinKind = enum { rack, synth, mixer, effect, drumkit, help, settings, plugin_mgr, auto, vst_auto };
+
+/// 自动化窗口的**视角**：按参数看（这个参数绑了哪些曲线）/ 按曲线看（这条曲线驱动哪些参数）
+pub const AutoWinView = enum { by_target, by_curve };
 
 /// 浮动窗口“绘制顺序 + 最终矩形”（`main.drawApp` 逐帧填写）
 pub const WinDraw = struct { kind: WinKind, x: i32, y: i32, w: i32, h: i32 };
@@ -771,7 +774,7 @@ pub const Playback = struct {
 /// 交互：字符追加；退格删末尾一个 code point；回车 = 提交；ESC = 取消；
 /// 点击输入框外 = 提交（吞掉该次点击）。
 pub const TextInput = struct {
-    pub const Target = enum { instrument, mixer_channel, pattern, track, preset_name, kit_pad_name, preset_rename, preset_search, audio_style, automation_value, automation_curve_name, automation_base, automation_depth, automation_smooth, channel_vol, channel_pan, inst_vol, inst_pan, bpm };
+    pub const Target = enum { instrument, mixer_channel, pattern, track, preset_name, kit_pad_name, preset_rename, preset_search, audio_style, automation_value, automation_curve_name, automation_base, automation_depth, automation_smooth, channel_vol, channel_pan, inst_vol, inst_pan, bpm, vst_param_search, vst_param_value };
 
     active: bool = false,
     target: Target = .instrument,
@@ -1377,6 +1380,20 @@ const StatePool = struct {
     }
 };
 
+/// **VST 参数自动化**：写入“已到位”判据（归一化值差小于它就不写）
+const vst_auto_eps: f64 = 1e-4;
+/// 用户拧完旋钮后，自动化让路的时长（ms；**touch 语义**）
+const vst_touch_ms: i64 = 400;
+
+/// **一阶极点一步**（VST 参数在 UI 侧施加时的平滑）：
+/// - `prev` 为 NaN（未播种）或 `smooth_ms <= 0` → 直接取 `target`（不从 0 爬升）；
+/// - 否则按时间常数 τ = smooth_ms/1000 向 `target` 追赶一步（`dt_s` = 本帧秒数）。
+pub fn poleStep(prev: f32, target: f32, smooth_ms: f32, dt_s: f32) f32 {
+    if (smooth_ms <= 0.0 or std.math.isNan(prev)) return target;
+    const k: f32 = std.math.clamp(1.0 - @exp(-@max(0.0, dt_s) / (smooth_ms / 1000.0)), 0.0, 1.0);
+    return prev + (target - prev) * k;
+}
+
 pub const App = struct {
     /// 已退役但音频线程可能仍在读的快照（帧倒计时后释放）
     pub const RetiredSnap = struct { snap: snapshot.Snapshot, frames: u16 };
@@ -1530,13 +1547,24 @@ pub const App = struct {
         x: i32 = 0,
         y: i32 = 0,
         curve_id: u32 = 0,
+        /// 重命名输入框的弹出位置（开菜单那一帧快照——菜单改成在 main 里画后，
+        /// 那边拿不到行头列的几何）
+        rename_x: i32 = 0,
+        rename_y: i32 = 0,
     } = .{},
-    /// **自动化链接窗口**（从混音台右键 `自动化…` 打开；一个参数一个窗口）
+    /// **自动化链接窗口**（一个参数一个窗口 / 一条曲线一个窗口）
     auto_win: struct {
         open: bool = false,
+        /// **视角**：`by_target` = “这个参数绑了哪些曲线”（从混音台/机架/VST 参数行进入）；
+        /// `by_curve` = “这条曲线驱动哪些参数”（从播放列表曲线行右键 `管理已链接项` 进入）。
+        /// 两者共用同一个窗口与同一张绑定表，只是第 1 列/标题/工具栏不同。
+        view: AutoWinView = .by_target,
         x: i32 = 240,
         y: i32 = 150,
+        /// `by_target` 视角的目标
         target: view_lane.Target = .{},
+        /// `by_curve` 视角的曲线 id
+        curve_id: u32 = 0,
         /// 拖动偏移（标题栏拖动用）
         drag_dx: i32 = 0,
         drag_dy: i32 = 0,
@@ -1572,6 +1600,40 @@ pub const App = struct {
     } = .{},
     /// 曲线 id 分配器（单调、不重用）
     next_curve_id: u32 = 0,
+
+    // ── VST 参数自动化（v1：**UI 侧**施加；见 `applyVstParamAutomation`）──
+    /// **VST 自动化窗口**（Windows：乐器窗口标题栏 `自动化` 按钮；Linux：直接占用乐器面板正文）
+    vst_auto: struct {
+        open: bool = false,
+        x: i32 = 220,
+        y: i32 = 110,
+        z: i32 = 0,
+        /// 目标乐器 uid（0 = 未指定）
+        inst_uid: u32 = 0,
+        /// 统一的滚动偏移（三段共用一个滚动区）
+        scroll: i32 = 0,
+        /// 搜索过滤（与文本输入实时同步，同名同预设搜索的做法）
+        filter_buf: [32]u8 = @splat(0),
+        filter_len: usize = 0,
+        /// 行内菜单（参数行右侧 “自动化” 按钮）
+        menu_open: bool = false,
+        /// 菜单刚打开的那一帧标记（**否则打开它的那次左键会在同帧把它关掉**）
+        menu_just_opened: bool = false,
+        menu_x: i32 = 0,
+        menu_y: i32 = 0,
+        menu_param: u32 = 0,
+        /// 标题拖动抓取偏移
+        drag_dx: i32 = 0,
+        drag_dy: i32 = 0,
+    } = .{},
+    /// “最近改动”的插件参数（最新在前；只存 (乐器 uid, 参数 id)）
+    vst_recent: [10]struct { inst_uid: u32, param_id: u32 } = @splat(.{ .inst_uid = 0, .param_id = 0 }),
+    vst_recent_n: usize = 0,
+    /// 用户此刻/刚刚拧过的参数（**touch 语义**：这段时间内不施加自动化）
+    vst_touch: [8]struct { inst_uid: u32, param_id: u32, until_ms: i64 } = @splat(.{ .inst_uid = 0, .param_id = 0, .until_ms = 0 }),
+    /// 最近一次**自动化写入**的值（回声抑制：插件把自己的变更回报成 performEdit 时不记历史）
+    vst_written: [16]struct { inst_uid: u32, param_id: u32, value: f64 } = @splat(.{ .inst_uid = 0, .param_id = 0, .value = -1 }),
+    vst_written_w: usize = 0,
     /// **钢琴窗编辑区**：envelope 编辑的当前目标 + **每个目标一条独立 lane**
     ///（否则切目标会共用同一条曲线——实测：乐器音量画的线会出现在乐器声像里）
     /// 播放列表自动化区高度（像素；**与钢琴窗编辑区各自独立**，布局数学共用 `view_lane.layoutPanel`）
@@ -1797,7 +1859,7 @@ pub const App = struct {
     plugin_mgr: PluginMgrWindow = .{},
     /// 本帧浮动窗口的**绘制顺序与最终矩形**（`main.drawApp` 逐帧填写；与绘制严格同序：
     /// 后排 = 在上）——插件子窗口区域裁切（`setEditorClip`）据此收集覆盖矩形
-    win_draw_info: [8]WinDraw = @splat(.{ .kind = .rack, .x = 0, .y = 0, .w = 0, .h = 0 }),
+    win_draw_info: [12]WinDraw = @splat(.{ .kind = .rack, .x = 0, .y = 0, .w = 0, .h = 0 }),
     win_draw_n: usize = 0,
     /// 插件管理数据（main 启动时加载；`null` = 未初始化——单元测试不加载）
     plugin_cfg: ?plugin_db.Config = null,
@@ -5161,6 +5223,46 @@ pub const App = struct {
         return self.preset_browser.filter_buf[0..self.preset_browser.filter_len];
     }
 
+    /// 打开 **VST 自动化窗口的参数搜索框**（复用文本输入基建；文字每帧实时同步到
+    /// `vst_auto.filter_*` —— 与 `beginPresetSearch` 同款做法）。
+    pub fn beginVstParamSearch(self: *App, x: i32, y: i32, w: i32) void {
+        const ti = &self.text_input;
+        const st = &self.vst_auto;
+        ti.active = true;
+        ti.target = .vst_param_search;
+        ti.index = 0;
+        ti.len = st.filter_len;
+        @memcpy(ti.buf[0..st.filter_len], st.filter_buf[0..st.filter_len]);
+        ti.cursor = ti.len;
+        ti.sel_anchor = null;
+        ti.drag_active = false;
+        ti.x = x;
+        ti.y = y;
+        ti.w = w;
+        ti.view_off = 0;
+        ti.aux_len = 0;
+    }
+
+    /// 打开 **VST 参数输入值…**（按百分比 0..100 解析）：
+    /// `instrument` = 乐器下标、`index` = VST3 参数 ID（不是参数下标——下标会随插件重启变）
+    pub fn beginVstParamValueEdit(self: *App, inst_idx: usize, param_id: u32, prefill: []const u8, x: i32, y: i32, w: i32) void {
+        const ti = &self.text_input;
+        ti.active = true;
+        ti.target = .vst_param_value;
+        ti.instrument = @intCast(std.math.clamp(inst_idx, 0, std.math.maxInt(i32)));
+        ti.index = param_id;
+        ti.len = @min(prefill.len, ti.buf.len);
+        @memcpy(ti.buf[0..ti.len], prefill[0..ti.len]);
+        ti.cursor = ti.len;
+        ti.sel_anchor = if (ti.len > 0) 0 else null; // 全选 → 直接输入即替换
+        ti.drag_active = false;
+        ti.x = x;
+        ti.y = y;
+        ti.w = w;
+        ti.view_off = 0;
+        ti.aux_len = 0;
+    }
+
     pub fn beginRenamePresetFile(self: *App, cat: usize, name_idx: usize, x: i32, y: i32) void {
         if (cat >= self.preset_lib.categories.items.len) return;
         const c = &self.preset_lib.categories.items[cat];
@@ -5636,7 +5738,7 @@ pub const App = struct {
 
     /// 按**参数名**生成曲线名（`通道1 · 音量` / `主通道 · 音量` / `通道2 · 声像`），重名自动加 `(2)`。
     pub fn autoCurveNameFor(self: *App, target: view_lane.Target, buf: []u8) []const u8 {
-        var tb: [48]u8 = undefined;
+        var tb: [96]u8 = undefined;
         const base: []const u8 = blk: {
             switch (target.kind) {
                 .none => break :blk "未绑定",
@@ -5656,6 +5758,14 @@ pub const App = struct {
                         break :blk std.fmt.bufPrint(&tb, "乐器? · {s}", .{suffix}) catch "曲线";
                     const nm = self.instruments.items[idx].name;
                     break :blk std.fmt.bufPrint(&tb, "{s} · {s}", .{ nm, suffix }) catch "曲线";
+                },
+                .vst_param => {
+                    const idx = self.instrumentIndexByUid(target.uid) orelse break :blk "插件参数";
+                    const inst = &self.instruments.items[idx];
+                    const pl = inst.plugin orelse break :blk std.fmt.bufPrint(&tb, "{s} · 参数", .{inst.name}) catch "曲线";
+                    const pi = pl.findParamIndex(target.param_id) orelse
+                        break :blk std.fmt.bufPrint(&tb, "{s} · 参数", .{inst.name}) catch "曲线";
+                    break :blk std.fmt.bufPrint(&tb, "{s} · {s}", .{ inst.name, pl.params[pi].name() }) catch "曲线";
                 },
             }
         };
@@ -5840,6 +5950,19 @@ pub const App = struct {
         return out[0..n];
     }
 
+    /// 某条曲线的全部绑定（窗口按曲线看——“管理已链接项”）
+    pub fn bindingsOfCurve(self: *const App, curve_id: u32, out: []view_lane.Binding) []const view_lane.Binding {
+        var n: usize = 0;
+        for (self.auto_bindings.items) |b| {
+            if (n >= out.len) break;
+            if (b.curve_id == curve_id) {
+                out[n] = b;
+                n += 1;
+            }
+        }
+        return out[0..n];
+    }
+
     pub fn bindingIndex(self: *const App, curve_id: u32, target: view_lane.Target) ?usize {
         for (self.auto_bindings.items, 0..) |b, i| {
             if (b.curve_id == curve_id and view_lane.Target.eql(b.target, target)) return i;
@@ -5905,6 +6028,7 @@ pub const App = struct {
                 .mixer_vol, .mixer_pan => self.channelIndexByUid(b.target.uid) orelse continue,
                 .inst_vol, .inst_pan => self.instrumentIndexByUid(b.target.uid) orelse continue,
                 .tempo => continue, // 节奏在 UI 侧应用（不占音频侧 lane 快照）
+                .vst_param => continue, // v1：插件参数在 **UI 侧**施加（见 `applyVstParamAutomation`）
                 .none => continue,
             };
             const is_inst = b.target.kind == .inst_vol or b.target.kind == .inst_pan;
@@ -5956,9 +6080,44 @@ pub const App = struct {
     }
 
     /// **打开自动化链接窗口**（唯一入口：打开即置顶）
+    /// **保留上次的位置**（同机架/混音台/乐器窗：关掉再开还在原处）
     pub fn openAutoWin(self: *App, target: view_lane.Target) void {
-        self.auto_win = .{ .open = true, .x = 240, .y = 150, .target = target, .just_opened = true };
+        const w = &self.auto_win;
+        const keep_x = w.x;
+        const keep_y = w.y;
+        w.* = .{ .open = true, .x = keep_x, .y = keep_y, .view = .by_target, .target = target, .just_opened = true };
         self.bringToFront(&self.auto_win.z);
+    }
+
+    /// **打开“管理已链接项”窗口**：同一条曲线驱动哪些参数（播放列表曲线行右键）
+    pub fn openCurveLinksWin(self: *App, curve_id: u32) void {
+        if (self.curveById(curve_id) == null) return;
+        const w = &self.auto_win;
+        const keep_x = w.x;
+        const keep_y = w.y;
+        w.* = .{ .open = true, .x = keep_x, .y = keep_y, .view = .by_curve, .curve_id = curve_id, .just_opened = true };
+        self.bringToFront(&self.auto_win.z);
+    }
+
+    /// **打开 VST 参数自动化窗口**（乐器下标；v1 只支持乐器 VSTi）
+    /// **保留上次的位置**（同机架/混音台：关掉再开还在原处）
+    pub fn openVstAutoWin(self: *App, inst_idx: usize) void {
+        if (inst_idx >= self.instruments.items.len) return;
+        const uid = self.instruments.items[inst_idx].uid;
+        const st = &self.vst_auto;
+        const keep = st.open and st.inst_uid == uid;
+        if (!keep) {
+            st.* = .{
+                .open = true,
+                .x = st.x,
+                .y = st.y,
+                .inst_uid = uid,
+                .scroll = 0,
+                .filter_len = 0,
+            };
+        }
+        st.open = true;
+        self.bringToFront(&st.z);
     }
 
     /// 该参数**所有**绑定的叠加值（UI 预览/状态行用；`step` 为工程步）
@@ -5968,7 +6127,7 @@ pub const App = struct {
             for (self.auto_bindings.items) |b| {
                 if (!self.isTargetBound(target)) break :blk base;
                 if (view_lane.Target.eql(b.target, target)) {
-                    break :blk b.base orelse view_lane.Target.defaultBase(target.kind);
+                    break :blk b.base orelse self.defaultBaseFor(target);
                 }
             }
             break :blk base;
@@ -6274,6 +6433,31 @@ pub const App = struct {
             if (inst.uid == uid) return i;
         }
         return null;
+    }
+
+    /// `vst_param` 目标 → （乐器下标、插件、参数下标）。
+    /// **每帧重新解析**（不跨帧持有 `*Plugin`：插件可能被换/卸载）。
+    pub fn vstParamResolve(self: *const App, t: view_lane.Target) ?struct { inst_idx: usize, pl: *vst_host.Plugin, param_idx: usize } {
+        if (t.kind != .vst_param) return null;
+        const ii = self.instrumentIndexByUid(t.uid) orelse return null;
+        const pl = self.instruments.items[ii].plugin orelse return null;
+        const pi = pl.findParamIndex(t.param_id) orelse return null;
+        return .{ .inst_idx = ii, .pl = pl, .param_idx = pi };
+    }
+
+    /// `vst_param` 目标的显示名（`Serum · Cutoff`）
+    pub fn vstParamLabel(self: *const App, t: view_lane.Target, buf: []u8) []const u8 {
+        const r = self.vstParamResolve(t) orelse return "插件参数";
+        return std.fmt.bufPrint(buf, "{s} · {s}", .{ self.instruments.items[r.inst_idx].name, r.pl.params[r.param_idx].name() }) catch "插件参数";
+    }
+
+    /// **绑定基准值的类型默认值**：插件参数取插件自己报的 `defaultNormalizedValue`
+    /// （否则滤波截止这类参数会被拉到 0 → 直接没声音），其余走 `Target.defaultBase`。
+    pub fn defaultBaseFor(self: *const App, t: view_lane.Target) f32 {
+        if (t.kind == .vst_param) {
+            if (self.vstParamResolve(t)) |r| return @floatCast(r.pl.params[r.param_idx].default_norm);
+        }
+        return view_lane.Target.defaultBase(t.kind);
     }
 
     /// uid → 当前数组下标（已删除/未知 → null）
@@ -6686,6 +6870,11 @@ pub const App = struct {
         const old = pl.cacheGet(idx);
         const id: u32 = if (idx < pl.params.len) pl.params[idx].id else 0;
         pl.setParamHost(idx, norm);
+        // 用户在我们自己的参数列表里拧了旋钮 → 同样算“刚动过”（自动化让路 + “最近改动”）
+        if (ref.kind == .instrument and ref.a < self.instruments.items.len) {
+            self.noteVstParamTouched(self.instruments.items[ref.a].uid, id);
+            self.noteVstAutoWritten(self.instruments.items[ref.a].uid, id, norm); // 手动写入也抑制回声
+        }
         self.markSlotStateDirty(ref);
         self.markPluginEdited();
         if (old) |o| {
@@ -6760,6 +6949,11 @@ pub const App = struct {
     pub fn drainSlotEditorEdits(self: *App, ref: PluginSlotRef, pl: *vst_host.Plugin) void {
         var buf: [64]vst_host.EditEvent = undefined;
         var any_perform = false;
+        // 乐器槽的稳定 uid（只对乐器 VSTi；FX/鼓组层暂不参与参数自动化）
+        const inst_uid: u32 = if (ref.kind == .instrument and ref.a < self.instruments.items.len)
+            self.instruments.items[ref.a].uid
+        else
+            0;
         while (true) {
             const n = pl.drainEditEvents(&buf);
             if (n == 0) break;
@@ -6768,6 +6962,12 @@ pub const App = struct {
                     .begin => self.splitGestureOnBegin(ref, ev.id),
                     .end => {},
                     .perform => {
+                        // **自动化回声**：这条是不是我们自己刚写进去的值？
+                        // 是 → 整条丢弃（不记手势/历史、不标脏），否则会每帧造幽灵条目 +
+                        // 反复重捕插件状态（`getState` 很贵）。
+                        if (inst_uid != 0 and self.vstAutoEcho(inst_uid, ev.id, ev.value)) continue;
+                        // 用户真的动了参数 → 记 touch 窗口（自动化让路）+“最近改动”
+                        if (inst_uid != 0) self.noteVstParamTouched(inst_uid, ev.id);
                         if (!any_perform) {
                             any_perform = true;
                             self.markSlotStateDirty(ref);
@@ -8420,6 +8620,8 @@ pub const App = struct {
             self.file_menu_open or self.panels.ctx_pattern != null or self.panels.ctx_audio_style != null or
             self.panels.ctx_track != null or self.panels.ctx_bpm or
             self.preset_browser.open or
+            // VST 参数行内 `自动化` 菜单 / 播放列表曲线行菜单：不遮就变成“点菜单 = 同时点到下面的内容”
+            self.vst_auto.menu_open or self.curve_menu.open or
             self.mixer_win.ctx_effect != null or self.mixer_win.ctx_channel != null or self.mixer_win.ctx_pan != null;
     }
 
@@ -8527,6 +8729,7 @@ pub const App = struct {
                 .enabled = b.enabled,
                 .smooth_ms = b.smooth_ms,
                 .invert = b.invert,
+                .param_id = b.target.param_id,
             };
         }
         // 样式名字（自定义名随工程保存；旧版加载方忽略）
@@ -8843,15 +9046,17 @@ pub const App = struct {
             self.next_curve_id = @max(self.next_curve_id, sl.id);
         }
         for (p.auto_bindings) |sb| {
-            if (sb.target_kind > @backingInt(view_lane.Target.Kind.inst_pan)) continue;
+            // 枚举值越界（未来版本写的 kind）→ 跳过；**不能用 `> inst_pan` 上界**
+            // （tempo / vst_param 都在它后面，会被默默丢掉）
+            const kind = std.enums.fromInt(view_lane.Target.Kind, sb.target_kind) orelse continue;
             self.auto_bindings.append(self.allocator, .{
                 .curve_id = sb.curve_id,
-                .target = .{ .kind = @fromBackingInt(@intCast(sb.target_kind)), .uid = sb.target_uid },
+                .target = .{ .kind = kind, .uid = sb.target_uid, .param_id = sb.param_id },
                 .depth = sb.depth,
                 .base = if (sb.base < 0) null else sb.base,
-                    .bipolar = sb.bipolar,
-                    .smooth_ms = sb.smooth_ms,
-                    .invert = sb.invert,
+                .bipolar = sb.bipolar,
+                .smooth_ms = sb.smooth_ms,
+                .invert = sb.invert,
                 .enabled = sb.enabled,
             }) catch {};
         }
@@ -9573,6 +9778,119 @@ pub const App = struct {
             self.export_wav.?.log_buf.deinit(self.allocator);
         }
         self.export_wav = null;
+    }
+
+    /// 播放中：插件参数自动化的**施加**（v1：UI 侧，每帧一次）。
+    ///
+    /// - **逐绑定极点**：每条绑定的贡献各自按自己的 `smooth_ms` 做一阶极点（与音频侧的
+    ///   `LaneSet.contributionSmooth` 同语义），再按极性/反向/深度缩放、求和；
+    ///   状态存在 `Binding.ui_smooth_state`（**瞬态**，不存栈）→ 用户改完曲线立即生效、不从 0 爬升。
+    /// - **touch 语义**：用户刚刚在插件 GUI 里拧过的参数（`vst_touch`，400ms 窗口）**让路**——
+    ///   这样“扭一下能听见、松手回弹”，又不会和自动化抢写。
+    /// - **回声抑制**：写入值记进 `vst_written`；插件若把自己的变更回报成 `performEdit`，
+    ///   在 `drainSlotEditorEdits` 里比对后**整条丢弃**（否则会造幽灵撤销条目 + 反复重捕插件状态）。
+    pub fn applyVstParamAutomation(self: *App, dt_ns: i64) void {
+        if (self.auto_bindings.items.len == 0) return;
+        // 离线导出：帧循环不是实时节拍，而且导出前已快照插件状态 → 不去扰它
+        if (self.export_wav != null) return;
+        const step: f32 = if (self.playing)
+            self.params.play_step.load(.monotonic)
+        else
+            @floatFromInt(self.playback.cursorStep(true));
+        const now_ms = text_edit.nowMs();
+        const dt_s: f32 = @max(0.0, @as(f32, @floatFromInt(dt_ns)) / 1e9);
+
+        // 1) 逐绑定推进极点，并把贡献汇总到它自己的目标上
+        const Slot = struct { target: view_lane.Target, base: ?f32, sum: f32 };
+        var slots: [32]Slot = undefined;
+        var n_slots: usize = 0;
+        for (self.auto_bindings.items) |*b| {
+            if (!b.enabled or b.target.kind != .vst_param) continue;
+            const lc = self.curveById(b.curve_id) orelse continue;
+            const v = lc.evalAt(step);
+            if (v < 0) continue; // 无曲线
+            b.ui_smooth_state = poleStep(b.ui_smooth_state, v, b.smooth_ms, dt_s);
+            const sv = b.ui_smooth_state;
+            const sign: f32 = if (b.invert) -1.0 else 1.0;
+            const scaled = (if (b.bipolar) (sv - 0.5) * 2.0 else sv) * b.depth * sign;
+            var si: usize = 0;
+            while (si < n_slots) : (si += 1) {
+                if (view_lane.Target.eql(slots[si].target, b.target)) break;
+            }
+            if (si == n_slots) {
+                if (n_slots >= slots.len) continue;
+                slots[n_slots] = .{ .target = b.target, .base = b.base, .sum = 0 };
+                n_slots += 1;
+            }
+            slots[si].sum += scaled;
+        }
+
+        // 2) 逐目标施加（每帧重新解析插件——不跨帧持有 `*Plugin`）
+        for (slots[0..n_slots]) |s| {
+            const r = self.vstParamResolve(s.target) orelse continue;
+            if (self.vstParamIsTouched(s.target, now_ms)) continue; // 用户正在拧 → 让路
+            const base = s.base orelse self.defaultBaseFor(s.target);
+            const val: f64 = @floatCast(std.math.clamp(base + s.sum, 0.0, 1.0));
+            if (@abs(val - r.pl.paramNorm(r.param_idx)) < vst_auto_eps) continue; // 已在位 → 不写
+            r.pl.setParamHost(r.param_idx, val);
+            self.noteVstAutoWritten(s.target.uid, s.target.param_id, val);
+        }
+    }
+
+    /// 该 VST 参数是否处于 “用户刚拧过” 的 touch 窗口内（→ 自动化让路）
+    fn vstParamIsTouched(self: *const App, t: view_lane.Target, now_ms: i64) bool {
+        for (self.vst_touch) |e| {
+            if (e.until_ms > now_ms and e.inst_uid == t.uid and e.param_id == t.param_id) return true;
+        }
+        return false;
+    }
+
+    /// 记一次“自动化写入”（回声抑制用；环，覆盖最旧）
+    fn noteVstAutoWritten(self: *App, inst_uid: u32, param_id: u32, value: f64) void {
+        self.vst_written[self.vst_written_w % self.vst_written.len] = .{ .inst_uid = inst_uid, .param_id = param_id, .value = value };
+        self.vst_written_w +%= 1;
+    }
+
+    /// 插件回报的 `performEdit` 是否**只是我们自己的写入回声**（→ 整条丢弃，不记历史）
+    fn vstAutoEcho(self: *const App, inst_uid: u32, param_id: u32, value: f64) bool {
+        for (self.vst_written) |w| {
+            if (w.param_id == param_id and w.inst_uid == inst_uid and @abs(w.value - value) < vst_auto_eps) return true;
+        }
+        return false;
+    }
+
+    /// 用户在插件 GUI 里动了一个参数：记 touch 窗口 + 推进“最近改动”列表（最新在前、去重）
+    pub fn noteVstParamTouched(self: *App, inst_uid: u32, param_id: u32) void {
+        const now_ms = text_edit.nowMs();
+        // touch 窗口：同参数 → 续期；否则占一个过期槽
+        var slot: ?usize = null;
+        var free_slot: ?usize = null;
+        for (self.vst_touch, 0..) |e, i| {
+            if (e.param_id == param_id and e.inst_uid == inst_uid) {
+                slot = i;
+                break;
+            }
+            if (free_slot == null and e.until_ms <= now_ms) free_slot = i;
+        }
+        const ts = slot orelse free_slot orelse 0;
+        self.vst_touch[ts] = .{ .inst_uid = inst_uid, .param_id = param_id, .until_ms = now_ms + vst_touch_ms };
+
+        // 最近列表：删同项 → 整体后移一格 → 插到最前
+        var n = self.vst_recent_n;
+        var k: usize = 0;
+        while (k < n) : (k += 1) {
+            if (self.vst_recent[k].inst_uid == inst_uid and self.vst_recent[k].param_id == param_id) {
+                var j = k;
+                while (j + 1 < n) : (j += 1) self.vst_recent[j] = self.vst_recent[j + 1];
+                n -= 1;
+                break;
+            }
+        }
+        const new_n = @min(n + 1, self.vst_recent.len);
+        var i = new_n;
+        while (i > 1) : (i -= 1) self.vst_recent[i - 1] = self.vst_recent[i - 2];
+        self.vst_recent[0] = .{ .inst_uid = inst_uid, .param_id = param_id };
+        self.vst_recent_n = new_n;
     }
 
     /// **BPM 自动化**（方案 B）：每帧把曲线值映到 BPM。
@@ -10508,6 +10826,26 @@ pub const App = struct {
             .preset_search => {
                 // 搜索框：文字已实时同步到 `preset_browser.filter_*`（见 beginPresetSearch）
                 // ——提交仅收起输入框，过滤保留
+            },
+            .vst_param_search => {
+                // VST 参数搜索：文字已实时同步到 `vst_auto.filter_*`（见 `beginVstParamSearch`）
+            },
+            .vst_param_value => {
+                // VST 参数输入值…（**百分比**：50 = 参数区间的 50%）
+                if (ti.instrument >= 0) {
+                    const ii: usize = @intCast(ti.instrument);
+                    if (ii < self.instruments.items.len) {
+                        if (self.instruments.items[ii].plugin) |pl| {
+                            const id: u32 = @truncate(ti.index);
+                            if (pl.findParamIndex(id)) |pi| {
+                                if (view_lane.parseValue(.percent, val)) |v| {
+                                    const ref = PluginSlotRef{ .kind = .instrument, .a = @intCast(@min(ii, std.math.maxInt(u16))) };
+                                    self.setPluginParamHost(ref, pl, pi, v);
+                                }
+                            }
+                        }
+                    }
+                }
             },
         }
         ti.active = false;
@@ -16929,6 +17267,56 @@ test "automation: 基准值可编辑 + 控件右键恢复默认（base/bipolar�
     try std.testing.expect(view_lane.Target.defaultBipolar(pt.kind));
     try std.testing.expect(app.bindCurveTarget(cid, pt));
     try std.testing.expect(app.auto_bindings.items[app.bindingIndex(cid, pt).?].bipolar);
+}
+
+test "automation: VST 参数目标（uid + param_id）的相等性/默认值" {
+    const a = view_lane.Target{ .kind = .vst_param, .uid = 7, .param_id = 100 };
+    const b = view_lane.Target{ .kind = .vst_param, .uid = 7, .param_id = 100 };
+    const c = view_lane.Target{ .kind = .vst_param, .uid = 7, .param_id = 101 };
+    const d = view_lane.Target{ .kind = .vst_param, .uid = 8, .param_id = 100 };
+
+    // 同乐器同参数 → 相等；不同参或不同乐器 → 不等
+    try std.testing.expect(view_lane.Target.eql(a, b));
+    try std.testing.expect(!view_lane.Target.eql(a, c));
+    try std.testing.expect(!view_lane.Target.eql(a, d));
+    // 不同 kind → 永不相等
+    try std.testing.expect(!view_lane.Target.eql(a, view_lane.Target{ .kind = .inst_vol, .uid = 7 }));
+    // 基础值缺省 = 0（播放时由 `defaultBaseFor` 落到插件的 defaultNormalizedValue）
+    try std.testing.expectEqual(@as(f32, 0.0), view_lane.Target.defaultBase(.vst_param));
+
+    // 绑定表能区分两个参数（否则链接了一个就会“传染”到其他参数）
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    const cid = app.addAutoCurve("c");
+    try std.testing.expect(app.bindCurveTarget(cid, a));
+    try std.testing.expect(app.isTargetBound(b)); // 同一个参数
+    try std.testing.expect(!app.isTargetBound(c));
+    try std.testing.expect(!app.isTargetBound(d));
+    // 同一参数重复链接 → 不建第二份
+    try std.testing.expect(!app.bindCurveTarget(cid, b));
+    try std.testing.expectEqual(@as(usize, 1), app.bindingCountOfCurve(cid));
+}
+
+test "automation: VST 参数的 UI 侧极点平滑（NaN 播种 / τ=0 / 追赶收敛）" {
+    const dt: f32 = 1.0 / 60.0;
+    // NaN（未播种）→ 直接取曲线值，不从 0 爬升
+    try std.testing.expectEqual(@as(f32, 0.7), poleStep(std.math.nan(f32), 0.7, 15.0, dt));
+    // τ=0 → 直通（不追赶，但仍由写入门槛去阶梯）
+    try std.testing.expectEqual(@as(f32, 0.7), poleStep(0.0, 0.7, 0.0, dt));
+    // 15ms 一帧（≈1/4 个 τ）→ 走到 1/e 附近偏小；单调靠近且不过冲
+    const s1 = poleStep(0.0, 1.0, 15.0, dt);
+    try std.testing.expect(s1 > 0.0 and s1 < 1.0);
+    // 连续 60 帧（≈ 1s = 66τ）→ 几乎到位
+    var v: f32 = 0.0;
+    for (0..60) |_| v = poleStep(v, 1.0, 15.0, dt);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), v, 1e-4);
+    // 下降方向同样适用
+    try std.testing.expect(poleStep(1.0, 0.0, 15.0, dt) < 1.0);
+    // 目标不变 → 稳定不动（不会自己漂）
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), poleStep(0.5, 0.5, 15.0, dt), 1e-6);
 }
 
 test "app: 片段批量拖动——撞轨道头时**全组停**（保持相对位置，不被压扁）" {

@@ -106,11 +106,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     }
 
     // 关闭按钮
-    const close_x = x + ww - 22;
-    const close_hovered = util.hitUI(ui, close_x, y + 2, 20, win_title_h - 4);
-    ui.renderer.fillRect(close_x, y + 2, 20, win_title_h - 4, if (close_hovered) ui.theme.danger else ui.theme.panel);
-    ui.label("×", close_x + 6, y + 4, ui.theme.text);
-    if (close_hovered and ui.mouse_pressed) {
+    if (util.titleCloseButton(ui, x, y, ww, win_title_h)) {
         app.mixer_win.panel = null;
         ew.eq_drag = null;
         return true;

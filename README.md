@@ -68,7 +68,9 @@ scoop install sawdust
 - [x] 音频文件（WAV/MP3）加载与波形缓存（音频样式 / 音频片段 / 波形窗 / 采样器层，
   见 `docs/audio-files.md`）
 - [ ] 自动化曲线（声像、音量、颤音、bpm变速等等等，还有 MIDI 通道声像的完整还原）
-  —— 🚧 正在 `automation` 分支上开发（未同步到 main）
+  —— 🚧 正在 `automation` 分支上开发（未同步到 main）；
+  **VST3 插件参数自动化 v1 已落地**（只做乐器 VSTi；UI 侧施加 + 逐绑定平滑，见
+  [`docs/automation.md`](docs/automation.md) §11.38；v2 拟搬进音频线程）
 - [ ] 更多效果器（合唱 / 失真 / 滤波器……）
 - [ ] 将自带的减法合成器升级成更强大的波表合成器，用合成器捏出一整套midi标准乐器音色
 - [ ] 音频录制（麦克风 / 线路输入 → 采样层与音频片段）

@@ -1750,3 +1750,31 @@ const names = if (total == 1) first.? else
 
 **规矩**：指针只用在“不会再改表”的短区间；跨过任何可能的增删，**重新解析**一次。
 （若要长期持有，存 **id/下标** 而不是指针。）
+
+## 菜单/弹层的绘制层：别画在“被自己屏蔽”的那一层里
+
+菜单展开时惯例做法是把 `App.menuIsOpen()` 算进全屏模态（`prio = 900, modal = true`）——
+这样菜单下面的按钮**不会**被同一个 `mouse_pressed` 再点一次。
+但 `util.hitUI()` 在 `ui.input_blocked` 时恒返回 false，而窗口层（prio 1..n）**低于** 900：
+**把菜单画在窗口层里 → 菜单自己也被屏蔽了，点了没反应**。
+
+**规矩**（参看 `drawBpmCtxMenu` / `view_vst_auto.drawMenu`）：
+1. 菜单本体在 `drawApp` 之后、`ui.endFrame()` 之前单独画（此时 `cur_prio = -1`、`input_blocked = false`）；
+2. 菜单的打开状态必须加进 `App.menuIsOpen()`，否则会“穿透点到下面的行”；
+3. 坐标夹回**屏幕**（不是窗口）——同一份代码可能被浮动窗口和嵌入式面板复用。
+
+### `noteOverlayRect` 只给**菜单/弹层**，**不要登记整个窗口**
+
+`ui.overlay_rects` 有两个用处：① `collectEditorCovers` 拿它裁切 VST 插件**子窗口**；
+② `syncEmbeddedEditor` 的输入闸门 `setEditorEnabled(app.modal == null and ui.overlay_n == 0)`——
+**只要有任意遮罩登记，插件编辑器就整块被禁用**。
+
+所以"浮动窗口"**不能**整窗登记（实测 bug：一开 VST 参数自动化窗口，插件自己的 GUI 就点不动了）；
+窗口之间的遮挡靠 `win_draw_info` 那一套（插件的子窗口会按上层的窗口矩形裁切）。
+只有菜单/下拉/输入框这类**瞬时**弹层才登记。
+
+### 用**左键**弹的菜单：必须加“刚打开”标记
+
+“点菜单外 → 收起”通常判 `ui.mouse_pressed`。但若菜单是**左键**点开的，打开它的那一帧
+`mouse_pressed` 仍为 true，而鼠标位置在菜单外（按钮上）→ 菜单刚出现就被自己的收起逻辑关掉
+（实测：点开瞬间闪一下就没了）。**修法**：`menu_just_opened` 标记，那一帧只画不判。

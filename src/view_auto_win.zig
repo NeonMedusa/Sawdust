@@ -71,61 +71,85 @@ pub fn draw(ui: *Ui, app: *App) void {
     ui.renderer.fillRect(x, y, w, h, ui.theme.panel);
     ui.renderer.strokeRect(x, y, w, h, ui.theme.accent);
     ui.renderer.fillRect(x + 1, y + 1, w - 2, util.title_h - 1, ui.theme.toolbar);
-    ui.noteOverlayRect(x, y, w, h);
+    // **不要整窗登记 `noteOverlayRect`**：那张表是给菜单/弹层用的，
+    // `syncEmbeddedEditor` 拿 `overlay_n != 0` 直接禁掉插件子窗口（输入闸门）→
+    // 一开自动化窗口，插件的 GUI 就点不动了。窗口遮挡走 `win_draw_info`。
 
-    var tb: [64]u8 = undefined;
-    var nm: [32]u8 = undefined;
-    const tname = targetName(app, win.target, &nm);
-    const title = std.fmt.bufPrint(&tb, "自动化 · {s}", .{tname}) catch "自动化";
-    ui.labelClipped(title, x + 8, y + 4, w - 40, ui.theme.text);
-
-    // ✕ 关闭
-    {
-        const bx = x + w - 22;
-        const by = y + 2;
-        const hovered = util.inRect(ui.mouse_x, ui.mouse_y, bx, by, 18, 16);
-        if (hovered) ui.renderer.fillRect(bx, by, 18, 16, ui.theme.item_hover);
-        ui.label("x", bx + 6, by + 3, if (hovered) ui.theme.accent else ui.theme.text_dim);
-        if (hovered and ui.mouse_pressed) win.open = false;
-    }
-
-    // ── 状态行：基准值 + 合成值（按当前游标）──
-    // **基准 = 目标类型的标准基准，不是推子/旋钮当前值**：
-    // 音量类 = 0（曲线值直接就是音量）、声像类 = 0.5（双向：中心不动，可上可下）；
-    // 将来 VST3 参数目标的基准/极性则取插件的 `defaultNormalizedValue` / `kIsBipolar`。
-    {
-        const base = view_lane.Target.defaultBase(win.target.kind);
-        const bipolar = view_lane.Target.defaultBipolar(win.target.kind);
-        const step: f32 = @floatFromInt(app.playback.cursorStep(true));
-        const v = app.autoValueFor(win.target, step, base);
-        var sb: [160]u8 = undefined;
-        const kind_txt: []const u8 = switch (win.target.kind) {
-            .master_vol => "主音量",
-            .mixer_vol, .inst_vol => "音量",
-            .mixer_pan, .inst_pan => "声像",
-            .tempo => "速度（BPM）",
-            .none => "未绑定",
+    // 标题缓冲要够大：`{乐器名} · {参数名}`（插件参数）或 `通道12 · 声像`
+    // ——旧版本这里是 `[32]`，VST 参数拼接一超长就 `catch "插件参数"`
+    // （实测：标题永远只剩“插件参数”）。
+    const by_curve = win.view == .by_curve;
+    var tb: [128]u8 = undefined;
+    var nm: [96]u8 = undefined;
+    const title = if (by_curve) blk: {
+        const lc = app.curveById(win.curve_id) orelse {
+            win.open = false; // 曲线被删了 → 自动关闭
+            return;
         };
-        const pol_txt: []const u8 = if (bipolar) "双向" else "单向";
-        const st = if (win.target.kind == .tempo)
-            // BPM 用**真实的 bpm 数字**显示（归一化 0..1 对用户没意义）
-            (if (app.isTargetBound(win.target))
-                std.fmt.bufPrint(&sb, "区间 {d:.0}~{d:.0} BPM  →  此刻 {d:.0} BPM", .{ model.bpm_min, model.bpm_max, view_lane.Target.bpmFromNorm(v) }) catch ""
+        break :blk std.fmt.bufPrint(&tb, "已链接项 · {s}", .{lc.name(&nm)}) catch "已链接项";
+    } else blk: {
+        const tname = targetName(app, win.target, &nm);
+        break :blk std.fmt.bufPrint(&tb, "自动化 · {s}", .{tname}) catch "自动化";
+    };
+    // 中段省略：名字太长时保留两头（“自动化” + 参数名）
+    ui.labelMiddle(title, x + 8, y + 4, w - 40, ui.theme.text);
+
+    // 关闭按钮（全项目统一：`util.titleCloseButton`）
+    if (util.titleCloseButton(ui, x, y, w, util.title_h)) win.open = false;
+
+    // ── 状态行 ──
+    // `by_target`：基准值 + 游标处合成值。**基准 = 目标类型的标准基准**，不是推子/旋钮当前值：
+    // 音量类 = 0（曲线值直接就是音量）、声像类 = 0.5（双向：中心不动，可上可下）；
+    // VST3 参数 = 插件自己报的 `defaultNormalizedValue`（见 `App.defaultBaseFor`）。
+    // `by_curve`：没有单一目标 → 显示**游标处曲线值** + 驱动了几个参数。
+    {
+        var sb: [160]u8 = undefined;
+        const step: f32 = @floatFromInt(app.playback.cursorStep(true));
+        const st: []const u8 = if (by_curve) blk: {
+            const lc = app.curveById(win.curve_id) orelse break :blk "";
+            const v = lc.evalAt(step);
+            const nbind = app.bindingCountOfCurve(win.curve_id);
+            break :blk if (v < 0)
+                std.fmt.bufPrint(&sb, "游标处：无曲线点  ·  驱动 {d} 个参数", .{nbind}) catch ""
             else
-                std.fmt.bufPrint(&sb, "区间 {d:.0}~{d:.0} BPM  →  尚未链接曲线（当前 {d} BPM）", .{ model.bpm_min, model.bpm_max, app.bpm }) catch "")
-        else if (app.isTargetBound(win.target))
-            std.fmt.bufPrint(&sb, "基准 {d:.2}（{s} · {s}）  →  合成 {d:.2}", .{ base, kind_txt, pol_txt, v }) catch ""
-        else
-            std.fmt.bufPrint(&sb, "基准 {d:.2}（{s} · {s}）  →  尚未链接曲线（旋钮静值 {d:.2}）", .{ base, kind_txt, pol_txt, baseValueOf(app, win.target) }) catch "";
+                std.fmt.bufPrint(&sb, "游标处曲线值 {d:.2}  ·  驱动 {d} 个参数", .{ v, nbind }) catch "";
+        } else blk: {
+            const base = app.defaultBaseFor(win.target);
+            const bipolar = view_lane.Target.defaultBipolar(win.target.kind);
+            const v = app.autoValueFor(win.target, step, base);
+            const kind_txt: []const u8 = switch (win.target.kind) {
+                .master_vol => "主音量",
+                .mixer_vol, .inst_vol => "音量",
+                .mixer_pan, .inst_pan => "声像",
+                .tempo => "速度（BPM）",
+                .vst_param => "插件参数",
+                .none => "未绑定",
+            };
+            const pol_txt: []const u8 = if (bipolar) "双向" else "单向";
+            break :blk if (win.target.kind == .tempo)
+                // BPM 用**真实的 bpm 数字**显示（归一化 0..1 对用户没意义）
+                (if (app.isTargetBound(win.target))
+                    std.fmt.bufPrint(&sb, "区间 {d:.0}~{d:.0} BPM  →  此刻 {d:.0} BPM", .{ model.bpm_min, model.bpm_max, view_lane.Target.bpmFromNorm(v) }) catch ""
+                else
+                    std.fmt.bufPrint(&sb, "区间 {d:.0}~{d:.0} BPM  →  尚未链接曲线（当前 {d} BPM）", .{ model.bpm_min, model.bpm_max, app.bpm }) catch "")
+            else if (app.isTargetBound(win.target))
+                std.fmt.bufPrint(&sb, "基准 {d:.2}（{s} · {s}）  →  合成 {d:.2}", .{ base, kind_txt, pol_txt, v }) catch ""
+            else
+                std.fmt.bufPrint(&sb, "基准 {d:.2}（{s} · {s}）  →  尚未链接曲线（旋钮静值 {d:.2}）", .{ base, kind_txt, pol_txt, baseValueOf(app, win.target) }) catch "";
+        };
         ui.labelClipped(st, x + 8, y + util.title_h + 4, w - 16, ui.theme.text_dim);
     }
 
     // ── 绑定行 ──
     var binds_buf: [32]view_lane.Binding = undefined;
-    const binds = app.bindingsOfTarget(win.target, &binds_buf);
+    const binds = if (by_curve)
+        app.bindingsOfCurve(win.curve_id, &binds_buf)
+    else
+        app.bindingsOfTarget(win.target, &binds_buf);
     const cap_top = y + util.title_h + 20;
     const list_top = cap_top + cap_h;
-    const list_bottom = y + h - 34;
+    // `by_curve` 没有底部按钮行 → 列表用满高度
+    const list_bottom = if (by_curve) y + h - 8 else y + h - 34;
     const list_h = @max(row_h, list_bottom - list_top);
     // 列标题（与行内控件**同一个居中算法**：标题中心 = 控件中心 → 首字尽量对齐）
     {
@@ -135,7 +159,7 @@ pub fn draw(ui: *Ui, app: *App) void {
                 return box_x + @divTrunc(box_w - tw, 2);
             }
         }.f;
-        ui.labelClipped("曲线", x + 4 + Col.name, cap_top, 90, ui.theme.text_dim);
+        ui.labelClipped(if (by_curve) "参数" else "曲线", x + 4 + Col.name, cap_top, 90, ui.theme.text_dim);
         ui.labelClipped("极性", capX(ui, x + 4 + Col.pol, Col.btn_w, "极性"), cap_top, 44, ui.theme.text_dim);
         ui.labelClipped("反向", capX(ui, x + 4 + Col.inv, Col.btn_w, "反向"), cap_top, 44, ui.theme.text_dim);
         ui.labelClipped("基础", capX(ui, x + 4 + Col.base, Col.base_w, "基础"), cap_top, 46, ui.theme.text_dim);
@@ -151,7 +175,13 @@ pub fn draw(ui: *Ui, app: *App) void {
     }
     win.rows_scroll = std.math.clamp(win.rows_scroll, 0, max_scroll);
     if (binds.len == 0) {
-        ui.labelClipped("尚未链接任何曲线 —— 用下方按钮链接或新建", x + 10, list_top + 8, w - 20, ui.theme.text_dim);
+        ui.labelClipped(
+            if (by_curve) "这条曲线还没链接任何参数 —— 用混音台/机架/VST 参数行的「自动化…」链接" else "尚未链接任何曲线 —— 用下方按钮链接或新建",
+            x + 10,
+            list_top + 8,
+            w - 20,
+            ui.theme.text_dim,
+        );
     }
     {
         var k: i32 = 0;
@@ -159,9 +189,18 @@ pub fn draw(ui: *Ui, app: *App) void {
         var ry = list_top;
         while (idx < binds.len and k < view_rows) : (idx += 1) {
             const b = binds[idx];
-            const bi = app.bindingIndex(b.curve_id, win.target) orelse continue;
-            const lc = app.curveById(b.curve_id) orelse continue;
-            drawRow(ui, app, bi, lc, x + 4, ry, w - 8);
+            const bi = app.bindingIndex(b.curve_id, b.target) orelse continue;
+            if (by_curve) {
+                // 第 1 列 = **参数名**
+                var nb: [96]u8 = undefined;
+                const label = targetName(app, b.target, &nb);
+                drawRow(ui, app, bi, label, x + 4, ry, w - 8);
+            } else {
+                // 第 1 列 = **曲线名**
+                const lc = app.curveById(b.curve_id) orelse continue;
+                var nb: [48]u8 = undefined;
+                drawRow(ui, app, bi, lc.name(&nb), x + 4, ry, w - 8);
+            }
             ry += row_h;
             k += 1;
         }
@@ -171,35 +210,39 @@ pub fn draw(ui: *Ui, app: *App) void {
     }
 
     // ── 底部操作：`+ 新曲线并链接` / `链接到曲线…`（下拉，避免平铺溢出）──
+    // **`by_curve` 视角不要底部按钮**（用户拍板）：曲线已经有了，反向链接（选参数）暂不做——
+    // VST 参数在“参数视角”里链，固定目标在混音台/机架里链，绑定本就是双向的。
     const by = y + h - 30;
-    ui.renderer.hline(x + 4, by - 4, w - 8, ui.theme.panel_border);
-    {
-        const bw1: i32 = 116;
-        const hovered1 = util.inRect(ui.mouse_x, ui.mouse_y, x + 8, by, bw1, 22);
-        ui.renderer.fillRect(x + 8, by, bw1, 22, if (hovered1) ui.theme.item_hover else ui.theme.slider_track);
-        ui.renderer.strokeRect(x + 8, by, bw1, 22, ui.theme.panel_border);
-        ui.labelClipped("+ 新曲线并链接", x + 12, by + 5, bw1 - 8, ui.theme.text);
-        if (hovered1 and ui.mouse_pressed) {
-            // **按参数名自动命名**（例：`通道1 · 音量`、`主通道 · 音量`），重名自动加 `(2)`
-            var nb: [48]u8 = undefined;
-            const cname = app.autoCurveNameFor(win.target, &nb);
-            const cid = app.addAutoCurve(cname);
-            if (cid != 0 and app.bindCurveTarget(cid, win.target)) app.setToast("已新建曲线并链接");
-        }
+    if (!by_curve) {
+        ui.renderer.hline(x + 4, by - 4, w - 8, ui.theme.panel_border);
+        {
+            const bw1: i32 = 116;
+            const hovered1 = util.inRect(ui.mouse_x, ui.mouse_y, x + 8, by, bw1, 22);
+            ui.renderer.fillRect(x + 8, by, bw1, 22, if (hovered1) ui.theme.item_hover else ui.theme.slider_track);
+            ui.renderer.strokeRect(x + 8, by, bw1, 22, ui.theme.panel_border);
+            ui.labelClipped("+ 新曲线并链接", x + 12, by + 5, bw1 - 8, ui.theme.text);
+            if (hovered1 and ui.mouse_pressed) {
+                // **按参数名自动命名**（例：`通道1 · 音量`、`主通道 · 音量`），重名自动加 `(2)`
+                var nb: [48]u8 = undefined;
+                const cname = app.autoCurveNameFor(win.target, &nb);
+                const cid = app.addAutoCurve(cname);
+                if (cid != 0 and app.bindCurveTarget(cid, win.target)) app.setToast("已新建曲线并链接");
+            }
 
-        const bx2 = x + 8 + bw1 + 8;
-        const bw2: i32 = 116;
-        const hovered2 = util.inRect(ui.mouse_x, ui.mouse_y, bx2, by, bw2, 22);
-        ui.renderer.fillRect(bx2, by, bw2, 22, if (hovered2 or win.pick_open) ui.theme.item_hover else ui.theme.slider_track);
-        ui.renderer.strokeRect(bx2, by, bw2, 22, ui.theme.panel_border);
-        ui.labelClipped("链接到曲线", bx2 + 8, by + 5, bw2 - 26, ui.theme.text);
-        util.menuArrow(ui, bx2 + bw2 - 18, by + @divTrunc(22 - util.menu_arrow_h, 2), ui.theme.text_dim); // 字体缺 ▾ → 自绘
-        if (hovered2 and ui.mouse_pressed) {
-            win.pick_open = !win.pick_open;
-            win.pick_scroll = 0;
+            const bx2 = x + 8 + bw1 + 8;
+            const bw2: i32 = 116;
+            const hovered2 = util.inRect(ui.mouse_x, ui.mouse_y, bx2, by, bw2, 22);
+            ui.renderer.fillRect(bx2, by, bw2, 22, if (hovered2 or win.pick_open) ui.theme.item_hover else ui.theme.slider_track);
+            ui.renderer.strokeRect(bx2, by, bw2, 22, ui.theme.panel_border);
+            ui.labelClipped("链接到曲线", bx2 + 8, by + 5, bw2 - 26, ui.theme.text);
+            util.menuArrow(ui, bx2 + bw2 - 18, by + @divTrunc(22 - util.menu_arrow_h, 2), ui.theme.text_dim); // 字体缺 ▾ → 自绘
+            if (hovered2 and ui.mouse_pressed) {
+                win.pick_open = !win.pick_open;
+                win.pick_scroll = 0;
+            }
+            const link_btn = Rect{ .x = bx2, .y = by, .w = bw2, .h = 22 };
+            if (win.pick_open) drawPickList(ui, app, x, by - 6, w, link_btn);
         }
-        const link_btn = Rect{ .x = bx2, .y = by, .w = bw2, .h = 22 };
-        if (win.pick_open) drawPickList(ui, app, x, by - 6, w, link_btn);
     }
 
     // 拖标题栏移动（按下记“鼠标 − 窗口左上”的偏移；按住期间反算）
@@ -225,10 +268,11 @@ pub fn draw(ui: *Ui, app: *App) void {
     drawRowCtxMenu(ui, app);
 }
 
-/// 一行绑定：`[✓] [曲线名] [极性] [反向] [基础] [深度] [平滑] [×]`
+/// 一行绑定：`[✓] [曲线名/参数名] [极性] [反向] [基础] [深度] [平滑] [×]`
+/// `label` = 第 1 列文字（`by_target` → 曲线名；`by_curve` → 参数名）。
 /// **几何只有一个来源**：控件同高 `ctrl_h`、同间距 `ctrl_gap`、同行内用 `ctrlY` 垂直居中、
 /// 文本一律用 `labelCentered`（按字体 ascent/descent 居中）——不要再手写 `+8 / +3` 之类。
-fn drawRow(ui: *Ui, app: *App, bi: usize, lc: *view_lane.Lane, x: i32, y: i32, w: i32) void {
+fn drawRow(ui: *Ui, app: *App, bi: usize, label: []const u8, x: i32, y: i32, w: i32) void {
     const b = &app.auto_bindings.items[bi];
     const row_bg = if (b.enabled) ui.theme.item_alt else ui.theme.toolbar;
     ui.renderer.fillRect(x, y, w, row_h - 4, row_bg);
@@ -245,13 +289,12 @@ fn drawRow(ui: *Ui, app: *App, bi: usize, lc: *view_lane.Lane, x: i32, y: i32, w
 
     // 曲线名（点击 → 切到播放列表编辑这条曲线；垂直居中同其他控件）
     {
-        var nb: [24]u8 = undefined;
-        const nm = lc.name(&nb);
         const hovered = util.inRect(ui.mouse_x, ui.mouse_y, x + Col.name, cy, Col.name_w, ctrl_h);
         if (hovered) ui.renderer.fillRect(x + Col.name, cy, Col.name_w, ctrl_h, ui.theme.item_hover);
         // 名字可能超宽 → **中段省略**（头…尾），垂直居中由 `textTop` 算
-        ui.labelMiddle(nm, x + Col.name, textTop(ui, cy), Col.name_w, if (hovered) ui.theme.accent else if (b.enabled) ui.theme.text else ui.theme.text_dim);
-        if (hovered and ui.mouse_pressed) app.auto_sel = lc.id;
+        ui.labelMiddle(label, x + Col.name, textTop(ui, cy), Col.name_w, if (hovered) ui.theme.accent else if (b.enabled) ui.theme.text else ui.theme.text_dim);
+        // 点击名字：两个视角都“选中这条曲线”（播放列表高亮的那条），行为一致
+        if (hovered and ui.mouse_pressed) app.auto_sel = b.curve_id;
     }
 
     // **极性**（单向 / 双向）——左键切换；右键菜单
@@ -284,7 +327,7 @@ fn drawRow(ui: *Ui, app: *App, bi: usize, lc: *view_lane.Lane, x: i32, y: i32, w
     // **基础值**（归一化 0..1，上下拖数字）：一律白字
     {
         const bx0 = x + Col.base;
-        var val: f32 = b.base orelse view_lane.Target.defaultBase(b.target.kind);
+        var val: f32 = b.base orelse app.defaultBaseFor(b.target);
         if (ui.dragNumberF(Ui.idOf("auto_win_base", 0) + bi, bx0, cy, Col.base_w, ctrl_h, &val, 0.0, 1.0, 1)) {
             b.base = val;
             app.history_pending = "调整自动化基础值";
@@ -335,7 +378,8 @@ fn drawRow(ui: *Ui, app: *App, bi: usize, lc: *view_lane.Lane, x: i32, y: i32, w
         const tw: i32 = @intFromFloat(ui.font.measure("×"));
         ui.labelCentered("×", rx + @divTrunc(ctrl_h - tw, 2), cy, ctrl_h, if (hovered) ui.theme.danger else ui.theme.text_dim);
         if (hovered and ui.mouse_pressed) {
-            if (app.unbindCurveTarget(b.curve_id, app.auto_win.target)) {
+            // **用行自己的 target**（不是 `win.target`：`by_curve` 视角下它没意义）
+            if (app.unbindCurveTarget(b.curve_id, b.target)) {
                 app.setToast("已取消链接");
                 app.commitHistory("取消自动化链接");
             }
@@ -441,7 +485,7 @@ fn drawRowCtxMenu(ui: *Ui, app: *App) void {
             var vb: [24]u8 = undefined;
             switch (win.ctx_field) {
                 .base => {
-                    const v = b.base orelse view_lane.Target.defaultBase(b.target.kind);
+                    const v = b.base orelse app.defaultBaseFor(b.target);
                     const pre = view_lane.formatValue(.percent, v, &vb);
                     app.beginEditAutomationBase(bi, pre, mx + 4, my + 4, menu_w - 8);
                 },
@@ -551,6 +595,7 @@ fn targetName(app: *const App, t: view_lane.Target, buf: []u8) []const u8 {
             const idx = app.instrumentIndexByUid(t.uid) orelse return std.fmt.bufPrint(buf, "乐器? · {s}", .{suffix}) catch "乐器";
             return std.fmt.bufPrint(buf, "{s} · {s}", .{ app.instruments.items[idx].name, suffix }) catch "乐器";
         },
+        .vst_param => return app.vstParamLabel(t, buf),
     }
 }
 
@@ -569,6 +614,10 @@ fn baseValueOf(app: *const App, t: view_lane.Target) f32 {
             return if (t.kind == .inst_vol) inst.volume else inst.pan;
         },
         .tempo => return view_lane.Target.normFromBpm(app.bpm),
+        .vst_param => {
+            const r = app.vstParamResolve(t) orelse return 0.0;
+            return @floatCast(r.pl.paramNorm(r.param_idx));
+        },
         .none => return 0.0,
     }
 }

@@ -386,6 +386,12 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         while (i < @as(usize, @intCast(rows_draw))) : (i += 1) {
             if (ty + track_h > tracks_y and ty < tracks_y + tracks_h) {
                 const selected = app.sel.track == @as(i32, @intCast(i));
+                // **命中框夹到可见轨道区**：行可能只露出一半（下半被自动化面板盖住）
+                // ——绘制已由 pushClip 裁过，但 `listItem/toggleSquare` 的命中框是全行高：
+                // 不夹的话“点自动化行头列”会穿透选中轨道头（实测 bug）。
+                const vy0 = @max(ty, tracks_y);
+                const vy1 = @min(ty + track_h, tracks_y + tracks_h);
+                const in_row = vy1 > vy0 and ui.hitRect(main_x, vy0, header_w, vy1 - vy0);
                 // 轨道名（左列；底色加深与内容区区分）
                 // 注：Ctrl 按下时不响应（让位给“按行框选”——起点在轨道名列的手势）
                 const muted = app.trackMuted(i);
@@ -393,16 +399,18 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 const btn_sz: i32 = @min(track_h - 2, @max(12, @as(i32, @intFromFloat(ui.font.lineHeight()))));
                 const btn_x: i32 = main_x + header_w - btn_sz - 4;
                 const btn_y: i32 = ty + @divTrunc(track_h - btn_sz, 2);
-                const over_mute = util.inRect(ui.mouse_x, ui.mouse_y, btn_x, btn_y, btn_sz, btn_sz);
-                if (ui.listItem(3000 + i, app.trackName(i), main_x, ty, header_w, track_h, selected, i % 2 == 1, ui.theme.bg, if (muted) muted_gray else null) and !ui.mods_ctrl and !over_mute) {
+                const over_mute = in_row and util.inRect(ui.mouse_x, ui.mouse_y, btn_x, btn_y, btn_sz, btn_sz);
+                // 只用来画（返回值不再信：命中由 `in_row` 决定）
+                _ = ui.listItem(3000 + i, app.trackName(i), main_x, ty, header_w, track_h, selected, i % 2 == 1, ui.theme.bg, if (muted) muted_gray else null);
+                if (in_row and !over_mute and !ui.mods_ctrl and ui.mouse_pressed) {
                     app.sel.track = @intCast(i);
                 }
-                if (ui.toggleSquare(!muted, btn_x, btn_y, btn_sz)) { // 蓝=发声 / 灰=静音
+                if (in_row and ui.toggleSquare(!muted, btn_x, btn_y, btn_sz)) { // 蓝=发声 / 灰=静音
                     app.setTrackMuted(i, !muted);
                     app.commitHistory(if (!muted) "静音轨道" else "取消静音轨道");
                 }
                 // 右键轨道头 → 重命名/清空菜单（位置快照；与样式右键同一模式）
-                if (ui.mouse_right_pressed and ui.hitRect(main_x, ty, header_w, track_h)) {
+                if (in_row and ui.mouse_right_pressed and util.inRect(ui.mouse_x, ui.mouse_y, main_x, ty, header_w, track_h)) {
                     app.panels.ctx_track = i;
                     app.panels.ctx_trk_x = ui.mouse_x;
                     app.panels.ctx_trk_y = ui.mouse_y;
@@ -1562,7 +1570,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                         app.beginRenameAutoCurve(cid, main_x + 4, ay + 44 + 18, rename_box_w);
                     }
                 }
-                // 右键 → **菜单**（不是直接删）
+                // 右键 → **菜单**（不是直接删）；菜单本体在 `drawCurveMenu`（main 在所有面板之后调）
                 if (lh.right) |hi| {
                     if (hi < n) {
                         app.curve_menu = .{
@@ -1571,38 +1579,15 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                             .x = ui.mouse_x,
                             .y = ui.mouse_y,
                             .curve_id = app.auto_curves.items[hi].id,
+                            .rename_x = main_x + 4,
+                            .rename_y = ay + 44 + 18,
                         };
                     }
                 }
             }
         }
 
-        // ── 曲线行右键菜单（重命名 / 删除曲线）──
-        if (app.curve_menu.open) {
-            const items = [_][]const u8{ "重命名", "删除曲线" };
-            const en = [_]bool{ true, true };
-            const bounds: @import("ui.zig").Rect = .{ .x = main_x, .y = ay, .w = @max(1, x + w - main_x), .h = auto_h };
-            if (util.menuPanel(ui, &app.curve_menu.x, &app.curve_menu.y, &app.curve_menu.open, app.curve_menu.just_opened, .{ .cursor = {} }, bounds, &items, 110, &en)) |ci| {
-                const cid = app.curve_menu.curve_id;
-                switch (ci) {
-                    0 => app.beginRenameAutoCurve(cid, main_x + 4, ay + 44 + 18, rename_box_w),
-                    else => {
-                        if (app.bindingCountOfCurve(cid) > 1) {
-                            app.struct_del_req = .{ .auto_curve = cid };
-                            app.modal = .delete_auto_curve;
-                            app.modal_choice = null;
-                        } else if (app.removeAutoCurve(cid)) {
-                            app.setToast("已删除曲线");
-                        }
-                    },
-                }
-            }
-            app.curve_menu.just_opened = false;
-        }
-
         // 值轨本体（内容层）：与剪辑区同一横坐标映射。
-        // ⚠️ **必须在这里重新解析曲线指针**：上面可能删过曲线（`removeAutoCurve` 会搬移/释放
-        // 仓库内存），沿用旧指针 = use-after-free（实测：右键删曲线后崩溃在 `view_lane.draw`）。
         const draw_lane = app.autoCurve() orelse return;
         view_lane.draw(ui, draw_lane, lane_x, ay, panel_w, auto_h, util.pianoStepPx(), app.steps_per_bar, app.playlist.scroll_x, app.playlist.zoom, app.allocator);
     }
@@ -1610,6 +1595,41 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     if (app.playlist.snap_menu_open and snap_btn_x + 40 < x + w - 24) {
         _ = util.snapSelectorMenu(ui, snap_btn_x, y + util.title_h, &app.playlist.snap, &app.playlist.snap_menu_open, snap_clicked);
     }
+}
+
+/// **曲线行右键菜单**（重命名 / 管理已链接项 / 删除曲线）。
+///
+/// 必须在 `drawApp` **之后**由 main 调（与其他右键菜单同一模式）：
+/// 1. 面板内的值轨是**后画**的，菜单若画在面板里就会被曲线盖住（实测）；
+/// 2. `curve_menu.open` 已计入 `menuIsOpen()` → 展开期间整层被模态遮住，
+///    不会“点菜单的同时又点到下面的曲线/轨道行”；
+/// 3. 菜单画在层外 → `input_blocked == false`，自己才点得到。
+pub fn drawCurveMenu(ui: *Ui, app: *App) void {
+    if (!app.curve_menu.open) return;
+    const cm = &app.curve_menu;
+    const items = [_][]const u8{ "重命名", "管理已链接项", "删除曲线" };
+    // 没链接任何参数时置灰（“管理空列表”无意义）
+    const en = [_]bool{ true, app.bindingCountOfCurve(cm.curve_id) > 0, true };
+    const bounds: @import("ui.zig").Rect = .{ .x = 0, .y = 0, .w = ui.renderer.logicalWidth(), .h = ui.renderer.logicalHeight() };
+    if (util.menuPanel(ui, &cm.x, &cm.y, &cm.open, cm.just_opened, .{ .cursor = {} }, bounds, &items, 128, &en)) |ci| {
+        const cid = cm.curve_id;
+        switch (ci) {
+            0 => app.beginRenameAutoCurve(cid, cm.rename_x, cm.rename_y, rename_box_w),
+            1 => app.openCurveLinksWin(cid), // 同一条曲线驱动哪些参数（自动化窗口的曲线视角）
+            else => {
+                if (app.bindingCountOfCurve(cid) > 1) {
+                    app.struct_del_req = .{ .auto_curve = cid };
+                    app.modal = .delete_auto_curve;
+                    app.modal_choice = null;
+                } else if (app.removeAutoCurve(cid)) {
+                    app.setToast("已删除曲线");
+                }
+            },
+        }
+    }
+    // 遮挡插件子窗口 + 菜单展开期间禁掉插件编辑器（与其它右键菜单一致）
+    ui.noteOverlayRect(cm.x, cm.y, 128, @as(i32, @intCast(items.len)) * util.menu_item_h + 4);
+    cm.just_opened = false;
 }
 
 test "playlist: hitAt——落点换算（轨道行/吸附/缩放/滚动；区域外 null）" {

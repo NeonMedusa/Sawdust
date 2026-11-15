@@ -43,10 +43,14 @@ pub const Point = struct {
 pub const Target = struct {
     kind: Kind = .none,
     uid: u32 = 0,
+    /// **`vst_param` 专用**：VST3 参数 ID（`ParamID`）。
+    /// 其他 target 恒 0。**插件身份用 `uid`（= 乐器 uid，稳定）**，不用槽位下标。
+    param_id: u32 = 0,
 
     /// `none` = 未绑定（曲线不驱动任何参数）
     /// **`tempo`（BPM）**：全局目标（`uid` 忽略）；曲线值按 `bpmFromNorm` 映射到 BPM。
-    pub const Kind = enum { none, master_vol, mixer_vol, mixer_pan, inst_vol, inst_pan, tempo };
+    /// **`vst_param`**：`uid` = 乐器 uid（v1 只支持乐器 VSTi）、`param_id` = 插件参数 ID。
+    pub const Kind = enum { none, master_vol, mixer_vol, mixer_pan, inst_vol, inst_pan, tempo, vst_param };
     /// **BPM 的归一化映射区间**（线性）：0 → 20，1 → 999
     pub const tempo_min: f32 = @import("model.zig").bpm_min;
 pub const tempo_span: f32 = @import("model.zig").bpm_max - tempo_min;
@@ -64,6 +68,7 @@ pub const tempo_span: f32 = @import("model.zig").bpm_max - tempo_min;
         if (a.kind != b.kind) return false;
         if (a.kind == .none) return true;
         if (a.kind == .master_vol or a.kind == .tempo) return true;
+        if (a.kind == .vst_param) return a.uid == b.uid and a.param_id == b.param_id;
         return a.uid == b.uid;
     }
 
@@ -75,6 +80,7 @@ pub const tempo_span: f32 = @import("model.zig").bpm_max - tempo_min;
             .master_vol, .mixer_vol, .inst_vol => 0.0,
             .mixer_pan, .inst_pan => 0.5,
             .tempo => 0.0,
+            .vst_param => 0.0,
             .none => 0.0,
         };
     }
@@ -118,9 +124,12 @@ pub const Binding = struct {
     /// `双向 + 反向` = 双向的镜像。
     invert: bool = false,
     /// **极点追赶的平滑时间常数**（毫秒；0 = 不平滑。块内斜坡始终保留，不受它影响）。
-    /// 与 `depth`/`bipolar` 同层（每条绑定自己一个）：同一通道多条绑定取**最大值**。
+    /// 与 `depth`/`bipolar` 同层（每条绑定自己一个）。
     smooth_ms: f32 = default_smooth_ms,
     enabled: bool = true,
+    /// **瞬态**：`vst_param` 在 **UI 侧**施加时的极点状态（不存栈、不进历史）。
+    /// NaN = 未播种（首次直接用曲线值，不从 0 爬升）。
+    ui_smooth_state: f32 = std.math.nan(f32),
 };
 
 /// 平滑时间常数：默认 15ms（= 乐器级一直以来的手感）、上限 200ms

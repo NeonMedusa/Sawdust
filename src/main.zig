@@ -36,6 +36,7 @@ const view_presets = @import("view_presets.zig");
 const view_drumkit = @import("view_drumkit.zig");
 const view_help = @import("view_help.zig");
 const view_auto_win = @import("view_auto_win.zig");
+const view_vst_auto = @import("view_vst_auto.zig");
 const view_wave = @import("view_wave.zig");
 const view_settings = @import("view_settings.zig");
 const font_info = @import("font_info.zig");
@@ -931,6 +932,7 @@ pub fn main(init: std.process.Init) !u8 {
 
         // 同步 BPM / 每拍步数 到音频线程（序列器换算步→帧用）
         app.applyTempoAutomation(); // BPM 自动化（有绑定才生效）
+        app.applyVstParamAutomation(app.frame_dt_ns); // VST 参数自动化（v1：UI 侧 60Hz 施加）
         app.params.bpm.store(std.math.clamp(app.bpm, model.bpm_min, model.bpm_max), .monotonic);
         app.params.time_num.store(app.time_num, .monotonic);
         app.params.time_den.store(app.time_den, .monotonic);
@@ -1004,6 +1006,10 @@ pub fn main(init: std.process.Init) !u8 {
         if (app.panels.ctx_track != null) view_playlist.drawTrackCtxMenu(&ui, &app);
         // BPM 右键菜单（同上：必须在工具栏/视图/窗口之后才不会被盖住）
         if (app.panels.ctx_bpm) drawBpmCtxMenu(&ui, &app);
+        // VST 参数行内 `自动化` 菜单（同上：超过窗口层的话会被窗口层自己的屏蔽卡住）
+        if (app.vst_auto.menu_open) view_vst_auto.drawMenu(&ui, &app);
+        // 播放列表曲线行右键菜单（同上：面板内的值轨是后画的，画在面板里会被曲线盖住）
+        if (app.curve_menu.open) view_playlist.drawCurveMenu(&ui, &app);
         // 预设浏览器（模态；同上——浮动窗口之后）
         if (app.preset_browser.open) view_presets.draw(&ui, &app, ui.renderer.logicalWidth(), ui.renderer.logicalHeight());
         // 模态确认框（最上层；自绘——避开系统 MessageBox 把鼠标吸到默认按钮）
@@ -2476,7 +2482,7 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     const menu_open = app.menuIsOpen();
 
     // 浮动窗口列表（按 z 升序 = 从下到上）；排序用插入排序（元素很少）
-    var wins: [9]struct { z: i32, draw: app_mod.WinKind } = undefined;
+    var wins: [10]struct { z: i32, draw: app_mod.WinKind } = undefined;
     var nwin: usize = 0;
     if (rack_open) {
         wins[nwin] = .{ .z = app.rack.z, .draw = .rack };
@@ -2512,6 +2518,10 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     }
     if (app.auto_win.open) {
         wins[nwin] = .{ .z = app.auto_win.z, .draw = .auto };
+        nwin += 1;
+    }
+    if (app.vst_auto.open) {
+        wins[nwin] = .{ .z = app.vst_auto.z, .draw = .vst_auto };
         nwin += 1;
     }
     {
@@ -2552,6 +2562,7 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
             .settings => .{ .x = app.settings_win.x, .y = app.settings_win.y, .w = app.settings_win.w, .h = app.settings_win.h },
             .plugin_mgr => .{ .x = app.plugin_mgr.x, .y = app.plugin_mgr.y, .w = app.plugin_mgr.w, .h = app.plugin_mgr.h },
             .auto => .{ .x = app.auto_win.x, .y = app.auto_win.y, .w = @import("view_auto_win.zig").W, .h = @import("view_auto_win.zig").H },
+            .vst_auto => .{ .x = app.vst_auto.x, .y = app.vst_auto.y, .w = @import("view_vst_auto.zig").W, .h = @import("view_vst_auto.zig").H },
         };
         _ = ui.declare(.{ .prio = 1 + @as(i32, @intCast(wi)), .rect = r });
     }
@@ -2628,6 +2639,7 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
             .settings => _ = view_settings.draw(ui, app, w, h),
             .plugin_mgr => _ = view_plugins.draw(ui, app, w, h),
             .auto => view_auto_win.draw(ui, app),
+            .vst_auto => view_vst_auto.draw(ui, app),
         }
         ui.endLayer();
     }
@@ -2654,6 +2666,7 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
             .settings => .{ .kind = .settings, .x = app.settings_win.x, .y = app.settings_win.y, .w = app.settings_win.w, .h = app.settings_win.h },
             .plugin_mgr => .{ .kind = .plugin_mgr, .x = app.plugin_mgr.x, .y = app.plugin_mgr.y, .w = app.plugin_mgr.w, .h = app.plugin_mgr.h },
             .auto => .{ .kind = .auto, .x = app.auto_win.x, .y = app.auto_win.y, .w = @import("view_auto_win.zig").W, .h = @import("view_auto_win.zig").H },
+            .vst_auto => .{ .kind = .vst_auto, .x = app.vst_auto.x, .y = app.vst_auto.y, .w = @import("view_vst_auto.zig").W, .h = @import("view_vst_auto.zig").H },
         };
         app.win_draw_n += 1;
     }
@@ -3388,7 +3401,7 @@ fn rectsOverlap(ax: i32, ay: i32, aw: i32, ah: i32, bx: i32, by: i32, bw: i32, b
 
 /// 收集“绘制在指定面板之后（= 在其上）的窗口/弹层”中与插件内容区相交的矩形
 /// （主窗口 client 坐标；`setEditorClip` 区域裁切用）。与绘制**同源**（`win_draw_info`）。
-/// 上限 24 = 窗口 ≤7 + 遮罩 ≤16，不会溢出。
+/// 上限 24 = 窗口 ≤12 + 遮罩 ≤16，不会溢出。
 fn collectEditorCovers(app: *App, ui: *const Ui, panel: app_mod.WinKind, cx: i32, cy: i32, cw: i32, ch: i32, out: []vst_host.EditClipRect) usize {
     // `cx/cy/cw/ch` 是**物理像素**（子窗口坐标），`win_draw_info` / `overlay_rects` 是逻辑像素
     const sc = ui.renderer.scale;
