@@ -137,10 +137,13 @@ pub const LaneSnap = struct {
     /// **槽位稳定指纹**（发布时由 `curve_id + target` 算出）：槽位被另一个绑定占用时
     /// （增/删绑定 → `slotFor` 重新分配）→ 音频侧据此**重新播种**平滑状态。
     key: u32 = 0,
-    /// 目标种类：0 = 增益（volume），1 = 声像（pan），**2 = VST 插件参数（v2）**
+    /// 目标种类：0 = 增益（volume），1 = 声像（pan），**2 = 乐器 VST3 参数**（v2），
+    /// **3 = 效果器 VST3 参数**、**4 = 鼓组层 VST3 参数**（v3）
     kind: u8 = 0,
-    /// `kind == 2` 专用：VST3 参数 ID（`ParamID`）
+    /// `kind >= 2` 专用：VST3 参数 ID（`ParamID`）
     param_id: u32 = 0,
+    /// `kind == 3` 专用：效果链槽位；`kind == 4` 专用：鼓组层**展平槽位**
+    slot: u16 = 0,
     /// **基线值**（叠加起点）：音量类 0，声像类 0.5
     base: f32 = 0.0,
     n: u32 = 0,
@@ -247,7 +250,9 @@ pub const LaneSet = struct {
         var i: usize = 0;
         while (i < self.n and i < self.lanes.len) : (i += 1) {
             const l = &self.lanes[i];
-            if (l.active and l.ch == ch and l.inst == inst and (l.kind == 1) == pan) k += 1;
+            // **`kind <= 1` 必须显式写**：“音量/声像”只有 0/1，插件参数（2/3/4）不属于推子/旋钮。
+            // 只写 `(kind == 1) == pan` 会把 kind≥2 的插件参数 lane 当成“音量”一起叠加（v2 遗留 bug）。
+            if (l.active and l.kind <= 1 and l.ch == ch and l.inst == inst and (l.kind == 1) == pan) k += 1;
         }
         return k;
     }
@@ -260,7 +265,7 @@ pub const LaneSet = struct {
         var i: usize = 0;
         while (i < self.n and i < self.lanes.len) : (i += 1) {
             const l = &self.lanes[i];
-            if (!l.active or l.n == 0 or l.ch != ch or l.inst != inst or (l.kind == 1) != pan) continue;
+            if (!l.active or l.n == 0 or l.kind > 1 or l.ch != ch or l.inst != inst or (l.kind == 1) != pan) continue;
             const v = l.evalAt(step);
             if (v < 0) continue;
             sum += if (l.bipolar) (v - 0.5) * 2.0 * l.depth else v * l.depth;
@@ -295,7 +300,7 @@ pub const LaneSet = struct {
         var i: usize = 0;
         while (i < self.n and i < self.lanes.len) : (i += 1) {
             const l = &self.lanes[i];
-            if (!l.active or l.n == 0 or l.ch != ch or l.inst != inst or (l.kind == 1) != pan) continue;
+            if (!l.active or l.n == 0 or l.kind > 1 or l.ch != ch or l.inst != inst or (l.kind == 1) != pan) continue;
             const v1 = l.evalAt(st1);
             if (v1 < 0) continue; // 无曲线
             const v0 = l.evalAt(st0);
@@ -334,9 +339,20 @@ pub const LaneSet = struct {
     /// - 值 = `clamp(base + 贡献, 0, 1)`——就是插件参数的归一化值。
     pub const VstParamStep = struct { param_id: u32, v0: f32, v1: f32 };
 
-    pub fn collectVstParams(
+    /// **插件参数 lane 的段推进**（v2/v3）：对 `(space, a, slot)` 所指的插件实例，
+    /// 求每条 `kind == space` lane 的**段首/段末**两个值（含逐绑定极点 + 基准 + 深度/极性/反向，
+    /// 结果已 clamp 0..1），写入 `out`，返回条数（≤ out.len）。
+    ///
+    /// - `space`：2 = 乐器（`a` = 乐器下标，`slot` 忽略）、3 = 效果器（`a` = 通道下标，`slot` = 槽位）、
+    ///   4 = 鼓组层（`a` = 乐器下标，`slot` = 展平层槽位）；
+    /// - **每条 lane 每段只能调一次**（它会推进 `state`）；
+    /// - `state`/`keys` 与 `contributionSmooth` 共用同一对数组（都按**槽位**索引）；
+    /// - 值 = `clamp(base + 贡献, 0, 1)`——就是插件参数的归一化值。
+    pub fn collectPluginParams(
         self: *const LaneSet,
-        inst_idx: usize,
+        space: u8,
+        a: usize,
+        slot: usize,
         st0: f32,
         st1: f32,
         dt_s: f32,
@@ -348,7 +364,9 @@ pub const LaneSet = struct {
         var i: usize = 0;
         while (i < self.n and i < self.lanes.len) : (i += 1) {
             const l = &self.lanes[i];
-            if (!l.active or l.n == 0 or l.kind != 2 or !l.inst or l.ch != inst_idx) continue;
+            if (!l.active or l.n == 0 or l.kind != space or l.ch != a) continue;
+            // 乐器 lane 不看 slot（其 slot 恒 0）；fx/kit 要匹配子对象槽位
+            if (space != 2 and l.slot != slot) continue;
             const v1 = l.evalAt(st1);
             if (v1 < 0) continue; // 无曲线
             const v0 = l.evalAt(st0);
@@ -375,12 +393,26 @@ pub const LaneSet = struct {
         return n_out;
     }
 
+    /// 乐器 VSTi 参数的段推进（= `collectPluginParams(2, inst_idx, 0, …)`，保留旧名给测试/发音点）
+    pub fn collectVstParams(
+        self: *const LaneSet,
+        inst_idx: usize,
+        st0: f32,
+        st1: f32,
+        dt_s: f32,
+        state: []f32,
+        keys: []u32,
+        out: []VstParamStep,
+    ) usize {
+        return self.collectPluginParams(2, inst_idx, 0, st0, st1, dt_s, state, keys, out);
+    }
+
     /// 该座位该分组的**基线值**（有绑定 → 曲线自己定值；无 → null = 用静态推子/旋钮）
     pub fn baseOf(self: *const LaneSet, ch: usize, pan: bool, inst: bool) ?f32 {
         var i: usize = 0;
         while (i < self.n and i < self.lanes.len) : (i += 1) {
             const l = &self.lanes[i];
-            if (l.active and l.n > 0 and l.ch == ch and l.inst == inst and (l.kind == 1) == pan) return l.base;
+            if (l.active and l.n > 0 and l.kind <= 1 and l.ch == ch and l.inst == inst and (l.kind == 1) == pan) return l.base;
         }
         return null;
     }
@@ -2843,6 +2875,15 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
                     }
                     const sc = engine.vsti_scratch[0..n];
                     @memset(sc, 0);
+                    // **鼓组层 VST3 参数自动化（v3）**：与乐器级 VSTi 同一套
+                    // （位置同样在 panic 小调用之后、主 process 之前）
+                    pl.clearAuto();
+                    if (lane_on) {
+                        var vps: [LaneSet.max_lanes]LaneSet.VstParamStep = undefined;
+                        const nvps = lane_set.collectPluginParams(4, i, l, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key, &vps);
+                        var vi: usize = 0;
+                        while (vi < nvps) : (vi += 1) pl.queueAuto(vps[vi].param_id, vps[vi].v0, vps[vi].v1);
+                    }
                     pl.processInstrument(sc, frames, st.evts[l].events[0..st.evts[l].n], host_time);
                     st.evts[l].n = 0;
                     var k2: usize = 0;
@@ -3020,7 +3061,7 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
     var ch_i: usize = 1;
     while (ch_i < n_ch) : (ch_i += 1) {
         const buf = engine.chan_bufs[ch_i * buf_stride ..][0..n];
-        processChannelChain(engine, params, ch_i, buf, frames, sr, tgt_ch, tgt_slot);
+        processChannelChain(engine, params, ch_i, buf, frames, sr, tgt_ch, tgt_slot, lane_set, lane_on, lane_st0, lane_st1, dt_blk);
 
         const muted = params.channel_muted[ch_i].load(.monotonic);
         const stat = params.channel_gain[ch_i].load(.monotonic);
@@ -3074,7 +3115,7 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
     // （“主通道嘛”：所有通道的音频最终都经它；其效果器作用在**汇总信号**上）
     if (n_ch > 0) {
         const buf = engine.chan_bufs[0..][0..n];
-        processChannelChain(engine, params, 0, buf, frames, sr, tgt_ch, tgt_slot);
+        processChannelChain(engine, params, 0, buf, frames, sr, tgt_ch, tgt_slot, lane_set, lane_on, lane_st0, lane_st1, dt_blk);
         const muted0 = params.channel_muted[0].load(.monotonic);
         const stat0 = params.channel_gain[0].load(.monotonic);
         const auto0 = lane_on and lane_set.hasChannel(0, false, false);
@@ -3122,7 +3163,7 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
 }
 /// 单通道效果链处理（EQ 系数重建 + 逐槽处理 + 频谱捕获）。/// 注：**无“无乐器跳过”优化**——混响/延迟的尾音需状态持续推进（空缓冲
 /// 处理廉价）；主通道还会承载子通道汇入信号。
-fn processChannelChain(engine: *Engine, params: *Params, ch_i: usize, buf: []f32, frames: u32, sr: f32, tgt_ch: i32, tgt_slot: i32) void {
+fn processChannelChain(engine: *Engine, params: *Params, ch_i: usize, buf: []f32, frames: u32, sr: f32, tgt_ch: i32, tgt_slot: i32, lane_set: *const LaneSet, lane_on: bool, lane_st0: f32, lane_st1: f32, dt_blk: f32) void {
     // EQ 系数重建：参数变化版本号驱动（多槽共享同一份 EQ 参数对象）
     const ver = params.channel_eq_version[ch_i].load(.monotonic);
     if (ver != engine.chan_eq_ver[ch_i]) {
@@ -3168,7 +3209,17 @@ fn processChannelChain(engine: *Engine, params: *Params, ch_i: usize, buf: []f32
                 }
             },
             5 => { // VST3 插件（实例未加载 → 直通；由 UI 侧惰性加载/退役）
-                if (params.plugin_ptrs[ch_i][slot].load(.monotonic)) |pl| pl.processWithHost(buf, frames, currentHostTime(engine, params));
+                if (params.plugin_ptrs[ch_i][slot].load(.monotonic)) |pl| {
+                    // **效果器 VST3 参数自动化（v3）**：本段两点 → 参数队列，然后才处理
+                    pl.clearAuto();
+                    if (lane_on) {
+                        var vps: [LaneSet.max_lanes]LaneSet.VstParamStep = undefined;
+                        const nvps = lane_set.collectPluginParams(3, ch_i, slot, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key, &vps);
+                        var vi: usize = 0;
+                        while (vi < nvps) : (vi += 1) pl.queueAuto(vps[vi].param_id, vps[vi].v0, vps[vi].v1);
+                    }
+                    pl.processWithHost(buf, frames, currentHostTime(engine, params));
+                }
             },
             2, 3, 4 => { // 混响 / 延迟 / 压缩器：**每槽独立状态盒**（UI 发布指针）
                 const raw = params.fx_ptrs[ch_i][slot].load(.monotonic) orelse continue;
@@ -3303,6 +3354,11 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
         renderSegment(engine, params, out, frames, sr, master);
         publishSounding(engine, params);
         _ = params.frames_played.fetchAdd(frames, .monotonic);
+        // **桩停止态也要把步位置发布出去**：`play_step` 是 UI 画游标的唯一数据源，
+        // 而它只在本函数两个分支的块末被写。不写的话停止后它会一直停在
+        // “上一块播放”的位置 → 下次起播的第一帧 UI 拿到陈旧值，游标在旧位置闪一下
+        // （实测反馈：“停止后再播放，游标先在原处闪一下再跳回开头”）。
+        params.play_step.store(@floatCast(engine.ref_step), .monotonic);
         publishOutMeter(params, out, frames);
         return;
     }
@@ -4580,6 +4636,154 @@ test "audio: VST 参数 lane 段推进（参数 ID / 基准 / 极性·反向 / �
     try std.testing.expectEqual(@as(usize, 1), n3);
     try std.testing.expect(out[0].v0 < 1e-6); // 段首值（极点推进前）还没走
     try std.testing.expect(out[0].v1 > 0.05 and out[0].v1 < 0.2); // 一步只走一小段
+}
+
+test "audio: 效果器/鼓组层参数 lane 段推进（v3：按 space + 子对象槽位过滤）" {
+    var set = LaneSet{};
+    // 三条 lane：乐器参数 / 效果器参数（通道 1 · 槽 2）/ 鼓组层参数（乐器 0 · 层 3）
+    {
+        const l = set.slotFor().?;
+        l.active = true;
+        l.kind = 2;
+        l.ch = 0;
+        l.param_id = 0x11;
+        l.base = 0;
+        l.depth = 1.0;
+        l.interp = 1;
+        l.n = 2;
+        l.steps[0] = 0;
+        l.vals[0] = 0.0;
+        l.steps[1] = 96;
+        l.vals[1] = 1.0;
+    }
+    {
+        const l = set.slotFor().?;
+        l.active = true;
+        l.kind = 3;
+        l.ch = 1;
+        l.slot = 2;
+        l.param_id = 0x22;
+        l.base = 0.5;
+        l.depth = 1.0;
+        l.interp = 1;
+        l.n = 2;
+        l.steps[0] = 0;
+        l.vals[0] = 0.0;
+        l.steps[1] = 96;
+        l.vals[1] = 1.0;
+    }
+    {
+        const l = set.slotFor().?;
+        l.active = true;
+        l.kind = 4;
+        l.ch = 0;
+        l.slot = 3;
+        l.param_id = 0x33;
+        l.base = 0.0;
+        l.depth = 1.0;
+        l.interp = 1;
+        l.n = 2;
+        l.steps[0] = 0;
+        l.vals[0] = 0.0;
+        l.steps[1] = 96;
+        l.vals[1] = 1.0;
+    }
+
+    var st: [LaneSet.max_lanes]f32 = @splat(std.math.nan(f32));
+    var keys: [LaneSet.max_lanes]u32 = @splat(0);
+    var out: [LaneSet.max_lanes]LaneSet.VstParamStep = undefined;
+
+    // 乐器 0 的乐器参数 lane
+    const n_inst = set.collectPluginParams(2, 0, 0, 0.0, 48.0, 0.01, &st, &keys, &out);
+    try std.testing.expectEqual(@as(usize, 1), n_inst);
+    try std.testing.expectEqual(@as(u32, 0x11), out[0].param_id);
+
+    // 通道 1 · 槽 2 的效果器 lane（段 0→48 → 0→0.5，基准 0.5 → 0.5→1.0）
+    const n_fx = set.collectPluginParams(3, 1, 2, 0.0, 48.0, 0.01, &st, &keys, &out);
+    try std.testing.expectEqual(@as(usize, 1), n_fx);
+    try std.testing.expectEqual(@as(u32, 0x22), out[0].param_id);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), out[0].v0, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out[0].v1, 1e-6);
+    // 同通道其他槽位 → 不命中（子对象槽位是匹配键）
+    try std.testing.expectEqual(@as(usize, 0), set.collectPluginParams(3, 1, 3, 0.0, 48.0, 0.01, &st, &keys, &out));
+    try std.testing.expectEqual(@as(usize, 0), set.collectPluginParams(3, 0, 2, 0.0, 48.0, 0.01, &st, &keys, &out));
+
+    // 鼓组层（乐器 0 · 展平层槽 3）
+    const n_kit = set.collectPluginParams(4, 0, 3, 0.0, 48.0, 0.01, &st, &keys, &out);
+    try std.testing.expectEqual(@as(usize, 1), n_kit);
+    try std.testing.expectEqual(@as(u32, 0x33), out[0].param_id);
+    try std.testing.expectEqual(@as(usize, 0), set.collectPluginParams(4, 0, 2, 0.0, 48.0, 0.01, &st, &keys, &out));
+}
+
+test "audio: 插件参数 lane **不参与**音量/声像叠加（v2 遗留 bug：kind≥2 被当成音量）" {
+    var set = LaneSet{};
+    {
+        const l = set.slotFor().?;
+        l.active = true;
+        l.kind = 2; // VST 参数（inst = true、ch = 乐器下标——与“乐器音量”同一个 ch/inst 空间）
+        l.ch = 0;
+        l.inst = true;
+        l.depth = 1.0;
+        l.base = 0;
+        l.interp = 1;
+        l.n = 2;
+        l.steps[0] = 0;
+        l.vals[0] = 0.0;
+        l.steps[1] = 96;
+        l.vals[1] = 1.0;
+    }
+    var st: [LaneSet.max_lanes]f32 = @splat(std.math.nan(f32));
+    var keys: [LaneSet.max_lanes]u32 = @splat(0);
+    // 音量/声像统计与叠加必须为 0（否则“自动化一个 VST 参数”会连带改乐器音量）
+    try std.testing.expectEqual(@as(usize, 0), set.countForChannel(0, false, true));
+    try std.testing.expectEqual(@as(usize, 0), set.countForChannel(0, true, true));
+    const c = set.contributionSmooth(0, false, true, 0.0, 96.0, 0.01, &st, &keys);
+    try std.testing.expectEqual(@as(f32, 0), c.before);
+    try std.testing.expectEqual(@as(f32, 0), c.after);
+    try std.testing.expect(set.baseOf(0, false, true) == null);
+    try std.testing.expectEqual(@as(f32, 0), set.contribution(0, 96.0, false, true));
+    // 同时它仍能被插件参数路径命中（没被“修坏”）
+    var out: [LaneSet.max_lanes]LaneSet.VstParamStep = undefined;
+    try std.testing.expectEqual(@as(usize, 1), set.collectPluginParams(2, 0, 0, 0.0, 96.0, 0.01, &st, &keys, &out));
+}
+
+test "audio: 停止态把步位置发布到 play_step（否则起播第一帧游标闪旧位置）" {
+    // 回归：`params.play_step` 只在**播放分支**的块末被写。停止后它一直停在
+    // “上一块播放”的位置 → 下次起播的第一帧 UI 读它画游标 → 在旧位置闪一下再跳回开头
+    // （实测反馈）。修法：停止分支也把 `ref_step`（= UI 游标）发布出去。
+    const a = std.testing.allocator;
+    var q = synth.EventQueue{};
+    var p = Params{};
+    p.events = &q;
+    p.sample_rate = 48_000;
+    p.bpm.store(120, .monotonic);
+    p.steps_per_beat.store(@intCast(@max(1, model.stepsPerBeat(4))), .monotonic);
+    p.time_num.store(4, .monotonic);
+    p.time_den.store(4, .monotonic);
+    p.volume.store(1.0, .monotonic);
+    try p.initCapacity(a, 1, 1, 1);
+    defer p.deinit(a);
+    var engine = Engine{ .allocator = a, .params = &p };
+    try engine.init(&p, a);
+    defer engine.deinit();
+
+    // 模拟“上一段播放停在 3840 步，然后停止、游标归 0”
+    p.play_step.store(3840.0, .monotonic);
+    p.playing.store(false, .monotonic);
+    p.ui_cursor_step.store(0.0, .monotonic);
+    p.ui_cursor_valid.store(true, .monotonic);
+
+    var out: [128 * 2]f32 = undefined;
+    @memset(&out, 0);
+    renderBlock(&engine, &p, &out, 128, 48_000.0);
+    // 一个停止块之后：play_step 必须已跟上游标（不再是化石值）
+    try std.testing.expectEqual(@as(f32, 0.0), p.play_step.load(.monotonic));
+
+    // 游标拖到 960 → 停止块也应跟上
+    p.ui_cursor_step.store(960.0, .monotonic);
+    @memset(&out, 0);
+    renderBlock(&engine, &p, &out, 128, 48_000.0);
+    try std.testing.expectEqual(@as(f32, 960.0), p.play_step.load(.monotonic));
 }
 
 test "audio: panic 的 128 个 note-off 带**乐器通道**（否则暂停/停止后挂音）" {

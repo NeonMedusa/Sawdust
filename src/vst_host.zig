@@ -965,6 +965,9 @@ pub fn dumpBuses(path: [:0]const u8) !void {
     inline for ([_]struct { d: icomp.BusDirections, t: icomp.MediaTypes, label: []const u8 }{
         .{ .d = .kInput, .t = .kAudio, .label = "in" },
         .{ .d = .kOutput, .t = .kAudio, .label = "out" },
+        // **事件总线**（ports）：多端口/MIDI 多音色插件的“端口”就是它；我们宿主只开 1 条
+        .{ .d = .kInput, .t = .kEvent, .label = "ev-in" },
+        .{ .d = .kOutput, .t = .kEvent, .label = "ev-out" },
     }) |side| {
         const n = component.vtable.getBusCount(raw_component, @backingInt(side.t), @backingInt(side.d));
         std.debug.print("[{s}] 总线数 {d}\n", .{ side.label, n });

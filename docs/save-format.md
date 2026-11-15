@@ -23,7 +23,7 @@
 | v6 | 鼓组 VST3 层 / 音频片段（`audio_style`/`trim_*`）/ `audio_styles`（`85f9bad`、`767c11e`） | 同上 |
 | v7 | `Project.instrument_order`（乐器上下移，`c47a6c3`） | `×40` + `instrument_order` 缺失 → 空（按槽位顺序） |
 | v8 | 音符/片段静音 `muted`（静音体系那一轮） | `×40` + `muted` 缺失 → `false` |
-| **v9（当前）** | **自动化整套**（`auto_lanes`/`auto_bindings`/`auto_sel`）+ `SavedBinding.smooth_ms·invert·param_id` + `SavedInstrument/SavedMixerChannel.uid` + **单位 U 96→3840** + **清格式**（删 5 个死字段、`bpm` 改 f32、删 JSON 通道） | 不发迁移（已是新单位） |
+| **v9（当前）** | **自动化整套**（`auto_lanes`/`auto_bindings`/`auto_sel`）+ `SavedBinding.smooth_ms·invert·param_id·target_slot` + `SavedInstrument/SavedMixerChannel/SavedEffectSlot/SavedDrumLayer.uid` + **单位 U 96→3840** + **清格式**（删 5 个死字段、`bpm` 改 f32、删 JSON 通道） | 不发迁移（已是新单位） |
 
 > 关键事实（免得再误判“空造版本”）：**v6/v7/v8 都是 main 真实发布过的**（v18 写 v8）。
 > automation 分支只新增了 **v9** 一个版本。读 v5–v8 时的 ×40 与字段默认值全在
@@ -409,9 +409,12 @@ Note 规则用 5% 的代码拿到了 88% 的收益（141.7KB / 160.5KB）——�
   新增测试用“写当前版本→版本字节改回 8→读”的路子守住这条。
 - **v9 引入的字段**（统一钉 `binary_version_v9 = 9`）：
   `Project.auto_lanes` / `auto_bindings` / `auto_sel`（v8 发布版**没有**自动化整套——不登记就会在旧档末尾
-  “多读三个字段”→ 字节错位）、`SavedBinding.smooth_ms`、`SavedBinding.invert`、`SavedBinding.param_id`
-  （VST 参数自动化 v1）、`SavedInstrument.uid` 与 `SavedMixerChannel.uid`（**稳定 uid**：
-  不落盘的话读档/撤销后 uid 重新编号 → 自动化绑定指向不存在的目标，“表面在、实际失效”）。
+    “多读三个字段”→ 字节错位）、`SavedBinding.smooth_ms`、`SavedBinding.invert`、`SavedBinding.param_id`
+    （VST 参数自动化 v1）、`SavedBinding.target_slot`（v3：fx/kit 的子对象 uid）、
+    `SavedInstrument.uid` 与 `SavedMixerChannel.uid`（**稳定 uid**：
+    不落盘的话读档/撤销后 uid 重新编号 → 自动化绑定指向不存在的目标，“表面在、实际失效”）、
+    `SavedEffectSlot.uid` / `SavedDrumLayer.uid`（v3：效果槽/鼓组层的稳定 uid——效果链插入删除、
+    鼓组层增删会让**位置漂移**，绑定必须按 uid 引用）。
   测试改用 `toBinaryAtVersion(…, 8)` **真实写出 v8 布局**（不再“写 v9 再改版本字节”——那种做法在有 v9 新字段时必炸），
   曲线点 ×40 的迁移另用 `migrateUnitsToV5` 的函数级测试盖住。
 

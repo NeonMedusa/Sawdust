@@ -173,6 +173,8 @@ pub const SavedBinding = struct {
     /// `view_lane.Target.Kind` 的序号
     target_kind: u8 = 0,
     target_uid: u32 = 0,
+    /// **v3（v9 内）**：`fx_param` / `kit_param` 的子对象 uid（效果槽 / 鼓组层）
+    target_slot: u32 = 0,
     /// 叠加深度
     depth: f32 = 1.0,
     /// 基准值（`null` = 用目标类型默认值）；JSON 里用哨兵 -1 表示 null
@@ -220,6 +222,8 @@ pub const SavedSynth = struct {
 
 /// 存档中的鼓组层（每垫一份内嵌合成器参数；见 `docs/drumkit.md` §8）
 pub const SavedDrumLayer = struct {
+    /// **稳定 uid**（v9：鼓组层参数自动化按它引用层）
+    uid: u32 = 0,
     /// 乐器类型（0 = 减法合成器 / 2 = VST3；旧存档缺失 → 0）
     kind: u32 = 0,
     synth: SavedSynth = .{},
@@ -313,6 +317,8 @@ pub const SavedEqBand = struct {
 
 /// 存档中的一个效果器（`kind`：1 = EQ / 2 = 混响 / 3 = 延迟 / 4 = 压缩器；0 = 无效）
 pub const SavedEffectSlot = struct {
+    /// **稳定 uid**（v9：效果器参数自动化按它引用槽位）
+    uid: u32 = 0,
     kind: u32 = 0, // 与 app.EffectKind 对应；0 = 无效
     enabled: bool = true,
     /// 干湿比（0 = 干声、1 = 完全效果）
@@ -512,6 +518,13 @@ fn introducedVersion(comptime T: type, comptime name: []const u8) ?u8 {
         if (comptime std.mem.eql(u8, name, "smooth_ms")) return binary_version_v9;
         if (comptime std.mem.eql(u8, name, "invert")) return binary_version_v9;
         if (comptime std.mem.eql(u8, name, "param_id")) return binary_version_v9;
+        // v3：fx_param / kit_param 的子对象 uid（效果槽 / 鼓组层）
+        if (comptime std.mem.eql(u8, name, "target_slot")) return binary_version_v9;
+        return null;
+    }
+    if (comptime std.mem.endsWith(u8, tn, "SavedEffectSlot") or std.mem.endsWith(u8, tn, "SavedDrumLayer")) {
+        // **稳定 uid**（v9）：效果槽/鼓组层的参数自动化按它引用（位置会因插入/删除而漂）
+        if (comptime std.mem.eql(u8, name, "uid")) return binary_version_v9;
         return null;
     }
     if (comptime std.mem.endsWith(u8, tn, "SavedInstrument") or std.mem.endsWith(u8, tn, "SavedMixerChannel")) {

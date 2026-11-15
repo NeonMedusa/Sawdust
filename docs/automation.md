@@ -1036,7 +1036,7 @@ view_playlist.zig:1468 in draw  →  view_lane.draw(ui, cur_lane, …)
 | --- | --- |
 | **v1（本轮）** | **乐器 VSTi 参数**；UI 侧 60Hz 施加 + 逐绑定平滑 τ |
 | v2 | 搬进音频线程（采样级）+ `ParamValueQueue` 采样偏移；tempo 平滑；拆“文档 BPM / 有效 BPM”；修导出不跟随 tempo 自动化 |
-| v3 | FX（通道效果器）/ 鼓组层参数——前提是先补**稳定 uid** |
+| v3 | FX（通道效果器）/ 鼓组层参数——先给 `EffectSlot` / `DrumLayer` 补**稳定 uid**（已做，见 §11.43） |
 
 #### 目标模型（`view_lane.Target`）
 
@@ -1139,7 +1139,7 @@ param_id: u32              // = VST3 ParamID（插件自己报的，不是“第
 
 #### 已知限制（v1 有意不做）
 
-- **FX / 鼓组层**参数暂不支持（缺稳定 uid，v3）；
+- ~~**FX / 鼓组层**参数暂不支持（缺稳定 uid，v3）~~ → **v3 已支持**（见 §11.43）；
 - 离线导出（`exportWavRun`）**不跟随** VST 参数自动化（它直接 `renderBlock`，不跑 UI 帧）——
   v2 搬进音频线程后结构性解决；
 - 每帧 `findParamIndex` 是线性查找；绑定数 ≤ 16，实测无压力（v2 换音频侧查表时再优化）。
@@ -1292,7 +1292,66 @@ v2 后：**自动化求值全在音频侧**，`renderBlock` 是唯一入口 → 
   可能在自动化跑着的时候显示旧值（等下一次手动拧/重载才同步）。
 - tempo 绑定存在时，工具栏 BPM 显示的是“曲线此刻的值”；在那里改 BPM 改的是**文档值**，
   听感上要等解绑才生效。
-- FX / 鼓组层参数仍不支持（v3，需先补稳定 uid）。
+- ~~FX / 鼓组层参数仍不支持（v3，需先补稳定 uid）~~ → **v3 已支持**（见 §11.43）。
+
+### 11.43 **v3：效果器 / 鼓组层参数自动化**
+
+#### 目标（`view_lane.Target`）
+
+```zig
+kind     = .fx_param                        // 通道效果器链上的 VST3 参数
+uid      = 通道 uid                          // MixerChannel.uid
+slot     = EffectSlot.uid                   // **槽位 uid**（插入/删除/重排后仍指向同一个槽）
+param_id = VST3 ParamID
+
+kind     = .kit_param                       // 鼓组层 VST3 参数
+uid      = 乐器 uid                          // DrumLayer 在乐器里
+slot     = DrumLayer.uid
+param_id = VST3 ParamID
+```
+
+- 为什么必须补 uid：效果器链是**动态数组**（`addEffect` 后可能 `removeEffect`/`moveEffect`），
+  鼓组层也一样（`kitLayerAdd*`/`kitLayerRemove`）——按下标引用的话，“插一个效果器”
+  会让所有后续绑定静默指向错槽。
+- uid 只增不重用（`App.takeSlotUid`）；读档/撤销后 `ensureSlotUids()` 补齐并升计数器。
+  存档字段：`SavedEffectSlot.uid` / `SavedDrumLayer.uid` / `SavedBinding.target_slot`（均 v9 引入）。
+
+#### 发布与音频侧
+
+| 层 | 变化 |
+| --- | --- |
+| `App.publishAutoLane` | `fx_param` → 通道 uid 解析通道，`slot uid` 解析当前槽位 → `kind = 3`；`kit_param` → 乐器 uid + 层 uid → 展平层槽位 → `kind = 4`；指纹再混入槽位 |
+| `audio.LaneSet.collectPluginParams(space, a, slot, …)` | 原来的 `collectVstParams` 泛化而成：`space` 2=乐器 / 3=效果器 / 4=鼓组层；fx/kit 还要匹配 `slot` |
+| `audio.renderSegment`（鼓组层分支） | `pl.clearAuto()` → `collectPluginParams(4, i, l, …)` → `queueAuto` → `processInstrument` |
+| `audio.processChannelChain`（效果链分支） | `pl.clearAuto()` → `collectPluginParams(3, ch, slot, …)` → `queueAuto` → `processWithHost` |
+
+- 三者共用同一套极点状态（`engine.bind_sm_val/key` 按槽位索引）；
+- **位置约束**：参数队列必须在 `process` 之前写完（与 panic 的 1 帧小调用互不干扰）；
+- takeover / 自动化回声两个守卫对 FX/鼓组层**自动生效**（同一批 `Plugin` 实例）。
+
+#### UI 入口
+
+- **三处插件容器完全对齐**（乐器 / 效果器 / 鼓组层）：
+  - 容器窗标题栏 `[自动化][预设 ▾][保存为…]`（同一顺序/同款底色）→ 打开**同一个**
+    `view_vst_auto` 窗口（三段式：已链接 / 最近改动 / 全部参数 + 搜索）；
+  - 该窗口现在按 `PluginSlotRef` 工作（`App.vst_auto.ref`），不再写死“乐器下标”：
+    “已链接”按 `App.slotParamIdentity(ref)` 筛（稳定 kind/uid/slot）；
+    “最近改动”按 `App.slotRefKey(ref)` 筛（`vst_recent` 已改成按插件槽存）。
+- **共用参数列表**（`util.drawPluginParamList`，FX 面板 / 鼓组层窗口 / 乐器回落窗口三处共用）：
+  每行右侧一个 `自动化` 按钮 → 打开自动化窗口（未链接时那里可直接新建/链接曲线）；
+  已链接行值只读且变绿（= 自动化真的在驱动）。
+  行 → 目标由 `App.targetForSlotParam(ref, param_id)` 把**运行时下标**换成 **uid 编码**。
+- **自带 GUI 的插件也能进自动化**：**唯一入口就是容器窗标题栏的 `自动化`**
+  （那个窗口就是完整参数表：已链接 / 最近改动 / 全部参数 + 搜索）。
+  曾短暂做过面板内部的 `界面 / 参数` 切换——**已删**：自动化窗口完全覆盖它的用途，
+  而面板顶部那行（启用 + 干湿）本来就是**调音台效果链行**的重复入口
+  （旁通方块 + 干湿旋钮在 `view_mixer.drawEffectRow`）——那一行连同 28px 行高一起砍掉，
+  面板内容区变大，插件编辑器窗口也不再留一条空白带（`vst_fx_chrome_h` = 仅标题栏）。
+  注：无界面插件（`editor_no_ui`）的面板正文**本来就是**软参数列表，不需要切换。
+- 自动化窗口标题/绑定行名：`App.fxParamLabel` / `App.kitParamLabel`
+  （`通道A · Pro-Q 3 · Frequency` / `鼓组 · 层2 · Cutoff`）。
+- **目标消失即解绑**：槽被删/换成内置效果/层被删 → `pruneAutoBindings` 移除绑定；
+  插件**未加载**时**保守保留**（只是暂时没加载）。
 
 
 

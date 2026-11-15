@@ -971,6 +971,8 @@ pub const EffectKind = enum(u32) {
 
 /// 一个效果器槽（插件实例）
 pub const EffectSlot = struct {
+    /// **稳定 uid**（v3：效果器参数自动化按它引用槽位；0 = 未分配）
+    uid: u32 = 0,
     kind: EffectKind = .empty,
     /// 开关（旁通）
     enabled: bool = true,
@@ -1600,14 +1602,15 @@ pub const App = struct {
     next_curve_id: u32 = 0,
 
     // ── VST 参数自动化（**v2：音频线程施加**；这里只有窗口/最近列表/回声环）──
-    /// **VST 自动化窗口**（Windows：乐器窗口标题栏 `自动化` 按钮；Linux：直接占用乐器面板正文）
+    /// **VST 自动化窗口**（窗口标题栏 `自动化` 按钮：乐器 / 效果器 / 鼓组层三处共用；
+    /// Linux：乐器面板正文直接用它）
     vst_auto: struct {
         open: bool = false,
         x: i32 = 220,
         y: i32 = 110,
         z: i32 = 0,
-        /// 目标乐器 uid（0 = 未指定）
-        inst_uid: u32 = 0,
+        /// 目标插件实例（**运行时寻址**；窗口开着时每帧重新解析插件指针）
+        ref: PluginSlotRef = .{ .kind = .instrument },
         /// 统一的滚动偏移（三段共用一个滚动区）
         scroll: i32 = 0,
         /// 搜索过滤（与文本输入实时同步，同名同预设搜索的做法）
@@ -1625,11 +1628,13 @@ pub const App = struct {
         drag_dy: i32 = 0,
     } = .{},
     /// “最近改动”的插件参数（最新在前；只存 (乐器 uid, 参数 id)）
-    vst_recent: [10]struct { inst_uid: u32, param_id: u32 } = @splat(.{ .inst_uid = 0, .param_id = 0 }),
+    vst_recent: [10]struct { slot_key: u64, param_id: u32 } = @splat(.{ .slot_key = 0, .param_id = 0 }),
     vst_recent_n: usize = 0,
     /// 最近一次**手动写入**的值（回声抑制：插件把自己的变更回报成 performEdit 时不记历史）
-    vst_written: [16]struct { inst_uid: u32, param_id: u32, value: f64 } = @splat(.{ .inst_uid = 0, .param_id = 0, .value = -1 }),
+    vst_written: [16]struct { slot_key: u64, param_id: u32, value: f64 } = @splat(.{ .slot_key = 0, .param_id = 0, .value = -1 }),
     vst_written_w: usize = 0,
+    /// `beginVstParamValueEdit` 的目标插件槽（v3：乐器 / 效果器 / 鼓组层共用）
+    vst_value_ref: PluginSlotRef = .{ .kind = .instrument },
     /// **钢琴窗编辑区**：envelope 编辑的当前目标 + **每个目标一条独立 lane**
     ///（否则切目标会共用同一条曲线——实测：乐器音量画的线会出现在乐器声像里）
     /// 播放列表自动化区高度（像素；**与钢琴窗编辑区各自独立**，布局数学共用 `view_lane.layoutPanel`）
@@ -1892,6 +1897,8 @@ pub const App = struct {
     next_channel_uid: u32 = 0,
     /// 乐器 uid 分配器（同上）
     next_instrument_uid: u32 = 0,
+    /// **效果器/鼓组层的稳定 uid 序列**（与乐器 uid 共享同一个空间——它们是不同 kind，不冲突）
+    next_slot_uid: u32 = 0,
     /// 已删除但可能仍被音频线程引用的插件实例（**延迟销毁**）——
     /// `countdown` 帧后由 `reapRetiredPlugins` 真正释放（远大于音频缓冲周期）
     retired_plugins: std.ArrayListUnmanaged(RetiredPlugin) = .empty,
@@ -2686,6 +2693,7 @@ pub const App = struct {
             }
             for (pad.layers.items, 0..) |layer, li| {
                 layers[li] = .{
+                    .uid = layer.uid,
                     .kind = @backingInt(layer.kind),
                     .synth = persist.exportSynth(layer.params),
                     .gain = layer.gain,
@@ -2898,7 +2906,7 @@ pub const App = struct {
                 const src: []u8 = self.allocator.dupe(u8, sl.source_preset) catch &.{};
                 // 未知类型（未来存档）→ 退回减法（现阶段可用引擎；参数照常载入）
                 const kind = std.enums.fromInt(model.LayerKind, sl.kind) orelse model.LayerKind.subtractive;
-                var layer = model.DrumLayer{ .kind = kind, .params = lp, .gain = sl.gain, .source_preset = src };
+                var layer = model.DrumLayer{ .kind = kind, .params = lp, .gain = sl.gain, .source_preset = src, .uid = sl.uid };
                 if (kind == .sampler) {
                     var path_buf2: [1024]u8 = undefined;
                     const resolved = self.resolveAudioPath(sl.asset_path, &path_buf2) orelse sl.asset_path;
@@ -3295,7 +3303,7 @@ pub const App = struct {
         lp.* = .{};
         if (saved) |s| persist.importSynth(s, lp);
         const src: []u8 = self.allocator.dupe(u8, source) catch &.{};
-        pad.layers.append(self.allocator, .{ .params = lp, .gain = 1.0, .source_preset = src }) catch {
+        pad.layers.append(self.allocator, .{ .params = lp, .gain = 1.0, .source_preset = src, .uid = self.takeSlotUid() }) catch {
             self.retireSynth(lp);
             return false;
         };
@@ -3315,6 +3323,7 @@ pub const App = struct {
         lp.* = .{};
         const src: []u8 = self.allocator.dupe(u8, source) catch &.{};
         var layer = model.DrumLayer{ .kind = .vst3, .params = lp, .gain = 1.0, .source_preset = src };
+        layer.uid = self.takeSlotUid(); // v3：层参数自动化按它引用这个层
         layer.setPluginPath(path);
         pad.layers.append(self.allocator, layer) catch {
             self.retireSynth(lp);
@@ -3928,6 +3937,7 @@ pub const App = struct {
         lp.* = .{};
         const src: []u8 = self.allocator.dupe(u8, std.fs.path.basename(path)) catch &.{};
         var layer = model.DrumLayer{ .kind = .sampler, .params = lp, .gain = 1.0, .source_preset = src };
+        layer.uid = self.takeSlotUid();
         layer.setAssetPath(path);
         layer.asset_idx = self.loadAudioAsset(path) orelse -1;
         layer.load_failed = layer.asset_idx < 0;
@@ -5253,12 +5263,13 @@ pub const App = struct {
     }
 
     /// 打开 **VST 参数输入值…**（按百分比 0..100 解析）：
+    /// `beginVstParamValueEdit` 的目标插件槽（v3：乐器 / 效果器 / 鼓组层共用）
     /// `instrument` = 乐器下标、`index` = VST3 参数 ID（不是参数下标——下标会随插件重启变）
-    pub fn beginVstParamValueEdit(self: *App, inst_idx: usize, param_id: u32, prefill: []const u8, x: i32, y: i32, w: i32) void {
+    pub fn beginVstParamValueEdit(self: *App, ref: PluginSlotRef, param_id: u32, prefill: []const u8, x: i32, y: i32, w: i32) void {
         const ti = &self.text_input;
         ti.active = true;
         ti.target = .vst_param_value;
-        ti.instrument = @intCast(std.math.clamp(inst_idx, 0, std.math.maxInt(i32)));
+        self.vst_value_ref = ref;
         ti.index = param_id;
         ti.len = @min(prefill.len, ti.buf.len);
         @memcpy(ti.buf[0..ti.len], prefill[0..ti.len]);
@@ -5776,6 +5787,13 @@ pub const App = struct {
                         break :blk std.fmt.bufPrint(&tb, "{s} · 参数", .{inst.name}) catch "曲线";
                     break :blk std.fmt.bufPrint(&tb, "{s} · {s}", .{ inst.name, pl.params[pi].name() }) catch "曲线";
                 },
+                .fx_param, .kit_param => {
+                    // 完整名可能很长（`通道A · Pro-Q 3 · Frequency`）——曲线名不比参数名：
+                    // 用“容器名 · 参数名”两段（省掉插件名的中段）
+                    var lb: [96]u8 = undefined;
+                    const full = if (target.kind == .fx_param) self.fxParamLabel(target, &lb) else self.kitParamLabel(target, &lb);
+                    break :blk full;
+                },
             }
         };
         // 重名 → 追加 (2)/(3)…
@@ -6021,6 +6039,8 @@ pub const App = struct {
         if (self.mixer_channels_state.items.len > 0 and self.mixer_channels_state.items[0].uid == 0) self.ensureChannelUids();
         // 乐器 uid 惰性补齐（读档/旧工程）
         if (self.instruments.items.len > 0 and self.instruments.items[0].uid == 0) self.ensureInstrumentUids();
+        // 效果槽 / 鼓组层 uid 惰性补齐（v3：参数自动化按 uid 引用）
+        self.ensureSlotUids();
         const cur = self.params.lane_pub.load(.monotonic);
         const next = (cur + 1) % 3;
         const set = &self.params.lane_bufs[next];
@@ -6038,10 +6058,23 @@ pub const App = struct {
                 .inst_vol, .inst_pan => self.instrumentIndexByUid(b.target.uid) orelse continue,
                 .tempo => continue, // 节奏在 UI 侧求值（不进音频 lane 快照；它是一全局量）
                 .vst_param => self.instrumentIndexByUid(b.target.uid) orelse continue, // v2：音频线程求值
+                .fx_param => self.channelIndexByUid(b.target.uid) orelse continue, // v3：效果器链
+                .kit_param => self.instrumentIndexByUid(b.target.uid) orelse continue, // v3：鼓组层
                 .none => continue,
             };
             const is_vst = b.target.kind == .vst_param;
-            const is_inst = is_vst or b.target.kind == .inst_vol or b.target.kind == .inst_pan;
+            const is_fx = b.target.kind == .fx_param;
+            const is_kit = b.target.kind == .kit_param;
+            const is_plugin = is_vst or is_fx or is_kit;
+            // 插件参数类：把**子对象 uid** 换成当前槽位（槽位会被插入/删除/重排改变）
+            var slot_now: usize = 0;
+            if (is_fx) {
+                slot_now = self.fxSlotIndexByUid(ch, b.target.slot) orelse continue;
+            } else if (is_kit) {
+                const loc = self.kitLayerByUid(ch, b.target.slot) orelse continue;
+                slot_now = self.kitLayerSlot(ch, self.instruments.items[ch].kit.?.pads.items[loc.pad].pitch, loc.layer) orelse continue;
+            }
+            const is_inst = is_vst or is_kit or b.target.kind == .inst_vol or b.target.kind == .inst_pan;
             const is_pan = b.target.kind == .mixer_pan or b.target.kind == .inst_pan;
             const lc = self.curveById(b.curve_id) orelse continue;
             const n = @min(lc.points.items.len, audio.LaneSnap.capacity);
@@ -6054,14 +6087,16 @@ pub const App = struct {
             snap.active = true;
             snap.ch = @intCast(@min(ch, 255));
             snap.inst = is_inst;
-            snap.kind = if (is_vst) 2 else if (is_pan) 1 else 0;
-            snap.param_id = if (is_vst) b.target.param_id else 0;
+            snap.slot = @intCast(@min(slot_now, std.math.maxInt(u16)));
+            snap.kind = if (is_kit) 4 else if (is_fx) 3 else if (is_vst) 2 else if (is_pan) 1 else 0;
+            snap.param_id = if (is_plugin) b.target.param_id else 0;
             // **槽位指纹**：音频侧据此判断“这个槽是不是换绑定了” → 重新播种平滑状态。
-            // vst_param 的同一乐器上可能挂多个参数 → 必须把 param_id 混进指纹（乘法打散）。
+            // 插件参数的同一容器上可能挂多个参数/多个子对象 → 必须把 param_id 与 slot 混进指纹。
             snap.key = b.curve_id ^ (@as(u32, @intCast(ch)) << 16) ^
                 (@as(u32, @intCast(@backingInt(b.target.kind))) << 24) ^
                 (if (is_inst) @as(u32, 1) << 8 else 0) ^
-                (if (is_vst) b.target.param_id *% 2654435761 else 0);
+                (if (is_plugin) b.target.param_id *% 2654435761 else 0) ^
+                (@as(u32, @intCast(slot_now)) *% 40503);
             snap.base = b.base orelse self.defaultBaseFor(b.target);
             snap.interp = switch (lc.interp) {
                 .hold => 0,
@@ -6114,17 +6149,16 @@ pub const App = struct {
 
     /// **打开 VST 参数自动化窗口**（乐器下标；v1 只支持乐器 VSTi）
     /// **保留上次的位置**（同机架/混音台：关掉再开还在原处）
-    pub fn openVstAutoWin(self: *App, inst_idx: usize) void {
-        if (inst_idx >= self.instruments.items.len) return;
-        const uid = self.instruments.items[inst_idx].uid;
+    pub fn openVstAutoWin(self: *App, ref: PluginSlotRef) void {
+        const key = slotRefKey(ref);
         const st = &self.vst_auto;
-        const keep = st.open and st.inst_uid == uid;
+        const keep = st.open and slotRefKey(st.ref) == key;
         if (!keep) {
             st.* = .{
                 .open = true,
                 .x = st.x,
                 .y = st.y,
-                .inst_uid = uid,
+                .ref = ref,
                 .scroll = 0,
                 .filter_len = 0,
             };
@@ -6153,8 +6187,28 @@ pub const App = struct {
                     const inst = &self.instruments.items[ii];
                     // 乐器已不是 VST3（被换成减法合成器等）→ 参数肯定不存
                     if (inst.kind != .vst3) break :blk false;
-                    // 插件未加载/加载失败/参数缓存未就绪 → **保守不删**（只是暫時沒加载）
+                    // 插件未加载/加载失败/参数缓存未就绪 → **保守不删**（只是暂时没加载）
                     const pl = inst.plugin orelse break :blk true;
+                    if (!pl.param_cache_valid or pl.paramCount() == 0) break :blk true;
+                    break :blk pl.findParamIndex(t.param_id) != null;
+                },
+                .fx_param => blk: {
+                    // 通道没了 / 槽 uid 没了（效果器被删）→ 目标消失，解绑
+                    const ch = self.channelIndexByUid(t.uid) orelse break :blk false;
+                    const slot = self.fxSlotIndexByUid(ch, t.slot) orelse break :blk false;
+                    const es = &self.mixer_channels_state.items[ch].effects.items[slot];
+                    // 槽被换成内置效果/变成其他插件 → 参数不可能对上
+                    if (es.kind != .plugin) break :blk false;
+                    const pl = es.plugin orelse break :blk true; // 未加载 → 保守保留
+                    if (!pl.param_cache_valid or pl.paramCount() == 0) break :blk true;
+                    break :blk pl.findParamIndex(t.param_id) != null;
+                },
+                .kit_param => blk: {
+                    const ii = self.instrumentIndexByUid(t.uid) orelse break :blk false;
+                    const loc = self.kitLayerByUid(ii, t.slot) orelse break :blk false;
+                    const ly = &self.instruments.items[ii].kit.?.pads.items[loc.pad].layers.items[loc.layer];
+                    if (ly.kind != .vst3) break :blk false;
+                    const pl = ly.plugin orelse break :blk true;
                     if (!pl.param_cache_valid or pl.paramCount() == 0) break :blk true;
                     break :blk pl.findParamIndex(t.param_id) != null;
                 },
@@ -6503,10 +6557,163 @@ pub const App = struct {
     /// **绑定基准值的类型默认值**：插件参数取插件自己报的 `defaultNormalizedValue`
     /// （否则滤波截止这类参数会被拉到 0 → 直接没声音），其余走 `Target.defaultBase`。
     pub fn defaultBaseFor(self: *const App, t: view_lane.Target) f32 {
-        if (t.kind == .vst_param) {
-            if (self.vstParamResolve(t)) |r| return @floatCast(r.pl.params[r.param_idx].default_norm);
+        if (t.isPluginParam()) {
+            if (self.pluginParamResolve(t)) |r| return @floatCast(r.pl.params[r.param_idx].default_norm);
         }
         return view_lane.Target.defaultBase(t.kind);
+    }
+
+    /// 插件参数类目标（`vst_param` / `fx_param` / `kit_param`）→ 插件实例 + 参数下标。
+    /// **每帧重新解析**（不跨帧持有 `*Plugin`：插件可能被换/卸载）。
+    /// 解析不出来 = 目标暂时不可达（插件未加载/参数缓存未就绪）→ null。
+    pub fn pluginParamResolve(self: *const App, t: view_lane.Target) ?struct { pl: *vst_host.Plugin, param_idx: usize } {
+        switch (t.kind) {
+            .vst_param => {
+                if (self.vstParamResolve(t)) |r| return .{ .pl = r.pl, .param_idx = r.param_idx };
+            },
+            .fx_param => {
+                if (self.fxParamResolve(t)) |r| return .{ .pl = r.pl, .param_idx = r.param_idx };
+            },
+            .kit_param => {
+                if (self.kitParamResolve(t)) |r| return .{ .pl = r.pl, .param_idx = r.param_idx };
+            },
+            else => {},
+        }
+        return null;
+    }
+
+    /// 通道内效果槽 uid → 当前槽位下标（已删除/未知 → null）
+    pub fn fxSlotIndexByUid(self: *const App, ch: usize, slot_uid: u32) ?usize {
+        if (ch >= self.mixer_channels_state.items.len) return null;
+        for (self.mixer_channels_state.items[ch].effects.items, 0..) |es, i| {
+            if (es.uid == slot_uid) return i;
+        }
+        return null;
+    }
+
+    /// 乐器鼓组里按层 uid 找（垫下标, 层下标）
+    pub fn kitLayerByUid(self: *const App, inst_idx: usize, layer_uid: u32) ?struct { pad: usize, layer: usize } {
+        if (inst_idx >= self.instruments.items.len) return null;
+        const kit = self.instruments.items[inst_idx].kit orelse return null;
+        for (kit.pads.items, 0..) |pad, pi| {
+            for (pad.layers.items, 0..) |ly, li| {
+                if (ly.uid == layer_uid) return .{ .pad = pi, .layer = li };
+            }
+        }
+        return null;
+    }
+
+    /// `fx_param` 目标 → （通道下标、槽位、插件、参数下标）
+    pub fn fxParamResolve(self: *const App, t: view_lane.Target) ?struct { ch_idx: usize, slot: usize, pl: *vst_host.Plugin, param_idx: usize } {
+        if (t.kind != .fx_param) return null;
+        const ch = self.channelIndexByUid(t.uid) orelse return null;
+        const slot = self.fxSlotIndexByUid(ch, t.slot) orelse return null;
+        const pl = self.mixer_channels_state.items[ch].effects.items[slot].plugin orelse return null;
+        const pi = pl.findParamIndex(t.param_id) orelse return null;
+        return .{ .ch_idx = ch, .slot = slot, .pl = pl, .param_idx = pi };
+    }
+
+    /// `kit_param` 目标 → （乐器下标、垫音高、层下标、插件、参数下标）
+    pub fn kitParamResolve(self: *const App, t: view_lane.Target) ?struct { inst_idx: usize, pitch: u8, layer_idx: usize, pl: *vst_host.Plugin, param_idx: usize } {
+        if (t.kind != .kit_param) return null;
+        const ii = self.instrumentIndexByUid(t.uid) orelse return null;
+        const loc = self.kitLayerByUid(ii, t.slot) orelse return null;
+        const pad = self.instruments.items[ii].kit.?.pads.items[loc.pad];
+        const pl = pad.layers.items[loc.layer].plugin orelse return null;
+        const pi = pl.findParamIndex(t.param_id) orelse return null;
+        return .{ .inst_idx = ii, .pitch = pad.pitch, .layer_idx = loc.layer, .pl = pl, .param_idx = pi };
+    }
+
+    /// `fx_param` 目标的显示名（`通道A · Pro-Q 3 · 频率`）
+    pub fn fxParamLabel(self: *const App, t: view_lane.Target, buf: []u8) []const u8 {
+        const ch = self.channelIndexByUid(t.uid) orelse return "效果器参数";
+        const slot = self.fxSlotIndexByUid(ch, t.slot) orelse return "效果器参数";
+        const es = &self.mixer_channels_state.items[ch].effects.items[slot];
+        const pl = es.plugin orelse return "效果器参数";
+        const pi = pl.findParamIndex(t.param_id) orelse return "效果器参数";
+        var nb: [24]u8 = undefined;
+        const nm = self.mixer_channels_state.items[ch].displayName(ch, &nb);
+        const base = std.fs.path.basename(es.pluginPath());
+        const fx_name = std.fs.path.stem(base);
+        return std.fmt.bufPrint(buf, "{s} · {s} · {s}", .{ nm, fx_name, pl.params[pi].name() }) catch "效果器参数";
+    }
+
+    /// `kit_param` 目标的显示名（`鼓组 · 层2 · Cutoff`）
+    pub fn kitParamLabel(self: *const App, t: view_lane.Target, buf: []u8) []const u8 {
+        const ii = self.instrumentIndexByUid(t.uid) orelse return "鼓组层参数";
+        const loc = self.kitLayerByUid(ii, t.slot) orelse return "鼓组层参数";
+        const inst = &self.instruments.items[ii];
+        const ly = &inst.kit.?.pads.items[loc.pad].layers.items[loc.layer];
+        const pl = ly.plugin orelse return "鼓组层参数";
+        const pi = pl.findParamIndex(t.param_id) orelse return "鼓组层参数";
+        return std.fmt.bufPrint(buf, "{s} · 层{d} · {s}", .{ inst.name, loc.layer + 1, pl.params[pi].name() }) catch "鼓组层参数";
+    }
+
+    /// 插件槽参数 → **稳定 uid 编码的自动化目标**（UI 参数行「自动化」按钮用）。
+    /// `ref` 是插件实例的**运行时寻址**（下标），这里换成 uid → 存档/重排后仍指向同一个对象。
+    pub fn targetForSlotParam(self: *const App, ref: PluginSlotRef, param_id: u32) ?view_lane.Target {
+        switch (ref.kind) {
+            .instrument => {
+                if (ref.a >= self.instruments.items.len) return null;
+                return .{ .kind = .vst_param, .uid = self.instruments.items[ref.a].uid, .param_id = param_id };
+            },
+            .fx => {
+                if (ref.a >= self.mixer_channels_state.items.len) return null;
+                const mc = &self.mixer_channels_state.items[ref.a];
+                if (ref.b >= mc.effects.items.len) return null;
+                return .{ .kind = .fx_param, .uid = mc.uid, .slot = mc.effects.items[ref.b].uid, .param_id = param_id };
+            },
+            .kit_layer => {
+                if (ref.a >= self.instruments.items.len) return null;
+                const inst = &self.instruments.items[ref.a];
+                const kit = inst.kit orelse return null;
+                // `ref.b` 是**展平层槽位**（`App.kitLayerSlot`）→ 反查到层的 uid
+                var slot: usize = 0;
+                for (kit.pads.items) |pad| {
+                    for (pad.layers.items) |ly| {
+                        if (slot == ref.b) return .{ .kind = .kit_param, .uid = inst.uid, .slot = ly.uid, .param_id = param_id };
+                        slot += 1;
+                    }
+                }
+                return null;
+            },
+        }
+    }
+
+    /// 给所有未分配 uid 的**效果槽 / 鼓组层**补上（读档/撤销/新建后调用）。幂等。
+    pub fn ensureSlotUids(self: *App) void {
+        for (self.mixer_channels_state.items) |*mc| {
+            for (mc.effects.items) |*es| {
+                if (es.uid != 0) self.next_slot_uid = @max(self.next_slot_uid, es.uid);
+            }
+        }
+        for (self.instruments.items) |*inst| {
+            const kit = inst.kit orelse continue;
+            for (kit.pads.items) |*pad| {
+                for (pad.layers.items) |*ly| {
+                    if (ly.uid != 0) self.next_slot_uid = @max(self.next_slot_uid, ly.uid);
+                }
+            }
+        }
+        for (self.mixer_channels_state.items) |*mc| {
+            for (mc.effects.items) |*es| {
+                if (es.uid == 0) es.uid = self.takeSlotUid();
+            }
+        }
+        for (self.instruments.items) |*inst| {
+            const kit = inst.kit orelse continue;
+            for (kit.pads.items) |*pad| {
+                for (pad.layers.items) |*ly| {
+                    if (ly.uid == 0) ly.uid = self.takeSlotUid();
+                }
+            }
+        }
+    }
+
+    fn takeSlotUid(self: *App) u32 {
+        self.next_slot_uid +%= 1;
+        if (self.next_slot_uid == 0) self.next_slot_uid = 1;
+        return self.next_slot_uid;
     }
 
     /// uid → 当前数组下标（已删除/未知 → null）
@@ -6524,7 +6731,8 @@ pub const App = struct {
         const chain = &self.mixer_channels_state.items[ch].effects;
         // 注：**允许叠加同种效果**（用户拍板：选择权交给用户——多个混响/延迟
         // 叠加做特殊效果是常规玩法）。DSP 状态已改每槽一份（见 `fx_state`）。
-        const slot = newEffectSlot(kind);
+        var slot = newEffectSlot(kind);
+        slot.uid = self.takeSlotUid(); // v3：参数自动化按它引用这个槽
         chain.append(self.allocator, slot) catch return null;
         return chain.items.len - 1;
     }
@@ -6885,7 +7093,7 @@ pub const App = struct {
     }
 
     /// 槽引用 → 活插件实例（无 → null）
-    fn slotPlugin(self: *const App, ref: PluginSlotRef) ?*vst_host.Plugin {
+    pub fn slotPlugin(self: *const App, ref: PluginSlotRef) ?*vst_host.Plugin {
         switch (ref.kind) {
             .instrument => {
                 if (ref.a >= self.instruments.items.len) return null;
@@ -6920,9 +7128,9 @@ pub const App = struct {
         const id: u32 = if (idx < pl.params.len) pl.params[idx].id else 0;
         pl.setParamHost(idx, norm);
         // 用户在我们自己的参数列表里拧了旋钮 → 同样算“刚动过”（自动化让路 + “最近改动”）
-        if (ref.kind == .instrument and ref.a < self.instruments.items.len) {
-            self.noteVstParamTouched(self.instruments.items[ref.a].uid, id);
-            self.noteVstAutoWritten(self.instruments.items[ref.a].uid, id, norm); // 手动写入也抑制回声
+        if (self.targetForSlotParam(ref, id) != null) {
+            self.noteVstParamTouched(ref, id);
+            self.noteVstAutoWritten(ref, id, norm); // 手动写入也抑制回声
         }
         self.markSlotStateDirty(ref);
         self.markPluginEdited();
@@ -6998,11 +7206,6 @@ pub const App = struct {
     pub fn drainSlotEditorEdits(self: *App, ref: PluginSlotRef, pl: *vst_host.Plugin) void {
         var buf: [64]vst_host.EditEvent = undefined;
         var any_perform = false;
-        // 乐器槽的稳定 uid（只对乐器 VSTi；FX/鼓组层暂不参与参数自动化）
-        const inst_uid: u32 = if (ref.kind == .instrument and ref.a < self.instruments.items.len)
-            self.instruments.items[ref.a].uid
-        else
-            0;
         while (true) {
             const n = pl.drainEditEvents(&buf);
             if (n == 0) break;
@@ -7011,18 +7214,20 @@ pub const App = struct {
                     .begin => self.splitGestureOnBegin(ref, ev.id),
                     .end => {},
                     .perform => {
-                        // **自动化回声**：这条是不是我们自己刚写进去的值？
-                        // 是 → 整条丢弃（不记手势/历史、不标脏），否则会每帧造幽灵条目 +
-                        // 反复重捕插件状态（`getState` 很贵）。
-                        if (inst_uid != 0 and self.vstAutoEcho(inst_uid, ev.id, ev.value)) continue;
-                        // **自动化回声**（v2）：参数由音频线程经 `inputParameterChanges` 驱动，
-                        // 个别插件会把它回报成 `performEdit`——值与当前曲线值一致就丢弃，
-                        // **不记历史、也不接管**（否则每个块都会“接管”，自动化永远不生效）。
-                        if (inst_uid != 0 and self.vstParamEchoByCurve(inst_uid, ev.id, ev.value)) continue;
-                        // 用户真的动了参数 → **自动化让路**（音频侧块计数）+“最近改动”
-                        if (inst_uid != 0) {
+                        // 该参数在当前寻址下的**自动化目标**（乐器 / 效果器 / 鼓组层；不在自动化体系里的槽 → null）
+                        const target_opt = self.targetForSlotParam(ref, ev.id);
+                        if (target_opt) |t| {
+                            // **自动化回声**：这条是不是我们自己刚写进去的值？
+                            // 是 → 整条丢弃（不记手势/历史、不标脏），否则会每帧造幽灵条目 +
+                            // 反复重捕插件状态（`getState` 很贵）。
+                            if (self.vstAutoEcho(ref, ev.id, ev.value)) continue;
+                            // **自动化回声**（v2/v3）：参数由音频线程经 `inputParameterChanges` 驱动，
+                            // 个别插件会把它回报成 `performEdit`——值与当前曲线值一致就丢弃，
+                            // **不记历史、也不接管**（否则每个块都会“接管”，自动化永远不生效）。
+                            if (self.vstParamEchoByTarget(t, ev.value)) continue;
+                            // 用户真的动了参数 → **自动化让路**（音频侧块计数）
                             pl.noteUserTakeover();
-                            self.noteVstParamTouched(inst_uid, ev.id);
+                            self.noteVstParamTouched(ref, ev.id);
                         }
                         if (!any_perform) {
                             any_perform = true;
@@ -7237,6 +7442,7 @@ pub const App = struct {
                 .curve_id = b.curve_id,
                 .target_kind = @backingInt(b.target.kind),
                 .target_uid = b.target.uid,
+                .target_slot = b.target.slot,
                 .depth = b.depth,
                 .base = if (b.base) |v| v else -1.0,
                 .bipolar = b.bipolar,
@@ -7295,7 +7501,7 @@ pub const App = struct {
             const kind = std.enums.fromInt(view_lane.Target.Kind, sb.target_kind) orelse continue;
             self.auto_bindings.append(self.allocator, .{
                 .curve_id = sb.curve_id,
-                .target = .{ .kind = kind, .uid = sb.target_uid, .param_id = sb.param_id },
+                .target = .{ .kind = kind, .uid = sb.target_uid, .param_id = sb.param_id, .slot = sb.target_slot },
                 .depth = sb.depth,
                 .base = if (sb.base < 0) null else sb.base,
                 .bipolar = sb.bipolar,
@@ -7421,6 +7627,7 @@ pub const App = struct {
                     }
                 }
                 effs[si] = .{
+                    .uid = es.uid,
                     .kind = @backingInt(es.kind),
                     .enabled = es.enabled,
                     .mix = es.mix,
@@ -7497,6 +7704,7 @@ pub const App = struct {
                         else => continue, // 未知类型跳过
                     };
                     var slot = newEffectSlot(kind);
+                    slot.uid = se.uid; // v9：稳定 uid（都为 0 时读档后由 `ensureSlotUids` 补）
                     slot.enabled = se.enabled;
                     slot.mix = se.mix;
                     // 通用参数（混响/延迟/压缩器；旧存档缺失 → 全 0）
@@ -7892,6 +8100,7 @@ pub const App = struct {
             if (a.curve_id != b.curve_id) return false;
             if (a.target_kind != @backingInt(b.target.kind)) return false;
             if (a.target_uid != b.target.uid) return false;
+            if (a.target_slot != b.target.slot) return false;
             if (a.param_id != b.target.param_id) return false;
             if (a.enabled != b.enabled or a.bipolar != b.bipolar or a.invert != b.invert) return false;
             if (@abs(a.depth - b.depth) > 1e-6) return false;
@@ -9144,6 +9353,9 @@ pub const App = struct {
         self.importProjectPrepare(p);
         for (p.audio_styles) |s| self.importAudioStyleOne(s);
         self.importProjectBody(p);
+        // v3：读档后把未带 uid 的效果槽/鼓组层补齐（旧档/旧 v9 内测档都可能为 0）
+        self.ensureInstrumentUids();
+        self.ensureSlotUids();
     }
 
     /// 阶段 1：清场 + 容量（便宜，毫秒级）
@@ -9567,6 +9779,35 @@ pub const App = struct {
         self.events.push(.{ .kind = .all_off });
     }
 
+    /// **播放 / 暂停**（工具栏按钮与空格键的**唯一入口**）。
+    ///
+    /// 起播 = 从当前游标处开始（基于音频时钟）：写锚点（`start_frame`/`start_step`）+ 换代 +
+    /// 重置调度窗口；**并把音频侧的步积分器同步到起点**。
+    ///
+    /// 最后那句不能省（实测 bug）：起来后的**第一帧** UI 会读 `params.play_step` 画游标，
+    /// 而它只有在**播放分支的块末**才被回写（`audio.renderBlock`）——若不清，读到的是
+    /// 上一段播放停下的陈旧值 → 游标在旧位置**闪一下**再跳回开头（听起来没问题，纯视觉）。
+    /// 跳转路径 `jumpPlaybackCursor` 早就是这么做的。
+    pub fn togglePlayback(self: *App) void {
+        self.playing = !self.playing;
+        if (!self.playing) {
+            self.params.playing.store(false, .monotonic);
+            return;
+        }
+        const from: i32 = if (self.sel.song_mode) self.playback.song_step else self.playback.piano_step;
+        self.playback.start_frame = self.params.frames_played.load(.monotonic);
+        self.playback.start_step = from;
+        self.params.start_frame.store(self.playback.start_frame, .monotonic);
+        self.params.start_step.store(from, .monotonic);
+        self.params.playing.store(true, .monotonic);
+        // 调度：作废旧事件 + 为跨起点长音符补发 on；重置调度窗口
+        self.markGenSoft(false); // 硬切换（起播）：照旧释放（无残留声部）
+        sequencer.reset(&self.scheduler);
+        self.params.sched_gen.store(self.scheduler.gen, .monotonic);
+        // 步积分器同步到起点（与 `jumpPlaybackCursor` 同一处理；见上面注释）
+        self.params.play_step.store(@floatFromInt(from), .monotonic);
+    }
+
     /// 当前模式（SONG/PAT）的循环区域（与当前游标同坐标；null = 未设置）
     pub fn loopRegion(self: *const App) ?[2]i32 {
         return if (self.sel.song_mode) self.playback.loop_song else self.playback.loop_pat;
@@ -9968,24 +10209,103 @@ pub const App = struct {
     ///
     /// 保留的快照侧语义：`vst_written` 环（手动写入回声抑制）。
     /// 回写与“人拧优先”的交接在 `vst_host.Plugin.auto_skip_blocks`（见 `noteUserTakeover`）。
+    /// 插件实例寻址的紧凑 key（回声环/最近改动用；不落盘）
+    pub fn slotRefKey(ref: PluginSlotRef) u64 {
+        return (@as(u64, @intCast(@backingInt(ref.kind))) << 48) |
+            (@as(u64, ref.a) << 32) | @as(u64, ref.b);
+    }
+
+    /// 插件槽的**稳定身份**（自动化窗口用它筛“已链接”）：`kind/uid/slot` 与存档绑定同一套编码
+    pub const SlotIdentity = struct {
+        kind: view_lane.Target.Kind,
+        uid: u32,
+        slot: u32,
+    };
+
+    /// `ref`（运行时寻址）→ 稳定身份；目标已不存在（乐器/通道/槽/层被删）→ null
+    pub fn slotParamIdentity(self: *const App, ref: PluginSlotRef) ?SlotIdentity {
+        switch (ref.kind) {
+            .instrument => {
+                if (ref.a >= self.instruments.items.len) return null;
+                return .{ .kind = .vst_param, .uid = self.instruments.items[ref.a].uid, .slot = 0 };
+            },
+            .fx => {
+                if (ref.a >= self.mixer_channels_state.items.len) return null;
+                const mc = &self.mixer_channels_state.items[ref.a];
+                if (ref.b >= mc.effects.items.len) return null;
+                return .{ .kind = .fx_param, .uid = mc.uid, .slot = mc.effects.items[ref.b].uid };
+            },
+            .kit_layer => {
+                if (ref.a >= self.instruments.items.len) return null;
+                const inst = &self.instruments.items[ref.a];
+                const kit = inst.kit orelse return null;
+                var slot: usize = 0;
+                for (kit.pads.items) |pad| {
+                    for (pad.layers.items) |ly| {
+                        if (slot == ref.b) return .{ .kind = .kit_param, .uid = inst.uid, .slot = ly.uid };
+                        slot += 1;
+                    }
+                }
+                return null;
+            },
+        }
+    }
+
+    /// 插件自动化窗口标题（`自动化 · {容器}`）
+    pub fn slotTitle(self: *const App, ref: PluginSlotRef, buf: []u8) []const u8 {
+        switch (ref.kind) {
+            .instrument => {
+                if (ref.a >= self.instruments.items.len) return "自动化";
+                return std.fmt.bufPrint(buf, "自动化 · {s}", .{self.instruments.items[ref.a].name}) catch "自动化";
+            },
+            .fx => {
+                if (ref.a >= self.mixer_channels_state.items.len) return "自动化";
+                const mc = &self.mixer_channels_state.items[ref.a];
+                if (ref.b >= mc.effects.items.len) return "自动化";
+                var nb: [24]u8 = undefined;
+                const nm = mc.displayName(ref.a, &nb);
+                const base = std.fs.path.basename(mc.effects.items[ref.b].pluginPath());
+                const fx_name = std.fs.path.stem(base);
+                return std.fmt.bufPrint(buf, "自动化 · {s} · {s}", .{ nm, fx_name }) catch "自动化";
+            },
+            .kit_layer => {
+                if (ref.a >= self.instruments.items.len) return "自动化";
+                const inst = &self.instruments.items[ref.a];
+                var slot: usize = 0;
+                if (inst.kit) |kit| {
+                    for (kit.pads.items) |pad| {
+                        for (pad.layers.items, 0..) |_, li| {
+                            if (slot == ref.b) {
+                                return std.fmt.bufPrint(buf, "自动化 · {s} · 层{d}", .{ inst.name, li + 1 }) catch "自动化";
+                            }
+                            slot += 1;
+                        }
+                    }
+                }
+                return "自动化";
+            },
+        }
+    }
+
     /// 记一次“手动写入”（回声抑制用；环，覆盖最旧）
-    fn noteVstAutoWritten(self: *App, inst_uid: u32, param_id: u32, value: f64) void {
-        self.vst_written[self.vst_written_w % self.vst_written.len] = .{ .inst_uid = inst_uid, .param_id = param_id, .value = value };
+    fn noteVstAutoWritten(self: *App, ref: PluginSlotRef, param_id: u32, value: f64) void {
+        self.vst_written[self.vst_written_w % self.vst_written.len] = .{ .slot_key = slotRefKey(ref), .param_id = param_id, .value = value };
         self.vst_written_w +%= 1;
     }
 
     /// 插件回报的 `performEdit` 是否**只是我们自己的写入回声**（→ 整条丢弃，不记历史）
-    fn vstAutoEcho(self: *const App, inst_uid: u32, param_id: u32, value: f64) bool {
+    fn vstAutoEcho(self: *const App, ref: PluginSlotRef, param_id: u32, value: f64) bool {
+        const key = slotRefKey(ref);
         for (self.vst_written) |w| {
-            if (w.param_id == param_id and w.inst_uid == inst_uid and @abs(w.value - value) < vst_auto_eps) return true;
+            if (w.param_id == param_id and w.slot_key == key and @abs(w.value - value) < vst_auto_eps) return true;
         }
         return false;
     }
 
-    /// **自动化回声**（v2）：该参数当前由自动化驱动，且报上来的值 ≈ 曲线此刻的值
+    /// **自动化回声**（v2/v3）：该参数当前由自动化驱动，且报上来的值 ≈ 曲线此刻的值
     /// → 判定为“插件在回报输入队列的功效”，整条丢弃（不记历史、**不接管**）。
-    fn vstParamEchoByCurve(self: *const App, inst_uid: u32, param_id: u32, value: f64) bool {
-        const t = view_lane.Target{ .kind = .vst_param, .uid = inst_uid, .param_id = param_id };
+    /// 三种插件参数目标（乐器/效果器/鼓组层）共用。
+    fn vstParamEchoByTarget(self: *const App, t: view_lane.Target, value: f64) bool {
         if (self.enabledBindingCount(t) == 0) return false;
         const step: f32 = if (self.playing)
             self.params.play_step.load(.monotonic)
@@ -9997,12 +10317,13 @@ pub const App = struct {
 
     /// 用户在插件 GUI 里动了一个参数：推进“最近改动”列表（最新在前、去重）。
     /// 注：**自动化让路**不在这里做——那是音频侧的 `auto_skip_blocks`（见 `noteUserTakeover`）。
-    pub fn noteVstParamTouched(self: *App, inst_uid: u32, param_id: u32) void {
+    pub fn noteVstParamTouched(self: *App, ref: PluginSlotRef, param_id: u32) void {
+        const key = slotRefKey(ref);
         // 最近列表：删同项 → 整体后移一格 → 插到最前
         var n = self.vst_recent_n;
         var k: usize = 0;
         while (k < n) : (k += 1) {
-            if (self.vst_recent[k].inst_uid == inst_uid and self.vst_recent[k].param_id == param_id) {
+            if (self.vst_recent[k].slot_key == key and self.vst_recent[k].param_id == param_id) {
                 var j = k;
                 while (j + 1 < n) : (j += 1) self.vst_recent[j] = self.vst_recent[j + 1];
                 n -= 1;
@@ -10012,7 +10333,7 @@ pub const App = struct {
         const new_n = @min(n + 1, self.vst_recent.len);
         var i = new_n;
         while (i > 1) : (i -= 1) self.vst_recent[i - 1] = self.vst_recent[i - 2];
-        self.vst_recent[0] = .{ .inst_uid = inst_uid, .param_id = param_id };
+        self.vst_recent[0] = .{ .slot_key = key, .param_id = param_id };
         self.vst_recent_n = new_n;
     }
 
@@ -10998,17 +11319,12 @@ pub const App = struct {
             },
             .vst_param_value => {
                 // VST 参数输入值…（**百分比**：50 = 参数区间的 50%）
-                if (ti.instrument >= 0) {
-                    const ii: usize = @intCast(ti.instrument);
-                    if (ii < self.instruments.items.len) {
-                        if (self.instruments.items[ii].plugin) |pl| {
-                            const id: u32 = @truncate(ti.index);
-                            if (pl.findParamIndex(id)) |pi| {
-                                if (view_lane.parseValue(.percent, val)) |v| {
-                                    const ref = PluginSlotRef{ .kind = .instrument, .a = @intCast(@min(ii, std.math.maxInt(u16))) };
-                                    self.setPluginParamHost(ref, pl, pi, v);
-                                }
-                            }
+                const ref = self.vst_value_ref;
+                if (self.slotPlugin(ref)) |pl| {
+                    const id: u32 = @truncate(ti.index);
+                    if (pl.findParamIndex(id)) |pi| {
+                        if (view_lane.parseValue(.percent, val)) |v| {
+                            self.setPluginParamHost(ref, pl, pi, v);
                         }
                     }
                 }
@@ -13528,6 +13844,72 @@ test "app: 自动化曲线 + 绑定随存档往返（点/手柄/断崖）" {
     try std.testing.expectEqual(view_lane.Target.Kind.mixer_vol, b2.target.kind);
     try std.testing.expectEqual(ch_uid, b2.target.uid);
     try std.testing.expectEqual(cid, app2.auto_sel);
+}
+
+test "app: v3——效果槽/鼓组层 uid 与 fx·kit 绑定目标随存档往返" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(3);
+    app.ensureChannelUids();
+    const inst_idx = app.addDrumkit("鼓组");
+    app.ensureInstrumentUids();
+
+    const ch: usize = 2;
+    const fx_slot = app.addEffect(ch, .plugin) orelse return error.TestUnexpectedResult;
+    const ch_uid = app.mixer_channels_state.items[ch].uid;
+    const fx_uid = app.mixer_channels_state.items[ch].effects.items[fx_slot].uid;
+    try std.testing.expect(fx_uid != 0);
+    try std.testing.expect(app.kitLayerAddVst3(inst_idx, 38, "C:\\x\\Fake.vst3", "手调"));
+    const layer_uid = app.instruments.items[@intCast(inst_idx)].kit.?.pads.items[0].layers.items[0].uid;
+    try std.testing.expect(layer_uid != 0);
+    // **uid 不能重复**（同一次 ensureSlotUids 里两边都要拿到不同值）
+    try std.testing.expect(fx_uid != layer_uid);
+
+    const cid = app.addAutoCurve("fx");
+    _ = app.curveById(cid).?.insertPoint(alloc, 0, 0.5);
+    try std.testing.expect(app.bindCurveTarget(cid, .{ .kind = .fx_param, .uid = ch_uid, .slot = fx_uid, .param_id = 0xAA }));
+    const cid2 = app.addAutoCurve("kit");
+    _ = app.curveById(cid2).?.insertPoint(alloc, 0, 0.5);
+    const inst_uid = app.instruments.items[@intCast(inst_idx)].uid;
+    try std.testing.expect(app.bindCurveTarget(cid2, .{ .kind = .kit_param, .uid = inst_uid, .slot = layer_uid, .param_id = 0xBB }));
+
+    const proj = try app.exportProject();
+    defer app.freeProject(proj);
+    // 存档里有 uid
+    try std.testing.expectEqual(fx_uid, proj.mixer[ch].effects[fx_slot].uid);
+
+    var app2 = App{ .allocator = alloc };
+    defer app2.deinitAll();
+    app2.resetMixerChannels(3);
+    app2.importProject(proj);
+
+    // 读档后 uid 原样回来（不重新编号）
+    try std.testing.expectEqual(fx_uid, app2.mixer_channels_state.items[app2.channelIndexByUid(ch_uid).?].effects.items[fx_slot].uid);
+    const inst2 = app2.instrumentIndexByUid(inst_uid).?;
+    const loc2 = app2.kitLayerByUid(inst2, layer_uid).?;
+    try std.testing.expectEqual(@as(usize, 0), loc2.pad);
+    try std.testing.expectEqual(@as(usize, 0), loc2.layer);
+
+    // 绑定目标（含子对象 uid）完全一致
+    try std.testing.expectEqual(@as(usize, 2), app2.auto_bindings.items.len);
+    var saw_fx = false;
+    var saw_kit = false;
+    for (app2.auto_bindings.items) |b| {
+        if (b.target.kind == .fx_param) {
+            saw_fx = true;
+            try std.testing.expectEqual(ch_uid, b.target.uid);
+            try std.testing.expectEqual(fx_uid, b.target.slot);
+            try std.testing.expectEqual(@as(u32, 0xAA), b.target.param_id);
+        } else if (b.target.kind == .kit_param) {
+            saw_kit = true;
+            try std.testing.expectEqual(inst_uid, b.target.uid);
+            try std.testing.expectEqual(layer_uid, b.target.slot);
+            try std.testing.expectEqual(@as(u32, 0xBB), b.target.param_id);
+        }
+    }
+    try std.testing.expect(saw_fx and saw_kit);
 }
 
 test "app: 撤销——乐器/全局设置（BPM、拍号、乐器增删）也恢复" {
@@ -17567,6 +17949,113 @@ test "automation: 基准值可编辑 + 控件右键恢复默认（base/bipolar�
     try std.testing.expect(view_lane.Target.defaultBipolar(pt.kind));
     try std.testing.expect(app.bindCurveTarget(cid, pt));
     try std.testing.expect(app.auto_bindings.items[app.bindingIndex(cid, pt).?].bipolar);
+}
+
+test "app: v3——效果器/鼓组层参数绑定的寻址、发布与目标消失即解绑" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(3);
+    app.ensureChannelUids();
+    const inst_idx = app.addDrumkit("鼓组");
+    try std.testing.expect(inst_idx >= 0);
+    app.ensureInstrumentUids();
+    app.ensureSlotUids();
+
+    // ── 效果器：一个插件槽（可自动化）+ 一个内置 EQ（不可）──
+    const ch: usize = 1;
+    const fx_slot = app.addEffect(ch, .plugin) orelse return error.TestUnexpectedResult;
+    const eq_slot = app.addEffect(ch, .eq) orelse return error.TestUnexpectedResult;
+    const ch_uid = app.mixer_channels_state.items[ch].uid;
+    const fx_uid = app.mixer_channels_state.items[ch].effects.items[fx_slot].uid;
+    try std.testing.expect(fx_uid != 0);
+    try std.testing.expect(fx_uid != app.mixer_channels_state.items[ch].effects.items[eq_slot].uid);
+
+    // 运行时寻址（ref）→ 稳定 uid 编码的目标
+    const t = app.targetForSlotParam(.{ .kind = .fx, .a = @intCast(ch), .b = @intCast(fx_slot) }, 0x99).?;
+    try std.testing.expectEqual(view_lane.Target.Kind.fx_param, t.kind);
+    try std.testing.expectEqual(ch_uid, t.uid);
+    try std.testing.expectEqual(fx_uid, t.slot);
+    try std.testing.expectEqual(@as(u32, 0x99), t.param_id);
+
+    // 发布：音频侧看到 kind=3 / 通道 / 槽 / param_id
+    const cid = app.addAutoCurve("fx");
+    try std.testing.expect(app.bindCurveTarget(cid, t));
+    _ = app.curveById(cid).?.insertPoint(alloc, 0, 0.5);
+    app.publishAutoLane();
+    {
+        const set = &app.params.lane_bufs[app.params.lane_pub.load(.monotonic)];
+        try std.testing.expectEqual(@as(usize, 1), set.n);
+        try std.testing.expectEqual(@as(u8, 3), set.lanes[0].kind);
+        try std.testing.expectEqual(@as(u8, @intCast(ch)), set.lanes[0].ch);
+        try std.testing.expectEqual(@as(u16, @intCast(fx_slot)), set.lanes[0].slot);
+        try std.testing.expectEqual(@as(u32, 0x99), set.lanes[0].param_id);
+        try std.testing.expect(set.lanes[0].active);
+    }
+    // 插件未加载 → **保守保留**（只是暂时没加载）
+    try std.testing.expectEqual(@as(usize, 0), app.pruneAutoBindings());
+    // 槽被删掉 → 目标消失 → 解绑
+    app.removeEffect(ch, fx_slot);
+    try std.testing.expectEqual(@as(usize, 1), app.pruneAutoBindings());
+    try std.testing.expect(!app.isTargetBound(t));
+
+    // ── 鼓组层：VST3 层也有稳定 uid，同样可发布/解绑──
+    try std.testing.expect(app.kitLayerAddVst3(inst_idx, 36, "C:\\x\\Fake.vst3", "手调"));
+    const inst_uid = app.instruments.items[@intCast(inst_idx)].uid;
+    const layer_uid = app.instruments.items[@intCast(inst_idx)].kit.?.pads.items[0].layers.items[0].uid;
+    try std.testing.expect(layer_uid != 0);
+    const slot0 = app.kitLayerSlot(@intCast(inst_idx), 36, 0).?;
+    const tk = app.targetForSlotParam(.{ .kind = .kit_layer, .a = @intCast(inst_idx), .b = @intCast(slot0) }, 0x77).?;
+    try std.testing.expectEqual(view_lane.Target.Kind.kit_param, tk.kind);
+    try std.testing.expectEqual(inst_uid, tk.uid);
+    try std.testing.expectEqual(layer_uid, tk.slot);
+
+    const cid2 = app.addAutoCurve("kit");
+    try std.testing.expect(app.bindCurveTarget(cid2, tk));
+    _ = app.curveById(cid2).?.insertPoint(alloc, 0, 0.5);
+    app.publishAutoLane();
+    {
+        const set = &app.params.lane_bufs[app.params.lane_pub.load(.monotonic)];
+        try std.testing.expectEqual(@as(usize, 1), set.n);
+        try std.testing.expectEqual(@as(u8, 4), set.lanes[0].kind);
+        try std.testing.expectEqual(@as(u8, @intCast(inst_idx)), set.lanes[0].ch);
+        try std.testing.expectEqual(@as(u16, @intCast(slot0)), set.lanes[0].slot);
+        try std.testing.expectEqual(@as(u32, 0x77), set.lanes[0].param_id);
+    }
+    // 层被删掉 → 解绑
+    try std.testing.expect(app.kitLayerRemove(inst_idx, 36, 0));
+    try std.testing.expectEqual(@as(usize, 1), app.pruneAutoBindings());
+    try std.testing.expect(!app.isTargetBound(tk));
+}
+
+test "app: 起播把步积分器同步到起点（修“停止后再播放游标闪旧位置”）" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    app.sel.song_mode = true;
+    app.playback.song_step = 480;
+    // 模拟“上一段播放停在了 3840 步”（UI 停止后游标回到开头，但积分器还记着旧值）
+    app.params.play_step.store(3840, .monotonic);
+
+    app.togglePlayback();
+    try std.testing.expect(app.playing);
+    // 起播必须把积分器拉到起点 → UI 下一帧画的就是开头，而不是化石位置
+    try std.testing.expectEqual(@as(f32, 480), app.params.play_step.load(.monotonic));
+    try std.testing.expectEqual(@as(i32, 480), app.params.start_step.load(.monotonic));
+    try std.testing.expect(app.params.playing.load(.monotonic));
+
+    // 再按一次 = 暂停：只关开关，不动起点
+    app.togglePlayback();
+    try std.testing.expect(!app.playing);
+    try std.testing.expect(!app.params.playing.load(.monotonic));
+    try std.testing.expectEqual(@as(f32, 480), app.params.play_step.load(.monotonic));
 }
 
 test "app: tempo 自动化——文档 BPM 不被污染 / 极点平滑 / 导出时长按曲线积分" {

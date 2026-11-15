@@ -18,8 +18,9 @@
 
 const std = @import("std");
 const r_mod = @import("render.zig");
-const App = @import("app.zig").App;
-const PluginSlotRef = @import("app.zig").PluginSlotRef;
+const app_mod = @import("app.zig");
+const App = app_mod.App;
+const PluginSlotRef = app_mod.PluginSlotRef;
 const Ui = @import("ui.zig").Ui;
 const util = @import("view_util.zig");
 const view_lane = @import("view_lane.zig");
@@ -40,7 +41,7 @@ const id_win: u64 = 12000;
 const menu_btn_w: i32 = 56;
 const menu_w: i32 = 132;
 
-/// **浮动窗口**（Windows：乐器窗口标题栏 `自动化` 按钮打开）
+/// **浮动窗口**（窗口标题栏 `自动化` 按钮打开：乐器 / 效果器 / 鼓组层三处共用）
 pub fn draw(ui: *Ui, app: *App) void {
     const st = &app.vst_auto;
     if (!st.open) return;
@@ -52,11 +53,11 @@ pub fn draw(ui: *Ui, app: *App) void {
     // 点窗口内任意处 → 置顶（“点谁谁在上”）
     if (util.inRect(ui.mouse_x, ui.mouse_y, x, y, w, h) and ui.mouse_pressed) app.bringToFront(&st.z);
 
-    // 目标乐器没了 → 自动关闭
-    const ii = app.instrumentIndexByUid(st.inst_uid) orelse {
+    // 目标插件槽没了（乐器/通道/槽/层被删）→ 自动关闭
+    if (app.slotParamIdentity(st.ref) == null) {
         st.open = false;
         return;
-    };
+    }
 
     // 窗口底 + 边框 + 标题栏
     ui.renderer.fillRect(x + 3, y + 3, w, h, r_mod.rgb(10, 11, 13));
@@ -69,7 +70,7 @@ pub fn draw(ui: *Ui, app: *App) void {
     // 插件自己的 GUI 就再也不可交互（实测 bug）。窗口的遮挡靠 `win_draw_info` 处理。
 
     var tb: [192]u8 = undefined;
-    const title = std.fmt.bufPrint(&tb, "自动化 · {s}", .{app.instruments.items[ii].name}) catch "自动化";
+    const title = app.slotTitle(st.ref, &tb);
     ui.labelClipped(title, x + 8, y + 4, w - 60, ui.theme.text);
 
     // 标题拖动（存抓取偏移，避免拿起来就跳）
@@ -98,22 +99,21 @@ pub fn draw(ui: *Ui, app: *App) void {
         return;
     }
 
-    drawBody(ui, app, ii, id_win + 100, x, y + title_h, w, h - title_h);
+    drawBody(ui, app, st.ref, id_win + 100, x, y + title_h, w, h - title_h);
 }
 
 /// **正文**（三段式）。`x/y/w/h` = 正文矩形（不含标题栏）。
-/// `ii` = 乐器下标：每帧由调用方重新解析（不跨帧持有 `*Plugin`）。
-pub fn drawBody(ui: *Ui, app: *App, ii: usize, id_base: u64, x: i32, y: i32, w: i32, h: i32) void {
+/// `ref` = 插件实例的**运行时寻址**（乐器 / 效果器槽 / 鼓组层）：每帧由调用方重新解析（不跨帧持有 `*Plugin`）。
+pub fn drawBody(ui: *Ui, app: *App, ref: PluginSlotRef, id_base: u64, x: i32, y: i32, w: i32, h: i32) void {
     const st = &app.vst_auto;
-    if (ii >= app.instruments.items.len) return;
-    const inst_uid = app.instruments.items[ii].uid;
-    const pl = app.instruments.items[ii].plugin orelse {
+    const ident = app.slotParamIdentity(ref) orelse return;
+    const pl = app.slotPlugin(ref) orelse {
         ui.label("（插件未加载——无法编辑参数；文件恢复后自动加载）", x + 10, y + 10, ui.theme.danger);
         return;
     };
     // 换目标 → 滚动/搜索复位
-    if (st.inst_uid != inst_uid) {
-        st.inst_uid = inst_uid;
+    if (App.slotRefKey(st.ref) != App.slotRefKey(ref)) {
+        st.ref = ref;
         st.scroll = 0;
         st.filter_len = 0;
         st.menu_open = false;
@@ -168,7 +168,8 @@ pub fn drawBody(ui: *Ui, app: *App, ii: usize, id_base: u64, x: i32, y: i32, w: 
     var linked: [48]LinkedRow = undefined;
     var n_linked: i32 = 0;
     for (app.auto_bindings.items) |b| {
-        if (b.target.kind != .vst_param or b.target.uid != inst_uid) continue;
+        // 本插件槽的绑定（乐器 / 效果器槽 / 鼓组层 → 稳定 uid 身份）
+        if (b.target.kind != ident.kind or b.target.uid != ident.uid or b.target.slot != ident.slot) continue;
         var gi: usize = 0;
         while (gi < @as(usize, @intCast(n_linked))) : (gi += 1) {
             if (view_lane.Target.eql(linked[gi].target, b.target)) break;
@@ -181,10 +182,11 @@ pub fn drawBody(ui: *Ui, app: *App, ii: usize, id_base: u64, x: i32, y: i32, w: 
         linked[gi].n += 1;
         linked[gi].enabled = linked[gi].enabled or b.enabled;
     }
-    // 最近改动是**跨乐器**的：只算本乐器的（不占行）
+    // 最近改动是**跨插件槽**的：只算本槽的（不占行）
+    const slot_key = App.slotRefKey(ref);
     var n_recent: i32 = 0;
     for (app.vst_recent[0..app.vst_recent_n]) |e| {
-        if (e.inst_uid == inst_uid and pl.findParamIndex(e.param_id) != null) n_recent += 1;
+        if (e.slot_key == slot_key and pl.findParamIndex(e.param_id) != null) n_recent += 1;
     }
 
     const q = st.filter_buf[0..st.filter_len];
@@ -246,9 +248,9 @@ pub fn drawBody(ui: *Ui, app: *App, ii: usize, id_base: u64, x: i32, y: i32, w: 
         var i: usize = 0;
         while (i < app.vst_recent_n) : (i += 1) {
             const e = app.vst_recent[i];
-            if (e.inst_uid != inst_uid) continue;
+            if (e.slot_key != slot_key) continue;
             const pi = pl.findParamIndex(e.param_id) orelse continue;
-            if (vis(cy, list_y, list_bot)) drawParamRow(ui, app, pl, pi, id_base + 2000 + @as(u64, pi), row_x, cy, row_w, inst_uid);
+            if (vis(cy, list_y, list_bot)) drawParamRow(ui, app, pl, pi, id_base + 2000 + @as(u64, pi), row_x, cy, row_w, ref);
             cy += row_h;
         }
     }
@@ -270,7 +272,7 @@ pub fn drawBody(ui: *Ui, app: *App, ii: usize, id_base: u64, x: i32, y: i32, w: 
                 continue;
             }
             if (cy > list_bot) break;
-            drawParamRow(ui, app, pl, pi, id_base + 3000 + @as(u64, pi), row_x, cy, row_w, inst_uid);
+            drawParamRow(ui, app, pl, pi, id_base + 3000 + @as(u64, pi), row_x, cy, row_w, ref);
             cy += row_h;
         }
     }
@@ -350,14 +352,13 @@ fn drawLinkedRow(ui: *Ui, app: *App, pl: *vst_host.Plugin, row: LinkedRow, id_ba
 }
 
 /// 普通参数行（最近改动 / 全部参数）：拖动改值 · 双击复位 · 右侧 `自动化` 按钮
-fn drawParamRow(ui: *Ui, app: *App, pl: *vst_host.Plugin, pi: usize, id_base: u64, x: i32, y: i32, w: i32, inst_uid: u32) void {
+fn drawParamRow(ui: *Ui, app: *App, pl: *vst_host.Plugin, pi: usize, id_base: u64, x: i32, y: i32, w: i32, ref: PluginSlotRef) void {
     const meta = &pl.params[pi];
-    const target = view_lane.Target{ .kind = .vst_param, .uid = inst_uid, .param_id = meta.id };
-    const bound = app.isTargetBound(target);
+    const target = app.targetForSlotParam(ref, meta.id);
+    const bound = if (target) |t| app.isTargetBound(t) else false;
     // 绿色 = 自动化**真的在驱动它**（同混音台/机架：绑了但全部停用就不算）
-    const active = app.enabledBindingCount(target) > 0;
+    const active = if (target) |t| app.enabledBindingCount(t) > 0 else false;
     const rid: u64 = id_base + 1;
-    const ii = app.instrumentIndexByUid(inst_uid);
 
     const rw = w - menu_btn_w - 4;
     const hovered = util.hitUI(ui, x, y, rw, row_h - 1);
@@ -366,18 +367,15 @@ fn drawParamRow(ui: *Ui, app: *App, pl: *vst_host.Plugin, pi: usize, id_base: u6
 
     // 已链接 → 值只读（跟着曲线走）；未链接 → 拖/双击
     if (!bound) {
-        if (ii) |inst_i| {
-            const ref = PluginSlotRef{ .kind = .instrument, .a = @intCast(@min(inst_i, std.math.maxInt(u16))) };
-            var v = pl.paramNorm(pi);
-            if (hovered and ui.mouse_double) {
-                app.setPluginParamHost(ref, pl, pi, meta.default_norm);
-            } else if (ui.dragNormV(rid, x, y, rw, row_h - 1, &v)) {
-                if (meta.step_count > 0) {
-                    const steps: f64 = @floatFromInt(meta.step_count);
-                    v = @round(v * steps) / steps;
-                }
-                app.setPluginParamHost(ref, pl, pi, v);
+        var v = pl.paramNorm(pi);
+        if (hovered and ui.mouse_double) {
+            app.setPluginParamHost(ref, pl, pi, meta.default_norm);
+        } else if (ui.dragNormV(rid, x, y, rw, row_h - 1, &v)) {
+            if (meta.step_count > 0) {
+                const steps: f64 = @floatFromInt(meta.step_count);
+                v = @round(v * steps) / steps;
             }
+            app.setPluginParamHost(ref, pl, pi, v);
         }
     }
 
@@ -390,7 +388,9 @@ fn drawParamRow(ui: *Ui, app: *App, pl: *vst_host.Plugin, pi: usize, id_base: u6
 
     // `自动化` → **直接打开自动化窗口**（同 `打开…`/`保存为…` 按钮的样式：不画箭头、不发灰）
     const bx = x + rw + 2;
-    if (ui.button(id_base + 2, "自动化", bx, y + 1, menu_btn_w, row_h - 3)) app.openAutoWin(target);
+    if (target) |t| {
+        if (ui.button(id_base + 2, "自动化", bx, y + 1, menu_btn_w, row_h - 3)) app.openAutoWin(t);
+    }
     // 行内右键：推子/旋钮同款三项菜单（恢复默认值 / 输入值… / 自动化…）
     if (!ui.mouse_pressed and util.hitUI(ui, x, y, rw, row_h - 1) and ui.mouse_right_pressed) {
         openRowMenu(app, meta.id, ui.mouse_x, ui.mouse_y);
@@ -420,11 +420,7 @@ pub fn drawMenu(ui: *Ui, app: *App) void {
     const just = st.menu_just_opened;
     st.menu_just_opened = false;
 
-    const ii = app.instrumentIndexByUid(st.inst_uid) orelse {
-        st.menu_open = false;
-        return;
-    };
-    const pl = app.instruments.items[ii].plugin orelse {
+    const pl = app.slotPlugin(st.ref) orelse {
         st.menu_open = false;
         return;
     };
@@ -433,7 +429,10 @@ pub fn drawMenu(ui: *Ui, app: *App) void {
         return;
     };
     const meta = &pl.params[pi];
-    const target = view_lane.Target{ .kind = .vst_param, .uid = st.inst_uid, .param_id = st.menu_param };
+    const target = app.targetForSlotParam(st.ref, st.menu_param) orelse {
+        st.menu_open = false;
+        return;
+    };
 
     const items = [_][]const u8{ "恢复默认值", "输入值…", "自动化…" };
     const mh: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
@@ -459,14 +458,15 @@ pub fn drawMenu(ui: *Ui, app: *App) void {
     }
 
     if (hit) |k| {
-        const ref = PluginSlotRef{ .kind = .instrument, .a = @intCast(@min(ii, std.math.maxInt(u16))) };
+        // 恢复默认值 / 输入值… 都直接作用于该插件槽（ref 已存于窗口状态）
+        const slot_ref = st.ref;
         switch (k) {
-            0 => app.setPluginParamHost(ref, pl, pi, meta.default_norm), // 恢复默认值
+            0 => app.setPluginParamHost(slot_ref, pl, pi, meta.default_norm), // 恢复默认值
             1 => {
                 // 输入值…（按**百分比** 0..100 解析：与自动化窗口的基础值同一套手感）
                 var vb: [16]u8 = undefined;
                 const pre = std.fmt.bufPrint(&vb, "{d:.1}", .{pl.paramNorm(pi) * 100.0}) catch "";
-                app.beginVstParamValueEdit(ii, meta.id, pre, mx + 4, my + 4, menu_w - 8);
+                app.beginVstParamValueEdit(slot_ref, meta.id, pre, mx + 4, my + 4, menu_w - 8);
             },
             else => app.openAutoWin(target), // 自动化…
         }

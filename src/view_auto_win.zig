@@ -123,6 +123,8 @@ pub fn draw(ui: *Ui, app: *App) void {
                 .mixer_pan, .inst_pan => "声像",
                 .tempo => "速度（BPM）",
                 .vst_param => "插件参数",
+                .fx_param => "效果器参数",
+                .kit_param => "鼓组层参数",
                 .none => "未绑定",
             };
             const pol_txt: []const u8 = if (bipolar) "双向" else "单向";
@@ -606,6 +608,8 @@ fn targetName(app: *const App, t: view_lane.Target, buf: []u8) []const u8 {
             return std.fmt.bufPrint(buf, "{s} · {s}", .{ app.instruments.items[idx].name, suffix }) catch "乐器";
         },
         .vst_param => return app.vstParamLabel(t, buf),
+        .fx_param => return app.fxParamLabel(t, buf),
+        .kit_param => return app.kitParamLabel(t, buf),
     }
 }
 
@@ -626,6 +630,14 @@ fn baseValueOf(app: *const App, t: view_lane.Target) f32 {
         .tempo => return view_lane.Target.normFromBpm(app.bpm),
         .vst_param => {
             const r = app.vstParamResolve(t) orelse return 0.0;
+            return @floatCast(r.pl.paramNorm(r.param_idx));
+        },
+        .fx_param => {
+            const r = app.fxParamResolve(t) orelse return 0.0;
+            return @floatCast(r.pl.paramNorm(r.param_idx));
+        },
+        .kit_param => {
+            const r = app.kitParamResolve(t) orelse return 0.0;
             return @floatCast(r.pl.paramNorm(r.param_idx));
         },
         .none => return 0.0,

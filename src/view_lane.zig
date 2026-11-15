@@ -68,14 +68,20 @@ pub const Point = struct {
 pub const Target = struct {
     kind: Kind = .none,
     uid: u32 = 0,
-    /// **`vst_param` 专用**：VST3 参数 ID（`ParamID`）。
-    /// 其他 target 恒 0。**插件身份用 `uid`（= 乐器 uid，稳定）**，不用槽位下标。
+    /// **`vst_param` / `fx_param` / `kit_param` 专用**：VST3 参数 ID（`ParamID`）。
+    /// 其他 target 恒 0。**插件身份用 `uid` + `slot`（稳定）**，不用槽位下标。
     param_id: u32 = 0,
+    /// **`fx_param` / `kit_param` 专用**：容器内子对象 uid
+    /// - `fx_param`：`uid` = 混音台通道 uid，`slot` = `EffectSlot.uid`
+    /// - `kit_param`：`uid` = 乐器 uid，`slot` = `DrumLayer.uid`
+    slot: u32 = 0,
 
     /// `none` = 未绑定（曲线不驱动任何参数）
     /// **`tempo`（BPM）**：全局目标（`uid` 忽略）；曲线值按 `bpmFromNorm` 映射到 BPM。
-    /// **`vst_param`**：`uid` = 乐器 uid（v1 只支持乐器 VSTi）、`param_id` = 插件参数 ID。
-    pub const Kind = enum { none, master_vol, mixer_vol, mixer_pan, inst_vol, inst_pan, tempo, vst_param };
+    /// **`vst_param`**：`uid` = 乐器 uid、`param_id` = 插件参数 ID（v1/v2 只支持乐器 VSTi）。
+    /// **`fx_param`**：效果器链上的 VST3 参数——`uid` = 通道、`slot` = 效果槽（v3）。
+    /// **`kit_param`**：鼓组层 VST3 参数——`uid` = 乐器、`slot` = 层（v3）。
+    pub const Kind = enum { none, master_vol, mixer_vol, mixer_pan, inst_vol, inst_pan, tempo, vst_param, fx_param, kit_param };
     /// **BPM 的归一化映射区间**（线性）：0 → 20，1 → 999
     pub const tempo_min: f32 = @import("model.zig").bpm_min;
     pub const tempo_span: f32 = @import("model.zig").bpm_max - tempo_min;
@@ -94,7 +100,14 @@ pub const Target = struct {
         if (a.kind == .none) return true;
         if (a.kind == .master_vol or a.kind == .tempo) return true;
         if (a.kind == .vst_param) return a.uid == b.uid and a.param_id == b.param_id;
+        // fx/kit：容器 uid + 子对象 uid + 参数 id 三者都要相等
+        if (a.kind == .fx_param or a.kind == .kit_param) return a.uid == b.uid and a.slot == b.slot and a.param_id == b.param_id;
         return a.uid == b.uid;
+    }
+
+    /// 是否是**插件参数类**目标（基值取插件自己报的默认值，UI 走参数列表那一套）
+    pub fn isPluginParam(self: Target) bool {
+        return self.kind == .vst_param or self.kind == .fx_param or self.kind == .kit_param;
     }
 
     /// **默认基准值**（新建绑定时的叠加起点）。对齐 VST3 的 `ParameterInfo.defaultNormalizedValue`。
@@ -105,7 +118,7 @@ pub const Target = struct {
             .master_vol, .mixer_vol, .inst_vol => 0.0,
             .mixer_pan, .inst_pan => 0.5,
             .tempo => 0.0,
-            .vst_param => 0.0,
+            .vst_param, .fx_param, .kit_param => 0.0, // 实际基值取插件自己报的默认值（`App.defaultBaseFor`）
             .none => 0.0,
         };
     }

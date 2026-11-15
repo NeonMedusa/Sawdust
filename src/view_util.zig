@@ -69,6 +69,8 @@ pub fn drawPluginParamList(
         ui.label("（此插件没有可用参数）", px + 8, list_top + 2, ui.theme.text_dim);
         return;
     }
+    // 每行右侧的「自动化」按钮（v3：FX / 鼓组层 / 乐器回落窗口共用这一个列表）
+    const auto_w: i32 = 56;
     const visible: i32 = @max(1, @divTrunc(list_h, row_h));
     const content_h: i32 = @as(i32, @intCast(pcount)) * row_h;
     const scroll_max: i32 = @max(0, content_h - visible * row_h);
@@ -80,6 +82,7 @@ pub fn drawPluginParamList(
     scroll_p.* = std.math.clamp(scroll_p.*, 0, scroll_max);
     const value_w: i32 = 130; // 右侧值文本预留宽
     {
+        const row_w = pw - scrollbar_w - auto_w - 4;
         const saved = ui.renderer.pushClip(px, list_top, pw - scrollbar_w, list_h);
         defer ui.renderer.popClip(saved);
         var idx: usize = 0;
@@ -88,13 +91,17 @@ pub fn drawPluginParamList(
             if (ry + row_h <= list_top or ry >= list_top + list_h) continue; // 视口剔除
             const meta = &p.params[idx];
             const rid: u64 = id_base + @as(u64, idx);
-            const hovered = hitUI(ui, px, ry, pw - scrollbar_w, row_h - 1);
+            const hovered = hitUI(ui, px, ry, row_w, row_h - 1);
             var v = p.paramNorm(idx);
             const read_only = (meta.flags & 0x2) != 0; // kIsReadOnly：插件声明只读，跳过交互
-            if (!read_only and hovered and ui.mouse_double) {
+            // 自动化绑定：值跟着曲线走 → 只读；绿色 = 自动化真的在驱动它
+            const target = app.targetForSlotParam(ref, meta.id);
+            const bound = if (target) |t| app.isTargetBound(t) else false;
+            const active = if (target) |t| app.enabledBindingCount(t) > 0 else false;
+            if (!read_only and !bound and hovered and ui.mouse_double) {
                 // 双击 → 恢复默认值（先于拖动判定：双击帧也会发按下，否则被拖动抢走）
                 app.setPluginParamHost(ref, p, idx, meta.default_norm);
-            } else if (!read_only and ui.dragNormV(rid, px, ry, pw - scrollbar_w, row_h - 1, &v)) {
+            } else if (!read_only and !bound and ui.dragNormV(rid, px, ry, row_w, row_h - 1, &v)) {
                 // 离散参数：吸附到步长（拖动锚点无级累积 → 逐格步进可达）
                 if (meta.step_count > 0) {
                     const steps: f64 = @floatFromInt(meta.step_count);
@@ -102,14 +109,19 @@ pub fn drawPluginParamList(
                 }
                 app.setPluginParamHost(ref, p, idx, v);
             }
-            const active = ui.active_id == rid;
-            ui.renderer.fillRect(px, ry, pw - scrollbar_w, row_h - 1, if (active) ui.theme.item_hover else if (hovered) ui.theme.toolbar else ui.theme.panel);
-            ui.renderer.strokeRect(px, ry, pw - scrollbar_w, row_h - 1, ui.theme.panel_border);
-            ui.labelClipped(meta.name(), px + 6, ry + 2, pw - scrollbar_w - value_w - 16, if (hovered or active) ui.theme.text else ui.theme.text_dim);
+            const is_active_drag = ui.active_id == rid;
+            ui.renderer.fillRect(px, ry, row_w, row_h - 1, if (is_active_drag) ui.theme.item_hover else if (hovered) ui.theme.toolbar else ui.theme.panel);
+            ui.renderer.strokeRect(px, ry, row_w, row_h - 1, ui.theme.panel_border);
+            const name_col = if (active) ui.theme.auto_active else if (hovered or is_active_drag) ui.theme.text else ui.theme.text_dim;
+            ui.labelClipped(meta.name(), px + 6, ry + 2, row_w - value_w - 16, name_col);
             var vb: [40]u8 = undefined;
             const vt = p.paramText(idx, &vb);
             const vw: i32 = @min(value_w, @as(i32, @intFromFloat(ui.font.measure(vt))));
-            ui.labelClipped(vt, px + pw - scrollbar_w - 6 - vw, ry + 2, vw + 2, ui.theme.text);
+            ui.labelClipped(vt, px + row_w - 6 - vw, ry + 2, vw + 2, if (active) ui.theme.auto_active else ui.theme.text);
+            // `自动化` → 打开自动化窗口（未链接时那里可直接新建/链接曲线）
+            if (target) |t| {
+                if (ui.button(rid + 0x10000, "自动化", px + row_w + 2, ry + 1, auto_w, row_h - 3)) app.openAutoWin(t);
+            }
         }
     }
     if (scroll_max > 0) {

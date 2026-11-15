@@ -617,21 +617,7 @@ pub fn main(init: std.process.Init) !u8 {
                         // 退出请用窗口关闭按钮（X / Alt+F4）
                     }
                     if (k.code == 0x20) { // Space：播放/暂停（从游标处开始，基于音频时钟）
-                        app.playing = !app.playing;
-                        if (app.playing) {
-                            const from = if (app.sel.song_mode) app.playback.song_step else app.playback.piano_step;
-                            app.playback.start_frame = app.params.frames_played.load(.monotonic);
-                            app.playback.start_step = from;
-                            app.params.start_frame.store(app.playback.start_frame, .monotonic);
-                            app.params.start_step.store(from, .monotonic);
-                            app.params.playing.store(true, .monotonic);
-                            // 调度：作废旧事件 + 为跨起点长音符补发 on；重置调度窗口
-                            app.markGenSoft(false); // 硬切换（起播）：照旧释放（无残留声部）
-                            sequencer.reset(&app.scheduler);
-                            app.params.sched_gen.store(app.scheduler.gen, .monotonic);
-                        } else {
-                            app.params.playing.store(false, .monotonic);
-                        }
+                        app.togglePlayback();
                     }
                     // Ctrl+S：保存（无路径则弹对话框）；Ctrl+Shift+S：另存为；Ctrl+O：打开。
                     // 注：只登记动作，不在事件迭代中弹对话框——事件数组可能被
@@ -2844,20 +2830,7 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
     }
     x += 40;
     if (ui.iconButton(200, if (app.playing) .pause else .play, x, by, 36, bh, app.playing, ui.theme.accent)) {
-        app.playing = !app.playing;
-        if (app.playing) {
-            const from = if (app.sel.song_mode) app.playback.song_step else app.playback.piano_step;
-            app.playback.start_frame = app.params.frames_played.load(.monotonic);
-            app.playback.start_step = from;
-            app.params.start_frame.store(app.playback.start_frame, .monotonic);
-            app.params.start_step.store(from, .monotonic);
-            app.params.playing.store(true, .monotonic);
-            app.markGenSoft(false); // 硬切换（起播）：照旧释放（无残留声部）
-            sequencer.reset(&app.scheduler);
-            app.params.sched_gen.store(app.scheduler.gen, .monotonic);
-        } else {
-            app.params.playing.store(false, .monotonic);
-        }
+        app.togglePlayback();
     }
     x += 40;
     if (ui.iconButton(201, .stop, x, by, 36, bh, false, ui.theme.accent)) {
@@ -3406,7 +3379,10 @@ fn syncInstrumentPlugins(app: *App) void {
 /// - 归属对不上的编辑器（面板关闭/切目标/插件被换的残留）→ 关闭；
 /// - 遮挡：其它浮动窗口（Z 高且矩形相交）或菜单/弹层（`ui` 登记的遮罩矩形）→ 隐藏。
 const vst_panel_title_h: i32 = 22;
-const vst_fx_row_h: i32 = 22 + 34; // 标题 + 控制行（启用开关）
+/// 效果面板嵌插件编辑器时的**金属框高度** = 只有标题栏。
+/// （曾为 `22 + 34`：那时面板内还有一行“启用/干湿”——那行已删，
+/// 旁通与干湿归调音台效果链行，见 `view_mixer.drawEffectRow`）
+const vst_fx_chrome_h: i32 = 22;
 
 fn rectsOverlap(ax: i32, ay: i32, aw: i32, ah: i32, bx: i32, by: i32, bw: i32, bh: i32) bool {
     return ax < bx + bw and bx < ax + aw and ay < by + bh and by < ay + ah;
@@ -3671,7 +3647,7 @@ fn syncPluginEditors(app: *App, ui: *Ui, fw: i32, fh: i32) void {
             }
             pl.setEditorEnabled(app.modal == null and ui.overlay_n == 0);
         } else if (pl.view != null) {
-            syncEmbeddedEditor(app, ui, pl, &app.effect_win, vst_fx_row_h, .effect, fw, fh);
+            syncEmbeddedEditor(app, ui, pl, &app.effect_win, vst_fx_chrome_h, .effect, fw, fh);
         }
     }
 }

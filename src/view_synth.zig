@@ -142,11 +142,10 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         const bh2: i32 = win_title_h - 6;
         const by2 = y + 3;
         title_btn_used = false;
-        // `自动化` 按钮：**只有乐器 VSTi**（v1 不支持 FX / 鼓组层——那两类还没稳定 uid）
+        // `自动化` 按钮：**所有 VST3 插件容器**（乐器 / 鼓组层）——与效果器窗对齐（v3）
         // Windows 才画：Linux 的面板正文**就是**自动化窗口，再开一个浮动窗就重复了
         const show_auto_btn = target_is_vst3 and builtin.os.tag != .linux and switch (sw.target) {
-            .instrument => true,
-            else => false,
+            .instrument, .kit_layer_replace => true,
         };
         if ((if (show_auto_btn) bx0 else bx1) > x + 180) { // 标题放不下就不画（窄窗）
             // [预设 ▾]
@@ -185,7 +184,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
                 title_btn_used = true;
                 ui.active_id = 0; // 防误触发标题拖动
             }
-            // [自动化]：VST 参数自动化（v1：只支持乐器 VSTi）
+            // [自动化]：VST 参数自动化（v3：乐器 / 鼓组层同一套）
             // 底色与 `预设/保存为…` 完全同款（不因“已打开”而常显蓝：那看着像开关）
             if (show_auto_btn) {
                 const h0 = util.hitUI(ui, bx0, by2, auto_w, bh2);
@@ -194,8 +193,16 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
                 ui.label("自动化", bx0 + 5, by2 + 2, ui.theme.text);
                 if (h0 and ui.mouse_pressed) {
                     switch (sw.target) {
-                        .instrument => |ii| app.openVstAutoWin(@intCast(@max(0, ii))),
-                        else => {},
+                        .instrument => |ii| app.openVstAutoWin(.{ .kind = .instrument, .a = @intCast(@max(0, ii)) }),
+                        .kit_layer_replace => |kr| {
+                            if (app.kitLayerSlot(@intCast(@max(0, kr.instrument)), kr.pitch, kr.layer)) |slot| {
+                                app.openVstAutoWin(.{
+                                    .kind = .kit_layer,
+                                    .a = @intCast(@max(0, kr.instrument)),
+                                    .b = @intCast(@min(slot, std.math.maxInt(u16))),
+                                });
+                            }
+                        },
                     }
                     title_btn_used = true; // 别让下面的“点窗口内任意处 → 置顶”把新窗口顶回去
                     ui.active_id = 0; // 防误触发标题拖动
@@ -401,6 +408,7 @@ fn drawVst3Body(
     if (pl_opt) |p| {
         if (p.view != null) {
             // Windows：编辑器嵌在面板里（原生子窗口覆盖内容区）→ 这里不用画
+            // （参数表/自动化走标题栏 `自动化`：那个窗口就是完整参数表 + 搜索）
             if (comptime builtin.os.tag != .linux) return;
             // Linux：编辑器是**独立顶层窗口**。按钮是开关——开关状态就是 `app.vst_editor_owner`
             // （用户用窗口自己的关闭按钮关掉时，main 每帧会把这个 owner 清空 → 状态自然同步）。
@@ -417,10 +425,9 @@ fn drawVst3Body(
             }
             // Linux：正文直接是 **VST 参数自动化窗口**（编辑器在独立窗口，正文空着浪费）
             if (comptime builtin.os.tag == .linux) {
-                if (ref.kind == .instrument) {
-                    view_vst_auto.drawBody(ui, app, @intCast(ref.a), id_base + 2000, x, y + win_title_h + 40, ww, hh - win_title_h - 40);
-                    return;
-                }
+                // v3：乐器 / 鼓组层两种容器都直接嵌自动化正文
+                view_vst_auto.drawBody(ui, app, ref, id_base + 2000, x, y + win_title_h + 40, ww, hh - win_title_h - 40);
+                return;
             }
         }
     }
