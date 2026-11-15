@@ -1536,6 +1536,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         // 行头列顶部两行：单位按钮 + 当前点数值（与钢琴窗同一份代码）
         const cur_lane = app.autoCurve() orelse return;
         const hh = view_lane.drawValueHeader(ui, cur_lane, main_x, ay, util.piano_header_w);
+        if (hh.unit_changed) app.commitHistory("切换曲线显示单位");
         if (hh.value_clicked) {
             if (cur_lane.sel_idx) |si| {
                 var vb: [24]u8 = undefined;
@@ -1553,7 +1554,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             for (0..n) |k| {
                 const lc = &app.auto_curves.items[k];
                 shown[k] = lc.name(&names[k]);
-                entries[k] = .{ .text = shown[k], .active = app.auto_sel == lc.id };
+                entries[k] = .{ .text = shown[k], .active = app.auto_sel == lc.id, .dimmed = app.bindingCountOfCurve(lc.id) == 0 };
             }
             if (n == 0) {
                 entries[0] = .{ .text = "（点下方轨道右键 → 自动化…）", .active = false };
@@ -1589,12 +1590,49 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
 
         // 值轨本体（内容层）：与剪辑区同一横坐标映射。
         const draw_lane = app.autoCurve() orelse return;
-        view_lane.draw(ui, draw_lane, lane_x, ay, panel_w, auto_h, util.pianoStepPx(), app.steps_per_bar, app.playlist.scroll_x, app.playlist.zoom, app.allocator);
+        const er = view_lane.draw(ui, draw_lane, lane_x, ay, panel_w, auto_h, util.pianoStepPx(), app.steps_per_bar, app.playlist.scroll_x, app.playlist.zoom, app.allocator);
+        // **曲线编辑进历史（S5）**：不同动作不同提示（而不是笼统一句“编辑曲线”）；
+        // 原子操作立即提交，拖动类用 `history_pending` 合并到松手。
+        const er_label: []const u8 = switch (er.kind) {
+            .add_point => "添加自动化点",
+            .delete_point => "删除自动化点",
+            .move_point => "移动自动化点",
+            .curve_handle => "调整自动化曲率",
+            .reset_curve => "曲率复位",
+            .none => "编辑自动化曲线",
+        };
+        if (er.atomic) {
+            app.commitHistory(er_label);
+        } else if (er.changed) {
+            app.history_pending = er_label;
+        }
+        // **空曲线引导**（曲线还没有任何点 → 告诉用户怎么开始；加点后自然消失）
+        if (draw_lane.points.items.len == 0) drawEmptyCurveHint(ui, lane_x, ay, @max(1, x + w - lane_x), auto_h);
     }
     // 吸附网格下拉（在**全部内容之后** → 绘制在最上层）
     if (app.playlist.snap_menu_open and snap_btn_x + 40 < x + w - 24) {
         _ = util.snapSelectorMenu(ui, snap_btn_x, y + util.title_h, &app.playlist.snap, &app.playlist.snap_menu_open, snap_clicked);
     }
+}
+
+/// **空曲线引导**：当前编辑的曲线一个点都没有时，在内容区居中画两行提示——
+/// 告诉用户“从哪里开始”（右键旋钮/推子 → 自动化…）+“这里就能画”（双击加第一个点）。
+/// 加点后 `points.len > 0` → 自动消失（不需要任何额外状态）。
+/// 文字必须经得住推敲：
+/// - 第一行给入口（右键菜单路径），否则新人不知道去哪建曲线；
+/// - 第二行给当前面板的直接动作（双击 = 加点，见 `view_lane.draw`）。
+fn drawEmptyCurveHint(ui: *Ui, x: i32, y: i32, w: i32, h: i32) void {
+    if (h < 56 or w < 180) return; // 面板太矮/太窄就不塞字了（会被截成二维码）
+    const l1 = "右键旋钮或推子 →「自动化…」新建或链接曲线";
+    const l2 = "双击这里添加点，右键删除点";
+    const w1: i32 = @intFromFloat(ui.font.measure(l1));
+    const w2: i32 = @intFromFloat(ui.font.measure(l2));
+    const lh: i32 = @intFromFloat(ui.font.lineHeight());
+    const cy = y + @divTrunc(h, 2) - lh;
+    // 行太长（窄面板）→ 能缩就缩（labelClipped 会末尾截断），不硬挤到行头列里
+    const max_w = w - 16;
+    ui.labelClipped(l1, x + @divTrunc(@max(0, w - @min(w1, max_w)), 2), cy, max_w, ui.theme.text);
+    ui.labelClipped(l2, x + @divTrunc(@max(0, w - @min(w2, max_w)), 2), cy + lh + 6, max_w, ui.theme.text_dim);
 }
 
 /// **曲线行右键菜单**（重命名 / 管理已链接项 / 删除曲线）。
@@ -1623,6 +1661,7 @@ pub fn drawCurveMenu(ui: *Ui, app: *App) void {
                     app.modal_choice = null;
                 } else if (app.removeAutoCurve(cid)) {
                     app.setToast("已删除曲线");
+                    app.commitHistory("删除自动化曲线");
                 }
             },
         }

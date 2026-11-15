@@ -20,7 +20,32 @@ pub const Interp = enum { hold, linear, smooth };
 /// 一个锚点；`curve` 属于“以本点为起点的那一段”（归一化，-1..1，0 = 直线）
 /// 一个锚点；`curve` 属于“以本点为起点的那一段”（归一化，-1..1，0 = 直线）
 /// `drawValueHeader` 的返回（值行是否被点、以及值行矩形）
-pub const HeaderHit = struct { value_clicked: bool, rect: Rect };
+pub const HeaderHit = struct { value_clicked: bool, rect: Rect, unit_changed: bool = false };
+
+/// `draw` 的返回：本帧改了曲线内容吗？（**历史/未保存标记由调用方提交**——
+/// 本文件不依赖 `App`，只报“改了 / 这次是原子操作 / 是哪一种改动”）
+pub const EditResult = struct {
+    /// 本帧有修改（拖动中每帧都可能为 true → 调用方用 `history_pending` 合并）
+    changed: bool = false,
+    /// 原子操作（双击加点 / 右键删点 / 曲率复位）→ 调用方应**立即** `commitHistory`
+    atomic: bool = false,
+    /// 动的是哪一种（历史提示用：不同动作 → 不同 label，而不是笼统一句“编辑曲线”）
+    kind: EditKind = .none,
+};
+
+pub const EditKind = enum {
+    none,
+    /// 双击空白处加点
+    add_point,
+    /// 右键删点
+    delete_point,
+    /// 拖锚点（改时间/值）
+    move_point,
+    /// 拖曲率手柄（pivot / curve）
+    curve_handle,
+    /// 曲率复位（双击手柄 / Ctrl 拖 / Ctrl 点击）
+    reset_curve,
+};
 
 pub const Point = struct {
     step: i32,
@@ -53,7 +78,7 @@ pub const Target = struct {
     pub const Kind = enum { none, master_vol, mixer_vol, mixer_pan, inst_vol, inst_pan, tempo, vst_param };
     /// **BPM 的归一化映射区间**（线性）：0 → 20，1 → 999
     pub const tempo_min: f32 = @import("model.zig").bpm_min;
-pub const tempo_span: f32 = @import("model.zig").bpm_max - tempo_min;
+    pub const tempo_span: f32 = @import("model.zig").bpm_max - tempo_min;
     /// 曲线值（0..1）→ BPM
     pub fn bpmFromNorm(v: f32) f32 {
         return tempo_min + std.math.clamp(v, 0.0, 1.0) * tempo_span;
@@ -413,13 +438,13 @@ pub fn draw(
     scroll_x: i32,
     zoom: f32,
     alloc: std.mem.Allocator,
-) void {
+) EditResult {
     _ = bar_steps; // 网格/刻度由调用方绘制（此处不重复画）
     // **内容坐标 → 内部步号**：`scroll_x` 是内容像素、`step_px` 是内容步宽 →
     // 左沿对应的步号在此**唯一一处**换算（以前让调用方传，出现过 “传了像素当步数”
     // 的 bug：静止时看不出、Ctrl+滚轮缩放时曲线与网格各走各的）。
     const scroll_s: f32 = @as(f32, @floatFromInt(scroll_x)) * zoom; // 屏幕滚动（精确；与网格同源）
-    if (w <= 8 or h <= 16) return;
+    if (w <= 8 or h <= 16) return .{};
     const r = &ui.renderer;
 
     // ⚠️ **不铺底色、不画网格**——底色/竖向网格/游标由调用方铺满**整个面板**。
@@ -611,6 +636,9 @@ pub fn draw(
         }
     }
 
+    // 本帧修改标记（调用方据此提交历史；拖动用 pending 合并到松手）
+    var res = EditResult{};
+
     // 按下：开始拖动 / 双击加点 / 右键删点
     if (ui.mouse_pressed and inside) {
         if (ui.mouse_double) {
@@ -619,9 +647,11 @@ pub fn draw(
             if (hit_curve) |i| {
                 lane.points.items[i].curve = 0;
                 lane.points.items[i].pivot = 0.5;
+                res = .{ .changed = true, .atomic = true, .kind = .reset_curve };
             } else if (hit_anchor == null) {
                 const st = @max(0, stepOfX(ui.mouse_x, x, step_px, zoom, scroll_s));
                 _ = lane.insertPoint(alloc, st, valueOfY(ui.mouse_y, y, h));
+                res = .{ .changed = true, .atomic = true, .kind = .add_point };
             }
         } else if (hit_anchor) |i| {
             lane.drag_kind = .anchor;
@@ -632,7 +662,10 @@ pub fn draw(
             ui.active_id = 7701;
         } else if (hit_curve) |i| {
             // Ctrl + 拖 → 直接吸附成直线
-            if (ui.mods_ctrl) lane.points.items[i].curve = 0 else {
+            if (ui.mods_ctrl) {
+                lane.points.items[i].curve = 0;
+                res = .{ .changed = true, .atomic = true, .kind = .reset_curve };
+            } else {
                 lane.drag_kind = .curve;
                 lane.drag_idx = i;
                 // **抓取偏移（两个轴都要）**：否则按下瞬间手柄会瞬移到鼠标位置——
@@ -659,7 +692,10 @@ pub fn draw(
     // 右键：删锚点（至少保留 1 个）
     if (ui.mouse_right_pressed and inside) {
         if (hit_anchor) |i| {
-            if (lane.points.items.len > 1) lane.removeAt(i);
+            if (lane.points.items.len > 1) {
+                lane.removeAt(i);
+                res = .{ .changed = true, .atomic = true, .kind = .delete_point };
+            }
         }
     }
 
@@ -685,6 +721,8 @@ pub fn draw(
                     if (i > 0) st = @max(st, lane.points.items[i - 1].step);
                     if (i + 1 < lane.points.items.len) st = @min(st, lane.points.items[i + 1].step);
                     p.step = st;
+                    res.changed = true;
+                    res.kind = .move_point;
                 }
             },
             .curve => {
@@ -702,10 +740,13 @@ pub fn draw(
                     lane.points.items[i].pivot = pv;
                     // 手柄夹在平行四边形内（两端值之间）→ 曲线**永不过冲**
                     lane.points.items[i].curve = curveFromHandle(a.value, b.value, pv, want);
+                    res.changed = true;
+                    res.kind = .curve_handle;
                 }
             },
         }
     }
+    return res;
 }
 
 // ─────────────────────────── 单测 ───────────────────────────
@@ -946,6 +987,7 @@ pub fn drawValueHeader(ui: *Ui, lane: *Lane, x: i32, y: i32, header_w: i32) Head
     const row_h: i32 = 18;
     const bx = x + 2;
     const bw = header_w - 3;
+    var unit_changed = false;
     // 第 1 行：单位按钮（整行宽；点击循环切换）
     {
         const ubtn_y = y + 2;
@@ -954,7 +996,10 @@ pub fn drawValueHeader(ui: *Ui, lane: *Lane, x: i32, y: i32, header_w: i32) Head
         var ubuf: [20]u8 = undefined;
         const ut = std.fmt.bufPrint(&ubuf, "单位：{s}", .{Unit.label(lane.display_unit)}) catch "";
         ui.labelClipped(ut, bx + 2, ubtn_y + 2, bw - 4, if (hovered) ui.theme.accent else ui.theme.text);
-        if (hovered and ui.mouse_pressed) cycleUnit(lane); // 点击型动作：不认领 active_id
+        if (hovered and ui.mouse_pressed) {
+            cycleUnit(lane);
+            unit_changed = true;
+        }
     }
     // 第 2 行：数值（**点击 → 键入**；调用方负责弹输入框）
     const val = Rect{ .x = bx, .y = y + 2 + row_h, .w = bw, .h = row_h - 2 };
@@ -965,7 +1010,7 @@ pub fn drawValueHeader(ui: *Ui, lane: *Lane, x: i32, y: i32, header_w: i32) Head
     const vt = std.fmt.bufPrint(&vbuf, "值：{s}", .{activeReadout(lane, &rbuf) orelse "—"}) catch "—";
     ui.labelClipped(vt, val.x + 2, val.y + 2, val.w - 4, if (v_hovered) ui.theme.accent else ui.theme.text);
     const clicked = v_hovered and ui.mouse_pressed and lane.sel_idx != null;
-    return .{ .value_clicked = clicked, .rect = val };
+    return .{ .value_clicked = clicked, .rect = val, .unit_changed = unit_changed };
 }
 
 /// **正在调整 / 悬停的点的读数**（行头列顶部固定行显示）。`null` = 当前没有可读的点。
@@ -1065,7 +1110,12 @@ pub fn drawShell(ui: *Ui, sh: Shell) void {
 }
 
 /// 行头列 lane 列表的一项
-pub const ListEntry = struct { text: []const u8, active: bool };
+pub const ListEntry = struct {
+    text: []const u8,
+    active: bool,
+    /// 二级弱化（如：**没被任何参数链接的曲线**）——用 `text_dim` 而非正常白字
+    dimmed: bool = false,
+};
 
 /// 列表命中结果：`index` = 左键点中；`right` = 右键点中；`dbl` = 双击
 pub const ListHit = struct { index: ?usize = null, right: ?usize = null, dbl: ?usize = null };
@@ -1097,7 +1147,7 @@ pub fn drawList(ui: *Ui, x: i32, y: i32, h: i32, header_w: i32, top_row: i32, sc
         const it = entries[i];
         const hovered = util.inRect(ui.mouse_x, ui.mouse_y, bx - 1, by, bw + 1, row_h);
         if (it.active) ui.renderer.fillRect(bx - 1, by, bw + 1, row_h - 1, ui.theme.toolbar);
-        const col: r_mod.Color = if (it.active) ui.theme.accent else ui.theme.text;
+        const col: r_mod.Color = if (it.active) ui.theme.accent else if (it.dimmed) ui.theme.text_dim else ui.theme.text;
         // 曲线名**存得多、显不了那么多** → 中段省略（头…尾）
         ui.labelMiddle(it.text, bx + 2, by + 2, bw - 3, col);
         if (hovered) {

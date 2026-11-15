@@ -323,7 +323,10 @@ pub fn main(init: std.process.Init) !u8 {
                                 app.commitHistory("删除轨道");
                             },
                             .auto_curve => |cid| {
-                                if (app.removeAutoCurve(cid)) app.setToast("已删除曲线");
+                                if (app.removeAutoCurve(cid)) {
+                                    app.setToast("已删除曲线");
+                                    app.commitHistory("删除自动化曲线");
+                                }
                             },
                         }
                     }

@@ -226,7 +226,10 @@ pub fn draw(ui: *Ui, app: *App) void {
                 var nb: [48]u8 = undefined;
                 const cname = app.autoCurveNameFor(win.target, &nb);
                 const cid = app.addAutoCurve(cname);
-                if (cid != 0 and app.bindCurveTarget(cid, win.target)) app.setToast("已新建曲线并链接");
+                if (cid != 0 and app.bindCurveTarget(cid, win.target)) {
+                    app.setToast("已新建曲线并链接");
+                    app.commitHistory("新建自动化曲线");
+                }
             }
 
             const bx2 = x + 8 + bw1 + 8;
@@ -284,7 +287,10 @@ fn drawRow(ui: *Ui, app: *App, bi: usize, label: []const u8, x: i32, y: i32, w: 
         const hovered = util.inRect(ui.mouse_x, ui.mouse_y, bx, cy, ctrl_h, ctrl_h);
         ui.renderer.fillRect(bx, cy, ctrl_h, ctrl_h, if (b.enabled) ui.theme.accent else ui.theme.slider_track);
         ui.renderer.strokeRect(bx, cy, ctrl_h, ctrl_h, ui.theme.panel_border);
-        if (hovered and ui.mouse_pressed) b.enabled = !b.enabled;
+        if (hovered and ui.mouse_pressed) {
+            b.enabled = !b.enabled;
+            app.commitHistory(if (b.enabled) "启用自动化绑定" else "停用自动化绑定");
+        }
     }
 
     // 曲线名（点击 → 切到播放列表编辑这条曲线；垂直居中同其他控件）
@@ -306,7 +312,10 @@ fn drawRow(ui: *Ui, app: *App, bi: usize, label: []const u8, x: i32, y: i32, w: 
         const txt: []const u8 = if (b.bipolar) "双向" else "单向";
         const tw: i32 = @intFromFloat(ui.font.measure(txt));
         ui.labelCentered(txt, px + @divTrunc(Col.btn_w - tw, 2), cy, ctrl_h, if (b.bipolar) ui.theme.accent else ui.theme.text);
-        if (hovered and ui.mouse_pressed) b.bipolar = !b.bipolar;
+        if (hovered and ui.mouse_pressed) {
+            b.bipolar = !b.bipolar;
+            app.commitHistory("切换自动化极性");
+        }
         if (hovered and ui.mouse_right_pressed) openCtx(app, ui, bi, .bipolar);
     }
 
@@ -320,7 +329,10 @@ fn drawRow(ui: *Ui, app: *App, bi: usize, label: []const u8, x: i32, y: i32, w: 
         const tw: i32 = @intFromFloat(ui.font.measure(txt));
         // 两种状态都是白字（只靠颜色强调：开 = 橙）
         ui.labelCentered(txt, ix + @divTrunc(Col.btn_w - tw, 2), cy, ctrl_h, if (b.invert) ui.theme.accent else ui.theme.text);
-        if (hovered and ui.mouse_pressed) b.invert = !b.invert;
+        if (hovered and ui.mouse_pressed) {
+            b.invert = !b.invert;
+            app.commitHistory("切换自动化反向");
+        }
         if (hovered and ui.mouse_right_pressed) openCtx(app, ui, bi, .invert);
     }
 
@@ -568,7 +580,10 @@ fn drawPickList(ui: *Ui, app: *App, win_x: i32, above_y: i32, win_w: i32, btn: R
         ui.drawScrollbar(px + panel_w - 6, py + 2, 5, ph - 4, win.pick_scroll * row, @as(i32, @intCast(avail)) * row, ph - 4);
     }
     if (hit) |cid| {
-        if (app.bindCurveTarget(cid, win.target)) app.setToast("已链接曲线");
+        if (app.bindCurveTarget(cid, win.target)) {
+            app.setToast("已链接曲线");
+            app.commitHistory("链接自动化曲线");
+        }
         win.pick_open = false;
     } else if (ui.mouse_pressed and !util.inRect(ui.mouse_x, ui.mouse_y, px, py, panel_w, ph) and
         !util.inRect(ui.mouse_x, ui.mouse_y, btn.x, btn.y, btn.w, btn.h))

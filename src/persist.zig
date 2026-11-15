@@ -269,6 +269,8 @@ pub const SavedDrumKit = struct {
 
 /// 存档中的乐器
 pub const SavedInstrument = struct {
+    /// **稳定 uid**（v9 引入；自动化绑定按它引用乐器）。0 = 旧存档/未分配
+    uid: u32 = 0,
     name: []const u8 = "",
     volume: f32 = 0.8,
     pan: f32 = 0.5,
@@ -325,6 +327,8 @@ pub const SavedEffectSlot = struct {
 
 /// 存档中的一个调音台通道
 pub const SavedMixerChannel = struct {
+    /// **稳定 uid**（v9 引入；自动化绑定按它引用通道）。0 = 旧存档/未分配
+    uid: u32 = 0,
     /// 自定义名字（UTF-8；空 = 无自定义名——用默认占位名）
     name: []const u8 = "",
     volume: f32 = 0.8,
@@ -582,6 +586,12 @@ fn introducedVersion(comptime T: type, comptime name: []const u8) ?u8 {
         if (comptime std.mem.eql(u8, name, "smooth_ms")) return binary_version_v9;
         if (comptime std.mem.eql(u8, name, "invert")) return binary_version_v9;
         if (comptime std.mem.eql(u8, name, "param_id")) return binary_version_v9;
+        return null;
+    }
+    if (comptime std.mem.endsWith(u8, tn, "SavedInstrument") or std.mem.endsWith(u8, tn, "SavedMixerChannel")) {
+        // **稳定 uid**（v9）：自动化绑定按 uid 引用目标。不落盘的话读档/撤销后
+        // uid 会重新编号 → 绑定“表面在、实际失效”（实测：读档后绑定指向不存在的通道）。
+        if (comptime std.mem.eql(u8, name, "uid")) return binary_version_v9;
         return null;
     }
     if (comptime std.mem.endsWith(u8, tn, "Project")) {

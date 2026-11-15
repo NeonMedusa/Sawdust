@@ -371,7 +371,8 @@ Note 规则用 5% 的代码拿到了 88% 的收益（141.7KB / 160.5KB）——�
 - **v9 引入的字段**（统一钉 `binary_version_v9 = 9`）：
   `Project.auto_lanes` / `auto_bindings` / `auto_sel`（v8 发布版**没有**自动化整套——不登记就会在旧档末尾
   “多读三个字段”→ 字节错位）、`SavedBinding.smooth_ms`、`SavedBinding.invert`、`SavedBinding.param_id`
-  （VST 参数自动化 v1）。
+  （VST 参数自动化 v1）、`SavedInstrument.uid` 与 `SavedMixerChannel.uid`（**稳定 uid**：
+  不落盘的话读档/撤销后 uid 重新编号 → 自动化绑定指向不存在的目标，“表面在、实际失效”）。
   测试改用 `toBinaryAtVersion(…, 8)` **真实写出 v8 布局**（不再“写 v9 再改版本字节”——那种做法在有 v9 新字段时必炸），
   曲线点 ×40 的迁移另用 `migrateUnitsToV5` 的函数级测试盖住。
 

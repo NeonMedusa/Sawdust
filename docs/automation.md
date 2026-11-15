@@ -1164,3 +1164,75 @@ VST 自动化窗口的**已链接**段：同一个参数挂 N 条曲线时**只�
 
 - 归组用 `Target.eql`（uid + param_id）；行数 = **不同参数数**（不是绑定数），滚动高度同源；
 - 这一行**不解绑**（`×` 已按用户要求去掉）：解绑统一在自动化窗口的绑定行 `×`。
+
+### 11.41 S5：曲线/绑定进历史 + 稳定 uid 落盘 + 目标消失即解绑
+
+#### 曲线/绑定进历史（撤销真的能回退曲线了）
+
+`HistoryState` 新增 `auto: AutoSave`（`lanes` + `binds`）+ `auto_sel`。
+
+- **导出/导入只有一份实现**：`App.exportAutoSave` / `importAutoSave` / `freeAutoSave`——
+  工程保存（`exportProject`）和历史快照（`captureHistory`）**共用**，不然两处各写一遍必漏字段。
+- `stateEqualsCurrent` 新增 `autoEquals()`：不比的话“画个点/改深度”会被判成“无变化”，
+  历史条目被**静默丢弃**（本项目已经踩过 ADSR/力度/通道名同型坑）。值用 `1e-6` 容差。
+- 提交时机：
+  | 动作 | 提交方式 |
+  | --- | --- |
+  | 拖点/拖手柄/拖基础·深度·平滑 | `history_pending`（松手合并成一条） |
+  | 双击加点 / 右键删点 / 曲率复位 / 切单位 | 立即 `commitHistory` |
+  | 新建曲线 / 链接 / 解绑 / 删除曲线 / 重命名 / 启用·极性·反向切换 | 立即 `commitHistory` |
+- `view_lane.draw` 新增返回 `EditResult{changed, atomic}`：**view_lane 不依赖 App**，
+  只报“改了 / 这是原子操作”，由 `view_playlist` 决定 `history_pending` 还是 `commitHistory`。
+
+#### 稳定 uid 必须落盘（否则绑定“表面在、实际失效”）
+
+持久化前：`SavedInstrument` / `SavedMixerChannel` **没有 uid 字段**，uid 是运行时发的。
+于是读档/撤销后 uid 重新编号 → `target_uid` 指向不存在的对象，绑定看似还在、实际不生效。
+
+现在两者都带 `uid: u32`（**v9** 登记）；`importMixerChannels` / `applySavedInstrument`
+恢复时写回并推进 `next_*_uid`；旧存档（uid == 0）→ 统一补发。
+这顺带修好了**撤销乐器编辑后绑定丢失**：历史快照也带 uid，撤销后绑定依然指得正。
+
+#### 目标消失 → 绑定消失，曲线保留（用户拍板）
+
+`App.pruneAutoBindings()`：
+
+- `.mixer_vol / .mixer_pan`：通道 uid 不存在 → 删；
+- `.inst_vol / .inst_pan`：乐器 uid 不存在 → 删；
+- `.vst_param`：乐器不存在或**已不是 VST3** → 删；若插件只是**没加载/加载失败/参数缓存未就绪**
+  → **保守保留**（否则插件一時没加载就会把用户的链接全清掉）；只有“插件已加载且确实没这个参数”才删；
+- `.master_vol / .tempo / .none`：恒有效。
+
+调用点：`commitHistory` 开头（新快照里不会留悬空绑定）、`applyHistoryState` 末尾、
+`importProjectBody` 末尾（读档自洁）。
+
+#### 未链接的曲线用灰字
+
+行头列曲线列表：`ListEntry.dimmed`（`bindingCountOfCurve(id) == 0`）→ 用 `text_dim` 而非白字，
+一眼能看出“这条曲线还没驱动任何参数”。
+
+#### 历史提示细化（不同动作不同 label）
+
+`view_lane.EditResult` 多了 `kind: EditKind`，操作历史里不再是一堆“编辑自动化曲线”：
+
+| 动作 | 历史条目 |
+| --- | --- |
+| 双击空白处加点 | `添加自动化点` |
+| 右键删点 | `删除自动化点` |
+| 拖锚点 | `移动自动化点` |
+| 拖曲率手柄 | `调整自动化曲率` |
+| 双击手柄 / Ctrl 拖 / Ctrl 点 → 拉直 | `曲率复位` |
+| 拖基础 / 深度 / 平滑 | `调整自动化基础值 / 深度 / 平滑`；右键恢复各自独立 |
+| 启用 / 极性 / 反向切换 | `启用自动化绑定` / `停用自动化绑定` / `切换自动化极性` / `切换自动化反向` |
+| 新建 / 链接 / 解绑 / 删除 / 重命名 / 键入点值 | 各自的“新建 / 链接 / 取消链接 / 删除 / 重命名 / 设置点值” |
+
+#### 新建（空）也清自动化 + 空曲线引导
+
+- `resetToDefaultProject` 现在把 `auto_curves` / `auto_bindings` / `auto_sel` 一并清空，
+  并关掉两个自动化窗口（目标全失效）——新建 = 和刚开软件完全一样。
+- 当前曲线**一个点都没有**时，面板内容区居中画两行提示（加点后自动消失，不需要额外状态）：
+  1. `右键旋钮或推子 →「自动化…」新建或链接曲线`（告诉新人入口在哪）
+  2. `也可以双击这里，直接加第一个点`（告诉当前面板能直接画）
+- 面板太矮（< 56px）/ 太窄（< 180px）不画（否则会被截成二维码）。
+
+
