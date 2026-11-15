@@ -99,6 +99,18 @@ pub const eq_bands = eq.band_count;
 pub const kit_max_layers = 16;
 
 /// UI ↔ 音频线程共享的参数（原子，无锁）
+/// **一阶极点一步**（自动化平滑的唯一实现）：
+/// - `prev` 为 NaN（未播种）或 `smooth_ms <= 0` → 直接取 `target`（不从 0 爬升）；
+/// - 否则按时间常数 τ = smooth_ms/1000 向 `target` 追赶一步（`dt_s` = 本步/本段秒数）。
+///
+/// 语义位置：音量/声像（`contributionSmooth`）与 VST 参数（`collectVstParams`）
+/// 用的是**同一个极点**，只是前者写在函数里、后者直接调它。
+pub fn poleStep(prev: f32, target: f32, smooth_ms: f32, dt_s: f32) f32 {
+    if (smooth_ms <= 0.0 or std.math.isNan(prev)) return target;
+    const k: f32 = std.math.clamp(1.0 - @exp(-@max(0.0, dt_s) / (smooth_ms / 1000.0)), 0.0, 1.0);
+    return prev + (target - prev) * k;
+}
+
 /// 工程作用域自动化曲线的**音频侧副本**（无锁发布）。
 /// 由 `App.publishAutoLane` 从 UI 线程填充（3 缓冲轮转 + 下标原子发布），
 /// 音频线程每段 `acquire` 读一次，取**段首/段末**两个端点值做块内斜坡。
@@ -120,12 +132,15 @@ pub const LaneSnap = struct {
     /// **反向**（与 `bipolar` 独立）：贡献取负（单向+反向 = ducking）
     invert: bool = false,
     /// **极点追赶的平滑时间常数**（毫秒；0 = 不平滑）。同一个通道/乐器上多条绑定 → 取最大值。
-    smooth_ms: f32 = 15.0,
+    /// 实际值由 App 侧发布（新绑定默认 0 = 直通；见 `view_lane.default_smooth_ms`）。
+    smooth_ms: f32 = 0.0,
     /// **槽位稳定指纹**（发布时由 `curve_id + target` 算出）：槽位被另一个绑定占用时
     /// （增/删绑定 → `slotFor` 重新分配）→ 音频侧据此**重新播种**平滑状态。
     key: u32 = 0,
-    /// 0 = 增益（volume），1 = 声像（pan）
+    /// 目标种类：0 = 增益（volume），1 = 声像（pan），**2 = VST 插件参数（v2）**
     kind: u8 = 0,
+    /// `kind == 2` 专用：VST3 参数 ID（`ParamID`）
+    param_id: u32 = 0,
     /// **基线值**（叠加起点）：音量类 0，声像类 0.5
     base: f32 = 0.0,
     n: u32 = 0,
@@ -309,6 +324,57 @@ pub const LaneSet = struct {
         return .{ .before = before, .after = after };
     }
 
+    /// **VST 参数 lane 的段推进**（v2）：对乐器 `inst_idx` 的每条 `kind == 2` lane 求
+    /// **段首/段末**两个值（含逐绑定极点 + 基准 + 深度/极性/反向，结果已 clamp 0..1），
+    /// 写入 `out`，返回条数（≤ out.len）。
+    ///
+    /// - **每条 lane 每段只能调一次**（它会推进 `state`）；
+    /// - `state`/`keys` 与 `contributionSmooth` 共用同一对数组（都按**槽位**索引，
+    ///   一个槽位只属于一条绑定，不会互相干扰）；
+    /// - 值 = `clamp(base + 贡献, 0, 1)`——就是插件参数的归一化值。
+    pub const VstParamStep = struct { param_id: u32, v0: f32, v1: f32 };
+
+    pub fn collectVstParams(
+        self: *const LaneSet,
+        inst_idx: usize,
+        st0: f32,
+        st1: f32,
+        dt_s: f32,
+        state: []f32,
+        keys: []u32,
+        out: []VstParamStep,
+    ) usize {
+        var n_out: usize = 0;
+        var i: usize = 0;
+        while (i < self.n and i < self.lanes.len) : (i += 1) {
+            const l = &self.lanes[i];
+            if (!l.active or l.n == 0 or l.kind != 2 or !l.inst or l.ch != inst_idx) continue;
+            const v1 = l.evalAt(st1);
+            if (v1 < 0) continue; // 无曲线
+            const v0 = l.evalAt(st0);
+            if (i >= state.len or i >= keys.len) continue;
+            // 槽位换了绑定（或首次使用）→ 用段首值播种（不从 0 爬升）
+            if (keys[i] != l.key or std.math.isNan(state[i])) {
+                keys[i] = l.key;
+                state[i] = if (v0 < 0) v1 else v0;
+            }
+            const prev = state[i];
+            const next = poleStep(prev, v1, l.smooth_ms, dt_s);
+            state[i] = next;
+            const sign: f32 = if (l.invert) -1.0 else 1.0;
+            const c0 = (if (l.bipolar) (prev - 0.5) * 2.0 else prev) * l.depth * sign;
+            const c1 = (if (l.bipolar) (next - 0.5) * 2.0 else next) * l.depth * sign;
+            if (n_out >= out.len) break;
+            out[n_out] = .{
+                .param_id = l.param_id,
+                .v0 = std.math.clamp(l.base + c0, 0.0, 1.0),
+                .v1 = std.math.clamp(l.base + c1, 0.0, 1.0),
+            };
+            n_out += 1;
+        }
+        return n_out;
+    }
+
     /// 该座位该分组的**基线值**（有绑定 → 曲线自己定值；无 → null = 用静态推子/旋钮）
     pub fn baseOf(self: *const LaneSet, ch: usize, pan: bool, inst: bool) ?f32 {
         var i: usize = 0;
@@ -409,6 +475,11 @@ pub const Params = struct {
     start_step: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
     /// 音频线程回传：**当前播放步位置**（积分器；BPM 自动化下 UI 读它画游标）
     play_step: std.atomic.Value(f32) = std.atomic.Value(f32).init(0),
+    /// **UI 游标步位置**（UI 每帧写）：**停止态**下音频侧用它作为自动化/渲染的步参考——
+    /// 否则 `ref_step` 会随“块数”自行滑走 → 拖着播放头试听时听到的是另一个位置的自动化值。
+    /// `ui_cursor_valid` = 是否已写过（测试/无 UI 场景不写 → 音频侧保持旧行为）。
+    ui_cursor_step: std.atomic.Value(f32) = std.atomic.Value(f32).init(0),
+    ui_cursor_valid: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// 调度 generation（reset 时递增；音频线程丢弃旧事件）
     sched_gen: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
     /// **软切换**（保位模式切换）：下一次 `sched_gen` 变化时**不释放声部**
@@ -444,6 +515,9 @@ pub const Params = struct {
     fx_ptrs: [][]std.atomic.Value(?*FxBox) = &.{},
     /// 每乐器路由到的调音台通道（0..channels_cap-1；UI 每帧同步）
     instrument_channel: []std.atomic.Value(u32) = &.{},
+    /// **每乐器的 MIDI 通道（0-15；-1 = 无）**：VSTi 事件转发时写入事件（多音色/多通道插件的关键）。
+    /// 以前恒写 channel 0 → 多通道 VSTi 只能收到 1 号通道（实测反馈“支持差”之一）。
+    instrument_midi_channel: []std.atomic.Value(i32) = &.{},
     /// 每乐器的 VST3 插件实例（kind == 2/VSTi；null = 未加载）——UI 侧惰性加载/发布
     instrument_plugin: []std.atomic.Value(?*vst_host.Plugin) = &.{},
 
@@ -572,6 +646,7 @@ pub const Params = struct {
         self.instrument_pan = try allocAtomicArr(f32, a, ic, 0.5);
         self.instrument_panic = try allocAtomicArr(bool, a, ic, false);
         self.instrument_channel = try allocAtomicArr(u32, a, ic, 0);
+        self.instrument_midi_channel = try allocAtomicArr(i32, a, ic, -1);
         self.instrument_plugin = try allocAtomicArr(?*vst_host.Plugin, a, ic, null);
         self.instrument_kind = try allocAtomicArr(u32, a, ic, 0);
         self.kit_layer_count = try allocAtomicArr(u32, a, ic, 0);
@@ -615,6 +690,7 @@ pub const Params = struct {
         freeAtomicArr(f32, a, &self.instrument_pan);
         freeAtomicArr(bool, a, &self.instrument_panic);
         freeAtomicArr(u32, a, &self.instrument_channel);
+        freeAtomicArr(i32, a, &self.instrument_midi_channel);
         freeAtomicArr(?*vst_host.Plugin, a, &self.instrument_plugin);
         freeAtomicArr(u32, a, &self.instrument_kind);
         freeAtomicArr(u32, a, &self.kit_layer_count);
@@ -659,6 +735,7 @@ pub const Params = struct {
             try growAtomicArr(f32, a, &self.instrument_pan, ic, 0.5);
             try growAtomicArr(bool, a, &self.instrument_panic, ic, false);
             try growAtomicArr(u32, a, &self.instrument_channel, ic, 0);
+            try growAtomicArr(i32, a, &self.instrument_midi_channel, ic, -1);
             try growAtomicArr(?*vst_host.Plugin, a, &self.instrument_plugin, ic, null);
             try growAtomicArr(u32, a, &self.instrument_kind, ic, 0);
             try growAtomicArr(u32, a, &self.kit_layer_count, ic, 0);
@@ -840,6 +917,14 @@ pub const Engine = struct {
     /// `bind_sm_key` = 该槽位当前绑定的指纹；不一致 → 重新播种（NaN = 未使用）。
     bind_sm_val: [LaneSet.max_lanes]f32 = @splat(std.math.nan(f32)),
     bind_sm_key: [LaneSet.max_lanes]u32 = @splat(0),
+    /// 不变量自检的节拍（每 8 块跑一次）
+    overrun_tick: u32 = 0,
+    /// 长音记录用：上一块的发声位图（“空闲块整段跳过 128 循环”用）
+    long_prev_lo: [32]u64 = @splat(0),
+    long_prev_hi: [32]u64 = @splat(0),
+    /// **每个 VSTi 乐器当前正在用的 MIDI 通道**（= 发 note-on 时的通道）。
+    /// 通道改了要拿**旧通道**补 off，否则旧音挂住不释音（实测：改通道/暂停后挂音）。
+    vsti_chan: [32]u8 = @splat(0),
     /// 鼓组层声部池（**惰性**：每乐器的 16 层池按需分配，见 `App.ensureKitPool`——
     /// 指针数组按容量维护；普通（非鼓组）乐器零开销，扩容拷贝量不再含声部状态）。
     kit_chunks: []std.atomic.Value(?*KitPool) = &.{},
@@ -1795,7 +1880,7 @@ fn reconcileVoices(engine: *Engine, params: *Params, cur_step: i32, insts: []con
                     }
                 }
                 if (!has and params.kit_layer_plugin[i][l].load(.acquire) != null) {
-                    kitLayerVstiNoteOff(engine, i, l, pad_pitch);
+                    kitLayerVstiNoteOff(engine, i, l, pad_pitch, 0, 0);
                 }
             } else {
                 // 合成器层：与普通乐器同样的**精确**释放（按 (pad, start_step)）
@@ -1836,7 +1921,7 @@ fn reconcileVoices(engine: *Engine, params: *Params, cur_step: i32, insts: []con
                     break;
                 }
             }
-            if (!keep) vstiNoteOff(engine, k, p);
+            if (!keep) vstiNoteOff(engine, k, p, 0, engine.vsti_chan[k]);
         }
     }
 
@@ -1973,13 +2058,15 @@ test "audio: A3b 鼓组对账——同 pad 两个实例只停被删的那个" {
         try std.testing.expectEqual(@as(i32, 0), v.start_step); // 幸存者必须是 start=0
     }
 }
-fn vstiNoteOn(engine: *Engine, i: usize, pitch: u8, velocity: u8) void {
+/// VSTi：note-on（`offset` = 块内采样偏移——v2 性能：纯 VSTi 工程整块只 `process` 一次；
+/// `channel` = 乐器自己的 MIDI 通道（0..15；多通道插件的关键——以前恒为 0））
+fn vstiNoteOn(engine: *Engine, i: usize, pitch: u8, velocity: u8, offset: i32, channel: u8) void {
     vstiActiveSet(engine, i, pitch, true);
     vstiPush(engine, i, .{
-        .sampleOffset = 0,
+        .sampleOffset = offset,
         .type = @backingInt(ivstevents.Event.EventTypes.kNoteOnEvent),
         .data = .{ .noteOn = .{
-            .channel = 0,
+            .channel = channel,
             .pitch = @intCast(pitch),
             .velocity = @as(f32, @floatFromInt(@max(1, velocity))) / 127.0,
             .length = 0,
@@ -1989,12 +2076,12 @@ fn vstiNoteOn(engine: *Engine, i: usize, pitch: u8, velocity: u8) void {
 }
 
 /// VST3 事件：构造一条 note-off（panic 与普通 off 共用）
-fn noteOffEvent(pitch: u8) ivstevents.Event {
+fn noteOffEvent(pitch: u8, channel: u8) ivstevents.Event {
     return .{
         .sampleOffset = 0,
         .type = @backingInt(ivstevents.Event.EventTypes.kNoteOffEvent),
         .data = .{ .noteOff = .{
-            .channel = 0,
+            .channel = channel,
             .pitch = @intCast(pitch),
             .velocity = 0,
             .noteId = -1,
@@ -2002,9 +2089,27 @@ fn noteOffEvent(pitch: u8) ivstevents.Event {
     };
 }
 
-fn vstiNoteOff(engine: *Engine, i: usize, pitch: u8) void {
+/// panic 用：全 128 音的 note-off（**通道必须与 note-on 一致**——发错通道 = 插件匹配不上
+/// → 暂停/停止后挂音，实测回归）。调用方负责清位图。
+fn panicNoteOffs(channel: u8) [128]ivstevents.Event {
+    var offs: [128]ivstevents.Event = undefined;
+    for (&offs, 0..) |*e, p| e.* = noteOffEvent(@intCast(p), channel);
+    return offs;
+}
+
+fn vstiNoteOff(engine: *Engine, i: usize, pitch: u8, offset: i32, channel: u8) void {
     vstiActiveSet(engine, i, pitch, false);
-    vstiPush(engine, i, noteOffEvent(pitch));
+    var ev = noteOffEvent(pitch, channel);
+    ev.sampleOffset = offset;
+    vstiPush(engine, i, ev);
+}
+
+/// 该乐器的 MIDI 通道（0..15；未设 = -1 → 0）
+fn midiChan(params: *const Params, i: usize) u8 {
+    if (i >= params.instrument_midi_channel.len) return 0;
+    const c = params.instrument_midi_channel[i].load(.monotonic);
+    if (c < 0) return 0;
+    return @intCast(@min(c, 15));
 }
 
 // ── 鼓组 VST3 层（每层一份事件批 + 位图；同乐器级 VSTi 惯例）──
@@ -2030,13 +2135,13 @@ fn kitLayerVstiPush(engine: *Engine, i: usize, l: usize, ev: ivstevents.Event) v
     b.n += 1;
 }
 
-fn kitLayerVstiNoteOn(engine: *Engine, i: usize, l: usize, pitch: u8, velocity: u8) void {
+fn kitLayerVstiNoteOn(engine: *Engine, i: usize, l: usize, pitch: u8, velocity: u8, offset: i32, channel: u8) void {
     kitLayerVstiActiveSet(engine, i, l, pitch, true);
     kitLayerVstiPush(engine, i, l, .{
-        .sampleOffset = 0,
+        .sampleOffset = offset,
         .type = @backingInt(ivstevents.Event.EventTypes.kNoteOnEvent),
         .data = .{ .noteOn = .{
-            .channel = 0,
+            .channel = channel,
             .pitch = @intCast(pitch),
             .velocity = @as(f32, @floatFromInt(@max(1, velocity))) / 127.0,
             .length = 0,
@@ -2045,13 +2150,13 @@ fn kitLayerVstiNoteOn(engine: *Engine, i: usize, l: usize, pitch: u8, velocity: 
     });
 }
 
-fn kitLayerVstiNoteOff(engine: *Engine, i: usize, l: usize, pitch: u8) void {
+fn kitLayerVstiNoteOff(engine: *Engine, i: usize, l: usize, pitch: u8, offset: i32, channel: u8) void {
     kitLayerVstiActiveSet(engine, i, l, pitch, false);
     kitLayerVstiPush(engine, i, l, .{
-        .sampleOffset = 0,
+        .sampleOffset = offset,
         .type = @backingInt(ivstevents.Event.EventTypes.kNoteOffEvent),
         .data = .{ .noteOff = .{
-            .channel = 0,
+            .channel = channel,
             .pitch = @intCast(pitch),
             .velocity = 0,
             .noteId = -1,
@@ -2065,13 +2170,13 @@ fn vstiAllOff(engine: *Engine, i: usize) void {
     while (lo != 0) {
         const p: u8 = @intCast(@ctz(lo));
         lo &= lo - 1;
-        vstiNoteOff(engine, i, p);
+        vstiNoteOff(engine, i, p, 0, engine.vsti_chan[i]);
     }
     var hi = engine.vsti_active_hi[i];
     while (hi != 0) {
         const p: u8 = @intCast(@ctz(hi));
         hi &= hi - 1;
-        vstiNoteOff(engine, i, p + 64);
+        vstiNoteOff(engine, i, p + 64, 0, engine.vsti_chan[i]);
     }
 }
 
@@ -2337,8 +2442,8 @@ fn publishSounding(engine: *Engine, params: *Params) void {
         }
         var lo: u64 = 0;
         var hi: u64 = 0;
-        for (engine.synths[i].voices) |v| {
-            if (!synth.isSounding(&v)) continue;
+        for (&engine.synths[i].voices) |*v| {
+            if (!synth.isSounding(v)) continue;
             const p = v.pitch;
             if (p < 0 or p > 127) continue;
             if (p < 64) {
@@ -2442,7 +2547,10 @@ fn currentHostTime(engine: *Engine, params: *Params) vst_host.HostTime {
 /// 触发一个音符事件（音频线程；`SchedEvent` / `NoteEvent` 均可——字段兼容）。
 /// **鼓组分支**：on 按音高分发到匹配层；off **不查映射**直接对所有层——
 /// 防“响着时改映射”漏 off → 悬挂（与调音台教训一致）。
-fn dispatchNote(engine: *Engine, ev: anytype) void {
+///
+/// `offset` = 块内采样偏移：纯 VSTi 工程整块只渲染一段，事件带真偏移交给插件；
+/// 内部合成器不关心（它在段边界触发，offset 恒 0）。
+fn dispatchNoteAt(engine: *Engine, ev: anytype, offset: i32) void {
     if (ev.instrument >= engine.synths.len) return;
     // VSTi：记下“该音高应该在哪一步结束”（诊断/自检用；不影响发声）
     const p_ = engine.params;
@@ -2461,15 +2569,18 @@ fn dispatchNote(engine: *Engine, ev: anytype) void {
         engine.trace_n +%= 1;
     }
     const params = engine.params;
+    // **批满防护**：块尾清批（下面 renderSegment 也会清），这里只保证不累积
     const kind = params.instrument_kind[ev.instrument].load(.monotonic);
     const is_kit = kind == 1;
     const is_vsti = kind == 2;
+    // MIDI 通道：跟着乐器走（多音色插件靠它分声部）
+    const chan: u8 = midiChan(params, ev.instrument);
     switch (ev.kind) {
         .on => {
             // **有效声像** = 乐器声像（基准）+ 音符级偏移（Sawdust 特色）
             const pan = effectivePan(params.instrument_pan[ev.instrument].load(.monotonic), ev.pan);
             if (is_vsti) {
-                vstiNoteOn(engine, ev.instrument, ev.pitch, ev.velocity);
+                vstiNoteOn(engine, ev.instrument, ev.pitch, ev.velocity, offset, chan);
             } else if (is_kit) {
                 const n_layers = @min(params.kit_layer_count[ev.instrument].load(.monotonic), kit_max_layers);
                 for (0..n_layers) |l| {
@@ -2478,7 +2589,7 @@ fn dispatchNote(engine: *Engine, ev: anytype) void {
                     // VST3 层：事件转发到该层插件（实例未就绪 → 跳过）
                     if (lkind == 2) {
                         if (params.kit_layer_plugin[ev.instrument][l].load(.acquire) != null) {
-                            kitLayerVstiNoteOn(engine, ev.instrument, l, ev.pitch, ev.velocity);
+                            kitLayerVstiNoteOn(engine, ev.instrument, l, ev.pitch, ev.velocity, offset, 0);
                         }
                         continue;
                     }
@@ -2496,7 +2607,7 @@ fn dispatchNote(engine: *Engine, ev: anytype) void {
         },
         .off => {
             if (is_vsti) {
-                vstiNoteOff(engine, ev.instrument, ev.pitch);
+                vstiNoteOff(engine, ev.instrument, ev.pitch, offset, chan);
             } else if (is_kit) {
                 // 全部层都收 off（无关层空转——防漏 off；采样器为一次性，off 自然无效）
                 const n_layers = @min(params.kit_layer_count[ev.instrument].load(.monotonic), kit_max_layers);
@@ -2504,7 +2615,7 @@ fn dispatchNote(engine: *Engine, ev: anytype) void {
                     const lkind = params.kit_layer_kind[ev.instrument][l].load(.monotonic);
                     if (lkind == 2) {
                         if (params.kit_layer_plugin[ev.instrument][l].load(.acquire) != null) {
-                            kitLayerVstiNoteOff(engine, ev.instrument, l, ev.pitch);
+                            kitLayerVstiNoteOff(engine, ev.instrument, l, ev.pitch, offset, 0);
                         }
                         continue;
                     }
@@ -2526,6 +2637,11 @@ fn dispatchNote(engine: *Engine, ev: anytype) void {
             releaseAllVoices(engine);
         },
     }
+}
+
+/// 兼容入口：offset 0（测试/即时事件用）
+fn dispatchNote(engine: *Engine, ev: anytype) void {
+    dispatchNoteAt(engine, ev, 0);
 }
 
 /// 展平索引取 EQ Biquad（`engine.slot_eq` 的布局：`[ch][slot][band][2]`）
@@ -2626,22 +2742,51 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
             // VST3 乐器（VSTi）：渲染到中转缓冲 → 增益 × 等功率立体声平衡 → 叠加进通道缓冲
             // （插件是原位写出，不能直接覆盖通道缓冲：同通道其他乐器/乐器的已渲染内容。
             //  声像 = 标准立体声平衡：输出当立体声总线，按旋钮位置对两侧做等功率增益）
-            const pl = params.instrument_plugin[i].load(.monotonic) orelse continue;
+            const pl = params.instrument_plugin[i].load(.monotonic) orelse {
+                // **插件没就绪也要清批**：否则事件累积到 256 后一直丢（并留下陈旧事件），
+                // 插件晚一点加载时会收到一批过期音符。同理 `vsti_end` 不再有意义。
+                engine.vsti_event_n[i] = 0;
+                continue;
+            };
             if (engine.vsti_scratch.len < n) continue; // 中转缓冲未初始化（测试环境）：未加载即跳过
+            // **乐器 MIDI 通道**（与 note-on/off 完全同一个值）：
+            // 通道改了而旧通道上还有音 → 先在**旧通道**上全 128 补 off，否则会挂音。
+            const chan_now: u8 = midiChan(params, i);
+            if (chan_now != engine.vsti_chan[i]) {
+                if (engine.vsti_active_lo[i] != 0 or engine.vsti_active_hi[i] != 0) {
+                    var offs_ch: [128]ivstevents.Event = undefined;
+                    for (&offs_ch, 0..) |*e, p| e.* = noteOffEvent(@intCast(p), engine.vsti_chan[i]);
+                    var tiny_ch: [2]f32 = .{ 0, 0 };
+                    pl.processInstrument(&tiny_ch, 1, &offs_ch, host_time);
+                    engine.vsti_active_lo[i] = 0;
+                    engine.vsti_active_hi[i] = 0;
+                }
+                engine.vsti_chan[i] = chan_now;
+            }
             // state 恢复防挂音（UI 置旗标）：本段先对全 128 音高补 off——
             // 恢复可能唤醒“快照里仍在发声”的幽灵声部（不在活跃位图）
             if (params.instrument_panic[i].swap(false, .acq_rel)) {
                 // panic **不碰本段事件批**：本地造 128 条 off 单独送插件。
                 // 为什么不能塞进批：跳转时批里已经有本段的真实事件（如回跳点的 note-on），
                 // 同批的 off 会把它们立刻关掉 → 实测「小节头/游标处第一个音不响」。
-                var offs: [128]ivstevents.Event = undefined;
-                for (&offs, 0..) |*e, p| e.* = noteOffEvent(@intCast(p));
+                // ⚠ **通道必须与 note-on 一致**（`engine.vsti_chan`）：插件按 (channel, pitch)
+                // 匹配 off，发错通道 = 挂在服务器上不释音（实测：暂停/停止后挂音）。
+                var offs = panicNoteOffs(engine.vsti_chan[i]);
                 for (0..128) |p| vstiActiveSet(engine, i, @intCast(p), false); // 位图清零（panic 语义）
                 var tiny: [2]f32 = .{ 0, 0 };
                 pl.processInstrument(&tiny, 1, &offs, host_time);
             }
             const sc = engine.vsti_scratch[0..n];
             @memset(sc, 0);
+            // **VST 参数自动化（v2）**：本段两点（offset 0 / frames−1）直接排给插件。
+            // 位置在 panic 块之后、主 process 之前——panic 的 1 帧小调用不应该消费它。
+            pl.clearAuto();
+            if (lane_on) {
+                var vps: [LaneSet.max_lanes]LaneSet.VstParamStep = undefined;
+                const nvps = lane_set.collectVstParams(i, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key, &vps);
+                var vi: usize = 0;
+                while (vi < nvps) : (vi += 1) pl.queueAuto(vps[vi].param_id, vps[vi].v0, vps[vi].v1);
+            }
             // 本段事件（段边界 = 事件时刻 → offset 全 0）；消费后清零
             pl.processInstrument(sc, frames, engine.vsti_events[i][0..engine.vsti_event_n[i]], host_time);
             engine.vsti_event_n[i] = 0;
@@ -2688,8 +2833,9 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
                     // **不塞进本层事件批**：同批的 off 会把跳转点的 note-on 立刻关掉
                     // （实测：鼓组 VST3 层同乐器级 VSTi 一样会“小节头/游标处第一个音不响”）。
                     if (params.kit_layer_panic[i][l].swap(false, .acq_rel)) {
-                        var offs: [128]ivstevents.Event = undefined;
-                        for (&offs, 0..) |*e, p| e.* = noteOffEvent(@intCast(p));
+                        // **鼓组层固定用通道 0**：层是“每个鼓垫一个插件”，通道语义不灰；
+                        // on/off/panic 三者一致才不会挂音（乐器级才跟 `midi_channel`）。
+                        var offs = panicNoteOffs(0);
                         st.active_lo[l] = 0;
                         st.active_hi[l] = 0; // 位图清零（与乐器级 panic 同语义）
                         var tiny: [2]f32 = .{ 0, 0 };
@@ -3144,7 +3290,16 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
 
     // 3) 非播放：只渲染（试听/释音尾），调度事件不触发
     if (!playing) {
-        engine.seg_abs0 = params.frames_played.load(.monotonic);
+        const abs_now = params.frames_played.load(.monotonic);
+        // **块参考系也要设**（否则 `renderSegment` 里的 `seg_abs0 - blk_abs0` 拿到陈旧值 →
+        // 自动化/音频片段的步位置偏移量）
+        engine.blk_abs0 = abs_now;
+        engine.seg_abs0 = abs_now;
+        // **停止态：步参考 = UI 游标**（“拖播放头试听”听到的是游标处该有的自动化值；
+        // 否则 `ref_step` 会停在停止那一刻 → 听到的总是那个旧位置的值）
+        if (params.ui_cursor_valid.load(.monotonic)) {
+            engine.ref_step = params.ui_cursor_step.load(.monotonic);
+        }
         renderSegment(engine, params, out, frames, sr, master);
         publishSounding(engine, params);
         _ = params.frames_played.fetchAdd(frames, .monotonic);
@@ -3154,16 +3309,6 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
 
     // 4) 播放：stash 管理 + 样本级事件触发
     if (gen != engine.stash_gen) handleGenChange(engine, params, gen, was_playing);
-    // 编辑代（重扫）：**不**清空 stash（有 drain 竞态会丢新事件），
-    // 注：读顺序为“代后界”（界先于代发布，读到新代时界必已就位）
-    const edit_gen = params.snap_gen.load(.monotonic);
-    const rescan_from = 0;
-    // 尽量多取新事件（stash 有空位时）。**按步序插入**（不是追加）：
-    // 播放中重扫补发的事件可能落在已 stash 的事件之前
-    // （见 `sequencer.rescanForEdit`）——追加的话它们会被前面的事件挡着，
-    // 拖到很晚才触发（表现：新增音符的 on 迟到/整段不响）。
-    // 作废事件（旧 gen / 旧编辑代）**不在此处过滤**——存进 stash 由触发
-    // 循环统一丢（避免过滤后 `got == 0` 提前退出而漏取后续有效事件）。
     // **A4**：事件唯一来源是快照（见 §11.8）——调度队列已无生产者，兜底路径删除。
 
     // 把音频线程的丢弃计数回传给 UI（每秒汇总打印用；每块一次 store，代价可忽略）
@@ -3185,6 +3330,7 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
             (@as(f64, @floatFromInt(abs0)) - @as(f64, @floatFromInt(start_frame))) / step_frames;
         engine.ref_gen = gen;
     }
+    // **停止态：步位置跟 UI 游标**已经在上面 `!playing` 分支处理了（不会走到这里）。
     engine.blk_abs0 = abs0;
     // 本块的“步 ↔ 帧”参考系（事件触发 / 音频片段 / 自动化求值共用）
     const ref_step_i: i32 = @intFromFloat(@floor(engine.ref_step));
@@ -3197,8 +3343,8 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
         var max_age: i32 = -1;
         var age_p: u32 = 0;
         var age_i: u32 = 0;
-        for (engine.synths, 0..) |sy, ii| {
-            for (sy.voices) |v| {
+        for (engine.synths, 0..) |*sy, ii| {
+            for (&sy.voices) |*v| {
                 if (v.env_stage == .idle) continue;
                 vcnt += 1;
                 if (v.env_stage == .release) continue; // 释音尾不算“挂音”
@@ -3271,28 +3417,43 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
             const lo = params.sounding_lo[i].load(.monotonic);
             const hi = params.sounding_hi[i].load(.monotonic);
             if (lo == 0 and hi == 0) continue;
-            var p: u8 = 0;
-            while (p < 128) : (p += 1) {
-                const on = if (p < 64)
-                    (lo >> @intCast(p)) & 1 != 0
-                else
-                    (hi >> @intCast(p - 64)) & 1 != 0;
-                if (!on) continue;
+            // **只遍历“在响”的位**（v2 性能）：以前逐 128 音高 × 每乐器 × 每块，
+            // 64 轨 × 16 VSTi 实测吃掉 ~84µs/块（Debug）。
+            var m = lo;
+            while (m != 0) {
+                const p: u8 = @intCast(@ctz(m));
+                m &= m - 1;
                 const e = engine.vsti_end[i][p];
                 if (e < 0 or cur_step < e) continue;
-                vstiNoteOff(engine, i, p);
+                vstiNoteOff(engine, i, p, 0, engine.vsti_chan[i]);
+                engine.vsti_end[i][p] = -1;
+                _ = params.dbg_local_off.fetchAdd(1, .monotonic);
+            }
+            var m2 = hi;
+            while (m2 != 0) {
+                const p: u8 = @intCast(@ctz(m2) + 64);
+                m2 &= m2 - 1;
+                const e = engine.vsti_end[i][p];
+                if (e < 0 or cur_step < e) continue;
+                vstiNoteOff(engine, i, p, 0, engine.vsti_chan[i]);
                 engine.vsti_end[i][p] = -1;
                 _ = params.dbg_local_off.fetchAdd(1, .monotonic);
             }
         }
         // 内置合成器（含鼓组的 synth 层池）
         for (engine.synths, 0..) |*sy, ii| {
-            for (sy.voices) |v| {
+            // **快速跳过**：非 VSTi 的空声部池不必逐声部扫（32 乐器 × 32 声部 × 每块）。
+            // 鼓组层池更贵（24 层 × 32 声部）：**只在真是鼓组乐器时**才扫。
+            const kind_ii = params.instrument_kind[ii].load(.monotonic);
+            // ⚠ **按引用遍历**：`Voice` 是几百字节的结构，`for (sy.voices) |v|` 会**逐个拷贝**
+            // （64 轨 × 16 乐器实测吃掉 ~80µs/块，Debug）。
+            for (&sy.voices) |*v| {
                 if (v.env_stage == .idle or v.env_stage == .release) continue;
                 if (v.end_step < 0 or cur_step < v.end_step) continue;
                 _ = synth.noteOff(sy, @intCast(@max(0, v.pitch)), v.start_step);
                 _ = params.dbg_local_off.fetchAdd(1, .monotonic);
             }
+            if (kind_ii != 1) continue; // 只有鼓组乐器才有层池
             if (kitPool(engine, ii)) |kp| {
                 for (&kp.*) |*s| {
                     for (s.voices) |v| {
@@ -3308,7 +3469,10 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
 
     // ── 不变量自检（常开，只计数不改行为）──
     // “每个音符都必须在自己的 end_step 附近结束”：超过 1 小节还在 attack/decay/sustain = 有 off 丢了。
-    {
+    // **看门狗：每 8 块跑一次**（它扫全部声部；每秒 375 块 → 47 次/秒已足够早发现，
+    // 而每块扫一次实测要 ~60µs（Debug）——纯监控不该占这个预算）。
+    engine.overrun_tick +%= 1;
+    if (engine.overrun_tick % 8 == 0) {
         const cur_step = params.last_step.load(.monotonic);
         const spb: i32 = @intCast(@max(1, params.steps_per_beat.load(.monotonic)));
         const sig: i32 = @intCast(@max(1, params.time_num.load(.monotonic)));
@@ -3316,7 +3480,7 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
         var now: u32 = 0;
         var late_max: i32 = 0;
         for (engine.synths) |sy| {
-            for (sy.voices) |v| {
+            for (&sy.voices) |*v| {
                 if (v.env_stage == .idle or v.env_stage == .release) continue;
                 if (v.end_step < 0) continue;
                 const late = cur_step - v.end_step;
@@ -3331,13 +3495,22 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
             const lo = params.sounding_lo[i].load(.monotonic);
             const hi = params.sounding_hi[i].load(.monotonic);
             if (lo == 0 and hi == 0) continue;
-            var p: u8 = 0;
-            while (p < 128) : (p += 1) {
-                const on = if (p < 64)
-                    (lo >> @intCast(p)) & 1 != 0
-                else
-                    (hi >> @intCast(p - 64)) & 1 != 0;
-                if (!on) continue;
+            // 只走**在响的位**（同本地到点释音：逐 128 音高是每块固定开销的大头）
+            var m = lo;
+            while (m != 0) {
+                const p: u8 = @intCast(@ctz(m));
+                m &= m - 1;
+                const e = engine.vsti_end[i][p];
+                if (e < 0) continue;
+                const late = cur_step - e;
+                if (late <= grace) continue;
+                now += 1;
+                if (late > late_max) late_max = late;
+            }
+            var m2 = hi;
+            while (m2 != 0) {
+                const p: u8 = @intCast(@ctz(m2) + 64);
+                m2 &= m2 - 1;
                 const e = engine.vsti_end[i][p];
                 if (e < 0) continue;
                 const late = cur_step - e;
@@ -3355,67 +3528,43 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
 
     params.dbg_stash_n.store(@intCast(engine.stash_n), .monotonic);
 
-    // ── **A2 影子对拍**：从快照按 block 求值，与队列侧“本块应触发的事件数”对比 ──
-    // **只统计，绝不参与发声**。用途：切主路（A3）前的等价性证明。
-    const sp_raw = params.snapshot_ptr.load(.acquire);
-    if (sp_raw != 0) {
-        const snap: *const snapshot.Snapshot = @ptrFromInt(sp_raw);
-        // 事件在块内触发的判据是 `ev_frame < abs0 + frames`（见下方触发循环），
-        // 即 `k*step_frames < D` ⟺ `k < ceil(D/step_frames)` —— 所以区间上界要用 **ceil**，
-        // 用 floor 会让“步边界没正好落在块末尾”的块**每块错一位**（实测每秒 3–6 次假不一致）。
-        const s0: i32 = @intFromFloat(@floor(engine.ref_step));
-        const s1: i32 = s0 + @as(i32, @intFromFloat(@ceil(@as(f64, @floatFromInt(frames)) / step_frames)));
-        const upto = params.sched_upto.load(.acquire);
-        // 传送/编辑代刚变 → 进入稳定期（见 `shadow_settle` 注释）
-        if (gen != engine.shadow_last_gen or edit_gen != engine.shadow_last_snap_gen) {
-            engine.shadow_last_gen = gen;
-            engine.shadow_last_snap_gen = edit_gen;
-            engine.shadow_settle = 64;
-        }
-        // 本块落在“重扫安全界之前”= 旧事件仍在触发、新数据尚未覆盖的过渡区 → 跳过
-        // A3a 之后 `rescan_from` / `sched_upto` 只在“队列路径”下有意义；快照路径下不适用
-        const in_rescan_gap = sp_raw == 0 and s0 <= rescan_from + 1;
-        // 队列还没覆盖到本块末尾（重扫后水位线回退/UI 落后）→ 比对无意义，跳过
-        if ((sp_raw == 0 and s1 > upto -| 8) or engine.shadow_settle > 0 or in_rescan_gap) {
-            if (engine.shadow_settle > 0) engine.shadow_settle -= 1;
-            _ = params.dbg_shadow_skipped.fetchAdd(1, .monotonic);
-        } else {
-            var q_on: u32 = 0;
-            var q_off: u32 = 0;
-            for (engine.stash[0..engine.stash_n]) |se| {
-                if (se.step < s0 or se.step >= s1) continue;
-                if (se.kind == .off) q_off += 1 else q_on += 1;
-            }
-            var shadow_evs: [256]synth.SchedEvent = undefined;
-            if (s1 > s0) {
-                if (snap.gatherRaw(&shadow_evs, s0, s1, gen)) |n| {
-                    var k_on: u32 = 0;
-                    var k_off: u32 = 0;
-                    for (shadow_evs[0..n]) |sev| {
-                        if (sev.kind == .off) k_off += 1 else k_on += 1;
-                    }
-                    _ = params.dbg_shadow_blocks.fetchAdd(1, .monotonic);
-                    if (q_on != k_on) _ = params.dbg_shadow_mismatch_on.fetchAdd(1, .monotonic);
-                    if (q_off != k_off) _ = params.dbg_shadow_mismatch_off.fetchAdd(1, .monotonic);
-                    if (q_on != k_on or q_off != k_off) {
-                        // 明细回传给 UI（音频线程不能分配/打印）——每秒汇总时写进日志
-                        params.shadow_det_s0.store(s0, .monotonic);
-                        params.shadow_det_s1.store(s1, .monotonic);
-                        params.shadow_det_qon.store(q_on, .monotonic);
-                        params.shadow_det_qoff.store(q_off, .monotonic);
-                        params.shadow_det_kon.store(k_on, .monotonic);
-                        params.shadow_det_koff.store(k_off, .monotonic);
-                        _ = params.shadow_det_n.fetchAdd(1, .monotonic);
-                    }
-                } else {
-                    _ = params.dbg_shadow_overflow.fetchAdd(1, .monotonic);
-                }
-            }
-        }
-    }
+    // ── **A2 影子对拍已退役**（v2 性能优化）：它每块都跑一次 gatherRaw（O(窗口步数)）+
+    // stash 全扫 + 4 个原子量，**纯诊断、不参与发声**。A3（快照成为唯一事件源）之后它只剩
+    // 开销：64 轨工程实测吃掉每块 ~180µs（Debug）。正确性交给 sched_stress 的不变量断言。
+    // （字段 dbg_shadow_* 保留，UI 也会读——恒 0/不增长即可。）
+
     var done: u32 = 0;
     var si: usize = 0;
-    while (done < frames and si < engine.stash_n) {
+    // ── **纯 VSTi 工程：整块一段**（v2 性能）──
+    // 以前每个事件都要切一段 → 重插件（Vital/Serum）每块要 `process()` 十几次，
+    // 小块调用固定开销极大（实测就是“VST 支持性能差”的主因）。
+    // VST3 事件自带 `sampleOffset`，所以不需要切段：事件带真偏移一次交给插件。
+    // 只有存在**内部合成器/鼓组**时才需要切段（它们在段边界触发）。
+    const split_needed = blk: {
+        const cap = @min(@as(usize, 32), params.instruments_cap);
+        for (0..cap) |k| {
+            if (params.instrument_kind[k].load(.monotonic) != 2) break :blk true;
+        }
+        // 远程事件（试听等）也走内部合成器 → 保守起见有排队就切
+        break :blk false;
+    };
+    if (!split_needed) {
+        const blk_end: i64 = @as(i64, @intCast(abs0)) + @as(i64, @intCast(frames));
+        while (si < engine.stash_n) {
+            const ev = engine.stash[si];
+            const ev_frame: i64 = ref_frame +
+                @as(i64, @intFromFloat(@round(@as(f64, @floatFromInt(ev.step - ref_step_i)) * step_frames)));
+            if (ev_frame >= blk_end) break; // 还没到（留给下一块）
+            const off: i32 = @intCast(std.math.clamp(ev_frame - @as(i64, @intCast(abs0)), 0, @as(i64, @intCast(frames -| 1))));
+            dispatchNoteAt(engine, ev, off);
+            engine.dbg_dispatched += 1;
+            si += 1;
+        }
+        engine.seg_abs0 = abs0;
+        renderSegment(engine, params, out, frames, sr, master);
+        done = frames;
+    }
+    while (split_needed and done < frames and si < engine.stash_n) {
         const ev = engine.stash[si];
         // 事件应在的绝对帧位置
         const ev_frame: i64 = ref_frame +
@@ -3435,7 +3584,7 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
         renderSegment(engine, params, out + done * 2, seg, sr, master);
         done += seg;
     }
-    if (done < frames) {
+    if (split_needed and done < frames) {
         engine.seg_abs0 = abs0 + done;
         renderSegment(engine, params, out + done * 2, frames - done, sr, master);
     }
@@ -4382,6 +4531,117 @@ test "audio: publishSounding——VSTi 直接发布 note-on 活跃位图" {
     try std.testing.expectEqual(@as(u64, 0), params.sounding_hi[0].load(.monotonic));
 }
 
+test "audio: VST 参数 lane 段推进（参数 ID / 基准 / 极性·反向 / 极点）" {
+    var set = LaneSet{};
+    const l = set.slotFor().?;
+    l.active = true;
+    l.inst = true;
+    l.kind = 2;
+    l.ch = 0;
+    l.param_id = 0x1234;
+    l.base = 0.25;
+    l.depth = 1.0;
+    l.smooth_ms = 0;
+    l.interp = 1;
+    l.n = 2;
+    l.steps[0] = 0;
+    l.vals[0] = 0.0;
+    l.steps[1] = 96;
+    l.vals[1] = 1.0;
+
+    var st: [LaneSet.max_lanes]f32 = @splat(std.math.nan(f32));
+    var keys: [LaneSet.max_lanes]u32 = @splat(0);
+    var out: [LaneSet.max_lanes]LaneSet.VstParamStep = undefined;
+
+    // 段 0→48 步：曲线 0→0.5；值 = 基准 0.25 + 贡献
+    const n = set.collectVstParams(0, 0.0, 48.0, 0.01, &st, &keys, &out);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(u32, 0x1234), out[0].param_id);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), out[0].v0, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), out[0].v1, 1e-6);
+    // 其他乐器 → 不命中（乐器索引是匹配键）
+    try std.testing.expectEqual(@as(usize, 0), set.collectVstParams(1, 0.0, 48.0, 0.01, &st, &keys, &out));
+
+    // 双向 + 反向：v=1 时贡献 = −(2×1−1) = −1 → 0.25−1 → clamp 0
+    l.bipolar = true;
+    l.invert = true;
+    const n2 = set.collectVstParams(0, 96.0, 96.0, 0.01, &st, &keys, &out);
+    try std.testing.expectEqual(@as(usize, 1), n2);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[0].v1, 1e-6);
+
+    // 极点：τ=100ms、dt=10ms → 一步只走 ~9.5%
+    l.bipolar = false;
+    l.invert = false;
+    l.base = 0;
+    l.smooth_ms = 100;
+    st[0] = std.math.nan(f32);
+    _ = set.collectVstParams(0, 0.0, 0.0, 0.01, &st, &keys, &out); // 播种（段首值）
+    const n3 = set.collectVstParams(0, 96.0, 96.0, 0.01, &st, &keys, &out);
+    try std.testing.expectEqual(@as(usize, 1), n3);
+    try std.testing.expect(out[0].v0 < 1e-6); // 段首值（极点推进前）还没走
+    try std.testing.expect(out[0].v1 > 0.05 and out[0].v1 < 0.2); // 一步只走一小段
+}
+
+test "audio: panic 的 128 个 note-off 带**乐器通道**（否则暂停/停止后挂音）" {
+    // 回归：v2 把 note-on 改成带乐器 MIDI 通道后，panic 仍发通道 0 →
+    // 插件按 (channel, pitch) 匹配不上 → 暂停/停止后音符不释音（用户实测）。
+    const ch: u8 = 9;
+    const offs = panicNoteOffs(ch);
+    try std.testing.expectEqual(@as(usize, 128), offs.len);
+    for (offs, 0..) |e, k| {
+        try std.testing.expectEqual(@backingInt(ivstevents.Event.EventTypes.kNoteOffEvent), e.type);
+        try std.testing.expectEqual(@as(i16, @intCast(ch)), e.data.noteOff.channel);
+        try std.testing.expectEqual(@as(i16, @intCast(k)), e.data.noteOff.pitch);
+    }
+}
+
+test "audio: VSTi 事件——MIDI 通道跟乐器 + 块内采样偏移（多通道 / 不切段）" {
+    const alloc = std.testing.allocator;
+    var env: KitTestEnv = undefined;
+    try env.init(alloc, false);
+    defer env.deinit(alloc);
+    const engine = &env.engine;
+    const params = &env.params;
+    params.instrument_kind[0].store(2, .monotonic);
+    params.instrument_midi_channel[0].store(9, .monotonic); // 乐器 0 → MIDI 通道 9
+    params.instrument_kind[1].store(2, .monotonic);
+    params.instrument_midi_channel[1].store(-1, .monotonic); // 未设 → 0
+
+    const NE = synth.NoteEvent;
+    // 块内采样偏移：纯 VSTi 工程整块只 process 一次，靠它保证音头位置
+    dispatchNoteAt(engine, NE{ .kind = .on, .pitch = 60, .instrument = 0, .velocity = 100 }, 123);
+    dispatchNoteAt(engine, NE{ .kind = .on, .pitch = 61, .instrument = 1, .velocity = 100 }, 7);
+    try std.testing.expectEqual(@as(usize, 1), engine.vsti_event_n[0]);
+    try std.testing.expectEqual(@as(i16, 9), engine.vsti_events[0][0].data.noteOn.channel);
+    try std.testing.expectEqual(@as(i32, 123), engine.vsti_events[0][0].sampleOffset);
+    try std.testing.expectEqual(@as(i16, 0), engine.vsti_events[1][0].data.noteOn.channel);
+    try std.testing.expectEqual(@as(i32, 7), engine.vsti_events[1][0].sampleOffset);
+
+    // note-off 带同一通道（否则插件那边会残留声部）
+    dispatchNoteAt(engine, NE{ .kind = .off, .pitch = 60, .instrument = 0 }, 200);
+    try std.testing.expectEqual(@as(usize, 2), engine.vsti_event_n[0]);
+    try std.testing.expectEqual(@as(i16, 9), engine.vsti_events[0][1].data.noteOff.channel);
+    try std.testing.expectEqual(@as(i32, 200), engine.vsti_events[0][1].sampleOffset);
+    // 位图：乐鑫 0 已全停、乐器 1 的 p61 仍在响
+    try std.testing.expectEqual(@as(u64, 0), engine.vsti_active_lo[0]);
+    try std.testing.expectEqual(@as(u64, 1) << 61, engine.vsti_active_lo[1]);
+}
+
+test "audio: 一阶极点（NaN 播种 / τ=0 直通 / 追赶收敛）——自动化平滑的唯一实现" {
+    const dt: f32 = 1.0 / 60.0;
+    // NaN（未播种）→ 直接取目标值，不从 0 爬升
+    try std.testing.expectEqual(@as(f32, 0.7), poleStep(std.math.nan(f32), 0.7, 15.0, dt));
+    // τ=0 → 直通（不追赶，但仍靠块内斜坡去阶梯）
+    try std.testing.expectEqual(@as(f32, 0.7), poleStep(0.0, 0.7, 0.0, dt));
+    const s1 = poleStep(0.0, 1.0, 15.0, dt);
+    try std.testing.expect(s1 > 0.0 and s1 < 1.0);
+    var v: f32 = 0.0;
+    for (0..60) |_| v = poleStep(v, 1.0, 15.0, dt);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), v, 1e-4);
+    try std.testing.expect(poleStep(1.0, 0.0, 15.0, dt) < 1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), poleStep(0.5, 0.5, 15.0, dt), 1e-6);
+}
+
 test "audio: VSTi panic——全 128 音高 note-off + 位图清零（state 恢复防挂音）" {
     var env: KitTestEnv = undefined;
     try env.init(std.testing.allocator, false);
@@ -4389,12 +4649,12 @@ test "audio: VSTi panic——全 128 音高 note-off + 位图清零（state 恢�
     const engine = &env.engine;
     const params = &env.params;
     params.instrument_kind[0].store(2, .monotonic);
-    vstiNoteOn(engine, 0, 60, 100);
-    vstiNoteOn(engine, 0, 72, 100);
+    vstiNoteOn(engine, 0, 60, 100, 0, 0);
+    vstiNoteOn(engine, 0, 72, 100, 0, 0);
     try std.testing.expect(engine.vsti_active_lo[0] != 0);
     try std.testing.expect(engine.vsti_active_hi[0] != 0);
     const before = engine.vsti_event_n[0];
-    for (0..128) |p| vstiNoteOff(engine, 0, @intCast(p)); // panic 式：全 128 无条件 off
+    for (0..128) |p| vstiNoteOff(engine, 0, @intCast(p), 0, 0); // panic 式：全 128 无条件 off
     try std.testing.expectEqual(@as(u64, 0), engine.vsti_active_lo[0]); // 位图清零
     try std.testing.expectEqual(@as(u64, 0), engine.vsti_active_hi[0]);
     try std.testing.expectEqual(before + 128, engine.vsti_event_n[0]); // 全 128 无条件 off

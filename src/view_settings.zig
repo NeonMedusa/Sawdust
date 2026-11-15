@@ -83,17 +83,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     ui.label("（拖动调整；实现为帧预算 = 1 秒 ÷ 帧率）", x + 14, yy + 44, ui.theme.text_dim);
     yy += 68;
 
-    // ── 数据交换（JSON 可读格式；说明放在这里有充足宽度——用户要求）──
-    ui.label("数据交换", x + 14, yy, ui.theme.text_dim);
-    if (ui.button(9523, "导入 JSON...", x + 14, yy + 16, 140, 24)) {
-        app.pending_file_action = .import_json;
-    }
-    if (ui.button(9524, "导出 JSON...", x + 162, yy + 16, 140, 24)) {
-        app.pending_file_action = .export_json;
-    }
-    ui.label("JSON：可读文本格式，便于迁移到其他 DAW。", x + 14, yy + 46, ui.theme.text_dim);
-    ui.label("导入 = 替换当前工程；导出 = 写出副本。", x + 14, yy + 60, ui.theme.text_dim);
-    yy += 84;
+    // ── 数据交换：JSON 通道已于 v9 删除（存档只剩二进制 `.saw`）──
 
     // ── 字体（当前实际生效的文件）──
     ui.label("字体（当前生效）", x + 14, yy, ui.theme.text_dim);

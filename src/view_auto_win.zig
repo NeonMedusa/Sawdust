@@ -362,23 +362,18 @@ fn drawRow(ui: *Ui, app: *App, bi: usize, label: []const u8, x: i32, y: i32, w: 
         }
     }
 
-    // **平滑**（极点追赶时间常数 ms）：0 = 不追赶；tempo 不适用 → 置灰
+    // **平滑**（极点追赶时间常数 ms）：0 = 不追赶（默认）；上限 200
+    // **所有目标通用**（含 tempo）：tempo 的求值已在块级/帧级带 `dt_s`（见 `App.applyTempoAt`），
+    // v2 之后不再有"帧粒度只剩 1 帧"的问题，所以不必置灰。
     {
         const sx = x + Col.smooth;
-        if (b.target.kind == .tempo) {
-            ui.renderer.fillRect(sx, cy, Col.smooth_w, ctrl_h, ui.theme.slider_track);
-            ui.renderer.strokeRect(sx, cy, Col.smooth_w, ctrl_h, ui.theme.panel_border);
-            const tw: i32 = @intFromFloat(ui.font.measure("—"));
-            ui.labelCentered("—", sx + @divTrunc(Col.smooth_w - tw, 2), cy, ctrl_h, ui.theme.text_dim);
-        } else {
-            var ms: i32 = @intFromFloat(@round(b.smooth_ms));
-            if (ui.dragNumberEx(Ui.idOf("auto_win_smooth", 0) + bi, sx, cy, Col.smooth_w, ctrl_h, &ms, 0, @intFromFloat(view_lane.smooth_ms_max), 6, 0, fmtMs)) {
-                b.smooth_ms = @floatFromInt(ms);
-                app.history_pending = "调整自动化平滑";
-            }
-            if (util.inRect(ui.mouse_x, ui.mouse_y, sx, cy, Col.smooth_w, ctrl_h) and ui.mouse_right_pressed) {
-                openCtx(app, ui, bi, .smooth);
-            }
+        var ms: i32 = @intFromFloat(@round(b.smooth_ms));
+        if (ui.dragNumberEx(Ui.idOf("auto_win_smooth", 0) + bi, sx, cy, Col.smooth_w, ctrl_h, &ms, 0, @intFromFloat(view_lane.smooth_ms_max), 6, 0, fmtMs)) {
+            b.smooth_ms = @floatFromInt(ms);
+            app.history_pending = "调整自动化平滑";
+        }
+        if (util.inRect(ui.mouse_x, ui.mouse_y, sx, cy, Col.smooth_w, ctrl_h) and ui.mouse_right_pressed) {
+            openCtx(app, ui, bi, .smooth);
         }
     }
 

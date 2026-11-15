@@ -2,21 +2,92 @@
 //!
 //! **设计**：
 //! - 磁盘格式与运行时模型**解耦**（`SynthParams` 等含原子字段，不能直接序列化）；
-//! - JSON 可读可调试；带 `version` 字段便于将来迁移；
+//! - 只保留**二进制**一种存档（JSON 可读通道已于 v9 删除）；
 //! - 纯逻辑（序列化/反序列化内存 ↔ 存档结构体）可单测；文件 IO 在 main 接线。
 
 const std = @import("std");
 const model = @import("model.zig");
 const synth = @import("synth.zig");
 
-/// 当前文件格式版本
-/// v1 → v2：片段坐标由“小节”改为 **U=96 步**（`bar` → `start`，`len` 单位同步）
-/// v2 → v3：乐器的 `mixer` 由 **1 起**改为 **0 起**（加载时减 1）
-pub const file_version: u32 = 5;
+/// **存档版本**（二进制；**只剩这一条线**——JSON 通道已在 v9 删除）。
+///
+/// 版本历史：
+/// - v5：首版二进制（`f4a7960`）；
+/// - v6：鼓组 VST3 层 / 音频片段 / 音频样式；
+/// - v7：`Project.instrument_order`（乐器显示顺序）；
+/// - v8：音符·片段静音 `muted`；
+/// - **v9**（当前，**未正式发布**）：自动化整套 + `SavedBinding.smooth_ms/invert/param_id`
+///   + `SavedInstrument/SavedMixerChannel.uid` + 时间分辨率 U 96→3840（步域 ×40）
+///   + **清格式**（删掉 `removed_fields` 那张表里的字段）。
+///
+/// **不变量**：任何 `Saved*`/`Project` 字段增删/调序**必须**跟上：
+/// 新增 → 登记 `introducedVersion`；删除 → 登记 `removed_fields`。
+/// v5 事故：改布局没登记 → 旧工程加载错位 → `integer does not fit…` 崩溃。
+pub const binary_version: u8 = 9;
+/// v5（首版二进制，f4a7960）——兼容读取用
+const binary_version_legacy: u8 = 5;
+/// v6（鼓组 VST3 层 / 音频片段 / 音频样式字段）——引入版本**钉死为 6**，
+/// 不随 `binary_version` 上调而漂移（否则 v6 存档会被误判为“缺字段”而错位）。
+const binary_version_v6: u8 = 6;
+/// v8（音符/片段静音 `muted`）——同理钉死。
+/// **坑**：这里曾直接写 `binary_version`（“当前版本即引入版本”）——
+/// 一旦把当前版本从 8 抬到 9，`muted` 的引入版本也跟着飘到 9，
+/// 旧 v8 档会被判为“没有该字段”而跳过它 → **字节流错位**。
+const binary_version_v8: u8 = 8;
+/// **v9 引入的字段**（含自动化：曲线/绑定整个家族——v8 发布版根本没有这两个数组）。
+const binary_version_v9: u8 = 9;
 
-/// v1 存档时代的 `units_per_whole`（**历史常量，永不随当前分辨率改变**）。
-/// v1 JSON 的 `bar`/`len` 换算与 `legacy_units_per_bar` 的默认值都用它。
-const legacy_units_frozen: i32 = 96;
+/// **同名但类型变过**的字段：旧档按 `old_T` 读，再转成当前类型。
+///
+/// 与 `introducedVersion`（新增）、`removed_fields`（删除）凑成三件套：
+/// 字段的**存在性变**看那两张表，**类型/语义变**看这张表。
+const ChangedField = struct {
+    owner: []const u8,
+    name: []const u8,
+    old_T: type,
+    /// 从这个版本开始是新类型（`ver < changed_in` 的档里是 `old_T`）
+    changed_in: u8,
+};
+
+const changed_fields = [_]ChangedField{
+    // `Project.bpm`：v5..v8 是 **i32**（整数 BPM）；v9 起改 f32（支持小数）。
+    // **不登记 = 把旧档的 `bpm` 当 4 字节 f32 读 → 后面全错位**（本次排查就是它）。
+    .{ .owner = "Project", .name = "bpm", .old_T = i32, .changed_in = binary_version_v9 },
+};
+
+/// **已删除字段**：旧档里存在、当前结构体里已不存在。
+///
+/// 二进制是“按结构体字段顺序反射”，字段一旦删掉，旧档里那几个字节就没人消费 →
+/// 后面全部错位。所以**删字段必须在这里登记**：读到 `ver < removed_in` 的档时
+/// 按 `T` 类型**读掉丢弃**（写测试用的旧布局时对称地补写零值）。
+const RemovedField = struct {
+    /// 所属结构体（`@typeName` 后缀匹配）
+    owner: []const u8,
+    /// 旧字段名（**仅用于文档 + 绊线自检**：该名字必须已经不存在）
+    name: []const u8,
+    /// 插在**当前结构体的哪个字段之前**（空串 = 结构体末尾）
+    before: []const u8,
+    /// 旧字段类型（只用于“读掉/写零值”）
+    T: type,
+    /// 从这个版本开始**不再存在**（`ver < removed_in` 的档里有它）
+    removed_in: u8,
+};
+
+const removed_fields = [_]RemovedField{
+    // Project 原顺序：version → bpm → volume → time_num → time_den → steps_per_bar
+    //              → pattern_count → … → legacy_units_per_bar → clips → …
+    // 1) `version`：JSON 时代的“文件版本”（二进制头里已有真版本，冗余且混淆）
+    .{ .owner = "Project", .name = "version", .before = "bpm", .T = u32, .removed_in = binary_version_v9 },
+    // 2) `steps_per_bar`：由拍号推导，加载侧**从来不信它**（留着就是人为踩坑）
+    .{ .owner = "Project", .name = "steps_per_bar", .before = "pattern_count", .T = i32, .removed_in = binary_version_v9 },
+    // 3) `legacy_units_per_bar`：只有 JSON v1 迁移用过
+    .{ .owner = "Project", .name = "legacy_units_per_bar", .before = "clips", .T = i32, .removed_in = binary_version_v9 },
+    // 4) SavedClip 末尾的 v1 兼容字段（`bar` / `len_bars`，两个 `?i32`）
+    .{ .owner = "SavedClip", .name = "bar", .before = "", .T = ?i32, .removed_in = binary_version_v9 },
+    .{ .owner = "SavedClip", .name = "len_bars", .before = "", .T = ?i32, .removed_in = binary_version_v9 },
+    // 5) SavedLane.curve_kind：占位常量（恒 1，无用）
+    .{ .owner = "SavedLane", .name = "curve_kind", .before = "points", .T = u8, .removed_in = binary_version_v9 },
+};
 
 /// 默认文件名
 pub const default_file_name: []const u8 = "project.saw";
@@ -55,45 +126,24 @@ pub const SavedClip = struct {
     trim_len: i32 = 0,
     /// 片段静音（v8；旧档缺失 → false）
     muted: bool = false,
-    // ── v1 兼容字段（**仅用于迁移**；v2 存档不写）──
-    /// v1：起始小节（1 起）。加载 v1 时据此重建 `start`。
-    bar: ?i32 = null,
-    /// v1：长度（小节）。加载 v1 时据此重建 `len`。
-    len_bars: ?i32 = null,
-
-    /// 序列化时**跳过 v1 兼容字段**（避免 JSON 里出现 null 噪音）
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("track");
-        try jw.write(self.track);
-        try jw.objectField("start");
-        try jw.write(self.start);
-        try jw.objectField("len");
-        try jw.write(self.len);
-        try jw.objectField("pattern");
-        try jw.write(self.pattern);
-        if (self.offset != 0) {
-            try jw.objectField("offset");
-            try jw.write(self.offset);
-        }
-        // 音频片段（默认省略：-1/0 = 样式片段）
-        if (self.audio_style >= 0) {
-            try jw.objectField("audio_style");
-            try jw.write(self.audio_style);
-        }
-        if (self.trim_start != 0) {
-            try jw.objectField("trim_start");
-            try jw.write(self.trim_start);
-        }
-        if (self.trim_len != 0) {
-            try jw.objectField("trim_len");
-            try jw.write(self.trim_len);
-        }
-        try jw.endObject();
-    }
 };
 
-/// **自动化曲线的锚点**（存档用；`step/value` 是世界坐标，pivot/curve 是手柄的几何位置）
+/// 存档中的音符（坐标单位：步）
+pub const SavedNote = struct {
+    step: i32,
+    len: i32,
+    pitch: i32,
+    pattern: i32 = 0,
+    instrument: i32 = 0,
+    /// 力度（1-127；缺省 = `note_default_velocity`，冻结格式常量）
+    velocity: i32 = note_default_velocity,
+    /// 声像（0-127；64 = 居中；缺省 = `note_default_pan`）
+    pan: i32 = note_default_pan,
+    /// 音符静音（v8；旧档缺失 → false）
+    muted: bool = false,
+};
+
+/// **自动化曲线的锚点**（`step/value` 是世界坐标，pivot/curve 是手柄的几何位置）
 pub const SavedLanePoint = struct {
     step: i32 = 0,
     value: f32 = 0,
@@ -112,8 +162,6 @@ pub const SavedLane = struct {
     name: []const u8 = "",
     /// 0 = hold / 1 = linear / 2 = smooth
     interp: u8 = 2,
-    /// 曲线算法版本（**当前恒 1**）：将来换数学时旧工程可继续按旧算法渲染
-    curve_kind: u8 = 1,
     /// 行头列显示单位（只影响 UI）
     display_unit: u8 = 0,
     points: []SavedLanePoint = &.{},
@@ -135,52 +183,9 @@ pub const SavedBinding = struct {
     invert: bool = false,
     /// **`vst_param` 专用**：VST3 参数 ID（其他 target 恒 0）
     param_id: u32 = 0,
-    /// **极点追赶的平滑时间常数**（毫秒；0 = 不平滑；缺省 = v9 之前的默认 15ms）
-    smooth_ms: f32 = 15.0,
-};
-
-/// 存档中的音符
-pub const SavedNote = struct {
-    step: i32,
-    len: i32,
-    pitch: i32,
-    // 默认 0：瘦身写入时省略（见 jsonStringify）；旧档总有该字段，给默认不改变解析
-    pattern: i32 = 0,
-    instrument: i32 = 0,
-    /// 力度（1-127；缺省 =`note_default_velocity`，冻结格式常量）
-    velocity: i32 = note_default_velocity,
-    /// 声像（0-127；64 = 居中；缺省 =`note_default_pan`）
-    pan: i32 = note_default_pan,
-    /// 音符静音（v8；旧档缺失 → false）
-    muted: bool = false,
-
-    /// 序列化省默认：格式/力度/声像/乐器为默认值时省略（占盘大头；见 docs/save-format.md）
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        try jw.objectField("step");
-        try jw.write(self.step);
-        try jw.objectField("len");
-        try jw.write(self.len);
-        try jw.objectField("pitch");
-        try jw.write(self.pitch);
-        if (self.pattern != 0) {
-            try jw.objectField("pattern");
-            try jw.write(self.pattern);
-        }
-        if (self.instrument != 0) {
-            try jw.objectField("instrument");
-            try jw.write(self.instrument);
-        }
-        if (self.velocity != note_default_velocity) {
-            try jw.objectField("velocity");
-            try jw.write(self.velocity);
-        }
-        if (self.pan != note_default_pan) {
-            try jw.objectField("pan");
-            try jw.write(self.pan);
-        }
-        try jw.endObject();
-    }
+    /// **极点追赶的平滑时间常数**（毫秒；0 = 不平滑）
+    /// v9 未发布 → 默认值直接定成 0（与 `view_lane.default_smooth_ms` 一致），无迁移义务
+    smooth_ms: f32 = 0.0,
 };
 
 /// 存档中的振荡器（原子字段 → 普通值）
@@ -342,14 +347,11 @@ pub const SavedMixerChannel = struct {
 };
 
 pub const Project = struct {
-    version: u32 = file_version,
     bpm: f32 = 120,
     /// 主音量（0-1；旧存档缺失 → 默认 0.75，与 App.volume 一致）
     volume: f32 = 0.75,
     time_num: i32 = 4,
     time_den: i32 = 4,
-    /// 每小节步数（冗余存储：拍号换算规则若变更仍能正确还原）
-    steps_per_bar: i32 = model.units_per_whole,
     /// 样式数量（旧存档缺失 → `pattern_count_default`；仅当 `pattern_names` 为空时用于重建）
     pattern_count: i32 = pattern_count_default,
     /// 样式名字（UTF-8；空 = 旧存档/无自定义名——加载时按 `pattern_count` 重建默认名）
@@ -362,10 +364,6 @@ pub const Project = struct {
     track_name_rows: []const i32 = &.{},
     /// 静音轨道（**排序行号列表**；空 = 无静音）——旧存档无此字段 → 全部未静音
     track_muted: []const i32 = &.{},
-    /// 兼容用：v1 存档的时长单位（小节）。加载 v1 时把 `bar/len` 乘此值转成步。
-    /// **冻结为 96**（v1 写档时的 U）——**不能跟 `model.units_per_whole` 走**，
-    /// 否则 U 变大后 v1 档会被多乘一次（v1 → 步 的换算基准是历史常量）。
-    legacy_units_per_bar: i32 = legacy_units_frozen,
     clips: []SavedClip = &.{},
     notes: []SavedNote = &.{},
     /// 音频样式（引用文件按相对工程目录的路径；片段经 `SavedClip.audio_style` 引用）
@@ -425,15 +423,6 @@ pub fn importSynth(s: *const SavedSynth, p: *synth.SynthParams) void {
     }
 }
 
-/// 把工程序列化为 JSON 字符串（调用方负责释放）
-pub fn toJson(allocator: std.mem.Allocator, project: Project) ![]u8 {
-    var out: std.Io.Writer.Allocating = .init(allocator);
-    errdefer out.deinit();
-    var jw = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .indent_2 } };
-    try jw.write(project);
-    return out.toOwnedSlice();
-}
-
 /// 应用设置（数据目录下 `settings.json`；缺失/损坏 → 默认值）
 pub const Settings = struct {
     /// 启动时打开上次工程（false = 新建空工程）
@@ -475,57 +464,11 @@ test "persist: 设置 JSON 往返（含路径转义；未知字段忽略、缺�
     try std.testing.expect(!parsed2.value.open_last);
     try std.testing.expectEqualStrings("", parsed2.value.last_project);
 }
-/// **向后兼容**：v1 存档的片段坐标为“小节”（`bar`/`len`），
-/// 自动按 `legacy_units_per_bar` 换算为步（v2 起统一用步）。
-pub fn fromJson(allocator: std.mem.Allocator, data: []const u8) !std.json.Parsed(Project) {
-    // **`.alloc_always` 必须**：默认的 `alloc_if_needed` 会让无转义字符串借用
-    // `data` 缓冲——调用方习惯性 `defer free(data)`，一旦生命周期估算错误
-    // （或被改写）就悬空。全拷进 arena 后，返回值自包含（见 preset.load 同注）。
-    var parsed = try std.json.parseFromSlice(Project, allocator, data, .{ .ignore_unknown_fields = true, .allocate = .alloc_always });
-    errdefer parsed.deinit();
-    if (parsed.value.version < 2) {
-        // v1：`bar`（1 起小节）与 `len`（小节）都是**小节单位**——
-        // 注意 v1 JSON 里长度字段也叫 `len`（与 v2 同名不同单位），已解析进 `len`。
-        const upb = if (parsed.value.legacy_units_per_bar > 0) parsed.value.legacy_units_per_bar else model.units_per_whole;
-        for (parsed.value.clips) |*c| {
-            if (c.bar) |bar| c.start = @max(0, bar - 1) * upb;
-            if (c.len_bars) |lb| {
-                c.len = @max(1, lb) * upb;
-            } else {
-                c.len = @max(1, c.len) * upb; // v1 的 `len` 字段 = 小节数
-            }
-            c.offset = c.offset * upb; // 局部小节 → 局部步
-            c.bar = null;
-            c.len_bars = null;
-        }
-        parsed.value.version = 2;
-    }
-    if (parsed.value.version < 3) {
-        // v2：乐器 `mixer` 是 **1 起**（主通道 = 1）→ v3 改为 0 起（减 1）
-        for (parsed.value.instruments) |*inst| {
-            inst.mixer -= 1;
-        }
-        parsed.value.version = 3;
-    }
-    if (parsed.value.version < 4) {
-        // v4：轨道名改为**稀疏对**（`track_name_rows` + `track_names`）。
-        // 旧密集数组这里**不做改写**——加载侧（`importProject`）的垫片按“跳过空串”
-        // 派生行号，本步仅作版本对齐（正式迁移函数链见 docs/save-format.md）。
-        parsed.value.version = 4;
-    }
-    if (parsed.value.version < 5) {
-        // v5：时间分辨率 `U` 96 → 3840（**960 PPQN**）——步域字段 ×40，其余不动。
-        // 见 `migrateUnitsToV5` 与 docs/units-3840.md。
-        migrateUnitsToV5(&parsed.value);
-        parsed.value.version = 5;
-    }
-    return parsed;
-}
 
-// ── v5 二进制格式（默认保存；JSON 保留为导入/导出通道）──
+// ── 二进制格式（**唯一存档格式**）──
 //
-// 布局：magic "SAWD" + u8 版本(5) + 载荷。载荷 = **comptime 反射编码**（全量字段，
-// 零逐结构维护——与 JSON 的 Z+ 策略互补：二进制不做任何省略）。
+// 布局：magic "SAWD" + u8 版本（当前 9）+ 载荷。载荷 = **comptime 反射编码**（全量字段，
+// 零逐结构维护；不做任何省略——省默认只在 JSON 时代有意义，现在磁盘体积已不是瓶颈）。
 // 编码规则：
 // - 整数：varint（有符号走 zigzag）；bool：1 字节；枚举：底层整数 varint；
 // - f32：原始 4 字节（平台本机字节序——本项目仅 Windows x64，不做跨端承诺）；
@@ -534,23 +477,6 @@ pub fn fromJson(allocator: std.mem.Allocator, data: []const u8) !std.json.Parsed
 //   存储（省 25%）：tag 0 = 空、1 = raw、2 = 文本回退（非法 base64 原样存）。
 // 读取严格：magic/版本校验 + 全量消费（尾部垃圾 = 错误——防截断/错位静默）。
 pub const binary_magic = "SAWD";
-/// 当前布局版本。
-/// **不变量**：任何 `Saved*`/`Project` 字段增删/调序**必须**递增它（v5 首版曾被
-/// 多次改布局未递增，导致旧工程加载错位 → `integer does not fit…` 崩溃，实测）。
-/// v5 旧档保留专门的兼容读（见 `introducedVersion`/`legacySkip`）。
-pub const binary_version: u8 = 9; // v9：时间分辨率 U 96→3840（步域字段 ×40）
-/// v5（首版二进制，f4a7960）——兼容读取用
-const binary_version_legacy: u8 = 5;
-/// v6（鼓组 VST3 层 / 音频片段 / 音频样式字段）——这些字段的引入版本**钉死为 6**，
-/// 不随 `binary_version` 上调而漂移（否则 v6 存档会被误判为“缺字段”而错位）。
-const binary_version_v6: u8 = 6;
-/// v8（音符/片段静音 `muted`）——同理钉死。
-/// **坑**：这里曾直接写 `binary_version`（“当前版本即引入版本”）——
-/// 一旦把当前版本从 8 抬到 9，`muted` 的引入版本也跟着飘到 9，
-/// 旧 v8 档会被判为“没有该字段”而跳过它 → **字节流错位**（v9 单位迁移时由新测试抓到）。
-const binary_version_v8: u8 = 8;
-/// **v9 引入的字段**（含自动化：曲线/绑定整个家族——v8 发布版根本没有这两个数组）。
-const binary_version_v9: u8 = 9;
 
 /// 某字段**首次出现的存档版本**（未登记 = 从首版就有 → null）。
 ///
@@ -612,6 +538,75 @@ fn introducedVersion(comptime T: type, comptime name: []const u8) ?u8 {
 fn legacySkip(ver: u8, comptime T: type, comptime name: []const u8) bool {
     const intro = comptime introducedVersion(T, name) orelse return false;
     return ver < intro;
+}
+
+/// 已删字段匹配：结构体相同且插在当前字段 `before` 之前
+fn removedMatches(comptime T: type, comptime rf: RemovedField, comptime before: []const u8) bool {
+    if (!std.mem.endsWith(u8, @typeName(T), rf.owner)) return false;
+    return std.mem.eql(u8, rf.before, before);
+}
+
+/// `owner` 字符串 → 结构体类型（**只给自检测试用**；新登记一行忘加分支会 `@compileError`）
+fn structByOwner(comptime owner: []const u8) type {
+    if (comptime std.mem.eql(u8, owner, "Project")) return Project;
+    if (comptime std.mem.eql(u8, owner, "SavedClip")) return SavedClip;
+    if (comptime std.mem.eql(u8, owner, "SavedNote")) return SavedNote;
+    if (comptime std.mem.eql(u8, owner, "SavedLane")) return SavedLane;
+    if (comptime std.mem.eql(u8, owner, "SavedBinding")) return SavedBinding;
+    if (comptime std.mem.eql(u8, owner, "SavedInstrument")) return SavedInstrument;
+    if (comptime std.mem.eql(u8, owner, "SavedMixerChannel")) return SavedMixerChannel;
+    if (comptime std.mem.eql(u8, owner, "SavedDrumLayer")) return SavedDrumLayer;
+    if (comptime std.mem.eql(u8, owner, "SavedDrumPad")) return SavedDrumPad;
+    if (comptime std.mem.eql(u8, owner, "SavedAudioStyle")) return SavedAudioStyle;
+    @compileError("removed_fields/changed_fields：未知 owner " ++ owner);
+}
+
+/// 写端（**仅测试用旧布局**）：目标版本比 `removed_in` 旧 → 按旧布局补写占位值。
+fn binWriteRemoved(comptime T: type, w: *BinWriter, comptime before: []const u8) !void {
+    inline for (removed_fields) |rf| {
+        if (comptime removedMatches(T, rf, before)) {
+            if (w.version < rf.removed_in) try binWriteValue(rf.T, w, std.mem.zeroes(rf.T));
+        }
+    }
+}
+
+/// 读端：目标存档比 `removed_in` 旧 → 把已删字段**读掉丢弃**（否则后面全错位）。
+fn binReadRemoved(comptime T: type, r: *BinReader, a: std.mem.Allocator, comptime before: []const u8) !void {
+    inline for (removed_fields) |rf| {
+        if (comptime removedMatches(T, rf, before)) {
+            if (r.version < rf.removed_in) _ = try binReadValue(rf.T, r, a);
+        }
+    }
+}
+
+/// 该字段是否**曾用过旧类型**（返回那次变更的信息；版本比较由调用方做）
+fn changedFieldInfo(comptime T: type, comptime name: []const u8) ?ChangedField {
+    inline for (changed_fields) |cf| {
+        if (comptime std.mem.endsWith(u8, @typeName(T), cf.owner) and std.mem.eql(u8, cf.name, name)) return cf;
+    }
+    return null;
+}
+
+/// 旧类型 → 当前类型（只支持数值互转）
+fn convertLegacyTo(comptime T: type, v: anytype) T {
+    const F = @TypeOf(v);
+    return switch (comptime @typeInfo(F)) {
+        .int => switch (comptime @typeInfo(T)) {
+            .int => @intCast(v),
+            .float => @floatFromInt(v),
+            else => @compileError("bin: 旧字段只能转数值：" ++ nameOf(T)),
+        },
+        .float => switch (comptime @typeInfo(T)) {
+            .float => @floatCast(v),
+            .int => @intFromFloat(v),
+            else => @compileError("bin: 旧字段只能转数值：" ++ nameOf(T)),
+        },
+        else => @compileError("bin: 旧字段只能转数值：" ++ nameOf(F)),
+    };
+}
+
+fn nameOf(comptime T: type) []const u8 {
+    return @typeName(T);
 }
 
 const BinWriter = struct {
@@ -723,6 +718,7 @@ fn binWriteValue(comptime T: type, w: *BinWriter, v: T) !void {
         .@"struct" => |s| {
             // 0.17：`@typeInfo` 改为数组结构体风格（field_names / field_types / field_attrs）
             inline for (s.field_names, s.field_types) |fname, FType| {
+                try binWriteRemoved(T, w, fname);
                 if (comptime introducedVersion(T, fname) != null) {
                     if (!legacySkip(w.version, T, fname)) { // 目标版本更旧 → 不写该字段
                         if (comptime isB64TextField(fname, FType)) {
@@ -733,10 +729,18 @@ fn binWriteValue(comptime T: type, w: *BinWriter, v: T) !void {
                     }
                 } else if (comptime isB64TextField(fname, FType)) {
                     try binWriteB64Field(w, @field(v, fname));
+                } else if (comptime changedFieldInfo(T, fname)) |cf| {
+                    // 旧档写**旧类型**（如 `bpm` 旧档是 i32）
+                    if (w.version < cf.changed_in) {
+                        try binWriteValue(cf.old_T, w, convertLegacyTo(cf.old_T, @field(v, fname)));
+                    } else {
+                        try binWriteValue(FType, w, @field(v, fname));
+                    }
                 } else {
                     try binWriteValue(FType, w, @field(v, fname));
                 }
             }
+            try binWriteRemoved(T, w, ""); // 结构体末尾的已删字段
         },
         else => @compileError("bin: unsupported type " ++ @typeName(T)),
     }
@@ -799,6 +803,7 @@ fn binReadValue(comptime T: type, r: *BinReader, a: std.mem.Allocator) !T {
         .@"struct" => |s| {
             var out: T = undefined;
             inline for (s.field_names, s.field_types, s.field_attrs) |fname, FType, attrs| {
+                try binReadRemoved(T, r, a, fname);
                 if (comptime introducedVersion(T, fname) != null) {
                     if (legacySkip(r.version, T, fname)) {
                         // 旧版本没有该字段 → 用声明默认值（0.17：默认值挂在 field_attrs 上）
@@ -813,10 +818,20 @@ fn binReadValue(comptime T: type, r: *BinReader, a: std.mem.Allocator) !T {
                     }
                 } else if (comptime isB64TextField(fname, FType)) {
                     @field(out, fname) = try binReadB64Field(r, a);
+                } else if (comptime changedFieldInfo(T, fname)) |cf| {
+                    // 旧档里是旧类型（如 `bpm` 旧档是 i32）→ 读完再转成当前类型
+                    if (r.version < cf.changed_in) {
+                        const raw = try binReadValue(cf.old_T, r, a);
+                        @field(out, fname) = convertLegacyTo(FType, raw);
+                    } else {
+                        @field(out, fname) = try binReadValue(FType, r, a);
+                    }
                 } else {
+                    // 溢出/错位在 `binReadValue` 里已转成 `error.CorruptProject`（不 panic）
                     @field(out, fname) = try binReadValue(FType, r, a);
                 }
             }
+            try binReadRemoved(T, r, a, ""); // 结构体末尾的已删字段
             return out;
         },
         else => @compileError("bin: unsupported type " ++ @typeName(T)),
@@ -829,7 +844,6 @@ fn binReadValue(comptime T: type, r: *BinReader, a: std.mem.Allocator) !T {
 /// - `Clip.start` / `Clip.len` / `Clip.offset`
 /// - `Note.step` / `Note.len`
 /// - 自动化曲线点 `SavedLanePoint.step`
-/// - 冗余的 `steps_per_bar`（仅当它与旧 U 一致）
 ///
 /// **绝不乘**：`trim_start` / `trim_len`（帧）、`speed`、`audio_style`、`bpm`、
 /// 拍号、乐器/效果器参数、各类索引。
@@ -854,10 +868,6 @@ fn migrateUnitsToV5(p: *Project) void {
     for (p.auto_lanes) |*ln| {
         for (ln.points) |*pt| pt.step = scale(pt.step, s);
     }
-    // 冗余字段：**它也是步域**（3/4 写 72、4/4 写 96）→ 一律 ×40。
-    // 注：加载侧现已**完全不信它**（`importProject` 直接由拍号推导），这里只为了
-    // 写得“自己一致”（旧档经过本函数后内存里看到的就是正确值）。
-    if (p.steps_per_bar > 0) p.steps_per_bar = scale(p.steps_per_bar, s);
 }
 
 /// 工程 → v5 二进制（调用方负责释放）
@@ -915,22 +925,28 @@ pub fn fromBinary(allocator: std.mem.Allocator, data: []const u8) !std.json.Pars
     return .{ .arena = arena, .value = out };
 }
 
-/// 自动识别存档：v5 二进制（magic 前缀）或 JSON（v1–v4 旧档）→ 工程。
-/// 默认保存写二进制；JSON 保留为导入/导出通道（见 docs/save-format.md）。
+/// 自动识别存档（现在只有一种）：二进制 `SAWD` → 工程；其它 → `error.NotBinaryProject`。
 pub fn parseAuto(allocator: std.mem.Allocator, data: []const u8) !std.json.Parsed(Project) {
-    if (data.len >= binary_magic.len and std.mem.eql(u8, data[0..binary_magic.len], binary_magic)) {
-        return fromBinary(allocator, data);
-    }
-    return fromJson(allocator, data);
+    return fromBinary(allocator, data);
 }
 
-/// 轻量探针：JSON 存档的 `version`（非 JSON/解析失败 → null；缺字段 → 1 = v1 语义）。
-/// 供“打开旧档 → 备份并升级”弹窗判定（见 main.loadProjectFromPath；③ 迁移流程）。
-pub fn probeJsonVersion(allocator: std.mem.Allocator, data: []const u8) ?u32 {
-    const Probe = struct { version: u32 = 1 };
-    var parsed = std.json.parseFromSlice(Probe, allocator, data, .{ .ignore_unknown_fields = true }) catch return null;
-    defer parsed.deinit();
-    return parsed.value.version;
+/// 解析失败的人话提示（UI 用：toast 里不要把裸错误名丢给用户）
+pub fn parseErrorHint(e: anyerror) []const u8 {
+    return switch (e) {
+        error.NotBinaryProject => "不是 Sawdust 工程文件（需要二进制 .saw；旧的 JSON 工程已不再支持）",
+        error.UnsupportedBinaryVersion => "存档版本不受支持（比当前版本新或早于 v5）",
+        error.CorruptProject, error.TrailingBinaryData => "存档已损坏（或不是本版本能读的格式）",
+        else => @errorName(e),
+    };
+}
+
+/// **轻量探版本**（不解析全档）：magic 后那个版本字节（v5..）；
+/// 不是二进制/被截断到只剩 magic → null。
+pub fn probeVersion(allocator: std.mem.Allocator, data: []const u8) ?u32 {
+    _ = allocator;
+    if (data.len <= binary_magic.len) return null;
+    if (!std.mem.eql(u8, data[0..binary_magic.len], binary_magic)) return null;
+    return data[binary_magic.len];
 }
 
 // ── 测试 ──
@@ -1005,197 +1021,6 @@ test "persist: 合成器参数往返（导出 → 导入）" {
     try std.testing.expectApproxEqAbs(@as(f32, 0), q3.osc[1].detune_power.load(.monotonic), 1e-6);
 }
 
-test "persist: JSON 往返（序列化 → 解析）" {
-    const allocator = std.testing.allocator;
-    const clips = [_]SavedClip{
-        .{ .track = 1, .start = 3 * model.units_per_whole, .len = 4 * model.units_per_whole, .pattern = 2 },
-        .{ .track = 0, .start = 9 * model.units_per_whole, .len = 2 * model.units_per_whole, .pattern = 0, .offset = model.units_per_whole },
-    };
-    const notes = [_]SavedNote{
-        .{ .step = 24, .len = 12, .pitch = 60, .pattern = 0, .instrument = 1 },
-    };
-    const instruments = [_]SavedInstrument{
-        .{ .name = "减法合成器", .volume = 0.7, .synth = .{ .attack = 0.1 } },
-    };
-
-    const project = Project{
-        .bpm = 140,
-        .volume = 0.42,
-        .time_num = 3,
-        .time_den = 4,
-        .steps_per_bar = @divTrunc(3 * model.units_per_whole, 4),
-        .clips = @constCast(&clips),
-        .notes = @constCast(&notes),
-        .instruments = @constCast(&instruments),
-    };
-
-    const json = try toJson(allocator, project);
-    defer allocator.free(json);
-
-    // JSON 可读性：应含版本与关键字段
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"version\": 5") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"bpm\": 140") != null);
-    const parsed = try fromJson(allocator, json);
-    defer parsed.deinit();
-
-    try std.testing.expectEqual(@as(u32, 5), parsed.value.version);
-    try std.testing.expectEqual(@as(f32, 140), parsed.value.bpm);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.42), parsed.value.volume, 1e-6); // 主音量往返
-    try std.testing.expectEqual(@as(i32, 3), parsed.value.time_num);
-    try std.testing.expectEqual(@divTrunc(3 * model.units_per_whole, 4), parsed.value.steps_per_bar);
-    try std.testing.expectEqual(@as(usize, 2), parsed.value.clips.len);
-    try std.testing.expectEqual(model.units_per_whole, parsed.value.clips[1].offset);
-    try std.testing.expectEqual(@as(usize, 1), parsed.value.notes.len);
-    try std.testing.expectEqual(@as(i32, 60), parsed.value.notes[0].pitch);
-    try std.testing.expectEqual(@as(i32, 1), parsed.value.notes[0].instrument);
-    try std.testing.expectEqualStrings("减法合成器", parsed.value.instruments[0].name);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.1), parsed.value.instruments[0].synth.attack, 1e-6);
-}
-
-test "persist: 未知字段被忽略（向前兼容）" {
-    const allocator = std.testing.allocator;
-    const json =
-        \\{"version":2,"bpm":100,"future_field":42,
-        \\ "clips":[],"notes":[],"instruments":[]}
-    ;
-    const parsed = try fromJson(allocator, json);
-    defer parsed.deinit();
-    try std.testing.expectEqual(@as(f32, 100), parsed.value.bpm);
-}
-
-test "persist: v1 存档自动迁移（小节 → 步）" {
-    const allocator = std.testing.allocator;
-    // v1 格式：片段用 bar/len（小节）；此处 bar = 3、len = 2、offset = 1
-    const json =
-        \\{"version":1,"bpm":120,"time_num":4,"time_den":4,"steps_per_bar":96,
-        \\ "clips":[{"track":0,"bar":3,"len":2,"pattern":0,"offset":1}],
-        \\ "notes":[],"instruments":[]}
-    ;
-    const parsed = try fromJson(allocator, json);
-    defer parsed.deinit();
-
-    try std.testing.expectEqual(@as(u32, 5), parsed.value.version); // 已升级
-    try std.testing.expectEqual(@as(usize, 1), parsed.value.clips.len);
-    const c = parsed.value.clips[0];
-    const B: i32 = model.units_per_whole;
-    try std.testing.expectEqual(2 * B, c.start); // bar 3 → 步 2 小节（0 起）
-    try std.testing.expectEqual(2 * B, c.len); // 2 小节 → 步
-    try std.testing.expectEqual(B, c.offset); // 1 小节局部 → 步
-
-    // 回写 v2 → 再读 → 不重复迁移
-    const json2 = try toJson(allocator, parsed.value);
-    defer allocator.free(json2);
-    const parsed2 = try fromJson(allocator, json2);
-    defer parsed2.deinit();
-    try std.testing.expectEqual(2 * B, parsed2.value.clips[0].start);
-    try std.testing.expectEqual(2 * B, parsed2.value.clips[0].len);
-}
-
-test "persist: v2 存档自动迁移（mixer 1 起 → 0 起）" {
-    const allocator = std.testing.allocator;
-    // v2：乐器 mixer = 1（旧语义：主通道 = 1）→ v3 应为 0
-    const json =
-        \\{"version":2,"bpm":120,"time_num":4,"time_den":4,"steps_per_bar":96,
-        \\ "clips":[],"notes":[],
-        \\ "instruments":[{"name":"A","mixer":1},{"name":"B","mixer":3}]}
-    ;
-    const parsed = try fromJson(allocator, json);
-    defer parsed.deinit();
-    try std.testing.expectEqual(@as(u32, 5), parsed.value.version);
-    try std.testing.expectEqual(@as(i32, 0), parsed.value.instruments[0].mixer); // 1 → 0
-    try std.testing.expectEqual(@as(i32, 2), parsed.value.instruments[1].mixer); // 3 → 2
-
-    // 回写再读：不重复迁移
-    const json2 = try toJson(allocator, parsed.value);
-    defer allocator.free(json2);
-    const parsed2 = try fromJson(allocator, json2);
-    defer parsed2.deinit();
-    try std.testing.expectEqual(@as(i32, 0), parsed2.value.instruments[0].mixer);
-}
-
-test "persist: 缺失字段用默认值（向后兼容）" {
-    const allocator = std.testing.allocator;
-    // 只有 version 和 bpm：其余字段应取默认
-    const json =
-        \\{"version":1,"bpm":90}
-    ;
-    const parsed = try fromJson(allocator, json);
-    defer parsed.deinit();
-    try std.testing.expectEqual(@as(f32, 90), parsed.value.bpm);
-    try std.testing.expectEqual(@as(i32, 4), parsed.value.time_num); // 默认
-    try std.testing.expectApproxEqAbs(@as(f32, 0.75), parsed.value.volume, 1e-6); // 缺字段 → 默认主音量
-    try std.testing.expectEqual(@as(usize, 0), parsed.value.clips.len);
-}
-
-test "persist: 力度/声像往返（缺字段的旧存档 → 默认值）" {
-    const allocator = std.testing.allocator;
-    const notes = [_]SavedNote{
-        .{ .step = 0, .len = 24, .pitch = 60, .pattern = 0, .velocity = 40, .pan = 20 },
-        .{ .step = 48, .len = 24, .pitch = 64, .pattern = 0 }, // 默认 100 / 64
-    };
-    const project = Project{ .notes = @constCast(&notes) };
-
-    const json = try toJson(allocator, project);
-    defer allocator.free(json);
-    const parsed = try fromJson(allocator, json);
-    defer parsed.deinit();
-
-    try std.testing.expectEqual(@as(usize, 2), parsed.value.notes.len);
-    try std.testing.expectEqual(@as(i32, 40), parsed.value.notes[0].velocity);
-    try std.testing.expectEqual(@as(i32, 20), parsed.value.notes[0].pan);
-    try std.testing.expectEqual(@as(i32, 100), parsed.value.notes[1].velocity);
-    try std.testing.expectEqual(@as(i32, 64), parsed.value.notes[1].pan);
-
-    // 旧存档（无字段）→ 默认值
-    const legacy =
-        \\{"version":3,"bpm":120,"time_num":4,"time_den":4,"steps_per_bar":96,
-        \\ "clips":[],"notes":[{"step":0,"len":12,"pitch":60,"pattern":0,"instrument":0}],
-        \\ "instruments":[]}
-    ;
-    const old = try fromJson(allocator, legacy);
-    defer old.deinit();
-    try std.testing.expectEqual(@as(i32, 100), old.value.notes[0].velocity);
-    try std.testing.expectEqual(@as(i32, 64), old.value.notes[0].pan);
-}
-
-test "persist: 瘦身——仅 Note 省默认（Z+）；其余结构反射全写" {
-    const allocator = std.testing.allocator;
-    const notes = [_]SavedNote{
-        .{ .step = 0, .len = 12, .pitch = 60, .pattern = 0 }, // 全默认 → 只剩三键
-        .{ .step = 96, .len = 12, .pitch = 62, .pattern = 1, .instrument = 2, .velocity = 90, .pan = 20 },
-    };
-    const instruments = [_]SavedInstrument{
-        .{ .name = "A", .synth = .{ .attack = 0.1 } },
-    };
-    const project = Project{ .notes = @constCast(&notes), .instruments = @constCast(&instruments) };
-    const json = try toJson(allocator, project);
-    defer allocator.free(json);
-
-    // Note：默认字段省略（用**值定位**断言，不受其他结构的键影响）
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"velocity\": 90") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"velocity\": 100") == null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"pan\": 20") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"pan\": 64") == null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"pattern\": 1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"pattern\": 0") == null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"instrument\": 2") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"instrument\": 0") == null);
-    // 其余结构：反射全写（Z+ 决定——低频实体不做省默认）
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"attack\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"decay\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"hpf\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"preset_name\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"kit\"") != null);
-    // 往返仍正确
-    const parsed = try fromJson(allocator, json);
-    defer parsed.deinit();
-    try std.testing.expectEqual(@as(usize, 2), parsed.value.notes.len);
-    try std.testing.expectEqual(@as(i32, 100), parsed.value.notes[0].velocity);
-    try std.testing.expectEqual(@as(i32, 64), parsed.value.notes[0].pan);
-    try std.testing.expectEqual(@as(i32, 90), parsed.value.notes[1].velocity);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.1), parsed.value.instruments[0].synth.attack, 1e-6);
-}
-
 test "persist: 冻结默认值（绊线——改动任意一项=破坏性格式变更，见 docs/save-format.md）" {
     try std.testing.expectEqual(@as(i32, 100), note_default_velocity);
     try std.testing.expectEqual(@as(i32, 64), note_default_pan);
@@ -1235,11 +1060,7 @@ test "persist: 冻结默认值（绊线——改动任意一项=破坏性格式�
     const mc = SavedMixerChannel{};
     try std.testing.expectEqual(@as(f32, 0.8), mc.volume);
     try std.testing.expectEqual(@as(f32, 0.5), mc.pan);
-    const p = Project{};
-    try std.testing.expectEqual(file_version, p.version);
-    try std.testing.expectEqual(@as(f32, 0.75), p.volume);
     try std.testing.expectEqual(@as(i32, 6), pattern_count_default);
-    try std.testing.expectEqual(model.units_per_whole, p.steps_per_bar); // = 当前分辨率（坐标结构常量）
 }
 
 /// 序列化 → 解析 → **深等**比较（值约定：浮点用 ≤3 位小数字面量——写入按 3 位小数格式化）。
@@ -1381,12 +1202,10 @@ test "persist: 全字段非默认往返（防手写序列化漏字段）" {
     const insts = [_]SavedInstrument{.{ .name = "A" }};
     const mix = [_]SavedMixerChannel{.{ .volume = 0.9 }};
     try expectRoundtrip(Project, .{
-        .version = file_version,
         .bpm = 140,
         .volume = 0.42,
         .time_num = 3,
         .time_den = 8,
-        .steps_per_bar = 72,
         .pattern_names = &pnames,
         .track_names = &tnames,
         .track_name_rows = &trows,
@@ -1430,12 +1249,10 @@ test "persist: v5 二进制往返（代表性子结构 + 全字段工程 + 空�
     const insts = [_]SavedInstrument{.{ .name = "A" }};
     const mix = [_]SavedMixerChannel{.{ .volume = 0.9 }};
     try expectBinRoundtrip(Project, .{
-        .version = file_version,
         .bpm = 140,
         .volume = 0.42,
         .time_num = 3,
         .time_den = 8,
-        .steps_per_bar = 72,
         .pattern_names = &pnames,
         .clips = @constCast(&clips),
         .notes = @constCast(&notes2),
@@ -1458,7 +1275,7 @@ test "persist: v5 二进制——插件状态 base64→raw（-25%）与非法回
     try expectBinRoundtrip(SavedInstrument, si); // 往返保真（含非法回退字段）
 }
 
-test "persist: parseAuto——JSON/二进制自动识别 + magic 严格性" {
+test "persist: parseAuto——只认二进制（magic / 尾部垃圾 / 版本不符均报错）" {
     const a = std.testing.allocator;
     const p = Project{ .bpm = 150 };
     const bin = try toBinary(a, p);
@@ -1467,11 +1284,8 @@ test "persist: parseAuto——JSON/二进制自动识别 + magic 严格性" {
     var pb = try parseAuto(a, bin);
     defer pb.deinit();
     try std.testing.expectEqual(@as(f32, 150), pb.value.bpm);
-    const js = try toJson(a, p);
-    defer a.free(js);
-    var pj = try parseAuto(a, js);
-    defer pj.deinit();
-    try std.testing.expectEqual(@as(i32, 150), pj.value.bpm);
+    // 非二进制（旧 JSON / 垃圾）→ 一律 NotBinaryProject
+    try std.testing.expectError(error.NotBinaryProject, parseAuto(a, "{\"bpm\":150}"));
     // 尾部垃圾 / 版本不符 → 错误（严格性）
     const bad = try std.mem.concat(a, u8, &.{ bin, "\x00" });
     defer a.free(bad);
@@ -1480,14 +1294,6 @@ test "persist: parseAuto——JSON/二进制自动识别 + magic 严格性" {
     defer a.free(bad2);
     bad2[4] = 99;
     try std.testing.expectError(error.UnsupportedBinaryVersion, parseAuto(a, bad2));
-}
-
-test "persist: probeJsonVersion——旧档探针" {
-    const a = std.testing.allocator;
-    try std.testing.expectEqual(@as(?u32, 3), probeJsonVersion(a, "{\"version\":3,\"bpm\":120}"));
-    try std.testing.expectEqual(@as(?u32, 1), probeJsonVersion(a, "{\"bpm\":120}")); // 缺字段 → 1（v1 语义）
-    try std.testing.expectEqual(@as(?u32, null), probeJsonVersion(a, "not json"));
-    try std.testing.expectEqual(@as(?u32, null), probeJsonVersion(a, ""));
 }
 
 test "persist: 真实文件往返（写盘 → 读回）" {
@@ -1509,15 +1315,15 @@ test "persist: 真实文件往返（写盘 → 读回）" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const json = try toJson(allocator, project);
-    defer allocator.free(json);
-    tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.saw", .data = json }) catch return error.SkipZigTest;
+    const bytes = try toBinary(allocator, project);
+    defer allocator.free(bytes);
+    tmp_dir.dir.writeFile(std.testing.io, .{ .sub_path = "test.saw", .data = bytes }) catch return error.SkipZigTest;
 
     // 读回
     const data = try tmp_dir.dir.readFileAlloc(std.testing.io, "test.saw", allocator, .unlimited);
     defer allocator.free(data);
 
-    const parsed = try fromJson(allocator, data);
+    const parsed = try fromBinary(allocator, data);
     defer parsed.deinit();
 
     try std.testing.expectEqual(@as(i32, 96), parsed.value.bpm);
@@ -1544,12 +1350,9 @@ test "persist: 调音台通道往返（增益/声像/静音/效果链）" {
     };
     const project = Project{ .mixer = @constCast(&mix) };
 
-    const json = try toJson(allocator, project);
-    defer allocator.free(json);
-    // JSON 里应有调音台字段
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"mixer\"") != null);
-
-    const parsed = try fromJson(allocator, json);
+    const bytes = try toBinary(allocator, project);
+    defer allocator.free(bytes);
+    const parsed = try fromBinary(allocator, bytes);
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 2), parsed.value.mixer.len);
     const m0 = parsed.value.mixer[0];
@@ -1571,11 +1374,6 @@ test "persist: 调音台通道往返（增益/声像/静音/效果链）" {
     // 第二通道
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), parsed.value.mixer[1].pan, 1e-6);
     try std.testing.expect(!parsed.value.mixer[1].muted);
-
-    // 旧存档无 mixer 字段 → 空数组（不报错）
-    const old = try fromJson(allocator, "{\"version\":2,\"bpm\":100}");
-    defer old.deinit();
-    try std.testing.expectEqual(@as(usize, 0), old.value.mixer.len);
 }
 
 test "persist: 效果链动态长度往返（>4 条不再截断）" {
@@ -1583,46 +1381,26 @@ test "persist: 效果链动态长度往返（>4 条不再截断）" {
     const six = [_]SavedEffectSlot{ .{ .kind = 1 }, .{ .kind = 1 }, .{ .kind = 1 }, .{ .kind = 1 }, .{ .kind = 1 }, .{ .kind = 1 } };
     const mix = [_]SavedMixerChannel{.{ .effect_count = 6, .effects = &six }};
     const project = Project{ .mixer = @constCast(&mix) };
-    const json = try toJson(allocator, project);
-    defer allocator.free(json);
-    const parsed = try fromJson(allocator, json);
+    const bytes = try toBinary(allocator, project);
+    defer allocator.free(bytes);
+    const parsed = try fromBinary(allocator, bytes);
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 6), parsed.value.mixer[0].effects.len);
-    // effect_count 已在写入侧省略（= effects.len；加载侧 `importMixerChannels` 按 kind 推断恢复）
+    // `effect_count` 与 `effects.len` 一致（导入侧 `importMixerChannels` 也按 kind 推断容错）
 }
 
-test "persist: v2 输出不含 v1 兼容字段（bar/len_bars）" {
-    const allocator = std.testing.allocator;
-    const clips = [_]SavedClip{.{ .track = 0, .start = 2 * model.units_per_whole, .len = model.units_per_whole, .pattern = 0 }};
-    const project = Project{ .clips = @constCast(&clips) };
-    const json = try toJson(allocator, project);
-    defer allocator.free(json);
-    // bar/len_bars 为 null 时不应出现在 JSON 里（避免噪音与误读）
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"bar\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "len_bars") == null);
-}
-
-test "persist: 样式名往返（旧存档无字段 → 空列表）" {
+test "persist: 样式名往返" {
     const allocator = std.testing.allocator;
     const names = [_][]const u8{ "主歌", "副歌" };
     const project = Project{ .pattern_names = &names };
 
-    const json = try toJson(allocator, project);
-    defer allocator.free(json);
-    const parsed = try fromJson(allocator, json);
+    const bytes = try toBinary(allocator, project);
+    defer allocator.free(bytes);
+    const parsed = try fromBinary(allocator, bytes);
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 2), parsed.value.pattern_names.len);
     try std.testing.expectEqualStrings("主歌", parsed.value.pattern_names[0]);
     try std.testing.expectEqualStrings("副歌", parsed.value.pattern_names[1]);
-
-    // 旧存档（v3、无 pattern_names）→ 空列表（加载方按 pattern_count 重建）
-    const legacy =
-        \\{"version":3,"bpm":120,"pattern_count":6}
-    ;
-    const old = try fromJson(allocator, legacy);
-    defer old.deinit();
-    try std.testing.expectEqual(@as(usize, 0), old.value.pattern_names.len);
-    try std.testing.expectEqual(@as(i32, 6), old.value.pattern_count);
 }
 
 test "persist: v9 单位迁移——步域 ×40、帧域/参数绝不动（含 3/4 的 steps_per_bar）" {
@@ -1638,10 +1416,8 @@ test "persist: v9 单位迁移——步域 ×40、帧域/参数绝不动（含 3
     const pts = [_]SavedLanePoint{.{ .step = 18, .value = 0.5 }};
     var lanes = [_]SavedLane{.{ .points = @constCast(&pts) }};
     const proj = Project{
-        .version = 8, // 旧版
         .time_num = 3,
         .time_den = 4,
-        .steps_per_bar = 72,
         .clips = @constCast(&clips),
         .notes = @constCast(&notes),
         .auto_lanes = @constCast(&lanes),
@@ -1661,8 +1437,6 @@ test "persist: v9 单位迁移——步域 ×40、帧域/参数绝不动（含 3
     // v8 档**没有自动化**（v9 才引入）→ 读出来应当是空的（字段跳过不丢字节）
     try std.testing.expectEqual(@as(usize, 0), p.auto_lanes.len);
     try std.testing.expectEqual(@as(usize, 0), p.auto_bindings.len);
-    // 冗余的 steps_per_bar：**也是步域**（3/4 = 72 → 2880）
-    try std.testing.expectEqual(model.stepsPerBarFor(3, 4), p.steps_per_bar);
     // 帧域 / 参数：**不动**
     try std.testing.expectEqual(@as(i32, 111), p.clips[1].trim_start);
     try std.testing.expectEqual(@as(i32, 222), p.clips[1].trim_len);
@@ -1676,14 +1450,141 @@ test "persist: v9 迁移也把自动化曲线点换算（×40）——函数级�
     var pts = [_]SavedLanePoint{ .{ .step = 18, .value = 0.5 }, .{ .step = 90, .value = 1 } };
     var lanes = [_]SavedLane{.{ .points = @constCast(&pts) }};
     var proj = Project{
-        .version = 8,
-        .steps_per_bar = 72,
         .auto_lanes = @constCast(&lanes),
     };
     migrateUnitsToV5(&proj);
     try std.testing.expectEqual(@as(i32, 18 * sc), proj.auto_lanes[0].points[0].step);
     try std.testing.expectEqual(@as(i32, 90 * sc), proj.auto_lanes[0].points[1].step);
     try std.testing.expectEqual(@as(f32, 0.5), proj.auto_lanes[0].points[0].value); // 值不换
+}
+
+test "persist: removed_fields / changed_fields 表自检（填错会静默错位，必须炸在测试里）" {
+    // 这些表**没有运行时校验**：`owner`/`before` 拼错 → 该丢的字节没丢 → 后面全错位，
+    // 而且只在“真实旧档”上才看得出来。所以在此逐条对准结构体自检。
+    inline for (removed_fields) |rf| {
+        const T = structByOwner(rf.owner);
+        // 1) 被删的字段**必须真的不存在了**（否则会被读两次）
+        try std.testing.expect(!@hasField(T, rf.name));
+        // 2) `before` 必须是当前存在的字段（空串 = 结尾）
+        if (rf.before.len > 0) try std.testing.expect(@hasField(T, rf.before));
+        // 3) 类型不能是带堆内存的（“读掉丢弃”只用得上标量/可选标量）
+        const Info = @typeInfo(rf.T);
+        try std.testing.expect(Info == .int or Info == .float or Info == .bool or Info == .optional);
+    }
+    inline for (changed_fields) |cf| {
+        const T = structByOwner(cf.owner);
+        // 1) 字段必须先当前存在（类型变更不是删除）
+        try std.testing.expect(@hasField(T, cf.name));
+        // 2) 新旧类型**必须真的不同**（否则这条登记是死登记，谁也不知道它在守护什么）
+        try std.testing.expect(@FieldType(T, cf.name) != cf.old_T);
+        // 3) `changed_in` 不能比当前版本还新
+        try std.testing.expect(cf.changed_in <= binary_version);
+    }
+}
+
+test "persist: probeVersion——二进制看版本字节 / 截断或垃圾 → null" {
+    const a = std.testing.allocator;
+    const p = Project{};
+    const bin = try toBinary(a, p);
+    defer a.free(bin);
+    try std.testing.expectEqual(@as(?u32, binary_version), probeVersion(a, bin));
+    // 旧布局也能探出真实版本号（升级弹窗靠它显示“v6”这类提示）
+    const bin6 = try toBinaryAtVersion(a, p, 6);
+    defer a.free(bin6);
+    try std.testing.expectEqual(@as(?u32, 6), probeVersion(a, bin6));
+    // 只剩 magic（截断）→ null（不当成版本 0 去乱弹窗）
+    try std.testing.expect(probeVersion(a, bin[0..binary_magic.len]) == null);
+    // 非二进制（旧 JSON / 干脆是垃圾）→ null
+    try std.testing.expect(probeVersion(a, "definitely not a project") == null);
+    try std.testing.expect(probeVersion(a, "{\"version\":3}") == null);
+}
+
+test "persist: v6 / v7 / v8 三种旧布局都能读（字段门控不吞字节 + ×40 迁移）" {
+    // 版本 → 引入内容（读者靠 `introducedVersion` 跳字段，**不靠补丁函数**）：
+    //   v6 = 鼓组 VST3 层 / 音频片段 / 音频样式；v7 = instrument_order；
+    //   v8 = 音符·片段静音 `muted`；v9 = 自动化整套 + uid + 绑定新字段 + 单位 ×40。
+    const a = std.testing.allocator;
+    const sc = model.unit_migration_scale;
+    var clips = [_]SavedClip{.{ .track = 3, .start = 4, .len = 8, .pattern = 1, .audio_style = 2, .trim_start = 55, .trim_len = 66, .muted = true }};
+    var notes = [_]SavedNote{.{ .step = 2, .len = 3, .pitch = 60, .pattern = 0, .instrument = 1, .muted = true }};
+    var order = [_]u32{ 1, 0 };
+    const proj = Project{
+        .bpm = 112,
+        .clips = @constCast(&clips),
+        .notes = @constCast(&notes),
+        .instrument_order = @constCast(&order),
+    };
+
+    // v6：有音频字段；没 instrument_order（v7）、没 muted（v8）、没自动化（v9）
+    {
+        const bytes = try toBinaryAtVersion(a, proj, 6);
+        defer a.free(bytes);
+        try std.testing.expectEqual(@as(u8, 6), bytes[4]);
+        var parsed = try fromBinary(a, bytes);
+        defer parsed.deinit();
+        const p = parsed.value;
+        try std.testing.expectEqual(@as(usize, 1), p.clips.len);
+        try std.testing.expectEqual(@as(i32, 2), p.clips[0].audio_style); // v6 字段在
+        try std.testing.expectEqual(@as(i32, 55), p.clips[0].trim_start);
+        try std.testing.expectEqual(@as(i32, 4 * sc), p.clips[0].start); // ×40
+        try std.testing.expectEqual(@as(bool, false), p.clips[0].muted); // v8 缺失 → false
+        try std.testing.expectEqual(@as(bool, false), p.notes[0].muted);
+        try std.testing.expectEqual(@as(i32, 2 * sc), p.notes[0].step);
+        try std.testing.expectEqual(@as(usize, 0), p.instrument_order.len); // v7 缺失 → empty
+        try std.testing.expectEqual(@as(usize, 0), p.auto_lanes.len); // v9 缺失 → empty
+        try std.testing.expectEqual(@as(usize, 0), p.auto_bindings.len);
+        // **类型变更**：v5..v8 的 `bpm` 是 i32，v9 才是 f32——按旧类型读完必须转回
+        try std.testing.expectEqual(@as(f32, 112), p.bpm);
+    }
+    // v7：多了 instrument_order
+    {
+        const bytes = try toBinaryAtVersion(a, proj, 7);
+        defer a.free(bytes);
+        var parsed = try fromBinary(a, bytes);
+        defer parsed.deinit();
+        const p = parsed.value;
+        try std.testing.expectEqualSlices(u32, &.{ 1, 0 }, p.instrument_order);
+        try std.testing.expectEqual(@as(bool, false), p.clips[0].muted); // v8 仍缺失
+        try std.testing.expectEqual(@as(i32, 2), p.clips[0].audio_style);
+    }
+    // v8：多了 muted（音符 + 片段），仍无自动化
+    {
+        const bytes = try toBinaryAtVersion(a, proj, 8);
+        defer a.free(bytes);
+        var parsed = try fromBinary(a, bytes);
+        defer parsed.deinit();
+        const p = parsed.value;
+        try std.testing.expectEqual(@as(bool, true), p.clips[0].muted);
+        try std.testing.expectEqual(@as(bool, true), p.notes[0].muted);
+        try std.testing.expectEqualSlices(u32, &.{ 1, 0 }, p.instrument_order);
+        try std.testing.expectEqual(@as(usize, 0), p.auto_lanes.len);
+    }
+    // v9（当前）：所有字段都在，并且**不再 ×40**（已是新单位）
+    {
+        const bytes = try toBinary(a, proj);
+        defer a.free(bytes);
+        var parsed = try fromBinary(a, bytes);
+        defer parsed.deinit();
+        const p = parsed.value;
+        try std.testing.expectEqual(@as(i32, 4), p.clips[0].start); // 原值
+        try std.testing.expectEqual(@as(i32, 2), p.notes[0].step);
+        try std.testing.expectEqual(@as(bool, true), p.clips[0].muted);
+        try std.testing.expectEqual(@as(f32, 112), p.bpm);
+    }
+    // v9 起 `bpm` 是 f32：**小数必须原样保留**（旧 i32 路径会截成 112）
+    {
+        const bytes = try toBinary(a, .{ .bpm = 90.5, .clips = @constCast(&clips) });
+        defer a.free(bytes);
+        var parsed = try fromBinary(a, bytes);
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(f32, 90.5), parsed.value.bpm);
+        // 写成旧布局（v8）时会截成整数——不报错、但精度丢失是该版本格式的固有约束
+        const old = try toBinaryAtVersion(a, .{ .bpm = 90.5 }, 8);
+        defer a.free(old);
+        var parsed_old = try fromBinary(a, old);
+        defer parsed_old.deinit();
+        try std.testing.expectEqual(@as(f32, 90), parsed_old.value.bpm);
+    }
 }
 
 test "persist: v5 旧布局兼容读（v5 之后追加的字段取默认值）" {

@@ -62,7 +62,7 @@ pub const Layout = struct {
 };
 
 /// 文件菜单动作（帧末统一执行）
-pub const FileAction = enum { new, open, save, save_as, import_midi, export_midi, export_wav, import_json, export_json };
+pub const FileAction = enum { new, open, save, save_as, import_midi, export_midi, export_wav };
 
 /// 编辑操作（框选/批量操作快捷键 → 由**当前视图**在帧内按上下文执行）
 pub const EditOp = enum { delete_selected, clone_right, copy, cut, paste, select_all, toggle_mute, quantize };
@@ -413,7 +413,7 @@ pub const ModalKind = enum {
     track_delete,
     /// 删除**自动化曲线** → 确认（删除/取消；被多个参数链接时必弹，单绑定直接删）
     delete_auto_curve,
-    /// 旧版存档（v1–v3 JSON）打开 → “备份并升级”确认（③ 迁移流程）
+    /// 旧版存档（二进制 v5–v8）打开 → “备份并升级”确认（③ 迁移流程）
     save_upgrade,
 };
 
@@ -1142,8 +1142,6 @@ pub const PickUse = union(enum) {
     project_save: struct { force_dialog: bool },
     project_open,
     import_midi,
-    import_json,
-    export_json,
     /// MIDI 导出：`pattern` < 0 = 全部样式；否则只导出该样式
     export_midi: struct { pattern: i32 = -1 },
     export_wav,
@@ -1173,8 +1171,8 @@ pub const PickRequest = struct {
         return switch (self.use_) {
             .project_save => "已取消保存",
             .project_open => "已取消打开",
-            .import_midi, .import_json => "已取消导入",
-            .export_json, .export_midi, .export_wav => "已取消导出",
+            .import_midi => "已取消导入",
+            .export_midi, .export_wav => "已取消导出",
             .plugin_folder, .plugin_file, .load_sample => "已取消选择",
             .relocate_instrument, .relocate_effect => "已取消重新定位",
         };
@@ -1391,19 +1389,8 @@ const StatePool = struct {
     }
 };
 
-/// **VST 参数自动化**：写入“已到位”判据（归一化值差小于它就不写）
+/// **VST 参数自动化**：手动写入“已到位/回声”判据（归一化值差小于它就不记）
 const vst_auto_eps: f64 = 1e-4;
-/// 用户拧完旋钮后，自动化让路的时长（ms；**touch 语义**）
-const vst_touch_ms: i64 = 400;
-
-/// **一阶极点一步**（VST 参数在 UI 侧施加时的平滑）：
-/// - `prev` 为 NaN（未播种）或 `smooth_ms <= 0` → 直接取 `target`（不从 0 爬升）；
-/// - 否则按时间常数 τ = smooth_ms/1000 向 `target` 追赶一步（`dt_s` = 本帧秒数）。
-pub fn poleStep(prev: f32, target: f32, smooth_ms: f32, dt_s: f32) f32 {
-    if (smooth_ms <= 0.0 or std.math.isNan(prev)) return target;
-    const k: f32 = std.math.clamp(1.0 - @exp(-@max(0.0, dt_s) / (smooth_ms / 1000.0)), 0.0, 1.0);
-    return prev + (target - prev) * k;
-}
 
 pub const App = struct {
     /// 已退役但音频线程可能仍在读的快照（帧倒计时后释放）
@@ -1612,7 +1599,7 @@ pub const App = struct {
     /// 曲线 id 分配器（单调、不重用）
     next_curve_id: u32 = 0,
 
-    // ── VST 参数自动化（v1：**UI 侧**施加；见 `applyVstParamAutomation`）──
+    // ── VST 参数自动化（**v2：音频线程施加**；这里只有窗口/最近列表/回声环）──
     /// **VST 自动化窗口**（Windows：乐器窗口标题栏 `自动化` 按钮；Linux：直接占用乐器面板正文）
     vst_auto: struct {
         open: bool = false,
@@ -1640,9 +1627,7 @@ pub const App = struct {
     /// “最近改动”的插件参数（最新在前；只存 (乐器 uid, 参数 id)）
     vst_recent: [10]struct { inst_uid: u32, param_id: u32 } = @splat(.{ .inst_uid = 0, .param_id = 0 }),
     vst_recent_n: usize = 0,
-    /// 用户此刻/刚刚拧过的参数（**touch 语义**：这段时间内不施加自动化）
-    vst_touch: [8]struct { inst_uid: u32, param_id: u32, until_ms: i64 } = @splat(.{ .inst_uid = 0, .param_id = 0, .until_ms = 0 }),
-    /// 最近一次**自动化写入**的值（回声抑制：插件把自己的变更回报成 performEdit 时不记历史）
+    /// 最近一次**手动写入**的值（回声抑制：插件把自己的变更回报成 performEdit 时不记历史）
     vst_written: [16]struct { inst_uid: u32, param_id: u32, value: f64 } = @splat(.{ .inst_uid = 0, .param_id = 0, .value = -1 }),
     vst_written_w: usize = 0,
     /// **钢琴窗编辑区**：envelope 编辑的当前目标 + **每个目标一条独立 lane**
@@ -1828,8 +1813,14 @@ pub const App = struct {
     params: audio.Params = .{},
     engine: audio.Engine = .{ .params = undefined },
     volume: f32 = 0.75,
-    /// BPM（拍/分；工具栏可上下拖动调整；范围 `model.bpm_min`~`model.bpm_max`）——**支持两位小数**
+    /// BPM（拍/分；工具栏可上下拖动调整；范围 `model.bpm_min`~`model.bpm_max`）——**支持两位小数**。
+    /// **它是“有效 BPM”**：无 tempo 绑定时 == `bpm_doc`；有绑定时由曲线每帧驱动。
+    /// 调度/音频侧/工具栏读数都用它。
     bpm: f32 = 120,
+    /// **文档 BPM**（用户设的、“存进工程”的那个值）。tempo 自动化不能污染它。
+    bpm_doc: f32 = 120,
+    /// tempo 自动化的**极点状态**（NaN = 未播种）；与音频侧 `poleStep` 同一套数学。
+    tempo_sm: f32 = std.math.nan(f32),
     /// 拍号分子（每小节拍数；工具栏可拖动）
     time_num: i32 = 4,
     /// 拍号分母（以几分音符为一拍；工具栏可拖动）——**只允许 2 的幂**
@@ -4285,7 +4276,7 @@ pub const App = struct {
         self.pending_open_path = self.allocator.dupe(u8, path) catch null;
     }
 
-    /// 登记待升级（旧版 JSON 存档；弹窗确认前不打开——③ 迁移流程）
+    /// 登记待升级（旧版二进制存档 v5–v8；弹窗确认前不打开——③ 迁移流程）
     pub fn setPendingUpgrade(self: *App, path: []const u8, version: u32) void {
         self.clearPendingUpgrade();
         self.pending_upgrade_path = self.allocator.dupe(u8, path) catch null;
@@ -6045,11 +6036,12 @@ pub const App = struct {
                 .master_vol => 0,
                 .mixer_vol, .mixer_pan => self.channelIndexByUid(b.target.uid) orelse continue,
                 .inst_vol, .inst_pan => self.instrumentIndexByUid(b.target.uid) orelse continue,
-                .tempo => continue, // 节奏在 UI 侧应用（不占音频侧 lane 快照）
-                .vst_param => continue, // v1：插件参数在 **UI 侧**施加（见 `applyVstParamAutomation`）
+                .tempo => continue, // 节奏在 UI 侧求值（不进音频 lane 快照；它是一全局量）
+                .vst_param => self.instrumentIndexByUid(b.target.uid) orelse continue, // v2：音频线程求值
                 .none => continue,
             };
-            const is_inst = b.target.kind == .inst_vol or b.target.kind == .inst_pan;
+            const is_vst = b.target.kind == .vst_param;
+            const is_inst = is_vst or b.target.kind == .inst_vol or b.target.kind == .inst_pan;
             const is_pan = b.target.kind == .mixer_pan or b.target.kind == .inst_pan;
             const lc = self.curveById(b.curve_id) orelse continue;
             const n = @min(lc.points.items.len, audio.LaneSnap.capacity);
@@ -6062,12 +6054,15 @@ pub const App = struct {
             snap.active = true;
             snap.ch = @intCast(@min(ch, 255));
             snap.inst = is_inst;
-            snap.kind = if (is_pan) 1 else 0;
-            // **槽位指纹**：音频侧据此判断“这个槽是不是换绑定了” → 重新播种平滑状态
+            snap.kind = if (is_vst) 2 else if (is_pan) 1 else 0;
+            snap.param_id = if (is_vst) b.target.param_id else 0;
+            // **槽位指纹**：音频侧据此判断“这个槽是不是换绑定了” → 重新播种平滑状态。
+            // vst_param 的同一乐器上可能挂多个参数 → 必须把 param_id 混进指纹（乘法打散）。
             snap.key = b.curve_id ^ (@as(u32, @intCast(ch)) << 16) ^
                 (@as(u32, @intCast(@backingInt(b.target.kind))) << 24) ^
-                (if (is_inst) @as(u32, 1) << 8 else 0);
-            snap.base = b.base orelse view_lane.Target.defaultBase(b.target.kind);
+                (if (is_inst) @as(u32, 1) << 8 else 0) ^
+                (if (is_vst) b.target.param_id *% 2654435761 else 0);
+            snap.base = b.base orelse self.defaultBaseFor(b.target);
             snap.interp = switch (lc.interp) {
                 .hold => 0,
                 .linear => 1,
@@ -7020,8 +7015,15 @@ pub const App = struct {
                         // 是 → 整条丢弃（不记手势/历史、不标脏），否则会每帧造幽灵条目 +
                         // 反复重捕插件状态（`getState` 很贵）。
                         if (inst_uid != 0 and self.vstAutoEcho(inst_uid, ev.id, ev.value)) continue;
-                        // 用户真的动了参数 → 记 touch 窗口（自动化让路）+“最近改动”
-                        if (inst_uid != 0) self.noteVstParamTouched(inst_uid, ev.id);
+                        // **自动化回声**（v2）：参数由音频线程经 `inputParameterChanges` 驱动，
+                        // 个别插件会把它回报成 `performEdit`——值与当前曲线值一致就丢弃，
+                        // **不记历史、也不接管**（否则每个块都会“接管”，自动化永远不生效）。
+                        if (inst_uid != 0 and self.vstParamEchoByCurve(inst_uid, ev.id, ev.value)) continue;
+                        // 用户真的动了参数 → **自动化让路**（音频侧块计数）+“最近改动”
+                        if (inst_uid != 0) {
+                            pl.noteUserTakeover();
+                            self.noteVstParamTouched(inst_uid, ev.id);
+                        }
                         if (!any_perform) {
                             any_perform = true;
                             self.markSlotStateDirty(ref);
@@ -7132,6 +7134,8 @@ pub const App = struct {
         self.playlist.view_rows = 128; // 可见行快照复位（下一帧视图重写）
         self.resetMixerChannels(default_mixer_channels);
         self.bpm = 120;
+        self.bpm_doc = 120;
+        self.tempo_sm = std.math.nan(f32);
         self.time_num = 4;
         self.time_den = 4;
         self.steps_per_bar = model.stepsPerBarFor(4, 4);
@@ -7221,7 +7225,6 @@ pub const App = struct {
                     .linear => 1,
                     .smooth => 2,
                 },
-                .curve_kind = 1,
                 .display_unit = @backingInt(lc.display_unit),
                 .points = pts,
             };
@@ -7724,7 +7727,7 @@ pub const App = struct {
             .track_muted = muted_list,
             .instrument_order = order_snap, // 显示顺序（上移/下移乐器也要能撤销）
             .param_edits = recs0,
-            .bpm = self.bpm,
+            .bpm = self.bpm_doc, // 历史里存**文档 BPM**（有效 BPM 每帧被曲线驱动，不能存）
             .time_num = self.time_num,
             .time_den = self.time_den,
             .steps_per_bar = self.steps_per_bar,
@@ -7812,7 +7815,7 @@ pub const App = struct {
         }
         // BPM 是 f32（支持小数）→ **容差比较**：否则 BPM 自动化每帧微调都会被当成“有变化”，
         // 产生满地历史条目 / 永远亮着的未保存标记。
-        if (@abs(st.bpm - self.bpm) > 0.001 or st.time_num != self.time_num or st.time_den != self.time_den) return false;
+        if (@abs(st.bpm - self.bpm_doc) > 0.001 or st.time_num != self.time_num or st.time_den != self.time_den) return false;
         // 样式名字（数量 + 内容）——否则重命名会被判“无变化”，静默丢弃历史条目
         if (st.pattern_names.len != self.pattern_items.items.len) return false;
         for (st.pattern_names, self.pattern_items.items) |a, b| {
@@ -8078,7 +8081,7 @@ pub const App = struct {
         } else {
             self.ensureOrder();
         }
-        self.bpm = st.bpm;
+        self.setDocBpm(st.bpm);
         self.time_num = st.time_num;
         self.time_den = st.time_den;
         // 同上：由拍号推导（撤销/重做也不信任快照里的冗余字段）
@@ -8983,11 +8986,10 @@ pub const App = struct {
             std.mem.sort(i32, muted_list, {}, std.sort.asc(i32));
         }
         return .{
-            .bpm = self.bpm,
+            .bpm = self.bpm_doc, // **存档用文档 BPM**（tempo 自动化不得污染它）
             .volume = self.volume, // 主音量（持久化——重开工程恢复）
             .time_num = self.time_num,
             .time_den = self.time_den,
-            .steps_per_bar = self.steps_per_bar,
             .pattern_count = self.patternCount(),
             .pattern_names = pat_names,
             .track_names = trk_names,
@@ -9234,6 +9236,8 @@ pub const App = struct {
 
         // 全局设置
         self.bpm = p.bpm;
+        self.bpm_doc = p.bpm;
+        self.tempo_sm = std.math.nan(f32);
         self.volume = p.volume; // 主音量（缺字段的旧存档 → 默认值）
         self.params.volume.store(self.volume, .monotonic); // 立即同步到音频线程
         self.time_num = p.time_num;
@@ -9720,7 +9724,10 @@ pub const App = struct {
         const step_frames_f: f64 = @as(f64, @floatFromInt(sr)) * 60.0 / (bpm * spb_per_beat);
         const end_step: u64 = @intCast(@max(0, self.clipsEndStep()));
         // 先乘再取整（不是“每步取整后 × 步数”）
-        const total_frames: u64 = @as(u64, @intFromFloat(@round(@as(f64, @floatFromInt(end_step)) * step_frames_f))) + sr * export_tail_sec;
+        // **有 tempo 自动化时，时长要把曲线积分出来**——否则长度按“起始 BPM”算，
+        // 变速工程会被截短（渐快）或多出一截（渐慢）。
+        const body_frames: f64 = self.exportBodyFrames(end_step, step_frames_f);
+        const total_frames: u64 = @as(u64, @intFromFloat(@round(body_frames))) + sr * export_tail_sec;
         const step_frames: u64 = @intFromFloat(@round(step_frames_f));
 
         // 渲染器先建：失败时设备/传输都还没动，直接返回。压缩格式先落临时 WAV。
@@ -9736,6 +9743,7 @@ pub const App = struct {
         self.params.start_frame.store(0, .monotonic);
         self.params.start_step.store(0, .monotonic);
         self.params.frames_played.store(0, .monotonic);
+        self.params.play_step.store(0, .monotonic); // 导出第一块的 tempo 求值要用它（积分器位置）
         self.params.bpm.store(std.math.clamp(self.bpm, model.bpm_min, model.bpm_max), .monotonic);
         self.params.steps_per_beat.store(@intFromFloat(spb_per_beat), .monotonic);
         self.markGenSoft(false); // 硬切换（导出起播）：照旧释放（无残留声部）
@@ -9797,6 +9805,23 @@ pub const App = struct {
         if (self.export_wav) |*ew| ew.cancel_req = true;
     }
 
+    /// 导出“正文”帧数：**有 tempo 自动化就按曲线逐步积分**（否则按当前步宽相乘）。
+    /// 不积分的话，渐快工程会被截短、渐慢工程会多出一截静音（时长对不上）。
+    fn exportBodyFrames(self: *const App, end_step: u64, step_frames_now: f64) f64 {
+        const tgt = view_lane.Target{ .kind = .tempo };
+        if (!self.isTargetBound(tgt)) return @as(f64, @floatFromInt(end_step)) * step_frames_now;
+        const sr: f64 = @floatFromInt(self.params.sample_rate);
+        const spb: f64 = @floatFromInt(@max(1, model.stepsPerBeat(self.time_den)));
+        var frames: f64 = 0;
+        var s: u64 = 0;
+        while (s < end_step) : (s += 1) {
+            const v = self.autoValueFor(tgt, @floatFromInt(s), 0.0);
+            const bpm: f64 = @max(model.bpm_min, @as(f64, view_lane.Target.bpmFromNorm(v)));
+            frames += sr * 60.0 / (bpm * spb);
+        }
+        return frames;
+    }
+
     /// 分块渲染（`budget_ns` 内尽量多跑；maxInt = 一次跑完——同步模式）。
     /// 完成后自动收尾（状态机消费：返回后 `export_wav` 已清理）。
     fn exportWavRun(self: *App, io: std.Io, budget_ns: i64) !void {
@@ -9810,6 +9835,12 @@ pub const App = struct {
             self.snap_dirty = true;
             self.pollSnapshotRebuild();
             const n: u32 = @intCast(@min(@as(u64, obuf.len / 2), ew.total_frames - ew.done));
+            // **导出也跟随 tempo 自动化**（与实时同一条曲线）：按积分器位置 + 块时长推极点，
+            // 再同步给音频侧（它用 `params.bpm` 换算步宽）。不加这句，导出的速度永远是文档值。
+            if (self.isTargetBound(.{ .kind = .tempo })) {
+                self.applyTempoAutomationAtBlock(n);
+                self.params.bpm.store(std.math.clamp(self.bpm, model.bpm_min, model.bpm_max), .monotonic);
+            }
             audio.renderBlock(&self.engine, &self.params, &obuf, n, @floatFromInt(self.params.sample_rate));
             try ew.writer.writeFrames(obuf[0 .. n * 2]);
             ew.done += n;
@@ -9931,72 +9962,13 @@ pub const App = struct {
         self.export_wav = null;
     }
 
-    /// 播放中：插件参数自动化的**施加**（v1：UI 侧，每帧一次）。
+    /// **（v2：已搬到音频线程）**旧 v1 在这里做“UI 侧 60Hz 施加”，现在删掉了——
+    /// VST 参数自动化改由 `audio.renderSegment` 每段求值 → `Plugin.queueAuto` →
+    /// `inputParameterChanges`（段内两点），好处：采样级、卡顿时不拖、**离线导出也跟随**。
     ///
-    /// - **逐绑定极点**：每条绑定的贡献各自按自己的 `smooth_ms` 做一阶极点（与音频侧的
-    ///   `LaneSet.contributionSmooth` 同语义），再按极性/反向/深度缩放、求和；
-    ///   状态存在 `Binding.ui_smooth_state`（**瞬态**，不存栈）→ 用户改完曲线立即生效、不从 0 爬升。
-    /// - **touch 语义**：用户刚刚在插件 GUI 里拧过的参数（`vst_touch`，400ms 窗口）**让路**——
-    ///   这样“扭一下能听见、松手回弹”，又不会和自动化抢写。
-    /// - **回声抑制**：写入值记进 `vst_written`；插件若把自己的变更回报成 `performEdit`，
-    ///   在 `drainSlotEditorEdits` 里比对后**整条丢弃**（否则会造幽灵撤销条目 + 反复重捕插件状态）。
-    pub fn applyVstParamAutomation(self: *App, dt_ns: i64) void {
-        if (self.auto_bindings.items.len == 0) return;
-        // 离线导出：帧循环不是实时节拍，而且导出前已快照插件状态 → 不去扰它
-        if (self.export_wav != null) return;
-        const step: f32 = if (self.playing)
-            self.params.play_step.load(.monotonic)
-        else
-            @floatFromInt(self.playback.cursorStep(true));
-        const now_ms = text_edit.nowMs();
-        const dt_s: f32 = @max(0.0, @as(f32, @floatFromInt(dt_ns)) / 1e9);
-
-        // 1) 逐绑定推进极点，并把贡献汇总到它自己的目标上
-        const Slot = struct { target: view_lane.Target, base: ?f32, sum: f32 };
-        var slots: [32]Slot = undefined;
-        var n_slots: usize = 0;
-        for (self.auto_bindings.items) |*b| {
-            if (!b.enabled or b.target.kind != .vst_param) continue;
-            const lc = self.curveById(b.curve_id) orelse continue;
-            const v = lc.evalAt(step);
-            if (v < 0) continue; // 无曲线
-            b.ui_smooth_state = poleStep(b.ui_smooth_state, v, b.smooth_ms, dt_s);
-            const sv = b.ui_smooth_state;
-            const sign: f32 = if (b.invert) -1.0 else 1.0;
-            const scaled = (if (b.bipolar) (sv - 0.5) * 2.0 else sv) * b.depth * sign;
-            var si: usize = 0;
-            while (si < n_slots) : (si += 1) {
-                if (view_lane.Target.eql(slots[si].target, b.target)) break;
-            }
-            if (si == n_slots) {
-                if (n_slots >= slots.len) continue;
-                slots[n_slots] = .{ .target = b.target, .base = b.base, .sum = 0 };
-                n_slots += 1;
-            }
-            slots[si].sum += scaled;
-        }
-
-        // 2) 逐目标施加（每帧重新解析插件——不跨帧持有 `*Plugin`）
-        for (slots[0..n_slots]) |s| {
-            const r = self.vstParamResolve(s.target) orelse continue;
-            if (self.vstParamIsTouched(s.target, now_ms)) continue; // 用户正在拧 → 让路
-            const base = s.base orelse self.defaultBaseFor(s.target);
-            const val: f64 = @floatCast(std.math.clamp(base + s.sum, 0.0, 1.0));
-            if (@abs(val - r.pl.paramNorm(r.param_idx)) < vst_auto_eps) continue; // 已在位 → 不写
-            r.pl.setParamHost(r.param_idx, val);
-            self.noteVstAutoWritten(s.target.uid, s.target.param_id, val);
-        }
-    }
-
-    /// 该 VST 参数是否处于 “用户刚拧过” 的 touch 窗口内（→ 自动化让路）
-    fn vstParamIsTouched(self: *const App, t: view_lane.Target, now_ms: i64) bool {
-        for (self.vst_touch) |e| {
-            if (e.until_ms > now_ms and e.inst_uid == t.uid and e.param_id == t.param_id) return true;
-        }
-        return false;
-    }
-
-    /// 记一次“自动化写入”（回声抑制用；环，覆盖最旧）
+    /// 保留的快照侧语义：`vst_written` 环（手动写入回声抑制）。
+    /// 回写与“人拧优先”的交接在 `vst_host.Plugin.auto_skip_blocks`（见 `noteUserTakeover`）。
+    /// 记一次“手动写入”（回声抑制用；环，覆盖最旧）
     fn noteVstAutoWritten(self: *App, inst_uid: u32, param_id: u32, value: f64) void {
         self.vst_written[self.vst_written_w % self.vst_written.len] = .{ .inst_uid = inst_uid, .param_id = param_id, .value = value };
         self.vst_written_w +%= 1;
@@ -10010,22 +9982,22 @@ pub const App = struct {
         return false;
     }
 
-    /// 用户在插件 GUI 里动了一个参数：记 touch 窗口 + 推进“最近改动”列表（最新在前、去重）
-    pub fn noteVstParamTouched(self: *App, inst_uid: u32, param_id: u32) void {
-        const now_ms = text_edit.nowMs();
-        // touch 窗口：同参数 → 续期；否则占一个过期槽
-        var slot: ?usize = null;
-        var free_slot: ?usize = null;
-        for (self.vst_touch, 0..) |e, i| {
-            if (e.param_id == param_id and e.inst_uid == inst_uid) {
-                slot = i;
-                break;
-            }
-            if (free_slot == null and e.until_ms <= now_ms) free_slot = i;
-        }
-        const ts = slot orelse free_slot orelse 0;
-        self.vst_touch[ts] = .{ .inst_uid = inst_uid, .param_id = param_id, .until_ms = now_ms + vst_touch_ms };
+    /// **自动化回声**（v2）：该参数当前由自动化驱动，且报上来的值 ≈ 曲线此刻的值
+    /// → 判定为“插件在回报输入队列的功效”，整条丢弃（不记历史、**不接管**）。
+    fn vstParamEchoByCurve(self: *const App, inst_uid: u32, param_id: u32, value: f64) bool {
+        const t = view_lane.Target{ .kind = .vst_param, .uid = inst_uid, .param_id = param_id };
+        if (self.enabledBindingCount(t) == 0) return false;
+        const step: f32 = if (self.playing)
+            self.params.play_step.load(.monotonic)
+        else
+            @floatFromInt(self.playback.cursorStep(true));
+        const v = self.autoValueFor(t, step, self.defaultBaseFor(t));
+        return @abs(@as(f64, v) - value) < 5e-3; // 比 1e-4 宽：块内斜坡/量化都可能差一点
+    }
 
+    /// 用户在插件 GUI 里动了一个参数：推进“最近改动”列表（最新在前、去重）。
+    /// 注：**自动化让路**不在这里做——那是音频侧的 `auto_skip_blocks`（见 `noteUserTakeover`）。
+    pub fn noteVstParamTouched(self: *App, inst_uid: u32, param_id: u32) void {
         // 最近列表：删同项 → 整体后移一格 → 插到最前
         var n = self.vst_recent_n;
         var k: usize = 0;
@@ -10044,19 +10016,56 @@ pub const App = struct {
         self.vst_recent_n = new_n;
     }
 
-    /// **BPM 自动化**（方案 B）：每帧把曲线值映到 BPM。
-    /// 恒切换（曲线→BPM）在 **UI 侧**做就够了——音频侧只需要块级的 `params.bpm`，
-    /// 而且它自己的步位置是**积分**推进的（变速不会跳）。
-    pub fn applyTempoAutomation(self: *App) void {
-        const tgt = view_lane.Target{ .kind = .tempo };
-        if (!self.isTargetBound(tgt)) return;
+    /// **BPM 自动化**（方案 B）：把曲线值映到**有效 BPM**（`self.bpm`）。
+    ///
+    /// - 无 tempo 绑定 → `bpm = bpm_doc`（文档值）；
+    /// - 有绑定 → 曲线值 → BPM，再过一道**逐绑定极点**（τ = 绑定里最大的 `smooth_ms`）；
+    /// - 平滑状态 `tempo_sm` 在无绑定时清 NaN，重新挂上时直接取曲线值（不从 0 爬升）；
+    /// - **离线导出期间不跑**（帧循环不是实时节拍）——导出走 `applyTempoAutomationAtBlock`。
+    pub fn applyTempoAutomation(self: *App, dt_ns: i64) void {
+        if (self.export_wav != null) return;
         const step: f32 = if (self.playing)
             self.params.play_step.load(.monotonic)
         else
             @floatFromInt(self.playback.cursorStep(true));
+        const dt_s: f32 = @max(0.0, @as(f32, @floatFromInt(dt_ns)) / 1e9);
+        self.applyTempoAt(step, dt_s);
+    }
+
+    /// 导出：**每块**跟随 tempo 自动化（块长 = 真相；与实时同一条曲线）。
+    /// `params.play_step` 就是音频侧积分器位置（renderBlock 每块末尾回写）。
+    pub fn applyTempoAutomationAtBlock(self: *App, frames: u32) void {
+        const step: f32 = self.params.play_step.load(.monotonic);
+        const sr: f32 = @floatFromInt(self.params.sample_rate);
+        const dt_s: f32 = @as(f32, @floatFromInt(frames)) / @max(1.0, sr);
+        self.applyTempoAt(step, dt_s);
+    }
+
+    /// 共同实现：曲线 → （极点）→ `self.bpm`
+    fn applyTempoAt(self: *App, step: f32, dt_s: f32) void {
+        const tgt = view_lane.Target{ .kind = .tempo };
+        if (!self.isTargetBound(tgt)) {
+            self.bpm = self.bpm_doc;
+            self.tempo_sm = std.math.nan(f32); // 下次挂上直接取曲线值
+            return;
+        }
         const v = self.autoValueFor(tgt, step, view_lane.Target.defaultBase(.tempo));
-        // **保留两位小数**（不再取整）：音频侧按 f32 BPM 算步宽
-        self.bpm = std.math.clamp(view_lane.Target.bpmFromNorm(v), model.bpm_min, model.bpm_max);
+        const raw = view_lane.Target.bpmFromNorm(v);
+        // τ：同一目标多条绑定 → **取最大值**（与音量/声像侧一致）
+        var tau: f32 = 0;
+        for (self.auto_bindings.items) |b| {
+            if (!b.enabled or b.target.kind != .tempo) continue;
+            tau = @max(tau, b.smooth_ms);
+        }
+        self.tempo_sm = @import("audio.zig").poleStep(self.tempo_sm, raw, tau, dt_s);
+        // **保留小数**：音频侧按 f32 BPM 算步宽
+        self.bpm = std.math.clamp(self.tempo_sm, model.bpm_min, model.bpm_max);
+    }
+
+    /// 设置**文档 BPM**（工具栏拖动/键入的唯一入口）：同步有效值（无绑定时才实时生效）
+    pub fn setDocBpm(self: *App, v: f32) void {
+        self.bpm_doc = std.math.clamp(v, model.bpm_min, model.bpm_max);
+        if (!self.isTargetBound(.{ .kind = .tempo })) self.bpm = self.bpm_doc;
     }
 
     /// 播放中的**小数步位置**（子步精度；未播放或域不匹配时 = 整数步）。
@@ -10881,11 +10890,11 @@ pub const App = struct {
                 }
             },
             .bpm => {
-                // 三位小数；**越界就夹到边界**（输 <10 → 10，输 >999 → 999）
-                const v = std.fmt.parseFloat(f32, val) catch self.bpm;
+                // 越界就夹到边界（输 <10 → 10，输 >999 → 999）；改的是**文档 BPM**
+                const v = std.fmt.parseFloat(f32, val) catch return;
                 const nv = std.math.clamp(v, model.bpm_min, model.bpm_max);
-                if (@abs(nv - self.bpm) > 0.0005) {
-                    self.bpm = nv;
+                if (@abs(nv - self.bpm_doc) > 0.0005) {
+                    self.setDocBpm(nv);
                     self.commitHistory("调整 BPM");
                 }
             },
@@ -11339,10 +11348,10 @@ test "app: 手势历史顺序（新操作起手先钉 → 撤销按因果顺序�
     app.resetHistory("初始状态");
 
     // 手势（如 BPM 滚轮）：起手即时提交
-    app.bpm = 100;
+    app.setDocBpm(100);
     app.touchGesture("调整 BPM");
     try std.testing.expectEqual(@as(usize, 2), app.history.items.len);
-    app.bpm = 110;
+    app.setDocBpm(110);
     app.touchGesture("调整 BPM"); // 同一条
     try std.testing.expectEqual(@as(usize, 2), app.history.items.len);
 
@@ -11902,7 +11911,7 @@ test "app: cursorStepFrac——子步精度（播放中 = 起始步 + 已播放�
     app.resetHistory("初始状态");
 
     // 48000Hz、150BPM、4/4（每拍 U/4 步）→ 每步恰好 20 帧（偶数，方便取半）
-    app.bpm = 150;
+    app.setDocBpm(150);
     app.time_den = 4;
     app.params.sample_rate = 48_000;
     app.playback.start_frame = 1000;
@@ -12437,7 +12446,7 @@ test "app: 游标平滑——前馈+收敛（渲染帧下线性；缓冲量化�
     _ = app.addInstrument("减法合成器");
     app.resetHistory("初始状态");
 
-    app.bpm = 120;
+    app.setDocBpm(120);
     app.time_den = 4;
     app.params.sample_rate = 48_000; // 每步 25 帧（= 48000×60/(120×960)）
     app.playback.start_frame = 0;
@@ -12487,7 +12496,7 @@ test "app: 导出 WAV——离线渲染整曲（长度 = 内容 + 2s 尾；有�
     app.resetHistory("初始状态");
 
     // 极小的“歌”：1 小节 1 个音符 + 1 个片段（渲染量小）
-    app.bpm = 240;
+    app.setDocBpm(240);
     app.time_den = 4;
     app.params.sample_rate = 48_000;
     app.params.volume.store(1.0, .monotonic);
@@ -13402,7 +13411,7 @@ test "automation: 乐器音量/声像目标 → 发布到乐器空间的 lane（
     }
 }
 
-test "automation: 发布 — 默认 15ms 平滑 / 超过 4 条绑定也不再静默丢弃（旧 [4] 槽 bug）" {
+test "automation: 发布 — 新绑定默认平滑 0（直通）/ 超过 4 条绑定也不再静默丢弃（旧 [4] 槽 bug）" {
     var app = App{ .allocator = std.testing.allocator };
     defer app.deinitAll();
     app.resetMixerChannels(default_mixer_channels);
@@ -13421,7 +13430,7 @@ test "automation: 发布 — 默认 15ms 平滑 / 超过 4 条绑定也不再静
         const set = &app.params.lane_bufs[app.params.lane_pub.load(.monotonic)];
         try std.testing.expectEqual(@as(usize, 6), set.n);
         try std.testing.expectEqual(@as(u32, 0), app.params.dbg_lane_overflow.load(.monotonic));
-        // 新绑定默认平滑 15ms（保存两侧一致）
+        // 新绑定默认平滑 0（= 直通；块内斜坡仍在）——两侧一致
         try std.testing.expectApproxEqAbs(view_lane.default_smooth_ms, set.lanes[0].smooth_ms, 1e-6);
         for (0..6) |i| try std.testing.expectEqual(@as(usize, 1), set.countForChannel(i, false, true));
     }
@@ -13447,10 +13456,25 @@ test "bpm: 小数 BPM 生效（步宽变化）+ tempo 绑定默认深度 20% + �
     try std.testing.expectApproxEqAbs(model.bpm_min, view_lane.Target.bpmFromNorm(0.0), 1e-4);
     try std.testing.expectApproxEqAbs(model.bpm_max, view_lane.Target.bpmFromNorm(1.0), 1e-4);
 
-    // tempo 绑定：默认深度 0.2（音量/声像仍 1.0）
+    // tempo 绑定：默认深度 0.2（音量/声像仍 1.0）；**平滑默认 0 = 直通**（所有目标一致）
     const cid = app.addAutoCurve("速度");
     try std.testing.expect(app.bindCurveTarget(cid, .{ .kind = .tempo }));
     try std.testing.expectApproxEqAbs(@as(f32, 0.2), app.auto_bindings.items[0].depth, 1e-6);
+    try std.testing.expectEqual(@as(f32, 0), app.auto_bindings.items[0].smooth_ms);
+    try std.testing.expectEqual(@as(f32, 0), view_lane.default_smooth_ms);
+    // tempo 也能调平滑（不置灰）：滑块写进来的非 0 值要真的生效——极点从旧值追赶，
+    // 一帧（8ms）只走一小段而不是直接跳到位
+    app.auto_bindings.items[0].smooth_ms = 200;
+    {
+        const lc = app.curveById(cid).?;
+        _ = lc.insertPoint(app.allocator, 0, 0.0);
+        _ = lc.insertPoint(app.allocator, model.units_per_whole, 1.0);
+    }
+    app.auto_bindings.items[0].depth = 1.0;
+    app.tempo_sm = std.math.nan(f32);
+    app.applyTempoAt(@floatFromInt(model.units_per_whole), 0.008); // 播种 = 上限
+    app.applyTempoAt(0.0, 0.008); // 一帧后只降一小段
+    try std.testing.expect(app.bpm > model.bpm_max * 0.5);
 }
 
 test "app: 自动化曲线 + 绑定随存档往返（点/手柄/断崖）" {
@@ -13517,7 +13541,7 @@ test "app: 撤销——乐器/全局设置（BPM、拍号、乐器增删）也�
     app.resetHistory("初始状态");
 
     // BPM 修改
-    app.bpm = 150;
+    app.setDocBpm(150);
     app.commitHistory("调整 BPM");
     // 拍号修改
     app.time_num = 3;
@@ -14242,7 +14266,7 @@ test "app: 样式——删除可撤销（快照含名字/音符，重做再删�
     try std.testing.expectEqual(@as(usize, 2), app.notes.items.len);
 }
 
-test "app: 鼓组——层增删/来源名、撤销恢复、存档往返（含 JSON）" {
+test "app: 鼓组——层增删/来源名、撤销恢复、存档往返（二进制）" {
     var app = App{ .allocator = std.testing.allocator };
     defer app.clips.deinit(app.allocator);
     defer app.notes.deinit(app.allocator);
@@ -14290,13 +14314,12 @@ test "app: 鼓组——层增删/来源名、撤销恢复、存档往返（含 J
     try std.testing.expectEqual(@as(usize, 3), app.instruments.items[0].kit.?.totalLayers());
     try std.testing.expectEqualStrings("subtractive/Kick808", app.instruments.items[0].kit.?.find(35).?.layers.items[1].source_preset);
 
-    // 存档导出 → 真实 JSON 往返 → 导入另一个 App
+    // 存档导出 → **二进制**往返 → 导入另一个 App
     const proj = try app.exportProject();
     defer app.freeProject(proj);
-    const json = try persist.toJson(std.testing.allocator, proj);
-    defer std.testing.allocator.free(json);
-    try std.testing.expect(std.mem.indexOf(u8, json, "\"kit\"") != null); // 字段确实写出
-    var parsed = try persist.fromJson(std.testing.allocator, json);
+    const bytes = try persist.toBinary(std.testing.allocator, proj);
+    defer std.testing.allocator.free(bytes);
+    var parsed = try persist.fromBinary(std.testing.allocator, bytes);
     defer parsed.deinit();
 
     var app2 = App{ .allocator = std.testing.allocator };
@@ -15108,7 +15131,7 @@ test "app: 新建（空）工程——1 样式 + Track1 最左 1 片段 + 1 乐�
     _ = app.addInstrument("减法合成器");
     app.addNote(.{ .step = 0, .len = 4, .pitch = 60, .pattern = 3, .instrument = 0 });
     app.addClip(.{ .track = 5, .start = 480, .len = 96, .pattern = 2 });
-    app.bpm = 90;
+    app.setDocBpm(90);
     app.resetHistory("初始状态");
 
     app.resetToDefaultProject();
@@ -15262,13 +15285,13 @@ test "VST3 状态：工程存档往返（base64 → pending 解码 → 恢复）
     es.plugin = pl;
     pl.setParamHost(0, 0.3);
 
-    // 导出（含状态）→ JSON 往返
+    // 导出（含状态）→ 二进制往返
     const proj = try app.exportProject();
     defer app.freeProject(proj);
     try std.testing.expect(proj.mixer[0].effects[0].plugin_state.len > 0);
-    const json = try persist.toJson(app.allocator, proj);
-    defer app.allocator.free(json);
-    var parsed = try persist.fromJson(app.allocator, json);
+    const bytes = try persist.toBinary(app.allocator, proj);
+    defer app.allocator.free(bytes);
+    var parsed = try persist.fromBinary(app.allocator, bytes);
     defer parsed.deinit();
     try std.testing.expect(parsed.value.mixer[0].effects[0].plugin_state.len > 0);
 
@@ -15381,13 +15404,13 @@ test "VST3 乐器：音色随工程存档与撤销往返（pending → restoreSt
     app.setPluginParamHost(iref, pl, 0, 0.5); // level = 0.5（唯一入口：应用 + 记录增量）
     app.pinPendingGesture();
 
-    // 工程导出（含乐器 state）→ JSON 往返
+    // 工程导出（含乐器 state）→ 二进制往返
     const proj = try app.exportProject();
     defer app.freeProject(proj);
     try std.testing.expect(proj.instruments[0].plugin_state.len > 0);
-    const json = try persist.toJson(app.allocator, proj);
-    defer app.allocator.free(json);
-    var parsed = try persist.fromJson(app.allocator, json);
+    const bytes = try persist.toBinary(app.allocator, proj);
+    defer app.allocator.free(bytes);
+    var parsed = try persist.fromBinary(app.allocator, bytes);
     defer parsed.deinit();
     try std.testing.expect(parsed.value.instruments[0].plugin_state.len > 0);
 
@@ -15857,7 +15880,7 @@ test "撤销：参数增量回放（不 setState）+ 未变槽捕获复用（零
 
     // 与插件无关的编辑（BPM）→ 未脏槽捕获复用：**不调 getState**
     const c0 = pl.get_state_calls;
-    app.bpm = 130;
+    app.setDocBpm(130);
     app.commitHistory("改 BPM");
     try std.testing.expectEqual(c0, pl.get_state_calls);
 
@@ -16077,7 +16100,7 @@ test "VST3 自愈：reboundFailedPluginSlots 按 CID 重定位失败槽（只碰
     try std.testing.expectEqual(@as(usize, 0), app.reboundFailedPluginSlots(io));
 }
 
-test "VST3 存档：类 CID 捕获（活实例/失败槽）+ JSON 往返" {
+test "VST3 存档：类 CID 捕获（活实例/失败槽）+ 二进制往返" {
     try skipIfNoVst(); // VST3 宿主未移植（非 Windows 跳过）
     const alloc = std.testing.allocator;
     const dll_z = alloc.dupeSentinel(u8, "zig-out/bin/zig_vst3_sine_synth.dll", 0) catch return;
@@ -16107,9 +16130,9 @@ test "VST3 存档：类 CID 捕获（活实例/失败槽）+ JSON 往返" {
     try std.testing.expectEqualStrings(live_hex, proj.instruments[0].plugin_cid);
     try std.testing.expectEqualStrings("0102030405060708090a0b0c0d0e0f10", proj.instruments[1].plugin_cid);
 
-    const json = try persist.toJson(alloc, proj);
-    defer alloc.free(json);
-    var parsed = try persist.fromJson(alloc, json);
+    const bytes = try persist.toBinary(alloc, proj);
+    defer alloc.free(bytes);
+    var parsed = try persist.fromBinary(alloc, bytes);
     defer parsed.deinit();
     try std.testing.expectEqualStrings(live_hex, parsed.value.instruments[0].plugin_cid);
     try std.testing.expectEqualStrings("0102030405060708090a0b0c0d0e0f10", parsed.value.instruments[1].plugin_cid);
@@ -16961,7 +16984,7 @@ test "工程加载（异步解码）：工程立刻可见，音频随后就位" 
     const dirp = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
     defer alloc.free(dirp);
 
-    // 源 App：两个音频样式 + 两个音频片段 → 导出存档 JSON
+    // 源 App：两个音频样式 + 两个音频片段 → 导出存档（二进制）
     var a1 = App{ .allocator = alloc };
     a1.attachIo(io);
     defer a1.clips.deinit(alloc);
@@ -16980,8 +17003,8 @@ test "工程加载（异步解码）：工程立刻可见，音频随后就位" 
     }
     const proj = try a1.exportProject();
     defer a1.freeProject(proj);
-    const json = try std.json.Stringify.valueAlloc(alloc, proj, .{});
-    defer alloc.free(json);
+    const bytes = try persist.toBinary(alloc, proj);
+    defer alloc.free(bytes);
 
     // 目标 App：异步加载（UI 线程不阻塞）
     var a2 = App{ .allocator = alloc };
@@ -16992,7 +17015,7 @@ test "工程加载（异步解码）：工程立刻可见，音频随后就位" 
     a2.resetPatterns(1);
     a2.resetMixerChannels(default_mixer_channels);
 
-    const parsed = try persist.parseAuto(alloc, json);
+    const parsed = try persist.parseAuto(alloc, bytes);
     a2.beginProjectLoadAsync(parsed, null);
     // 立刻可见：样式与片段都已就位（音频可能还在解码 → asset = -1 但长度正确）
     try std.testing.expectEqual(@as(usize, 2), a2.audio_styles.items.len);
@@ -17546,6 +17569,57 @@ test "automation: 基准值可编辑 + 控件右键恢复默认（base/bipolar�
     try std.testing.expect(app.auto_bindings.items[app.bindingIndex(cid, pt).?].bipolar);
 }
 
+test "app: tempo 自动化——文档 BPM 不被污染 / 极点平滑 / 导出时长按曲线积分" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.params.sample_rate = 48_000;
+
+    try std.testing.expectEqual(@as(f32, 120), app.bpm_doc);
+    try std.testing.expectEqual(@as(f32, 120), app.bpm);
+
+    const cid = app.addAutoCurve("t");
+    {
+        const lc = app.curveById(cid).?;
+        _ = lc.insertPoint(alloc, 0, 0.0);
+        _ = lc.insertPoint(alloc, model.units_per_whole, 1.0); // 一小节内 0→1
+    }
+    try std.testing.expect(app.bindCurveTarget(cid, .{ .kind = .tempo }));
+    app.auto_bindings.items[0].depth = 1.0; // 测试里要全幅（默认 tempo 深度是 0.2）
+    app.auto_bindings.items[0].smooth_ms = 0; // 直通，便于断言
+
+    // 步 0 → 曲线 0 → BPM 下限；**文档值不动**
+    app.applyTempoAt(0.0, 0.016);
+    try std.testing.expectApproxEqAbs(@as(f32, model.bpm_min), app.bpm, 1e-2);
+    try std.testing.expectEqual(@as(f32, 120), app.bpm_doc);
+    // 段末 → 上限
+    app.applyTempoAt(@floatFromInt(model.units_per_whole), 0.016);
+    try std.testing.expectApproxEqAbs(@as(f32, model.bpm_max), app.bpm, 1e-1);
+
+    // 极点：τ=100ms、dt=16ms → 一帧只走一小步（从上限往下降）
+    app.auto_bindings.items[0].smooth_ms = 100;
+    app.tempo_sm = std.math.nan(f32);
+    app.applyTempoAt(@floatFromInt(model.units_per_whole), 0.016); // 播种 = 上限
+    app.applyTempoAt(0.0, 0.016);
+    try std.testing.expect(app.bpm > 500.0); // 远没到底
+
+    // 导出时长：曲线 10→999 的积分应严格落在“全程 999”与“全程 10”之间
+    const steps: u64 = model.units_per_whole;
+    const spb: f64 = @floatFromInt(@max(1, model.stepsPerBeat(app.time_den)));
+    const sf_min: f64 = @as(f64, @floatFromInt(app.params.sample_rate)) * 60.0 / (@as(f64, model.bpm_min) * spb);
+    const sf_max: f64 = @as(f64, @floatFromInt(app.params.sample_rate)) * 60.0 / (@as(f64, model.bpm_max) * spb);
+    const body = app.exportBodyFrames(steps, sf_min);
+    try std.testing.expect(body > @as(f64, @floatFromInt(steps)) * sf_max);
+    try std.testing.expect(body < @as(f64, @floatFromInt(steps)) * sf_min);
+
+    // 解绑 → 有效 BPM 回到文档值
+    try std.testing.expect(app.unbindCurveTarget(cid, .{ .kind = .tempo }));
+    app.applyTempoAt(0.0, 0.016);
+    try std.testing.expectEqual(@as(f32, 120), app.bpm);
+}
+
 test "automation: VST 参数目标（uid + param_id）的相等性/默认值" {
     const a = view_lane.Target{ .kind = .vst_param, .uid = 7, .param_id = 100 };
     const b = view_lane.Target{ .kind = .vst_param, .uid = 7, .param_id = 100 };
@@ -17575,25 +17649,6 @@ test "automation: VST 参数目标（uid + param_id）的相等性/默认值" {
     // 同一参数重复链接 → 不建第二份
     try std.testing.expect(!app.bindCurveTarget(cid, b));
     try std.testing.expectEqual(@as(usize, 1), app.bindingCountOfCurve(cid));
-}
-
-test "automation: VST 参数的 UI 侧极点平滑（NaN 播种 / τ=0 / 追赶收敛）" {
-    const dt: f32 = 1.0 / 60.0;
-    // NaN（未播种）→ 直接取曲线值，不从 0 爬升
-    try std.testing.expectEqual(@as(f32, 0.7), poleStep(std.math.nan(f32), 0.7, 15.0, dt));
-    // τ=0 → 直通（不追赶，但仍由写入门槛去阶梯）
-    try std.testing.expectEqual(@as(f32, 0.7), poleStep(0.0, 0.7, 0.0, dt));
-    // 15ms 一帧（≈1/4 个 τ）→ 走到 1/e 附近偏小；单调靠近且不过冲
-    const s1 = poleStep(0.0, 1.0, 15.0, dt);
-    try std.testing.expect(s1 > 0.0 and s1 < 1.0);
-    // 连续 60 帧（≈ 1s = 66τ）→ 几乎到位
-    var v: f32 = 0.0;
-    for (0..60) |_| v = poleStep(v, 1.0, 15.0, dt);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), v, 1e-4);
-    // 下降方向同样适用
-    try std.testing.expect(poleStep(1.0, 0.0, 15.0, dt) < 1.0);
-    // 目标不变 → 稳定不动（不会自己漂）
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), poleStep(0.5, 0.5, 15.0, dt), 1e-6);
 }
 
 test "app: 片段批量拖动——撞轨道头时**全组停**（保持相对位置，不被压扁）" {

@@ -152,13 +152,12 @@ pub const Binding = struct {
     /// 与 `depth`/`bipolar` 同层（每条绑定自己一个）。
     smooth_ms: f32 = default_smooth_ms,
     enabled: bool = true,
-    /// **瞬态**：`vst_param` 在 **UI 侧**施加时的极点状态（不存栈、不进历史）。
-    /// NaN = 未播种（首次直接用曲线值，不从 0 爬升）。
-    ui_smooth_state: f32 = std.math.nan(f32),
 };
 
-/// 平滑时间常数：默认 15ms（= 乐器级一直以来的手感）、上限 200ms
-pub const default_smooth_ms: f32 = 15.0;
+/// 平滑时间常数：**默认 0（不平滑）**、上限 200ms。
+/// 无极点时仍有"块内线性斜坡"（去掉块率阶梯），所以 0 不等于"跳变"；
+/// 只有需要额外阻尼（快速拖动时更露、自动化跟手更柔和）时才往上调。
+pub const default_smooth_ms: f32 = 0.0;
 pub const smooth_ms_max: f32 = 200.0;
 /// 深度上限（200%；`publishAutoLane` 与 UI 共用）
 pub const depth_max: f32 = 2.0;

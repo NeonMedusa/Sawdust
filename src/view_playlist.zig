@@ -25,6 +25,32 @@ pub fn clipXW(c: model.Clip, lane_x: i32, step_px: f32, scroll_x: i32, zoom: f32
     return .{ .x = px0, .w = @max(1, px1 - px0) };
 }
 
+/// 步 → 屏幕像素 x（**绝对**坐标：与 `clipXW` 的取整规则完全一致）
+pub fn stepToPx(step: i32, lane_x: i32, step_px: f32, scroll_x: i32, zoom: f32) i32 {
+    const xf: f32 = (@as(f32, @floatFromInt(step)) * step_px - @as(f32, @floatFromInt(scroll_x))) * zoom;
+    return lane_x + @as(i32, @intFromFloat(@round(xf)));
+}
+
+/// 片段内**音符预览**一行的像素区间（与片段矩形相交后才返回）。
+///
+/// `tl_step` / `tl_len` 是**时间轴**步（= `clip.start + (note.step - clip.offset)`）。
+///
+/// 关键：x 必须用**绝对步**换算（`stepToPx`），**不能用** `clip_x + trunc(s*clip_w/len)`。
+/// 后者用的是取整后的片段宽度，而 `clipXW` 里两条边各自 `round()`：U=3840 之后
+/// 每步像素（`step_px * zoom`）不再总是整数 → `clip_w/len` 带 ±0.5px 误差，且随左端
+/// 位置正负摆动 → **拖左右边缘时音符预览整体抖 ±1px**（实测反馈）。
+/// 绝对换算后音符位置不包含 `clip_x`/`clip_w`，拖边缘时纹丝不动。
+pub fn previewNoteSpan(tl_step: i32, tl_len: i32, clip_x: i32, clip_w: i32, lane_x: i32, step_px: f32, scroll_x: i32, zoom: f32) ?struct { x: i32, w: i32 } {
+    const xs = stepToPx(tl_step, lane_x, step_px, scroll_x, zoom);
+    const xe = stepToPx(tl_step + tl_len, lane_x, step_px, scroll_x, zoom);
+    var w = xe - xs;
+    if (w < 1) w = 1; // 极短音符缩到 0 像素时仍留一点火苗
+    const x0 = @max(xs, clip_x);
+    const x1 = @min(xs + w, clip_x + clip_w);
+    if (x1 <= x0) return null;
+    return .{ .x = x0, .w = x1 - x0 };
+}
+
 /// 样式配色（minimap / 片段色块）：按序号在色相上分布，保证相邻样式颜色可区分。
 /// 静音视觉（浅灰）：轨道名与片段整体变灰
 /// 片段自身静音（Ctrl+M）的灰
@@ -405,7 +431,12 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 if (in_row and !over_mute and !ui.mods_ctrl and ui.mouse_pressed) {
                     app.sel.track = @intCast(i);
                 }
-                if (in_row and ui.toggleSquare(!muted, btn_x, btn_y, btn_sz)) { // 蓝=发声 / 灰=静音
+                // 静音方块：**每帧都画**——它是常显状态（蓝=发声/灰=静音），不是 hover 提示。
+                // `toggleSquare` 里同时“画 + 判点击”，所以**绝不能**塞进 `and` 的短路里：
+                // 曾经写成 `if (in_row and ui.toggleSquare(...))` → 鼠标不在该行就不画 →
+                // 开关变成“鼠标悬停才出现”（实测回归）。
+                const mute_clicked = ui.toggleSquare(!muted, btn_x, btn_y, btn_sz);
+                if (in_row and mute_clicked) {
                     app.setTrackMuted(i, !muted);
                     app.commitHistory(if (!muted) "静音轨道" else "取消静音轨道");
                 }
@@ -555,10 +586,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                         // ── 片段内音符预览（minimap 风格）──
                         // 只画“片段可见窗口”（offset..offset+len）内的音符；
                         // 纵向用该样式的音域映射（与三处 minimap 同一规则）
-                        // 预览区**与片段边缘严格对齐**（不内缩）：
-                        // 否则与网格/边缘错位——拖边缘时音符看起来“漂移几像素”（实测 bug）
-                        const inner_x = clip_x;
-                        const inner_w = @max(1, clip_w);
+                        // 横向不用内缩矩形——直接与片段矩形求交（见 `previewNoteSpan`）
                         const inner_y = ty + 2 + label_h;
                         const inner_h = @max(2, track_h - 4 - label_h);
                         {
@@ -579,16 +607,12 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                                     if (n.pattern != clip.pattern) continue;
                                     const rel = n.step - win_lo;
                                     if (rel >= win_steps or rel + n.len <= 0) continue; // 不在可见窗口
-                                    const s = @max(0, rel);
-                                    const e = @min(win_steps, rel + n.len);
-                                    // **用 i64 做乘法**：`s`（步）× `inner_w`（像素）
-                                    // 在 U=3840 下可以到 15 万 × 15 万 → i32 直接溢出（实测 panic）；
-                                    // 本函数其他坐标换算早就走 f32/f64，只有这里漏了。
-                                    const nx = inner_x + @as(i32, @intCast(@divTrunc(@as(i64, s) * @as(i64, inner_w), @as(i64, win_steps))));
-                                    const nw = @max(1, @as(i32, @intCast(@divTrunc(@as(i64, e - s) * @as(i64, inner_w), @as(i64, win_steps)))));
+                                    // x/宽度全部用**时间轴绝对步**换算并与片段矩形求交（见 `previewNoteSpan` 注释）
+                                    // 注：`n.step` 是**样式内**步 → 先换成时间轴步（`clip.start + rel`）
+                                    const span = previewNoteSpan(clip.start + rel, n.len, clip_x, clip_w, lane_x, step_px, app.playlist.scroll_x, zoom) orelse continue;
                                     const y_norm = range.yOf(n.pitch);
                                     const ny = inner_y + inner_h - 2 - @as(i32, @intFromFloat(y_norm * @as(f32, @floatFromInt(inner_h - 2))));
-                                    ui.renderer.fillRect(nx, ny, nw, 2, inner_col);
+                                    ui.renderer.fillRect(span.x, ny, span.w, 2, inner_col);
                                 }
                             }
                         }
@@ -1714,4 +1738,65 @@ test "playlist: hitAt——落点换算（轨道行/吸附/缩放/滚动；区�
     try std.testing.expect(hitAt(&app, 120, 40) == null); // tracks_y 上方
     try std.testing.expect(hitAt(&app, 120, 50 + 300 + 1) == null); // tracks_h 下方
     try std.testing.expect(hitAt(&app, 100 + 400, 60) == null); // view_w 右侧
+}
+
+test "playlist: 片段内音符预览——拖左右边缘时逐像素不抖（绝对步换算）" {
+    // 历史 bug：预览 x 用过 `clip_x + trunc(s*clip_w/len)`，而 `clipXW` 两条边各自
+    // `round()`；U=3840 后每步像素不再总是整数 → 宽度带 ±0.5px 误差随左端位置搜动
+    // → 拖边缘时整片音符预览抖 ±1px（实测反馈）。
+    //
+    // 参数自检：第一组 `0.3 px/步` 是**旧写法必抖档**（实测 41 个拖动位置里出现 2~5 种 x），
+    // 用这组才能保证这个测试真能拦住回退。
+    const step_px: f32 = util.pianoStepPx(); // U=3840 → 0.125 px/步
+    const scroll_x: i32 = 0;
+    const configs = [_]struct { lane_x: i32, zoom: f32, start: i32, len: i32, notes: []const i32 }{
+        .{ .lane_x = 200, .zoom = 2.4, .start = 400, .len = 160, .notes = &.{ 0, 40, 100 } }, // 0.3 px/步（旧写法必抖）
+        .{ .lane_x = 200, .zoom = 20.0, .start = 3840, .len = 960, .notes = &.{ 0, 100, 480, 900 } }, // 2.5 px/步
+    };
+
+    inline for (configs) |cfg| {
+        const note_len: i32 = 40;
+        for (cfg.notes) |nstep| {
+            const tl: i32 = cfg.start + nstep; // 时间轴步（窗口从 0 起 → 无偏移）
+            const r0 = clipXW(.{ .track = 0, .start = cfg.start, .len = cfg.len, .pattern = 0, .offset = 0 }, cfg.lane_x, step_px, scroll_x, cfg.zoom);
+            const base = previewNoteSpan(tl, note_len, r0.x, r0.w, cfg.lane_x, step_px, scroll_x, cfg.zoom);
+            try std.testing.expect(base != null); // 防“两边都是 null → 空过”
+            // 左缘往外拖 d 步：start-d / len+d / offset-d（内容在时间轴上不动）
+            for (1..41) |di| {
+                const d: i32 = @intCast(di);
+                const rl = clipXW(.{ .track = 0, .start = cfg.start - d, .len = cfg.len + d, .pattern = 0, .offset = -d }, cfg.lane_x, step_px, scroll_x, cfg.zoom);
+                try std.testing.expectEqual(base, previewNoteSpan(tl, note_len, rl.x, rl.w, cfg.lane_x, step_px, scroll_x, cfg.zoom));
+            }
+            // 右缘往外拖 d 步：len+d（内容不动）
+            for (1..41) |di| {
+                const d: i32 = @intCast(di);
+                const rr = clipXW(.{ .track = 0, .start = cfg.start, .len = cfg.len + d, .pattern = 0, .offset = 0 }, cfg.lane_x, step_px, scroll_x, cfg.zoom);
+                try std.testing.expectEqual(base, previewNoteSpan(tl, note_len, rr.x, rr.w, cfg.lane_x, step_px, scroll_x, cfg.zoom));
+            }
+        }
+    }
+
+    // 撑出右端的音符：拖右缘只能“逐步露出来”，**左端不得飘**（旧写法会飘）
+    {
+        const cfg = configs[1];
+        const note_len: i32 = 120;
+        const r0 = clipXW(.{ .track = 0, .start = cfg.start, .len = cfg.len, .pattern = 0, .offset = 0 }, cfg.lane_x, step_px, scroll_x, cfg.zoom);
+        const base = previewNoteSpan(cfg.start + 955, note_len, r0.x, r0.w, cfg.lane_x, step_px, scroll_x, cfg.zoom).?;
+        for (1..61) |di| {
+            const d: i32 = @intCast(di);
+            const rr = clipXW(.{ .track = 0, .start = cfg.start, .len = cfg.len + d, .pattern = 0, .offset = 0 }, cfg.lane_x, step_px, scroll_x, cfg.zoom);
+            const sr = previewNoteSpan(cfg.start + 955, note_len, rr.x, rr.w, cfg.lane_x, step_px, scroll_x, cfg.zoom).?;
+            try std.testing.expectEqual(base.x, sr.x); // 左端不动
+            try std.testing.expect(sr.w >= base.w); // 只会变宽（露出来）
+        }
+    }
+
+    // 裁切：音符起点在片段左边缘之外 → 从 clip_x 起画（不超出片段）
+    const rc = clipXW(.{ .track = 0, .start = 3840, .len = 960, .pattern = 0, .offset = 0 }, 200, step_px, scroll_x, 20.0);
+    const clamped = previewNoteSpan(3640, 400, rc.x, rc.w, 200, step_px, scroll_x, 20.0).?;
+    try std.testing.expectEqual(rc.x, clamped.x);
+    try std.testing.expect(clamped.x + clamped.w <= rc.x + rc.w);
+    // 完全在片段之外 → null（不画）
+    try std.testing.expect(previewNoteSpan(3440, 300, rc.x, rc.w, 200, step_px, scroll_x, 20.0) == null);
+    try std.testing.expect(previewNoteSpan(4800, 100, rc.x, rc.w, 200, step_px, scroll_x, 20.0) == null);
 }

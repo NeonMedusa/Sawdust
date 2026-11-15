@@ -57,7 +57,7 @@ scoop install sawdust
   导出（轨首 CC10 = 乐器声像）；单测覆盖解析 / 写出的往返
 - **音频输出 / 导出**：设置页可选择后端与播放设备（重启生效）；离线导出 WAV、MP3、
   FLAC、OGG，MP3/OGG 可选码率、FLAC 可选压缩等级（压缩格式需系统 FFmpeg）
-- **工程**：`.saw`（JSON）保存 / 加载、打开 / 新建（空）的未保存提醒、
+- **工程**：`.saw`（二进制）保存 / 加载、打开 / 新建（空）的未保存提醒、
   **操作历史**（面板跳转 / Ctrl+Z / Ctrl+Alt+Z；播放中撤销不中断播放）
 
 界面自绘（零 GUI 框架）：窗口、控件、图标形状全部像素级绘制。
@@ -152,7 +152,7 @@ zig translate-c -I libs/stb       libs/stb/stb_truetype.h    > src/c/stb_truetyp
 | `src/sequencer.zig` | 音序器：事件调度、编辑重扫（播放中编辑水位线） |
 | `src/model.zig` | 数据模型：音符 / 片段 / 乐器 / 鼓组（`U = 3840` = 960 PPQN 的步长单位） |
 | `src/midi.zig` | MIDI 导入/导出（SMF 解析 + 写出；纯逻辑可单测） |
-| `src/persist.zig` | 工程保存/加载（JSON `.saw`；版本迁移） |
+| `src/persist.zig` | 工程保存/加载（二进制 `.saw`；版本迁移与字段登记表） |
 | `src/preset.zig` | 预设库（扫描 / 读写 / 分类） |
 | `src/vst_host.zig` | VST3 宿主：加载 / 处理 / 参数 / 状态 / 编辑器窗口（见 `docs/plugin-hosting.md`） |
 | `src/vstscan.zig` | VST3 探测工具（枚举 / 试跑 / 参数 / 编辑器冒烟） |

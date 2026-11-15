@@ -753,6 +753,8 @@ pub fn main(init: std.process.Init) !u8 {
             else
                 0;
             app.params.instrument_channel[i].store(ch, .monotonic);
+            // MIDI 通道（-1 = 无）：VSTi 事件按它写进 `channel`（多通道插件必需）
+            app.params.instrument_midi_channel[i].store(if (inst) |it| it.midi_channel else -1, .monotonic);
             // 乐器类型 + 鼓组层槽位（kind 边沿会在音频侧触发全释音）
             app.params.instrument_kind[i].store(if (inst) |it| @backingInt(it.kind) else 0, .monotonic);
             // VST3 乐器实例（kind == 2；帧末 syncInstrumentPlugins 惰性加载/发布）
@@ -934,8 +936,10 @@ pub fn main(init: std.process.Init) !u8 {
         }
 
         // 同步 BPM / 每拍步数 到音频线程（序列器换算步→帧用）
-        app.applyTempoAutomation(); // BPM 自动化（有绑定才生效）
-        app.applyVstParamAutomation(app.frame_dt_ns); // VST 参数自动化（v1：UI 侧 60Hz 施加）
+        app.applyTempoAutomation(app.frame_dt_ns); // BPM 自动化（有绑定才生效）
+        // **UI 游标步位置**（停止态下音频侧用它做自动化/渲染的步参考）
+        app.params.ui_cursor_step.store(@floatFromInt(app.playback.cursorStep(true)), .monotonic);
+        app.params.ui_cursor_valid.store(true, .monotonic);
         app.params.bpm.store(std.math.clamp(app.bpm, model.bpm_min, model.bpm_max), .monotonic);
         app.params.time_num.store(app.time_num, .monotonic);
         app.params.time_den.store(app.time_den, .monotonic);
@@ -1129,8 +1133,6 @@ pub fn main(init: std.process.Init) !u8 {
                     app.export_options_win.open = true;
                     app.export_options_win.probe_req = true; // 打开面板时重新探测 FFmpeg
                 },
-                .import_json => importJsonWithDialog(&app, &win, io),
-                .export_json => exportJsonWithDialog(&app, &win, io),
             }
         }
 
@@ -2883,11 +2885,19 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
     ui.labelCentered("BPM", x, by, bh, ui.theme.text_dim);
     x += @as(i32, @intFromFloat(ui.font.measure("BPM"))) + 8;
     {
-        const old_bpm = app.bpm;
+        const tempo_auto = app.isTargetBound(.{ .kind = .tempo });
+        // **显示有效 BPM**（有 tempo 自动化时数字跟随曲线——用户拍板的反馈感），
+        // 但**拖/键入改的是文档值**（`bpm_doc`）：自动化挂住时数字会弹回曲线值，
+        // 那是“被曲线接管”的正常表现（见 `docs/automation.md` §11.42 已知限制）。
+        var shown: f32 = if (tempo_auto) app.bpm else app.bpm_doc;
+        const shown_before = shown;
         // **与以前同样的手感**：拖 8px = 1 BPM，且**只改整数位**
         // （小数由右键「输入值…」键入，如 `120.555`；推到边界时小数清零）
-        _ = ui.dragNumberBpm(350, x, by, 56, bh, &app.bpm, model.bpm_min, model.bpm_max, 8);
-        if (app.bpm != old_bpm) app.history_pending = "调整 BPM"; // 松手时 coalesce 提交
+        const edited = ui.dragNumberBpm(350, x, by, 56, bh, &shown, model.bpm_min, model.bpm_max, 8);
+        if (edited and shown != shown_before) {
+            app.setDocBpm(shown);
+            app.history_pending = "调整 BPM"; // 松手时 coalesce 提交
+        }
         // **右键 → 菜单（输入值… / 自动化…）**——不再直接开自动化窗口
         if (util.hitUI(ui, x, by, 56, bh) and ui.mouse_right_pressed) {
             app.panels.ctx_bpm = true;
@@ -3234,11 +3244,11 @@ fn schedLogTick(app: *App, io: std.Io) void {
     // **A4**：调度现在只有一条路径（快照），旧 push 模型的“作废/队列/编辑代”指标已删。
     var line_buf: [512]u8 = undefined;
     const line = std.fmt.bufPrint(&line_buf, "[sched] 1s: 声部={d} 最老={d}步(p{d} i{d}) | off 命中={d} 落空={d} 重触发={d} | 积压 stash={d} 满增={d} | 本地off={d} 超时={d}/{d} 迟到={d}步 | 步={d} | lane 斜坡={d} 绑定溢出={d} | inst0_g={d:.3} synth0_sm={d:.3} seg_g={d:.3} seg_kind={d} seg_n={d} seg_ptr={x} ui_ptr={x}\n", .{
-        voices,                                         max_age,                                                                                    age_p,                                 age_i,                                      off_hit,
-        off_miss,                                       retrig,                                                                                     stash_n,                               d_stash,                                    local_off,
-        ov_now,                                         ov_peak,                                                                                    ov_late,                               app.playback.cursorStep(app.sel.song_mode), app.params.dbg_lane_ramps.swap(0, .monotonic), app.params.dbg_lane_overflow.swap(0, .monotonic),
-        app.params.instrument_gain[0].load(.monotonic), if (app.engine.synths.len > 0) app.engine.synths[0].smoothed_master else @as(f32, -1),      app.params.dbg_seg_g.load(.monotonic), app.params.dbg_seg_kind.load(.monotonic),   app.params.dbg_seg_render.swap(0, .monotonic),
-        app.params.dbg_seg_ptr.load(.monotonic),        if (app.params.instrument_gain.len > 0) @intFromPtr(&app.params.instrument_gain[0]) else 0,
+        voices,                                           max_age,                                        age_p,                                                                                      age_i,                                      off_hit,
+        off_miss,                                         retrig,                                         stash_n,                                                                                    d_stash,                                    local_off,
+        ov_now,                                           ov_peak,                                        ov_late,                                                                                    app.playback.cursorStep(app.sel.song_mode), app.params.dbg_lane_ramps.swap(0, .monotonic),
+        app.params.dbg_lane_overflow.swap(0, .monotonic), app.params.instrument_gain[0].load(.monotonic), if (app.engine.synths.len > 0) app.engine.synths[0].smoothed_master else @as(f32, -1),      app.params.dbg_seg_g.load(.monotonic),      app.params.dbg_seg_kind.load(.monotonic),
+        app.params.dbg_seg_render.swap(0, .monotonic),    app.params.dbg_seg_ptr.load(.monotonic),        if (app.params.instrument_gain.len > 0) @intFromPtr(&app.params.instrument_gain[0]) else 0,
     }) catch return;
     std.debug.print("{s}", .{line});
 
@@ -3892,8 +3902,6 @@ fn dispatchPick(app: *App, io: std.Io, use_: app_mod.PickUse, path: []const u8) 
         .project_save => saveProjectToPath(app, io, path),
         .project_open => openProjectAtPath(app, io, path),
         .import_midi => importMidiFromPath(app, io, path),
-        .import_json => loadProjectFromPath(app, io, path),
-        .export_json => exportJsonToPath(app, io, path),
         .export_midi => |em| exportMidiCommon(app, io, path, em.pattern),
         .export_wav => exportWavToPath(app, io, path),
         .plugin_folder => addPluginFolderPath(app, path),
@@ -4486,7 +4494,7 @@ fn performUpgrade(app: *App, io: std.Io) void {
     defer app.allocator.free(data);
 
     var parsed = persist.parseAuto(app.allocator, data) catch |e| {
-        app.setToastWith("升级失败：解析失败（{s}）", .{@errorName(e)});
+        app.setToastWith("升级失败：{s}", .{persist.parseErrorHint(e)});
         app.clearPendingUpgrade();
         return;
     };
@@ -4557,37 +4565,32 @@ fn loadProjectFromPath(app: *App, io: std.Io, path: []const u8) void {
     };
     defer app.allocator.free(data);
 
-    // **旧格式一律“备份并升级”弹窗**（与 JSON v1–v3 同一条路径——用户拍板）：
-    // - 二进制 v5 = 旧布局（能兼容读），但保存后旧版就再也打不开 → 必须让用户知情；
-    // - 二进制 v6 = 当前 → 直接打开；更高 → 拒绝。
-    if (data.len >= persist.binary_magic.len and std.mem.eql(u8, data[0..persist.binary_magic.len], persist.binary_magic)) {
-        if (data.len > persist.binary_magic.len) {
-            const bver = data[persist.binary_magic.len];
-            if (bver > persist.binary_version) {
-                app.setToastWith("打开失败：存档版本过新（v{d}），请使用更新的 Sawdust", .{bver});
-                return;
-            }
-            if (bver < persist.binary_version) {
-                app.setPendingUpgrade(path, bver);
-                app.modal = .save_upgrade;
-                app.modal_choice = null;
-                return; // 等弹窗确认（performUpgrade）；取消 = 不打开
-            }
-        }
-    } else if (persist.probeJsonVersion(app.allocator, data)) |ver| {
-        if (ver > persist.file_version) {
+    // **只认二进制存档**（JSON 通道已于 v9 删除）：
+    // - 不是 SAWD magic → 直接报错（旧 JSON 工程已无法打开）；
+    // - 版本 > 当前 → 拒绝（请换新版 Sawdust）；
+    // - 版本 < 当前 → “备份并升级”弹窗（能兼容读 + 读入时 ×40，但保存后旧版打不开）。
+    if (!std.mem.eql(u8, data[0..@min(data.len, persist.binary_magic.len)], persist.binary_magic)) {
+        app.setToast("打开失败：不是 Sawdust 工程文件（需要二进制 .saw）");
+        return;
+    }
+    if (persist.probeVersion(app.allocator, data)) |ver| {
+        if (ver > persist.binary_version) {
             app.setToastWith("打开失败：存档版本过新（v{d}），请使用更新的 Sawdust", .{ver});
             return;
         }
-        // JSON（v1–v4）保存后同样会变成不可回退的 v6 二进制 → 全部走升级弹窗
-        app.setPendingUpgrade(path, ver);
-        app.modal = .save_upgrade;
-        app.modal_choice = null;
+        if (ver < persist.binary_version) {
+            app.setPendingUpgrade(path, ver);
+            app.modal = .save_upgrade;
+            app.modal_choice = null;
+            return; // 等弹窗确认（performUpgrade）；取消 = 不打开
+        }
+    } else {
+        app.setToast("打开失败：存档被截断（只有文件头）");
         return;
     }
 
     const parsed = persist.parseAuto(app.allocator, data) catch |e| {
-        app.setToastWith("打开失败：解析失败（{s}）", .{@errorName(e)});
+        app.setToastWith("打开失败：{s}", .{persist.parseErrorHint(e)});
         return;
     };
     // 注意：**不再 defer parsed.deinit()** —— `beginProjectLoad` 接管所有权
@@ -4638,42 +4641,6 @@ fn importMidiFromPath(app: *App, io: std.Io, path: []const u8) void {
     }
 }
 
-/// JSON 过滤器（描述\0通配\0…；与 project_filter 同格式）
-const json_filter = "JSON 文件 (*.json)\x00*.json\x00所有文件 (*.*)\x00*.*\x00";
-
-/// 导入 JSON（可读/迁移格式；与“打开”同流程——旧档同样走备份升级弹窗）
-fn importJsonWithDialog(app: *App, win: *window.Window, io: std.Io) void {
-    _ = win;
-    _ = io;
-    app.requestPick(.{ .kind = .open, .use_ = .import_json, .title = "导入 JSON（可读/迁移格式）", .filter = json_filter });
-}
-
-/// 导出 JSON（可读文本格式，便于迁移到其他 DAW）——不改变当前工程路径/保存态
-fn exportJsonWithDialog(app: *App, win: *window.Window, io: std.Io) void {
-    _ = win;
-    _ = io;
-    app.requestPick(.{ .kind = .save, .use_ = .export_json, .title = "导出 JSON（可读/迁移格式）", .filter = json_filter, .default_name = "song.json" });
-}
-
-/// 导出 JSON 的实际执行（对话框结果）
-fn exportJsonToPath(app: *App, io: std.Io, path: []const u8) void {
-    const project = app.exportProject() catch |e| {
-        app.setToastWith("导出失败：导出失败（{s}）", .{@errorName(e)});
-        return;
-    };
-    defer app.freeProject(project);
-    const json = persist.toJson(app.allocator, project) catch |e| {
-        app.setToastWith("导出失败：序列化失败（{s}）", .{@errorName(e)});
-        return;
-    };
-    defer app.allocator.free(json);
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = json }) catch |e| {
-        app.setToastWith("导出失败：写入失败（{s}）", .{@errorName(e)});
-        return;
-    };
-    app.setToastWith("已导出 JSON（可读格式）：{s}", .{path});
-}
-
 /// 导出 MIDI：全部片段按全局时间展开 → 写出文件。
 fn exportMidiWithDialog(app: *App, win: *window.Window, io: std.Io) void {
     _ = win;
@@ -4722,7 +4689,7 @@ fn exportMidiCommon(app: *App, io: std.Io, path: []const u8, pattern: i32) void 
         defer app.allocator.free(notes);
         if (notes.len == 0) continue; // 空组不落盘
         const bytes = midi.write(app.allocator, .{
-            .bpm = app.bpm,
+            .bpm = app.bpm_doc, // MIDI 文件头写**文档 BPM**（tempo 自动化不写入）
             .time_num = @intCast(std.math.clamp(app.time_num, 1, 255)),
             .time_den = @intCast(std.math.clamp(app.time_den, 1, 64)),
             .notes = notes,
