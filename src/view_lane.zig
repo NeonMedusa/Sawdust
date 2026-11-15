@@ -48,8 +48,8 @@ pub const Target = struct {
     /// **`tempo`（BPM）**：全局目标（`uid` 忽略）；曲线值按 `bpmFromNorm` 映射到 BPM。
     pub const Kind = enum { none, master_vol, mixer_vol, mixer_pan, inst_vol, inst_pan, tempo };
     /// **BPM 的归一化映射区间**（线性）：0 → 20，1 → 999
-    pub const tempo_min: f32 = 20.0;
-    pub const tempo_span: f32 = 979.0;
+    pub const tempo_min: f32 = @import("model.zig").bpm_min;
+pub const tempo_span: f32 = @import("model.zig").bpm_max - tempo_min;
     /// 曲线值（0..1）→ BPM
     pub fn bpmFromNorm(v: f32) f32 {
         return tempo_min + std.math.clamp(v, 0.0, 1.0) * tempo_span;
@@ -106,15 +106,28 @@ pub const Target = struct {
 pub const Binding = struct {
     curve_id: u32,
     target: Target,
-    /// 叠加深度 0..1（将来可 >1）
+    /// 叠加深度 0..2（0 = 不起作用；>1 = 超出基线的夸张幅度）
     depth: f32 = 1.0,
     /// **基准值**（叠加起点，归一化 0..1）；`null` = 用目标类型的默认值
     /// （见 `Target.defaultBase`：音量 0 / 声像 0.5）。右键可恢复默认。
     base: ?f32 = null,
     /// **极性**：false = 单向（曲线 0 处不改变，只往上加）；true = 双向（曲线 0.5 处不改变，可上可下）
     bipolar: bool = false,
+    /// **反向**（与 `bipolar` 独立）：把贡献取负。
+    /// `单向 + 反向` = 曲线越高、参数压得越低（**ducking** 的天然形状：平线在 0、事件处抬到 1）；
+    /// `双向 + 反向` = 双向的镜像。
+    invert: bool = false,
+    /// **极点追赶的平滑时间常数**（毫秒；0 = 不平滑。块内斜坡始终保留，不受它影响）。
+    /// 与 `depth`/`bipolar` 同层（每条绑定自己一个）：同一通道多条绑定取**最大值**。
+    smooth_ms: f32 = default_smooth_ms,
     enabled: bool = true,
 };
+
+/// 平滑时间常数：默认 15ms（= 乐器级一直以来的手感）、上限 200ms
+pub const default_smooth_ms: f32 = 15.0;
+pub const smooth_ms_max: f32 = 200.0;
+/// 深度上限（200%；`publishAutoLane` 与 UI 共用）
+pub const depth_max: f32 = 2.0;
 
 /// 手势态
 const DragKind = enum { none, anchor, curve };
@@ -122,8 +135,10 @@ const DragKind = enum { none, anchor, curve };
 pub const Lane = struct {
     /// **稳定 id**（单调、不重用）——绑定表按 id 引用，删除/重排不会错位
     id: u32 = 0,
-    /// 曲线名（定长 UTF-8；`name_len == 0` → 显示 `curveNameFallback`）
-    name_buf: [24]u8 = @splat(0),
+    /// 曲线名（定长 UTF-8；`name_len == 0` → 显示 `curveNameFallback`）。
+    /// **32 字节 = 10 个汉字**（或 32 个 ASCII）。存储放宽、**显示时中段省略**（见 `Ui.ellipsisMiddle`）：
+    /// 行头列/窗口里只有 ~6 个字的位置，存不下 10 个字的名就只能截。
+    name_buf: [32]u8 = @splat(0),
     name_len: u8 = 0,
     target: Target = .{},
     /// **归属乐器**（乐器作用域的 target 用）：-1 = 未绑定。
@@ -164,8 +179,14 @@ pub const Lane = struct {
         return std.fmt.bufPrint(buf, "曲线{d}", .{self.id}) catch "曲线";
     }
 
+    /// 设名字：**按码点截断**（绝不切出半个汉字——旧的按字节截断会把
+    /// “减法合成器 · 音量”（25 字节）切成非法 UTF-8，渲染成豆腐块）
     pub fn setName(self: *Lane, s: []const u8) void {
-        const n = @min(s.len, self.name_buf.len);
+        var n: usize = @min(s.len, self.name_buf.len);
+        if (n < s.len) {
+            // 回退到多字节序列的起始字节（continuation = 0b10xxxxxx）
+            while (n > 0 and (s[n] & 0xC0) == 0x80) n -= 1;
+        }
         @memcpy(self.name_buf[0..n], s[0..n]);
         self.name_len = @intCast(n);
     }
@@ -825,7 +846,7 @@ pub fn formatValue(u: Unit, v: f32, buf: []u8) []const u8 {
             const dbc = std.math.clamp(db, -60.0, 6.0);
             break :blk std.fmt.bufPrint(buf, "{d:.1}", .{dbc}) catch "";
         },
-        .bpm => std.fmt.bufPrint(buf, "{d}", .{@as(i32, @intFromFloat(@round(20.0 + vc * 979.0)))}) catch "",
+        .bpm => std.fmt.bufPrint(buf, "{d}", .{@as(i32, @intFromFloat(@round(Target.bpmFromNorm(vc))))}) catch "",
         .pan => blk: {
             const p: i32 = @intFromFloat(@round((vc * 2.0 - 1.0) * 100.0));
             if (p == 0) break :blk "C";
@@ -1068,7 +1089,8 @@ pub fn drawList(ui: *Ui, x: i32, y: i32, h: i32, header_w: i32, top_row: i32, sc
         const hovered = util.inRect(ui.mouse_x, ui.mouse_y, bx - 1, by, bw + 1, row_h);
         if (it.active) ui.renderer.fillRect(bx - 1, by, bw + 1, row_h - 1, ui.theme.toolbar);
         const col: r_mod.Color = if (it.active) ui.theme.accent else ui.theme.text;
-        ui.labelClipped(it.text, bx + 2, by + 2, bw - 3, col);
+        // 曲线名**存得多、显不了那么多** → 中段省略（头…尾）
+        ui.labelMiddle(it.text, bx + 2, by + 2, bw - 3, col);
         if (hovered) {
             if (ui.mouse_pressed) hit.index = i;
             if (ui.mouse_double) hit.dbl = i;
@@ -1142,10 +1164,10 @@ test "unit: 归一化 ↔ 显示 往返稳定（dB 有舍入，其余精确）" 
     try std.testing.expectEqual(@as(?f32, 0.0), parseValue(.db, "-60"));
     try std.testing.expectEqual(@as(?f32, 0.0), parseValue(.db, "-80"));
 
-    // BPM：20–999
-    const bpm_v: f32 = (120.0 - 20.0) / 979.0;
+    // BPM：`model.bpm_min`–`model.bpm_max`（归一化 ↔ 真实 BPM 用 `Target` 的那一套）
+    const bpm_v: f32 = Target.normFromBpm(120.0);
     try std.testing.expectEqualStrings("120", formatValue(.bpm, bpm_v, &buf));
-    try std.testing.expectApproxEqAbs(bpm_v, parseValue(.bpm, "120").?, 1e-4);
+    try std.testing.expectApproxEqAbs(120.0, Target.bpmFromNorm(bpm_v), 1e-3);
 
     // PAN：L/R/C
     try std.testing.expectEqualStrings("C", formatValue(.pan, 0.5, &buf));
@@ -1190,6 +1212,30 @@ pub fn drawValueGrid(ui: *Ui, r: Rect, dense: bool) void {
             continue;
         ui.renderer.hline(r.x, vy, r.w, col);
     }
+}
+
+test "lane: 曲线名——**按码点截断**（32 字节 = 10 汉字），自动命名不再切出非法 UTF-8" {
+    var lane = Lane{ .id = 7 };
+    var nb: [24]u8 = undefined;
+
+    // ① 默认自动命名：“减法合成器 · 音量” = 25 字节 —— 旧 24 字节缓冲会在最后一个字中间切开
+    lane.setName("减法合成器 · 音量");
+    try std.testing.expect(std.unicode.utf8ValidateSlice(lane.name(&nb)));
+    try std.testing.expectEqualStrings("减法合成器 · 音量", lane.name(&nb));
+
+    // ② 11 个汉字（33 字节）→ 截到 10 个（30 字节），仍然合法 UTF-8
+    lane.setName("一二三四五六七八九十一");
+    try std.testing.expectEqual(@as(u8, 30), lane.name_len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(lane.name(&nb)));
+    try std.testing.expectEqualStrings("一二三四五六七八九十", lane.name(&nb));
+
+    // ③ 刚好 32 字节的 ASCII 全收
+    lane.setName("0123456789012345678901234567890A");
+    try std.testing.expectEqual(@as(u8, 32), lane.name_len);
+
+    // ④ 空名 → 回退显示 “曲线N”
+    lane.setName("");
+    try std.testing.expectEqualStrings("曲线7", lane.name(&nb));
 }
 
 test "lane: 锚点 x 与竖向网格线**逐像素重合**（任意缩放/滚动）" {

@@ -368,6 +368,11 @@ Note 规则用 5% 的代码拿到了 88% 的收益（141.7KB / 160.5KB）——�
   “当前版本”（`binary_version`）——抬到 9 之后，旧 v8 档会被当成“无 `muted` 字段”
   而跳过它 → **字节错位**。现固定为 `binary_version_v8 = 8`（与 v6 同型）；
   新增测试用“写当前版本→版本字节改回 8→读”的路子守住这条。
+- **v9 引入的字段**（统一钉 `binary_version_v9 = 9`）：
+  `Project.auto_lanes` / `auto_bindings` / `auto_sel`（v8 发布版**没有**自动化整套——不登记就会在旧档末尾
+  “多读三个字段”→ 字节错位）、`SavedBinding.smooth_ms`、`SavedBinding.invert`。
+  测试改用 `toBinaryAtVersion(…, 8)` **真实写出 v8 布局**（不再“写 v9 再改版本字节”——那种做法在有 v9 新字段时必炸），
+  曲线点 ×40 的迁移另用 `migrateUnitsToV5` 的函数级测试盖住。
 
 **连带修的真问题**（U 变大后误差被放大 40 倍）：
 - 导出时长：`exportAudioBegin` 原本“每步取整成整数帧再 × 步数”→ 改为 **f64 帧/步先乘后取整**

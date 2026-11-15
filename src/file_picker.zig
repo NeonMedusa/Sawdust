@@ -423,8 +423,7 @@ pub fn draw(ui: *Ui, self: *Picker, w: i32, h: i32) Outcome {
         // 编辑中：标红 = 上次 Enter 跳转失败
         const border = if (self.edit_err) ui.theme.danger else ui.theme.accent;
         ui.renderer.strokeRect(px + 6, bar_y, bar_w, 20, border);
-        self.edit_view_off = ui.textFieldSyncOffset(self.editText(), self.edit_cursor, bar_w - 8, self.edit_view_off);
-        ui.textFieldEx(self.editText(), self.edit_cursor, text_edit.selPair(self.editSel()), self.edit_view_off, px + 10, bar_y + 3, bar_w - 8, 16, text_edit.blinkOnSince(self.edit_epoch));
+        ui.textFieldInput(self.editText(), self.edit_cursor, text_edit.selPair(self.editSel()), self.edit_drag, &self.edit_view_off, self.edit_epoch, px + 10, bar_y + 3, bar_w - 8, 16);
     } else {
         ui.labelClipped(self.cwd, px + 10, bar_y + 3, bar_w - 8, ui.theme.text_dim);
         if (!just and ui.mouse_pressed and util.inRect(ui.mouse_x, ui.mouse_y, px + 6, bar_y, bar_w, 20)) {
@@ -515,8 +514,7 @@ pub fn draw(ui: *Ui, self: *Picker, w: i32, h: i32) Outcome {
         ui.renderer.fillRect(px + 60, by, pw - 60 - 12, 20, ui.theme.toolbar);
         if (self.edit_target == .name) {
             ui.renderer.strokeRect(px + 60, by, pw - 72, 20, ui.theme.accent);
-            self.edit_view_off = ui.textFieldSyncOffset(self.editText(), self.edit_cursor, pw - 80, self.edit_view_off);
-            ui.textFieldEx(self.editText(), self.edit_cursor, text_edit.selPair(self.editSel()), self.edit_view_off, px + 64, by + 3, pw - 80, 16, text_edit.blinkOnSince(self.edit_epoch));
+            ui.textFieldInput(self.editText(), self.edit_cursor, text_edit.selPair(self.editSel()), self.edit_drag, &self.edit_view_off, self.edit_epoch, px + 64, by + 3, pw - 80, 16);
         } else {
             ui.textField(self.name_buf[0..self.name_len], self.name_len, null, 0, px + 64, by + 3, pw - 74, 18);
             if (!just and ui.mouse_pressed and util.inRect(ui.mouse_x, ui.mouse_y, px + 60, by, pw - 72, 20)) {

@@ -696,7 +696,13 @@ pub fn main(init: std.process.Init) !u8 {
         // - 点在框内：定位光标；按住拖动 = 框选（光标跟随鼠标，可拖出框外）
         if (app.text_input.active) {
             const ti = &app.text_input;
-            // 输入框几何是**逻辑像素** → 鼠标先换算
+            // 框内 x → 字节偏移（带着水平滚动偏移）——按下与拖动共用一个换算
+            const idx_at = struct {
+                fn f(u: *Ui, t: *const @TypeOf(app.text_input), mx_l: i32) usize {
+                    const local: f32 = @floatFromInt(mx_l - (t.x + 4) + t.view_off);
+                    return u.textIndexAtX(t.text(), local);
+                }
+            }.f;
             const mx_l = i2l(ui_input.mouse_x, scale);
             const my_l = i2l(ui_input.mouse_y, scale);
             const in_box = mx_l >= ti.x and mx_l < ti.x + ti.w and
@@ -706,16 +712,14 @@ pub fn main(init: std.process.Init) !u8 {
                     app.textInputCommit();
                     ui_input.mouse_down = false; // 防拖动启动
                 } else {
-                    // 框内：拖动 → 框选（锚点 = 击点）；单击 → 仅定位光标
-                    const local: f32 = @floatFromInt(mx_l - (ti.x + 4) + ti.view_off);
-                    app.textInputPointerDown(ui.textIndexAtX(ti.text(), local));
+                    // 框内按下：定位光标（锚点=击点）；按住拖动才是框选
+                    app.textInputPointerDown(idx_at(&ui, ti, mx_l));
                 }
                 ui_input.mouse_pressed = false;
                 ui_input.mouse_double = false;
-            } else if (app.text_input.drag_active) {
+            } else if (ti.drag_active) {
                 if (ui_input.mouse_down) {
-                    const local: f32 = @floatFromInt(i2l(ui_input.mouse_x, scale) - (ti.x + 4) + ti.view_off);
-                    app.textInputPointerMove(ui.textIndexAtX(ti.text(), local));
+                    app.textInputPointerMove(idx_at(&ui, ti, mx_l));
                 } else {
                     app.textInputPointerUp();
                 }
@@ -900,7 +904,7 @@ pub fn main(init: std.process.Init) !u8 {
             else blk: {
                 // 兜底（刚起播、积分器还没发过值）：老公式
                 const frames = app.params.frames_played.load(.monotonic);
-                const bpm: f64 = @max(20.0, @as(f64, std.math.clamp(app.bpm, 20.0, 999.0)));
+                const bpm: f64 = @max(model.bpm_min, @as(f64, std.math.clamp(app.bpm, model.bpm_min, model.bpm_max)));
                 const spb_per_beat: f64 = @floatFromInt(@max(1, model.stepsPerBeat(app.time_den)));
                 const step_frames: f64 = @max(1.0, @as(f64, @floatFromInt(app.params.sample_rate)) * 60.0 / (bpm * spb_per_beat));
                 const elapsed_frames: u64 = frames -| app.playback.start_frame;
@@ -927,7 +931,7 @@ pub fn main(init: std.process.Init) !u8 {
 
         // 同步 BPM / 每拍步数 到音频线程（序列器换算步→帧用）
         app.applyTempoAutomation(); // BPM 自动化（有绑定才生效）
-        app.params.bpm.store(std.math.clamp(app.bpm, 20.0, 999.0), .monotonic);
+        app.params.bpm.store(std.math.clamp(app.bpm, model.bpm_min, model.bpm_max), .monotonic);
         app.params.time_num.store(app.time_num, .monotonic);
         app.params.time_den.store(app.time_den, .monotonic);
         app.params.steps_per_beat.store(@intCast(model.stepsPerBeat(app.time_den)), .monotonic);
@@ -935,16 +939,15 @@ pub fn main(init: std.process.Init) !u8 {
         ui.renderer = r_mod.Renderer.init(&win.fb);
         ui.renderer.scale = scale; // **DPI 缩放**：所有图元在 renderer 内部乘 scale
         ui.frame_n +%= 1; // 立即式 UI：本帧序号（Debug 撞车检测按帧重置）
-        // **文本输入框打开时的 hover 独占**：下面的点击已在输入框那块被吞掉，
-        // 但 hover / 光标仍会穿到下层（实测：框后面元素仍弹 hover、光标也变了）。
-        // 把指针挪到屏幕外即可——输入框自己用 `ui_input` 提前处理完点击/框选，不依赖之后的 hover。
-        // 注：挪的是**物理**坐标，必须在 `i2l` 之前；缩放后的逻辑坐标同样是“屏外”。
-        if (app.text_input.active) {
-            ui_input.mouse_x = -100000;
-            ui_input.mouse_y = -100000;
-        }
-        ui.mouse_x = i2l(ui_input.mouse_x, scale);
-        ui.mouse_y = i2l(ui_input.mouse_y, scale);
+        // **文本输入框打开时的 hover 独占**：点击已在上面被输入框吞掉，但 hover / 光标
+        // 仍会穿到下层（实测：框后面元素仍弹 hover）。
+        // 只把**给 UI 的每帧副本**换成屏外坐标；`ui_input` 是跨帧持存的，
+        // 改它会导致下一帧仍拿到 -100000（鼠标不动就没有 move 事件来覆盖）——
+        // 详见 `docs/pitfalls.md`《不要为了隔离 hover 而改写跨帧持存的输入状态》。
+        const ui_mx: i32 = if (app.text_input.active) -100000 else ui_input.mouse_x;
+        const ui_my: i32 = if (app.text_input.active) -100000 else ui_input.mouse_y;
+        ui.mouse_x = i2l(ui_mx, scale);
+        ui.mouse_y = i2l(ui_my, scale);
         ui.mouse_down = ui_input.mouse_down;
         ui.mouse_pressed = ui_input.mouse_pressed;
         ui.mouse_released = ui_input.mouse_released;
@@ -1017,11 +1020,10 @@ pub fn main(init: std.process.Init) !u8 {
         // 文本输入框（最顶层——跨窗口/菜单，重命名乐器/通道用）
         if (app.text_input.active) {
             const ti = &app.text_input;
-            ti.view_off = ui.textFieldSyncOffset(ti.text(), ti.cursor, ti.w, ti.view_off);
             if (ti.caret_epoch == 0) ti.caret_epoch = text_edit.nowMs(); // 刚激活 → 从"亮"开始
             ui.noteOverlayRect(ti.x, ti.y, ti.w, text_input_h); // 遮挡插件子窗口
             ui.renderer.fillRect(ti.x + 2, ti.y + 2, ti.w, text_input_h, r_mod.rgb(12, 13, 16)); // 阴影
-            ui.textFieldEx(ti.text(), ti.cursor, ti.selection(), ti.view_off, ti.x, ti.y, ti.w, text_input_h, text_edit.blinkOnSince(ti.caret_epoch));
+            ui.textFieldInput(ti.text(), ti.cursor, ti.selection(), ti.drag_active, &ti.view_off, ti.caret_epoch, ti.x, ti.y, ti.w, text_input_h);
         }
         // 内置文件选择器（模态，绘于最上层）——先画它，再统一 present
         if (picker) |*pk| {
@@ -2474,7 +2476,7 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     const menu_open = app.menuIsOpen();
 
     // 浮动窗口列表（按 z 升序 = 从下到上）；排序用插入排序（元素很少）
-    var wins: [8]struct { z: i32, draw: app_mod.WinKind } = undefined;
+    var wins: [9]struct { z: i32, draw: app_mod.WinKind } = undefined;
     var nwin: usize = 0;
     if (rack_open) {
         wins[nwin] = .{ .z = app.rack.z, .draw = .rack };
@@ -2506,6 +2508,10 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     }
     if (app.plugin_mgr.open) {
         wins[nwin] = .{ .z = app.plugin_mgr.z, .draw = .plugin_mgr };
+        nwin += 1;
+    }
+    if (app.auto_win.open) {
+        wins[nwin] = .{ .z = app.auto_win.z, .draw = .auto };
         nwin += 1;
     }
     {
@@ -2545,6 +2551,7 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
             .help => .{ .x = app.help_win.x, .y = app.help_win.y, .w = app.help_win.w, .h = app.help_win.h },
             .settings => .{ .x = app.settings_win.x, .y = app.settings_win.y, .w = app.settings_win.w, .h = app.settings_win.h },
             .plugin_mgr => .{ .x = app.plugin_mgr.x, .y = app.plugin_mgr.y, .w = app.plugin_mgr.w, .h = app.plugin_mgr.h },
+            .auto => .{ .x = app.auto_win.x, .y = app.auto_win.y, .w = @import("view_auto_win.zig").W, .h = @import("view_auto_win.zig").H },
         };
         _ = ui.declare(.{ .prio = 1 + @as(i32, @intCast(wi)), .rect = r });
     }
@@ -2555,12 +2562,6 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     // 波形窗口（v1 固定置顶：优先级高于所有 wins）
     if (app.wave_win.open) {
         _ = ui.declare(.{ .prio = 1 + @as(i32, @intCast(nwin)), .rect = .{ .x = app.wave_win.x, .y = app.wave_win.y, .w = app.wave_win.w, .h = app.wave_win.h } });
-    }
-    // 自动化链接窗口：**最上层**（prio 900 以下、高于所有 wins/wave）——
-    // 必须在这里声明，主界面（含播放列表）绘制时才知道自己被盖住，
-    // 否则点击会穿透到下层（实测：点窗口 → 在播放列表里放了片段）。
-    if (app.auto_win.open) {
-        _ = ui.declare(.{ .prio = 1 + @as(i32, @intCast(nwin)) + 1, .rect = .{ .x = app.auto_win.x, .y = app.auto_win.y, .w = @import("view_auto_win.zig").W, .h = @import("view_auto_win.zig").H } });
     }
 
     // 主界面（prio 0）
@@ -2626,14 +2627,8 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
             .help => _ = view_help.draw(ui, app, w, h),
             .settings => _ = view_settings.draw(ui, app, w, h),
             .plugin_mgr => _ = view_plugins.draw(ui, app, w, h),
+            .auto => view_auto_win.draw(ui, app),
         }
-        ui.endLayer();
-    }
-
-    // 自动化链接窗口（最上层；声明见帧首）
-    if (app.auto_win.open) {
-        _ = ui.beginLayer(1 + @as(i32, @intCast(nwin)) + 1);
-        view_auto_win.draw(ui, app);
         ui.endLayer();
     }
 
@@ -2658,6 +2653,7 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
             .help => .{ .kind = .help, .x = app.help_win.x, .y = app.help_win.y, .w = app.help_win.w, .h = app.help_win.h },
             .settings => .{ .kind = .settings, .x = app.settings_win.x, .y = app.settings_win.y, .w = app.settings_win.w, .h = app.settings_win.h },
             .plugin_mgr => .{ .kind = .plugin_mgr, .x = app.plugin_mgr.x, .y = app.plugin_mgr.y, .w = app.plugin_mgr.w, .h = app.plugin_mgr.h },
+            .auto => .{ .kind = .auto, .x = app.auto_win.x, .y = app.auto_win.y, .w = @import("view_auto_win.zig").W, .h = @import("view_auto_win.zig").H },
         };
         app.win_draw_n += 1;
     }
@@ -2689,7 +2685,7 @@ pub fn drawBpmCtxMenu(ui: *Ui, app: *App) void {
         if (ii == 0) {
             app.beginInputBpm(mx + 4, my + 6);
         } else {
-            app.auto_win = .{ .open = true, .x = 240, .y = 150, .target = .{ .kind = .tempo }, .just_opened = true };
+            app.openAutoWin(.{ .kind = .tempo });
         }
         app.panels.ctx_bpm = false;
     } else if (ui.mouse_pressed and !inside) {
@@ -2874,7 +2870,7 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
         const old_bpm = app.bpm;
         // **与以前同样的手感**：拖 8px = 1 BPM，且**只改整数位**
         // （小数由右键「输入值…」键入，如 `120.555`；推到边界时小数清零）
-        _ = ui.dragNumberBpm(350, x, by, 56, bh, &app.bpm, 20.0, 999.0, 8);
+        _ = ui.dragNumberBpm(350, x, by, 56, bh, &app.bpm, model.bpm_min, model.bpm_max, 8);
         if (app.bpm != old_bpm) app.history_pending = "调整 BPM"; // 松手时 coalesce 提交
         // **右键 → 菜单（输入值… / 自动化…）**——不再直接开自动化窗口
         if (util.hitUI(ui, x, by, 56, bh) and ui.mouse_right_pressed) {
@@ -2907,7 +2903,7 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
                 if (ii == 0) {
                     app.beginInputBpm(mx + 4, my + 4);
                 } else {
-                    app.auto_win = .{ .open = true, .x = 240, .y = 150, .target = .{ .kind = .tempo }, .just_opened = true };
+                    app.openAutoWin(.{ .kind = .tempo });
                 }
                 app.panels.ctx_bpm = false;
             } else if (ui.mouse_pressed and !inside) {
@@ -3221,10 +3217,10 @@ fn schedLogTick(app: *App, io: std.Io) void {
 
     // **A4**：调度现在只有一条路径（快照），旧 push 模型的“作废/队列/编辑代”指标已删。
     var line_buf: [512]u8 = undefined;
-    const line = std.fmt.bufPrint(&line_buf, "[sched] 1s: 声部={d} 最老={d}步(p{d} i{d}) | off 命中={d} 落空={d} 重触发={d} | 积压 stash={d} 满增={d} | 本地off={d} 超时={d}/{d} 迟到={d}步 | 步={d} | lane 斜坡={d} | inst0_g={d:.3} synth0_sm={d:.3} seg_g={d:.3} seg_kind={d} seg_n={d} seg_ptr={x} ui_ptr={x}\n", .{
+    const line = std.fmt.bufPrint(&line_buf, "[sched] 1s: 声部={d} 最老={d}步(p{d} i{d}) | off 命中={d} 落空={d} 重触发={d} | 积压 stash={d} 满增={d} | 本地off={d} 超时={d}/{d} 迟到={d}步 | 步={d} | lane 斜坡={d} 绑定溢出={d} | inst0_g={d:.3} synth0_sm={d:.3} seg_g={d:.3} seg_kind={d} seg_n={d} seg_ptr={x} ui_ptr={x}\n", .{
         voices,                                         max_age,                                                                                    age_p,                                 age_i,                                      off_hit,
         off_miss,                                       retrig,                                                                                     stash_n,                               d_stash,                                    local_off,
-        ov_now,                                         ov_peak,                                                                                    ov_late,                               app.playback.cursorStep(app.sel.song_mode), app.params.dbg_lane_ramps.swap(0, .monotonic),
+        ov_now,                                         ov_peak,                                                                                    ov_late,                               app.playback.cursorStep(app.sel.song_mode), app.params.dbg_lane_ramps.swap(0, .monotonic), app.params.dbg_lane_overflow.swap(0, .monotonic),
         app.params.instrument_gain[0].load(.monotonic), if (app.engine.synths.len > 0) app.engine.synths[0].smoothed_master else @as(f32, -1),      app.params.dbg_seg_g.load(.monotonic), app.params.dbg_seg_kind.load(.monotonic),   app.params.dbg_seg_render.swap(0, .monotonic),
         app.params.dbg_seg_ptr.load(.monotonic),        if (app.params.instrument_gain.len > 0) @intFromPtr(&app.params.instrument_gain[0]) else 0,
     }) catch return;

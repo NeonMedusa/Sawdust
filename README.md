@@ -163,7 +163,9 @@ VST3 宿主见 `docs/plugin-hosting.md`；**Zig 0.17 迁移实录**见 `docs/zig
 **播放中编辑的调度与释音协议**见 `docs/scheduler-protocol.md`（不变量 / 事件生命期 / 重扫门控 / 诊断字段）；
 **内存 / CPU / 二进制体积账本**见 `docs/resources.md`（池化现状 / 优化 backlog / 发布口径矩阵 / `.rodata` 初值镜像坑）；
 **UI 缩放（DPI）**见 `docs/ui-scaling.md`（逻辑像素单点乘算 / 字体按 DPI 光栅化 / 环境变量覆盖）；
-**拖动 / 吸附 / Alt 细调**见 `docs/drag-snap.md`（八条不变式 / `GridRebase` 量化与重锚 / 橡皮筋与饱和点 / 八条手势路径对照）；
+**拖动 / 吸附 / Alt 细调 / Ctrl+Q 绝对量化**见 `docs/drag-snap.md`（八条不变式 / `GridRebase` 量化与重锚 / 橡皮筋与饱和点 / 手势路径对照表 / §9 量化两步法）；
+**网格与时间分辨率（960 PPQN = U 3840）**见 `docs/units-3840.md`（四族网格档位 / 整除上限 / 存档 v9 迁移 / 实机问题录）；
+**命中判定**见 `docs/pianoroll-hit.md`（像素容差 `noteAtMousePx` / 边缘热区 / 手势帧序瞬移 / 播放列表片段命中与叠放轮换）；
 **SONG / PAT 双模式**见 `docs/song-pat.md`（两个播放域 / 锚片段与白环 / 两个方向的切换映射表 / 幽灵游标 / 点片段带游标 / 手工回归清单）；
 **自动化（参数曲线）的模型与计划**见 `docs/automation.md`（点 + 每段插值 / 两种编辑视图 / 存取与历史纪律）。
 **线性工作流改造（轨道 + 片段，线性 DAW 风格）的设计稿**见 `docs/linear-refactor.md`。

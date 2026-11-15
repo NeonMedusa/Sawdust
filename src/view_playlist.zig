@@ -32,6 +32,11 @@ pub const muted_gray: r_mod.Color = r_mod.rgb(150, 150, 154);
 /// **轨道静音**：比片段静音更暗（让用户一眼分辨"是自己静音了"还是"轨道静音了"）
 pub const muted_gray_track: r_mod.Color = r_mod.rgb(92, 92, 96);
 
+/// 曲线**重命名输入框的宽度**：行头列只有 90px（~6 个字），而名字存 32 字节
+/// （10 汉字 ≈ 150px）→ 框窄了就会横向滚动，拖选时“看到的末尾”与映射对不上。
+/// 输入框浮在最上层，本来就可以比列宽——直接给够。
+const rename_box_w: i32 = 200;
+
 pub fn patternColor(pattern: i32) r_mod.Color {
     const palette = [_]r_mod.Color{
         r_mod.rgb(90, 170, 255), // 蓝
@@ -1468,7 +1473,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             },
             .quantize => {
                 // **绝对量化**：先整块搬左端上网格、再对齐右端（`offset`/`trim_start` 不动）
-                // （见 `model.quantizeClipWindow` / `App.quantizeSelectedClips`）。
+                // （见 `model.quantizeClipSpan` / `App.quantizeSelectedClips`）。
                 if (app.selectedClipCount() == 0) {
                     app.setToast("先用 Ctrl+拖框选要量化的片段");
                 } else {
@@ -1554,7 +1559,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 if (lh.dbl) |hi| {
                     if (hi < n) {
                         const cid = app.auto_curves.items[hi].id;
-                        app.beginRenameAutoCurve(cid, main_x + 4, ay + 44 + 18, util.piano_header_w);
+                        app.beginRenameAutoCurve(cid, main_x + 4, ay + 44 + 18, rename_box_w);
                     }
                 }
                 // 右键 → **菜单**（不是直接删）
@@ -1580,7 +1585,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             if (util.menuPanel(ui, &app.curve_menu.x, &app.curve_menu.y, &app.curve_menu.open, app.curve_menu.just_opened, .{ .cursor = {} }, bounds, &items, 110, &en)) |ci| {
                 const cid = app.curve_menu.curve_id;
                 switch (ci) {
-                    0 => app.beginRenameAutoCurve(cid, main_x + 4, ay + 44 + 18, util.piano_header_w),
+                    0 => app.beginRenameAutoCurve(cid, main_x + 4, ay + 44 + 18, rename_box_w),
                     else => {
                         if (app.bindingCountOfCurve(cid) > 1) {
                             app.struct_del_req = .{ .auto_curve = cid };

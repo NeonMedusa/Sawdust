@@ -295,7 +295,7 @@ fn drawParamPanel(ui: *Ui, app: *App, es: *app_mod.EffectSlot, px: i32, py: i32,
                 app.history_pending = "调整延迟节奏";
             }
             var mb: [24]u8 = undefined;
-            const bpm_c: f32 = @max(20.0, app.bpm);
+            const bpm_c: f32 = @max(model.bpm_min, app.bpm);
             const ms = fx.delay_tempos[@intCast(code)].beats * 60000.0 / bpm_c;
             ui.label(std.fmt.bufPrint(&mb, "{d:.0}ms", .{ms}) catch "", knob_x + 68, yy + @divTrunc(knob, 2) - 6, ui.theme.text);
             yy += row_h;

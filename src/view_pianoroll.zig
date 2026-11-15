@@ -1447,13 +1447,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 if (n > 0) app.setToastWith("已全选 {d} 个音符", .{n});
             },
             .quantize => {
-                // **绝对量化**：两端上网格 + 长度至少一格（见 `model.quantizeSpan`）。
-                // 只动框选中的、且属于当前样式 + 当前乐器的音符（与框选/Del 同一收窄口径）。
-                var sel: usize = 0;
-                for (app.notes.items) |nt| {
-                    if (nt.selected and nt.pattern == pattern and nt.instrument == app.sel.instrument) sel += 1;
-                }
-                if (sel == 0) {
+                // **绝对量化**：两端**各自就近**上网格（右端看**原**右端，见 `model.quantizeNoteSpan`）。
+                // 与播放列表侧对称：都只认 `selected`（框选），空选区只提示不动。
+                if (app.selectedNoteCount() == 0) {
                     app.setToast("先用 Ctrl+拖框选要量化的音符");
                 } else {
                     const n = app.quantizeSelectedNotes(pattern, app.sel.instrument, snap_steps);

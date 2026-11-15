@@ -3,22 +3,59 @@
 //! 从混音台通道右键菜单的 `自动化…` 打开；管理“这个参数绑了哪些曲线、每条的深度/极性”。
 //!
 //! - 叠加语义：`参数 = clamp(静态推子 + Σ 深度 × (单向: v / 双向: 2v−1), 0, 1)`
-//! - 每行：`[✓启用] 曲线名 · 深度滑条 · 单向/双向 · 映射占位(1:1) · ×移除`
-//! - 底部：`+ 新曲线并链接` + 未绑定曲线的快捷芯片
-//! - 映射曲线（画任意映射）**本轮仅占位**（1:1 斜线，点击提示暂未实现）
+//! - 每行：`[✓启用] 曲线名 · 极性 · 反向 · 基础值 · 深度 · 平滑(ms) · ×移除`
+//! - 左键拖/点改值；**右键统一弹菜单**（恢复默认值 / 输入值…）
+//! - 映射曲线**不做**（用户拍板：占位已删）
 //!
 //! 与“按曲线看”的播放列表行头列共享同一张绑定表（两个视角，互相同步）。
 
 const std = @import("std");
 const App = @import("app.zig").App;
 const Ui = @import("ui.zig").Ui;
+const model = @import("model.zig");
 const util = @import("view_util.zig");
 const view_lane = @import("view_lane.zig");
 
-pub const W: i32 = 460;
-pub const H: i32 = 268;
+pub const W: i32 = 448;
+pub const H: i32 = 300;
 
 const row_h: i32 = 34;
+/// 表头行高（列标题：曲线 / 极性 / 反向 / 基础 / 深度 / 平滑）
+const cap_h: i32 = 14;
+
+// ── **一套几何**（强迫症版）：所有控件同高 `ctrl_h`、同间距 `gap`、同行内垂直居中 ──
+const ctrl_h: i32 = 18; // 开关 / 按钮 / 推子 / × 全部 18 高
+const ctrl_gap: i32 = 8; // 相邻控件水平间距（全行统一）
+const row_pad: i32 = 6; // 行左右内边距
+/// 控件在行内的 y（行内容高 = row_h−4，垂直居中）
+fn ctrlY(row_y: i32) i32 {
+    return row_y + @divTrunc(row_h - 4 - ctrl_h, 2);
+}
+
+/// 文本在 (cy, ctrl_h) 内垂直居中时的**顶边 y**（给需要裁剪的 `labelClipped` 用）。
+/// 短标签直接用 `ui.labelCentered`（按 ascent/descent 算基线），两者视觉一致。
+fn textTop(ui: *const Ui, cy: i32) i32 {
+    const lh: i32 = @intFromFloat(ui.font.lineHeight());
+    return cy + @divTrunc(ctrl_h - lh, 2);
+}
+
+/// 行内列偏移（相对行左边 x；`w` = 行宽）——**全由 `ctrl_gap` 递推**，不再手写数字
+/// 列序：曲线开关 → 曲线名 → 极性 → 反向 → 基础 → 深度 → 平滑 → ×
+const Col = struct {
+    pub const on: i32 = row_pad;
+    pub const name: i32 = on + ctrl_h + ctrl_gap;
+    pub const name_w: i32 = 92;
+    pub const pol: i32 = name + name_w + ctrl_gap;
+    pub const btn_w: i32 = 40;
+    pub const inv: i32 = pol + btn_w + ctrl_gap;
+    pub const base: i32 = inv + btn_w + ctrl_gap;
+    pub const base_w: i32 = 52;
+    pub const depth: i32 = base + base_w + ctrl_gap;
+    pub const depth_w: i32 = 56;
+    pub const smooth: i32 = depth + depth_w + ctrl_gap;
+    pub const smooth_w: i32 = 56;
+    pub const del: i32 = smooth + smooth_w + ctrl_gap;
+};
 
 pub fn draw(ui: *Ui, app: *App) void {
     const win = &app.auto_win;
@@ -28,7 +65,9 @@ pub fn draw(ui: *Ui, app: *App) void {
     const x = win.x;
     const y = win.y;
 
-    // ── 窗口底 + 边框 + 标题栏 ──
+    const mouse_in_win = util.inRect(ui.mouse_x, ui.mouse_y, x, y, w, h);
+
+    // 窗口底 + 边框 + 标题栏
     ui.renderer.fillRect(x, y, w, h, ui.theme.panel);
     ui.renderer.strokeRect(x, y, w, h, ui.theme.accent);
     ui.renderer.fillRect(x + 1, y + 1, w - 2, util.title_h - 1, ui.theme.toolbar);
@@ -71,9 +110,9 @@ pub fn draw(ui: *Ui, app: *App) void {
         const st = if (win.target.kind == .tempo)
             // BPM 用**真实的 bpm 数字**显示（归一化 0..1 对用户没意义）
             (if (app.isTargetBound(win.target))
-                std.fmt.bufPrint(&sb, "区间 20~999 BPM  →  此刻 {d:.0} BPM", .{view_lane.Target.bpmFromNorm(v)}) catch ""
+                std.fmt.bufPrint(&sb, "区间 {d:.0}~{d:.0} BPM  →  此刻 {d:.0} BPM", .{ model.bpm_min, model.bpm_max, view_lane.Target.bpmFromNorm(v) }) catch ""
             else
-                std.fmt.bufPrint(&sb, "区间 20~999 BPM  →  尚未链接曲线（当前 {d} BPM）", .{app.bpm}) catch "")
+                std.fmt.bufPrint(&sb, "区间 {d:.0}~{d:.0} BPM  →  尚未链接曲线（当前 {d} BPM）", .{ model.bpm_min, model.bpm_max, app.bpm }) catch "")
         else if (app.isTargetBound(win.target))
             std.fmt.bufPrint(&sb, "基准 {d:.2}（{s} · {s}）  →  合成 {d:.2}", .{ base, kind_txt, pol_txt, v }) catch ""
         else
@@ -84,9 +123,25 @@ pub fn draw(ui: *Ui, app: *App) void {
     // ── 绑定行 ──
     var binds_buf: [32]view_lane.Binding = undefined;
     const binds = app.bindingsOfTarget(win.target, &binds_buf);
-    const list_top = y + util.title_h + 20;
+    const cap_top = y + util.title_h + 20;
+    const list_top = cap_top + cap_h;
     const list_bottom = y + h - 34;
     const list_h = @max(row_h, list_bottom - list_top);
+    // 列标题（与行内控件**同一个居中算法**：标题中心 = 控件中心 → 首字尽量对齐）
+    {
+        const capX = struct {
+            fn f(ui_: *const Ui, box_x: i32, box_w: i32, text: []const u8) i32 {
+                const tw: i32 = @intFromFloat(ui_.font.measure(text));
+                return box_x + @divTrunc(box_w - tw, 2);
+            }
+        }.f;
+        ui.labelClipped("曲线", x + 4 + Col.name, cap_top, 90, ui.theme.text_dim);
+        ui.labelClipped("极性", capX(ui, x + 4 + Col.pol, Col.btn_w, "极性"), cap_top, 44, ui.theme.text_dim);
+        ui.labelClipped("反向", capX(ui, x + 4 + Col.inv, Col.btn_w, "反向"), cap_top, 44, ui.theme.text_dim);
+        ui.labelClipped("基础", capX(ui, x + 4 + Col.base, Col.base_w, "基础"), cap_top, 46, ui.theme.text_dim);
+        ui.labelClipped("深度", capX(ui, x + 4 + Col.depth, Col.depth_w, "深度"), cap_top, 46, ui.theme.text_dim);
+        ui.labelClipped("平滑", capX(ui, x + 4 + Col.smooth, Col.smooth_w, "平滑"), cap_top, 46, ui.theme.text_dim);
+    }
     const view_rows: i32 = @max(1, @divTrunc(list_h, row_h));
     const content_rows: i32 = @intCast(binds.len);
     const max_scroll: i32 = @max(0, content_rows - view_rows);
@@ -162,98 +217,251 @@ pub fn draw(ui: *Ui, app: *App) void {
             } else ui.active_id = 0;
         }
     }
+
+    // **点到谁谁在上**（与其他浮动窗口一致）：本帧在窗口内按下 → 置顶
+    if (mouse_in_win and ui.mouse_pressed) app.bringToFront(&win.z);
+
+    // 行内右键菜单：**最后一次绘制**（盖在行/底部按钮之上，不会被它们挡或抢命中）
+    drawRowCtxMenu(ui, app);
 }
 
-/// 一行绑定：`[✓] 名字 [深度滑条] [单向/双向] [映射占位] [×]`
+/// 一行绑定：`[✓] [曲线名] [极性] [反向] [基础] [深度] [平滑] [×]`
+/// **几何只有一个来源**：控件同高 `ctrl_h`、同间距 `ctrl_gap`、同行内用 `ctrlY` 垂直居中、
+/// 文本一律用 `labelCentered`（按字体 ascent/descent 居中）——不要再手写 `+8 / +3` 之类。
 fn drawRow(ui: *Ui, app: *App, bi: usize, lc: *view_lane.Lane, x: i32, y: i32, w: i32) void {
     const b = &app.auto_bindings.items[bi];
     const row_bg = if (b.enabled) ui.theme.item_alt else ui.theme.toolbar;
     ui.renderer.fillRect(x, y, w, row_h - 4, row_bg);
+    const cy = ctrlY(y);
 
-    // 启用开关
+    // 启用开关（方形；开 = 蓝，关 = 灰）
     {
-        const bx = x + 4;
-        const by = y + 7;
-        const hovered = util.inRect(ui.mouse_x, ui.mouse_y, bx, by, 16, 16);
-        ui.renderer.fillRect(bx, by, 16, 16, if (b.enabled) ui.theme.accent else ui.theme.slider_track);
-        ui.renderer.strokeRect(bx, by, 16, 16, ui.theme.panel_border);
-
+        const bx = x + Col.on;
+        const hovered = util.inRect(ui.mouse_x, ui.mouse_y, bx, cy, ctrl_h, ctrl_h);
+        ui.renderer.fillRect(bx, cy, ctrl_h, ctrl_h, if (b.enabled) ui.theme.accent else ui.theme.slider_track);
+        ui.renderer.strokeRect(bx, cy, ctrl_h, ctrl_h, ui.theme.panel_border);
         if (hovered and ui.mouse_pressed) b.enabled = !b.enabled;
     }
 
-    // 曲线名（点击 → 切到播放列表编辑这条曲线）
+    // 曲线名（点击 → 切到播放列表编辑这条曲线；垂直居中同其他控件）
     {
         var nb: [24]u8 = undefined;
         const nm = lc.name(&nb);
-        const nw: i32 = 96;
-        const hovered = util.inRect(ui.mouse_x, ui.mouse_y, x + 24, y + 4, nw, row_h - 8);
-        ui.labelClipped(nm, x + 24, y + 8, nw, if (hovered) ui.theme.accent else if (b.enabled) ui.theme.text else ui.theme.text_dim);
+        const hovered = util.inRect(ui.mouse_x, ui.mouse_y, x + Col.name, cy, Col.name_w, ctrl_h);
+        if (hovered) ui.renderer.fillRect(x + Col.name, cy, Col.name_w, ctrl_h, ui.theme.item_hover);
+        // 名字可能超宽 → **中段省略**（头…尾），垂直居中由 `textTop` 算
+        ui.labelMiddle(nm, x + Col.name, textTop(ui, cy), Col.name_w, if (hovered) ui.theme.accent else if (b.enabled) ui.theme.text else ui.theme.text_dim);
         if (hovered and ui.mouse_pressed) app.auto_sel = lc.id;
     }
 
-    // **基准值**（归一化 0..1）：左键键入、**右键恢复类型默认**（音量 0 / 声像 0.5）
+    // **极性**（单向 / 双向）——左键切换；右键菜单
     {
-        const bx0 = x + 24 + 96 + 2;
-        const spec_base = view_lane.Target.defaultBase(b.target.kind);
-        const bv = b.base orelse spec_base;
-        const hovered = util.inRect(ui.mouse_x, ui.mouse_y, bx0, y + 8, 52, 16);
-        ui.renderer.fillRect(bx0, y + 8, 52, 16, if (hovered) ui.theme.item_hover else ui.theme.slider_track);
-        ui.renderer.strokeRect(bx0, y + 8, 52, 16, ui.theme.panel_border);
-        var bb: [24]u8 = undefined;
-        const bt = std.fmt.bufPrint(&bb, "基{d:.2}", .{bv}) catch "基";
-        ui.labelClipped(bt, bx0 + 4, y + 10, 48, if (b.base == null) ui.theme.text_dim else ui.theme.text);
-        if (hovered and ui.mouse_pressed) {
-            app.beginEditAutomationBase(bi, bt, bx0, y + 24, 60);
-        }
-        if (hovered and ui.mouse_right_pressed) b.base = null; // 恢复类型默认
-    }
-
-    // 深度滑条（0..100%）
-    {
-        var depth = b.depth;
-        const sx = x + 24 + 96 + 58;
-        const sw = w - (sx - x) - 150;
-        if (ui.slider(Ui.idOf("auto_win_depth", 0) + bi, &depth, sx, y + 8, @max(40, sw), 16)) {
-            b.depth = std.math.clamp(depth, 0.0, 1.0);
-        }
-        var db: [16]u8 = undefined;
-        const dt = std.fmt.bufPrint(&db, "{d}%", .{@as(i32, @intFromFloat(@round(b.depth * 100.0)))}) catch "";
-        ui.labelClipped(dt, sx + @max(40, sw) + 4, y + 10, 40, ui.theme.text_dim);
-    }
-
-    // 极性（单向 / 双向）——点击切换
-    {
-        const px = x + w - 106;
-        const py = y + 8;
-        const hovered = util.inRect(ui.mouse_x, ui.mouse_y, px, py, 44, 16);
-        ui.renderer.fillRect(px, py, 44, 16, if (hovered) ui.theme.item_hover else ui.theme.slider_track);
-        ui.renderer.strokeRect(px, py, 44, 16, ui.theme.panel_border);
-        ui.labelClipped(if (b.bipolar) "双向" else "单向", px + 6, py + 3, 36, if (b.bipolar) ui.theme.accent else ui.theme.text);
+        const px = x + Col.pol;
+        const hovered = util.inRect(ui.mouse_x, ui.mouse_y, px, cy, Col.btn_w, ctrl_h);
+        ui.renderer.fillRect(px, cy, Col.btn_w, ctrl_h, if (hovered) ui.theme.item_hover else ui.theme.slider_track);
+        ui.renderer.strokeRect(px, cy, Col.btn_w, ctrl_h, ui.theme.panel_border);
+        const txt: []const u8 = if (b.bipolar) "双向" else "单向";
+        const tw: i32 = @intFromFloat(ui.font.measure(txt));
+        ui.labelCentered(txt, px + @divTrunc(Col.btn_w - tw, 2), cy, ctrl_h, if (b.bipolar) ui.theme.accent else ui.theme.text);
         if (hovered and ui.mouse_pressed) b.bipolar = !b.bipolar;
-        if (hovered and ui.mouse_right_pressed) b.bipolar = view_lane.Target.defaultBipolar(b.target.kind); // 恢复默认极性
+        if (hovered and ui.mouse_right_pressed) openCtx(app, ui, bi, .bipolar);
     }
 
-    // 映射占位（1:1 斜线；点击提示暂未实现）
+    // **反向**（与极性独立）：单向+反向 = ducking（曲线越高，参数压得越低）
     {
-        const mx = x + w - 56;
-        const my = y + 4;
-        ui.renderer.fillRect(mx, my, 24, 24, ui.theme.slider_track);
-        ui.renderer.strokeRect(mx, my, 24, 24, ui.theme.panel_border);
-        ui.renderer.line(mx + 3, my + 20, mx + 20, my + 3, ui.theme.text_dim); // 1:1
-        const hovered = util.inRect(ui.mouse_x, ui.mouse_y, mx, my, 24, 24);
-        if (hovered and ui.mouse_pressed) app.setToast("映射曲线即将支持");
+        const ix = x + Col.inv;
+        const hovered = util.inRect(ui.mouse_x, ui.mouse_y, ix, cy, Col.btn_w, ctrl_h);
+        ui.renderer.fillRect(ix, cy, Col.btn_w, ctrl_h, if (hovered) ui.theme.item_hover else ui.theme.slider_track);
+        ui.renderer.strokeRect(ix, cy, Col.btn_w, ctrl_h, ui.theme.panel_border);
+        const txt: []const u8 = if (b.invert) "反向" else "正常";
+        const tw: i32 = @intFromFloat(ui.font.measure(txt));
+        // 两种状态都是白字（只靠颜色强调：开 = 橙）
+        ui.labelCentered(txt, ix + @divTrunc(Col.btn_w - tw, 2), cy, ctrl_h, if (b.invert) ui.theme.accent else ui.theme.text);
+        if (hovered and ui.mouse_pressed) b.invert = !b.invert;
+        if (hovered and ui.mouse_right_pressed) openCtx(app, ui, bi, .invert);
     }
 
-    // 移除
+    // **基础值**（归一化 0..1，上下拖数字）：一律白字
     {
-        const rx = x + w - 26;
-        const ry = y + 6;
-        const hovered = util.inRect(ui.mouse_x, ui.mouse_y, rx, ry, 18, 18);
-        if (hovered) ui.renderer.fillRect(rx, ry, 18, 18, ui.theme.item_hover);
-        ui.labelClipped("×", rx + 5, ry + 3, 12, if (hovered) ui.theme.danger else ui.theme.text_dim);
-        if (hovered and ui.mouse_pressed) {
-            if (app.unbindCurveTarget(b.curve_id, app.auto_win.target)) app.setToast("已取消链接");
+        const bx0 = x + Col.base;
+        var val: f32 = b.base orelse view_lane.Target.defaultBase(b.target.kind);
+        if (ui.dragNumberF(Ui.idOf("auto_win_base", 0) + bi, bx0, cy, Col.base_w, ctrl_h, &val, 0.0, 1.0, 1)) {
+            b.base = val;
+            app.history_pending = "调整自动化基础值";
         }
+        if (util.inRect(ui.mouse_x, ui.mouse_y, bx0, cy, Col.base_w, ctrl_h) and ui.mouse_right_pressed) {
+            openCtx(app, ui, bi, .base);
+        }
+    }
+
+    // **深度**（上下拖数字，0% ~ 200%，中点 = 100%；单位画在控件内，避免和下一列叠住）
+    {
+        const sx = x + Col.depth;
+        var pct: i32 = @intFromFloat(@round(b.depth * 100.0));
+        if (ui.dragNumberEx(Ui.idOf("auto_win_depth", 0) + bi, sx, cy, Col.depth_w, ctrl_h, &pct, 0, @intFromFloat(view_lane.depth_max * 100.0), 4, 0, fmtPct)) {
+            b.depth = @as(f32, @floatFromInt(pct)) / 100.0;
+            app.history_pending = "调整自动化深度";
+        }
+        if (util.inRect(ui.mouse_x, ui.mouse_y, sx, cy, Col.depth_w, ctrl_h) and ui.mouse_right_pressed) {
+            openCtx(app, ui, bi, .depth);
+        }
+    }
+
+    // **平滑**（极点追赶时间常数 ms）：0 = 不追赶；tempo 不适用 → 置灰
+    {
+        const sx = x + Col.smooth;
+        if (b.target.kind == .tempo) {
+            ui.renderer.fillRect(sx, cy, Col.smooth_w, ctrl_h, ui.theme.slider_track);
+            ui.renderer.strokeRect(sx, cy, Col.smooth_w, ctrl_h, ui.theme.panel_border);
+            const tw: i32 = @intFromFloat(ui.font.measure("—"));
+            ui.labelCentered("—", sx + @divTrunc(Col.smooth_w - tw, 2), cy, ctrl_h, ui.theme.text_dim);
+        } else {
+            var ms: i32 = @intFromFloat(@round(b.smooth_ms));
+            if (ui.dragNumberEx(Ui.idOf("auto_win_smooth", 0) + bi, sx, cy, Col.smooth_w, ctrl_h, &ms, 0, @intFromFloat(view_lane.smooth_ms_max), 6, 0, fmtMs)) {
+                b.smooth_ms = @floatFromInt(ms);
+                app.history_pending = "调整自动化平滑";
+            }
+            if (util.inRect(ui.mouse_x, ui.mouse_y, sx, cy, Col.smooth_w, ctrl_h) and ui.mouse_right_pressed) {
+                openCtx(app, ui, bi, .smooth);
+            }
+        }
+    }
+
+    // 移除（右侧贴边；与其它控件同高同 y）
+    {
+        const rx = x + Col.del;
+        const hovered = util.inRect(ui.mouse_x, ui.mouse_y, rx, cy, ctrl_h, ctrl_h);
+        if (hovered) ui.renderer.fillRect(rx, cy, ctrl_h, ctrl_h, ui.theme.item_hover);
+        const tw: i32 = @intFromFloat(ui.font.measure("×"));
+        ui.labelCentered("×", rx + @divTrunc(ctrl_h - tw, 2), cy, ctrl_h, if (hovered) ui.theme.danger else ui.theme.text_dim);
+        if (hovered and ui.mouse_pressed) {
+            if (app.unbindCurveTarget(b.curve_id, app.auto_win.target)) {
+                app.setToast("已取消链接");
+                app.commitHistory("取消自动化链接");
+            }
+        }
+    }
+}
+
+/// 行内数值控件的显示格式：“100%” / “15ms”（把单位画在同一个控件里，避免和下一列重叠）
+fn fmtPct(v: i32, buf: []u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{d}%", .{v}) catch "";
+}
+fn fmtMs(v: i32, buf: []u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{d}ms", .{v}) catch "";
+}
+
+/// 打开行内右键菜单（记下哪一条绑定的哪个控件）
+fn openCtx(app: *App, ui: *Ui, bi: usize, field: @TypeOf(app.auto_win.ctx_field)) void {
+    app.auto_win.ctx_row = bi;
+    app.auto_win.ctx_field = field;
+    app.auto_win.ctx_x = ui.mouse_x;
+    app.auto_win.ctx_y = ui.mouse_y;
+}
+
+/// 行内右键菜单：`恢复默认值` / `输入值…`（极性只有前者）
+fn drawRowCtxMenu(ui: *Ui, app: *App) void {
+    const win = &app.auto_win;
+    const bi = win.ctx_row orelse return;
+    if (win.ctx_field == .none) return;
+    if (bi >= app.auto_bindings.items.len) {
+        win.ctx_row = null;
+        return;
+    }
+    const b = &app.auto_bindings.items[bi];
+    const has_input = win.ctx_field != .bipolar and win.ctx_field != .invert;
+    const items = if (has_input)
+        [_][]const u8{ "恢复默认值", "输入值…" }
+    else
+        [_][]const u8{ "恢复默认值", "" };
+    const n_items: usize = if (has_input) 2 else 1;
+    const menu_w: i32 = 128;
+    const menu_h: i32 = @as(i32, @intCast(n_items)) * util.menu_item_h + 4;
+    // **夹回窗口内**：菜单不能被窗口边缘截断，也不能跑到窗口外
+    // （窗口层是 NoClip 绘制、输入屏蔽只按窗口矩形——跑出去会“看得见但点不到”，
+    //  更糟的是点到下面的视图）
+    const mx = std.math.clamp(win.ctx_x, win.x + 4, win.x + W - menu_w - 4);
+    const my = std.math.clamp(win.ctx_y, win.y + util.title_h + 2, win.y + H - menu_h - 4);
+    ui.renderer.fillRect(mx, my, menu_w, menu_h, ui.theme.panel);
+    ui.renderer.strokeRect(mx, my, menu_w, menu_h, ui.theme.accent);
+    ui.noteOverlayRect(mx, my, menu_w, menu_h);
+
+    var clicked: ?usize = null;
+    var inside = false;
+    for (items[0..n_items], 0..) |it, k| {
+        const iy = my + 2 + @as(i32, @intCast(k)) * util.menu_item_h;
+        const hov = util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, menu_w - 2, util.menu_item_h);
+        if (hov) {
+            inside = true;
+            ui.renderer.fillRect(mx + 1, iy, menu_w - 2, util.menu_item_h, ui.theme.item_hover);
+        }
+        ui.label(it, mx + 8, iy + 2, ui.theme.text);
+        if (hov and ui.mouse_pressed) clicked = k;
+    }
+    if (clicked) |k| {
+        if (k == 0) {
+            // 恢复默认值
+            switch (win.ctx_field) {
+                .base => {
+                    if (b.base != null) {
+                        b.base = null;
+                        app.commitHistory("恢复自动化基础值");
+                    }
+                },
+                .depth => {
+                    const d = view_lane.Target.defaultDepth(b.target.kind);
+                    if (b.depth != d) {
+                        b.depth = d;
+                        app.commitHistory("恢复自动化深度");
+                    }
+                },
+                .smooth => {
+                    if (b.smooth_ms != view_lane.default_smooth_ms) {
+                        b.smooth_ms = view_lane.default_smooth_ms;
+                        app.commitHistory("恢复自动化平滑");
+                    }
+                },
+                .bipolar => {
+                    const v = view_lane.Target.defaultBipolar(b.target.kind);
+                    if (b.bipolar != v) {
+                        b.bipolar = v;
+                        app.commitHistory("恢复自动化极性");
+                    }
+                },
+                .invert => {
+                    if (b.invert) {
+                        b.invert = false;
+                        app.commitHistory("恢复自动化反向");
+                    }
+                },
+                .none => {},
+            }
+        } else {
+            // 输入值…（预填当前值，单位：基础/深度 = 百分比，平滑 = 整数 ms）
+            var vb: [24]u8 = undefined;
+            switch (win.ctx_field) {
+                .base => {
+                    const v = b.base orelse view_lane.Target.defaultBase(b.target.kind);
+                    const pre = view_lane.formatValue(.percent, v, &vb);
+                    app.beginEditAutomationBase(bi, pre, mx + 4, my + 4, menu_w - 8);
+                },
+                .depth => {
+                    const v = std.math.clamp(b.depth / view_lane.depth_max, 0.0, 1.0);
+                    const pre = view_lane.formatValue(.percent, v, &vb);
+                    app.beginEditAutomationDepth(bi, pre, mx + 4, my + 4, menu_w - 8);
+                },
+                .smooth => {
+                    const pre = std.fmt.bufPrint(&vb, "{d}", .{@as(i32, @intFromFloat(@round(b.smooth_ms)))}) catch "";
+                    app.beginEditAutomationSmooth(bi, pre, mx + 4, my + 4, menu_w - 8);
+                },
+                .bipolar, .invert, .none => {},
+            }
+        }
+        win.ctx_row = null;
+        win.ctx_field = .none;
+    } else if (ui.mouse_pressed and !inside and !util.inRect(ui.mouse_x, ui.mouse_y, mx, my, menu_w, menu_h)) {
+        win.ctx_row = null;
+        win.ctx_field = .none;
     }
 }
 
@@ -273,7 +481,9 @@ fn drawPickList(ui: *Ui, app: *App, win_x: i32, above_y: i32, win_w: i32, btn: R
     const rows: i32 = @intCast(@min(avail, @as(usize, @intCast(pick_rows_max))));
     const ph: i32 = @max(row, rows * row + 4);
     const px = win_x + 8;
-    const py = above_y - ph;
+    // **夹回窗口内**（默认向上弹，空间不够就往下走）——同行内右键菜单：
+    // 窗口层 NoClip 绘制但输入屏蔽只按窗口矩形，贴到窗口外会“看得见点不到”。
+    const py = std.math.clamp(above_y - ph, win.y + util.title_h + 2, win.y + H - ph - 4);
 
     ui.renderer.fillRect(px, py, panel_w, ph, ui.theme.panel);
     ui.renderer.strokeRect(px, py, panel_w, ph, ui.theme.accent);

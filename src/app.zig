@@ -280,7 +280,7 @@ pub const PresetTarget = union(enum) {
 
 /// 预设浏览器弹窗状态（**统一的插件+预设选择器**；见 `docs/drumkit.md` §5.2）
 /// 浮动窗口种类（绘制序列表与插件子窗口裁切共用）
-pub const WinKind = enum { rack, synth, mixer, effect, drumkit, help, settings, plugin_mgr };
+pub const WinKind = enum { rack, synth, mixer, effect, drumkit, help, settings, plugin_mgr, auto };
 
 /// 浮动窗口“绘制顺序 + 最终矩形”（`main.drawApp` 逐帧填写）
 pub const WinDraw = struct { kind: WinKind, x: i32, y: i32, w: i32, h: i32 };
@@ -771,7 +771,7 @@ pub const Playback = struct {
 /// 交互：字符追加；退格删末尾一个 code point；回车 = 提交；ESC = 取消；
 /// 点击输入框外 = 提交（吞掉该次点击）。
 pub const TextInput = struct {
-    pub const Target = enum { instrument, mixer_channel, pattern, track, preset_name, kit_pad_name, preset_rename, preset_search, audio_style, automation_value, automation_curve_name, automation_base, bpm };
+    pub const Target = enum { instrument, mixer_channel, pattern, track, preset_name, kit_pad_name, preset_rename, preset_search, audio_style, automation_value, automation_curve_name, automation_base, automation_depth, automation_smooth, channel_vol, channel_pan, inst_vol, inst_pan, bpm };
 
     active: bool = false,
     target: Target = .instrument,
@@ -1548,6 +1548,27 @@ pub const App = struct {
         pick_scroll: i32 = 0,
         /// 绑定行列表的滚动行偏移
         rows_scroll: i32 = 0,
+        /// **窗口层级**（与其他浮动窗口同一套“点到谁谁在上”）
+        z: i32 = 0,
+        /// **行内右键菜单**：绑定行下标 + 哪个控件（null = 未展开）
+        ctx_row: ?usize = null,
+        ctx_field: RowField = .none,
+        ctx_x: i32 = 0,
+        ctx_y: i32 = 0,
+
+        pub const RowField = enum {
+            none,
+            /// 基础值（恢复类型默认 / 输入值…）
+            base,
+            /// 叠加深度
+            depth,
+            /// 极点追赶平滑（τ）
+            smooth,
+            /// 极性（只有“恢复默认”）
+            bipolar,
+            /// 反向（只有“恢复默认”）
+            invert,
+        };
     } = .{},
     /// 曲线 id 分配器（单调、不重用）
     next_curve_id: u32 = 0,
@@ -1734,7 +1755,7 @@ pub const App = struct {
     params: audio.Params = .{},
     engine: audio.Engine = .{ .params = undefined },
     volume: f32 = 0.75,
-    /// BPM（拍/分；工具栏可上下拖动调整；范围 20-999）——**支持两位小数**
+    /// BPM（拍/分；工具栏可上下拖动调整；范围 `model.bpm_min`~`model.bpm_max`）——**支持两位小数**
     bpm: f32 = 120,
     /// 拍号分子（每小节拍数；工具栏可拖动）
     time_num: i32 = 4,
@@ -2103,14 +2124,15 @@ pub const App = struct {
     }
 
     /// **绝对量化：选中音符**（Ctrl+Q；grid = 视图给的网格步数，钢琴窗 = `snapSteps(app.piano.snap)`）。
-    /// 只动 `step`/`len`（两端对齐 + 长度至少一格，见 `model.quantizeSpan`），
-    /// 力度/声像/静音一概不碰。`pattern`/`instrument` 由视图传入——与框选、Del、Ctrl+M 的收窄口径一致。
+    /// 两端**各自就近**到网格（右端看**原**右端，见 `model.quantizeNoteSpan`）：
+    /// 只动 `step`/`len`，力度/声像/静音一概不碰。
+    /// `pattern`/`instrument` 由视图传入——与框选、Del、Ctrl+M 的收窄口径一致。
     /// 返回改动个数（0 = 选区已全在网格上）。
     pub fn quantizeSelectedNotes(self: *App, pattern: i32, instrument: i32, grid: i32) usize {
         var n: usize = 0;
         for (self.notes.items) |*nt| {
             if (!nt.selected or nt.pattern != pattern or nt.instrument != instrument) continue;
-            const q = model.quantizeSpan(nt.step, nt.len, grid);
+            const q = model.quantizeNoteSpan(nt.step, nt.len, grid);
             if (q.start == nt.step and q.len == nt.len) continue;
             nt.step = q.start;
             nt.len = q.len;
@@ -2121,7 +2143,7 @@ pub const App = struct {
     }
 
     /// **绝对量化：选中片段**（Ctrl+Q；grid = `snapSteps(app.playlist.snap)`）。
-    /// 两步语义（见 `model.quantizeClipWindow`）：先**整块搬**到左端上网格，
+    /// 两步（见 `model.quantizeClipSpan`）：先**整块搬**到左端上网格，
     /// 再对齐右端 → 长度整格（至少一格）。`offset` / `trim_start` **一概不动**
     /// → “左端 ↔ 内部内容”的映射不变，内容跟着片段一起走。
     /// 音频允许长出静音尾巴（`audio.clipSpan` 按素材长度截断，不会越界读）。
@@ -2134,7 +2156,7 @@ pub const App = struct {
         var n: usize = 0;
         for (self.clips.items) |*c| {
             if (!c.selected) continue;
-            const q = model.quantizeClipWindow(c.start, c.len, g);
+            const q = model.quantizeClipSpan(c.start, c.len, g);
             if (q.start == c.start and q.len == c.len) continue;
             const before = c.*;
             c.start = q.start;
@@ -3696,7 +3718,7 @@ pub const App = struct {
             self.audio_styles.items[@intCast(style_idx)].frames_hint;
         if (eng_frames > 0) {
             const sr: u64 = if (self.params.sample_rate > 0) self.params.sample_rate else audio_fallback_rate;
-            const bpm2: f64 = @max(20.0, @as(f64, std.math.clamp(self.bpm, 20.0, 999.0)));
+            const bpm2: f64 = @max(model.bpm_min, @as(f64, std.math.clamp(self.bpm, model.bpm_min, model.bpm_max)));
             const spb2: f64 = @floatFromInt(@max(1, model.stepsPerBeat(self.time_den)));
             const step_frames: f64 = @max(1.0, @as(f64, @floatFromInt(sr)) * 60.0 / (bpm2 * spb2));
             // **向下取整**（与旧整数除法同语义）：自然时长宁短勿长，避免多出一整步的空白
@@ -5691,9 +5713,60 @@ pub const App = struct {
 
     /// 开始编辑某条绑定的**基准值**（复用文本输入；`auto_lane` 复用为绑定下标）
     pub fn beginEditAutomationBase(self: *App, binding_idx: usize, prefill: []const u8, x: i32, y: i32, w: i32) void {
+        self.beginEditBindingNum(.automation_base, binding_idx, prefill, x, y, w);
+    }
+
+    /// 深度（0..200%）：输入按百分比解析
+    pub fn beginEditAutomationDepth(self: *App, binding_idx: usize, prefill: []const u8, x: i32, y: i32, w: i32) void {
+        self.beginEditBindingNum(.automation_depth, binding_idx, prefill, x, y, w);
+    }
+
+    /// 极点平滑（0..200ms）：输入按整数毫秒解析
+    pub fn beginEditAutomationSmooth(self: *App, binding_idx: usize, prefill: []const u8, x: i32, y: i32, w: i32) void {
+        self.beginEditBindingNum(.automation_smooth, binding_idx, prefill, x, y, w);
+    }
+
+    /// 混音台通道声像（0..1）：`ch` = 通道下标（0 = 主通道）
+    pub fn beginEditChannelPan(self: *App, ch: usize, prefill: []const u8, x: i32, y: i32, w: i32) void {
+        self.beginEditIndexedNum(.channel_pan, ch, prefill, x, y, w);
+    }
+
+    /// 乐器音量 / 声像（0..1）：`idx` = 乐器下标
+    pub fn beginEditInstVol(self: *App, idx: usize, prefill: []const u8, x: i32, y: i32, w: i32) void {
+        self.beginEditIndexedNum(.inst_vol, idx, prefill, x, y, w);
+    }
+    pub fn beginEditInstPan(self: *App, idx: usize, prefill: []const u8, x: i32, y: i32, w: i32) void {
+        self.beginEditIndexedNum(.inst_pan, idx, prefill, x, y, w);
+    }
+
+    /// 混音台通道音量（0..1 小数）：`ch` = 通道下标（0 = 主通道）
+    pub fn beginEditChannelVol(self: *App, ch: usize, prefill: []const u8, x: i32, y: i32, w: i32) void {
+        self.beginEditIndexedNum(.channel_vol, ch, prefill, x, y, w);
+    }
+
+    /// “按下标定位的数值输入”共用的开场（通道/乐器音量声像）
+    fn beginEditIndexedNum(self: *App, target_: TextInput.Target, index: usize, prefill: []const u8, x: i32, y: i32, w: i32) void {
         const ti = &self.text_input;
         ti.active = true;
-        ti.target = .automation_base;
+        ti.target = target_;
+        ti.index = index;
+        ti.len = @min(prefill.len, ti.buf.len);
+        @memcpy(ti.buf[0..ti.len], prefill[0..ti.len]);
+        ti.cursor = ti.len;
+        ti.sel_anchor = if (ti.len > 0) 0 else null;
+        ti.drag_active = false;
+        ti.view_off = 0;
+        ti.x = x;
+        ti.y = y;
+        ti.w = w;
+        ti.aux_len = 0;
+    }
+
+    /// 三处“绑定级数值输入”共用的开场（target 不同，其余一致）
+    fn beginEditBindingNum(self: *App, target_: TextInput.Target, binding_idx: usize, prefill: []const u8, x: i32, y: i32, w: i32) void {
+        const ti = &self.text_input;
+        ti.active = true;
+        ti.target = target_;
         ti.index = binding_idx;
         ti.auto_lane = @intCast(binding_idx);
         ti.len = @min(prefill.len, ti.buf.len);
@@ -5793,6 +5866,8 @@ pub const App = struct {
             .target = target,
             .bipolar = view_lane.Target.defaultBipolar(target.kind),
             .depth = view_lane.Target.defaultDepth(target.kind),
+            .smooth_ms = view_lane.default_smooth_ms,
+            .invert = false,
         }) catch return false;
         return true;
     }
@@ -5837,19 +5912,29 @@ pub const App = struct {
             const lc = self.curveById(b.curve_id) orelse continue;
             const n = @min(lc.points.items.len, audio.LaneSnap.capacity);
             if (n == 0) continue;
-            const snap = set.slotFor() orelse continue; // 每个座位最多 `lanes.len` 条
+            const snap = set.slotFor() orelse {
+                // 超过 `LaneSet.max_lanes` → 不再静默失效：记一次诊断（每秒汇总打印）
+                _ = self.params.dbg_lane_overflow.fetchAdd(1, .monotonic);
+                continue;
+            };
             snap.active = true;
             snap.ch = @intCast(@min(ch, 255));
             snap.inst = is_inst;
             snap.kind = if (is_pan) 1 else 0;
+            // **槽位指纹**：音频侧据此判断“这个槽是不是换绑定了” → 重新播种平滑状态
+            snap.key = b.curve_id ^ (@as(u32, @intCast(ch)) << 16) ^
+                (@as(u32, @intCast(@backingInt(b.target.kind))) << 24) ^
+                (if (is_inst) @as(u32, 1) << 8 else 0);
             snap.base = b.base orelse view_lane.Target.defaultBase(b.target.kind);
             snap.interp = switch (lc.interp) {
                 .hold => 0,
                 .linear => 1,
                 .smooth => 2,
             };
-            snap.depth = std.math.clamp(b.depth, 0.0, 4.0);
+            snap.depth = std.math.clamp(b.depth, 0.0, view_lane.depth_max);
             snap.bipolar = b.bipolar;
+            snap.invert = b.invert;
+            snap.smooth_ms = std.math.clamp(b.smooth_ms, 0.0, view_lane.smooth_ms_max);
             snap.n = @intCast(n);
             for (lc.points.items[0..n], 0..) |p, i| {
                 snap.steps[i] = p.step;
@@ -5858,6 +5943,22 @@ pub const App = struct {
                 snap.pivots[i] = p.pivot;
             }
         }
+    }
+
+    /// 该参数的**启用中**绑定数（>0 = 自动化真的在驱动它 —— UI 用它标绿旋钮/推子）
+    pub fn enabledBindingCount(self: *const App, target: view_lane.Target) usize {
+        var n: usize = 0;
+        for (self.auto_bindings.items) |b| {
+            if (!b.enabled) continue;
+            if (view_lane.Target.eql(b.target, target)) n += 1;
+        }
+        return n;
+    }
+
+    /// **打开自动化链接窗口**（唯一入口：打开即置顶）
+    pub fn openAutoWin(self: *App, target: view_lane.Target) void {
+        self.auto_win = .{ .open = true, .x = 240, .y = 150, .target = target, .just_opened = true };
+        self.bringToFront(&self.auto_win.z);
     }
 
     /// 该参数**所有**绑定的叠加值（UI 预览/状态行用；`step` 为工程步）
@@ -5875,12 +5976,14 @@ pub const App = struct {
         for (self.auto_bindings.items) |b| {
             if (!b.enabled) continue;
             if (!view_lane.Target.eql(b.target, target)) continue;
-            if (b.target.kind == .inst_vol or b.target.kind == .inst_pan) continue; // 乐器链路下一轮
             const i = self.curveIndexById(b.curve_id) orelse continue;
             const lc = &self.auto_curves.items[i];
             const v = lc.evalAt(step);
             if (v < 0) continue;
-            const contrib = if (b.bipolar) (v - 0.5) * 2.0 * b.depth else v * b.depth;
+            const contrib = blk: {
+                const sc = if (b.bipolar) (v - 0.5) * 2.0 else v;
+                break :blk (if (b.invert) -sc else sc) * b.depth;
+            };
             sum += contrib;
         }
         return std.math.clamp(sum, 0.0, 1.0);
@@ -8422,6 +8525,8 @@ pub const App = struct {
                 .base = if (b.base) |v| v else -1.0,
                 .bipolar = b.bipolar,
                 .enabled = b.enabled,
+                .smooth_ms = b.smooth_ms,
+                .invert = b.invert,
             };
         }
         // 样式名字（自定义名随工程保存；旧版加载方忽略）
@@ -8744,7 +8849,9 @@ pub const App = struct {
                 .target = .{ .kind = @fromBackingInt(@intCast(sb.target_kind)), .uid = sb.target_uid },
                 .depth = sb.depth,
                 .base = if (sb.base < 0) null else sb.base,
-                .bipolar = sb.bipolar,
+                    .bipolar = sb.bipolar,
+                    .smooth_ms = sb.smooth_ms,
+                    .invert = sb.invert,
                 .enabled = sb.enabled,
             }) catch {};
         }
@@ -9250,7 +9357,7 @@ pub const App = struct {
         const snap_song_mode = self.sel.song_mode;
 
         const sr: u64 = self.params.sample_rate;
-        const bpm: f64 = @max(20.0, @as(f64, std.math.clamp(self.bpm, 20.0, 999.0)));
+        const bpm: f64 = @max(model.bpm_min, @as(f64, std.math.clamp(self.bpm, model.bpm_min, model.bpm_max)));
         const spb_per_beat: f64 = @floatFromInt(@max(1, model.stepsPerBeat(self.time_den)));
         // **帧/步用 f64 保留小数**（U=3840 下每步可能只有十几帧，
         // 四舍五入到整数会在几百步后累积成百分之几的时长误差 → 导出被截短）。
@@ -9273,7 +9380,7 @@ pub const App = struct {
         self.params.start_frame.store(0, .monotonic);
         self.params.start_step.store(0, .monotonic);
         self.params.frames_played.store(0, .monotonic);
-        self.params.bpm.store(std.math.clamp(self.bpm, 20.0, 999.0), .monotonic);
+        self.params.bpm.store(std.math.clamp(self.bpm, model.bpm_min, model.bpm_max), .monotonic);
         self.params.steps_per_beat.store(@intFromFloat(spb_per_beat), .monotonic);
         self.markGenSoft(false); // 硬切换（导出起播）：照旧释放（无残留声部）
         // **A4**：离线渲染必须让音频线程“当作正在播放”（`renderBlock` 在 `!playing` 时直接返回，
@@ -9480,7 +9587,7 @@ pub const App = struct {
             @floatFromInt(self.playback.cursorStep(true));
         const v = self.autoValueFor(tgt, step, view_lane.Target.defaultBase(.tempo));
         // **保留两位小数**（不再取整）：音频侧按 f32 BPM 算步宽
-        self.bpm = std.math.clamp(view_lane.Target.bpmFromNorm(v), 20.0, 999.0);
+        self.bpm = std.math.clamp(view_lane.Target.bpmFromNorm(v), model.bpm_min, model.bpm_max);
     }
 
     /// 播放中的**小数步位置**（子步精度；未播放或域不匹配时 = 整数步）。
@@ -9495,7 +9602,7 @@ pub const App = struct {
         const acc = self.params.play_step.load(.monotonic);
         if (acc > 0) return acc;
         const frames = self.params.frames_played.load(.monotonic);
-        const bpm: f64 = @max(20.0, @as(f64, std.math.clamp(self.bpm, 20.0, 999.0)));
+        const bpm: f64 = @max(model.bpm_min, @as(f64, std.math.clamp(self.bpm, model.bpm_min, model.bpm_max)));
         const spb_per_beat: f64 = @floatFromInt(@max(1, model.stepsPerBeat(self.time_den)));
         const step_frames: f64 = @max(1.0, @as(f64, @floatFromInt(self.params.sample_rate)) * 60.0 / (bpm * spb_per_beat));
         const elapsed = frames -| self.playback.start_frame;
@@ -9515,7 +9622,7 @@ pub const App = struct {
             return;
         }
         const dt_s: f32 = @as(f32, @floatFromInt(self.frame_dt_ns)) / 1e9;
-        const bpm: f64 = @max(20.0, @as(f64, std.math.clamp(self.bpm, 20.0, 999.0)));
+        const bpm: f64 = @max(model.bpm_min, @as(f64, std.math.clamp(self.bpm, model.bpm_min, model.bpm_max)));
         const spb_per_beat: f64 = @floatFromInt(@max(1, model.stepsPerBeat(self.time_den)));
         const step_frames: f64 = @max(1.0, @as(f64, @floatFromInt(self.params.sample_rate)) * 60.0 / (bpm * spb_per_beat));
         const v: f32 = @floatCast(@as(f64, @floatFromInt(self.params.sample_rate)) / step_frames); // 步/秒
@@ -10140,11 +10247,13 @@ pub const App = struct {
 
     /// 鼠标按下定位：`byte_off` = 击点对应的字节偏移（调用方用
     /// `Ui.textIndexAtX` 换算）。置光标并开始拖选（锚点 = 击点）。
+    /// **一次点击 = 只定位光标**（无选区）；按住移动才拉出选区。
     pub fn textInputPointerDown(self: *App, byte_off: usize) void {
         const ti = &self.text_input;
         if (!ti.active) return;
-        ti.cursor = byte_off;
-        ti.sel_anchor = byte_off; // 锚点 = 击点（拖出后成为选区起点）
+        const off = @min(byte_off, ti.len); // 防御：映射再偏也不越界
+        ti.cursor = off;
+        ti.sel_anchor = off; // 锚点 = 击点（拖出后成为选区起点）
         ti.drag_active = true;
     }
 
@@ -10156,7 +10265,7 @@ pub const App = struct {
     pub fn textInputPointerMove(self: *App, byte_off: usize) void {
         const ti = &self.text_input;
         if (!ti.active or !ti.drag_active) return;
-        ti.cursor = byte_off;
+        ti.cursor = @min(byte_off, ti.len);
     }
 
     /// 鼠标松开：结束拖选
@@ -10196,6 +10305,66 @@ pub const App = struct {
                 if (ti.auto_lane >= 0 and @as(usize, @intCast(ti.auto_lane)) < self.auto_bindings.items.len) {
                     if (@import("view_lane.zig").parseValue(.percent, val)) |v| {
                         self.auto_bindings.items[@intCast(ti.auto_lane)].base = std.math.clamp(v, 0.0, 1.0);
+                        self.commitHistory("设置自动化基础值");
+                    }
+                }
+            },
+            .automation_depth => {
+                if (ti.auto_lane >= 0 and @as(usize, @intCast(ti.auto_lane)) < self.auto_bindings.items.len) {
+                    if (@import("view_lane.zig").parseValue(.percent, val)) |v| {
+                        self.auto_bindings.items[@intCast(ti.auto_lane)].depth =
+                            std.math.clamp(v, 0.0, view_lane.depth_max);
+                        self.commitHistory("设置自动化深度");
+                    }
+                }
+            },
+            .automation_smooth => {
+                if (ti.auto_lane >= 0 and @as(usize, @intCast(ti.auto_lane)) < self.auto_bindings.items.len) {
+                    const v = std.fmt.parseFloat(f32, val) catch return;
+                    self.auto_bindings.items[@intCast(ti.auto_lane)].smooth_ms =
+                        std.math.clamp(@round(v), 0.0, view_lane.smooth_ms_max);
+                    self.commitHistory("设置自动化平滑");
+                }
+            },
+            .channel_vol => {
+                if (ti.index < self.mixer_channels_state.items.len) {
+                    const v = std.fmt.parseFloat(f32, val) catch return;
+                    const nv = std.math.clamp(v, 0.0, 1.0);
+                    const mc = &self.mixer_channels_state.items[ti.index];
+                    if (@abs(nv - mc.volume) > 0.0005) {
+                        mc.volume = nv;
+                        self.commitHistory("设置通道音量");
+                    }
+                }
+            },
+            .channel_pan => {
+                if (ti.index < self.mixer_channels_state.items.len) {
+                    const v = view_lane.parseValue(.pan, val) orelse return;
+                    const mc = &self.mixer_channels_state.items[ti.index];
+                    if (@abs(v - mc.pan) > 0.0005) {
+                        mc.pan = v;
+                        self.commitHistory("设置通道声像");
+                    }
+                }
+            },
+            .inst_vol => {
+                if (ti.index < self.instruments.items.len) {
+                    const v = std.fmt.parseFloat(f32, val) catch return;
+                    const nv = std.math.clamp(v, 0.0, 1.0);
+                    const inst = &self.instruments.items[ti.index];
+                    if (@abs(nv - inst.volume) > 0.0005) {
+                        inst.volume = nv;
+                        self.commitHistory("设置乐器音量");
+                    }
+                }
+            },
+            .inst_pan => {
+                if (ti.index < self.instruments.items.len) {
+                    const v = view_lane.parseValue(.pan, val) orelse return;
+                    const inst = &self.instruments.items[ti.index];
+                    if (@abs(v - inst.pan) > 0.0005) {
+                        inst.pan = v;
+                        self.commitHistory("设置乐器声像");
                     }
                 }
             },
@@ -10237,9 +10406,9 @@ pub const App = struct {
                 }
             },
             .bpm => {
-                // 三位小数；**越界就夹到边界**（输 <20 → 20，输 >999 → 999）
+                // 三位小数；**越界就夹到边界**（输 <10 → 10，输 >999 → 999）
                 const v = std.fmt.parseFloat(f32, val) catch self.bpm;
-                const nv = std.math.clamp(v, 20.0, 999.0);
+                const nv = std.math.clamp(v, model.bpm_min, model.bpm_max);
                 if (@abs(nv - self.bpm) > 0.0005) {
                     self.bpm = nv;
                     self.commitHistory("调整 BPM");
@@ -12597,6 +12766,18 @@ test "app: 重命名——光标定位/插入/Del/选区/Ctrl+A" {
     try std.testing.expectEqual(@as(?[2]usize, .{ 0, 1 }), app.text_input.selection()); // 拖出 → 选区
     app.textInputPointerUp();
 
+    // 回归（新增）：**越界偏移被夹到 `len`**——鼠标 px → 字节偏移的换算带
+    // 水平滚动偏移（`view_off`），边界上容易多出一两个字；不夹就会
+    // `text[0..cursor]` 越界 / 光标飞出文本。
+    app.textInputSelectAll();
+    const tlen = app.text_input.len;
+    app.textInputPointerDown(tlen + 99);
+    try std.testing.expectEqual(tlen, app.text_input.cursor);
+    app.textInputPointerMove(tlen + 999);
+    try std.testing.expectEqual(tlen, app.text_input.cursor);
+    try std.testing.expectEqual(@as(?[2]usize, null), app.text_input.selection()); // 锚点=光标=末尾
+    app.textInputPointerUp();
+
     // 回归（键盘同理）：Shift+右 → Shift+左（回锚点）→ Shift+右：
     // 仍应从**原锚点**扩展（而非从头再来）
     app.textInputMoveCursor(-2, false); // Home → 光标 0
@@ -12726,7 +12907,32 @@ test "automation: 乐器音量/声像目标 → 发布到乐器空间的 lane（
     }
 }
 
-test "bpm: 小数 BPM 生效（步宽变化）+ tempo 绑定默认深度 20% + 端点 20/999" {
+test "automation: 发布 — 默认 15ms 平滑 / 超过 4 条绑定也不再静默丢弃（旧 [4] 槽 bug）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.deinitAll();
+    app.resetMixerChannels(default_mixer_channels);
+    for (0..6) |_| _ = app.addInstrument("减法合成器");
+    app.ensureInstrumentUids();
+
+    // 六个乐器各绑一条曲线 → 全部都要发布（旧实现只能装 4 条，第 5、6 条静默失效）
+    for (0..6) |i| {
+        const cid = app.addAutoCurve("c");
+        const lc = app.curveById(cid).?;
+        _ = lc.insertPoint(app.allocator, 0, 0.5);
+        try std.testing.expect(app.bindCurveTarget(cid, .{ .kind = .inst_vol, .uid = app.instruments.items[i].uid }));
+    }
+    app.publishAutoLane();
+    {
+        const set = &app.params.lane_bufs[app.params.lane_pub.load(.monotonic)];
+        try std.testing.expectEqual(@as(usize, 6), set.n);
+        try std.testing.expectEqual(@as(u32, 0), app.params.dbg_lane_overflow.load(.monotonic));
+        // 新绑定默认平滑 15ms（保存两侧一致）
+        try std.testing.expectApproxEqAbs(view_lane.default_smooth_ms, set.lanes[0].smooth_ms, 1e-6);
+        for (0..6) |i| try std.testing.expectEqual(@as(usize, 1), set.countForChannel(i, false, true));
+    }
+}
+
+test "bpm: 小数 BPM 生效（步宽变化）+ tempo 绑定默认深度 20% + 端点 10/999" {
     var app = App{ .allocator = std.testing.allocator };
     defer app.deinitAll();
     app.resetMixerChannels(default_mixer_channels);
@@ -12742,9 +12948,9 @@ test "bpm: 小数 BPM 生效（步宽变化）+ tempo 绑定默认深度 20% + �
     // 实际步宽（整数帧）仍应可算且 > 0
     try std.testing.expect(app.framesPerStep() > 0);
 
-    // 归一化端点：0 → 20，1 → 999
-    try std.testing.expectApproxEqAbs(@as(f32, 20.0), view_lane.Target.bpmFromNorm(0.0), 1e-4);
-    try std.testing.expectApproxEqAbs(@as(f32, 999.0), view_lane.Target.bpmFromNorm(1.0), 1e-4);
+    // 归一化端点：0 → 10（`model.bpm_min`），1 → 999（`model.bpm_max`）
+    try std.testing.expectApproxEqAbs(model.bpm_min, view_lane.Target.bpmFromNorm(0.0), 1e-4);
+    try std.testing.expectApproxEqAbs(model.bpm_max, view_lane.Target.bpmFromNorm(1.0), 1e-4);
 
     // tempo 绑定：默认深度 0.2（音量/声像仍 1.0）
     const cid = app.addAutoCurve("速度");
@@ -13188,7 +13394,7 @@ test "app: Ctrl+Q 量化音符（两端上网格 + 长度至少一格 + 只动�
     try std.testing.expectEqual(@as(i32, 240), g); // 1/16 = 240 步（U=3840）
     try std.testing.expectEqual(@as(usize, 1), app.quantizeSelectedNotes(0, 0, g));
     try std.testing.expectEqual(@as(i32, 0), app.notes.items[0].step); // 100 → 0
-    try std.testing.expectEqual(@as(i32, 720), app.notes.items[0].len); // 右端 600 → 720
+    try std.testing.expectEqual(@as(i32, 720), app.notes.items[0].len); // 右端看**原**右端 600 → 720
     // 其余三个一字未动
     try std.testing.expectEqual(@as(i32, 100), app.notes.items[1].step);
     try std.testing.expectEqual(@as(i32, 500), app.notes.items[1].len);
@@ -16415,6 +16621,45 @@ test "automation_value: 键入数值按显示单位解析（% / dB 静音 / 非�
     for ("999") |c| app.textInputAppend(c);
     app.textInputCommit();
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), app.autoCurve().?.points.items[0].value, 1e-6);
+}
+
+test "app: 右键输入值——通道/乐器 音量与声像（0..1 与 L/R/C）" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+
+    // 通道音量：十进制 0..1（与推子读数一致）
+    app.beginEditChannelVol(1, "0.62", 0, 0, 60);
+    app.textInputCommit();
+    try std.testing.expectApproxEqAbs(@as(f32, 0.62), app.mixer_channels_state.items[1].volume, 1e-4);
+
+    // 通道声像：L50 → 0.25；C → 0.5；R100 → 1.0
+    app.beginEditChannelPan(1, "L50", 0, 0, 60);
+    app.textInputCommit();
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), app.mixer_channels_state.items[1].pan, 1e-4);
+    app.beginEditChannelPan(1, "C", 0, 0, 60);
+    app.textInputCommit();
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), app.mixer_channels_state.items[1].pan, 1e-4);
+    app.beginEditChannelPan(1, "R100", 0, 0, 60);
+    app.textInputCommit();
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), app.mixer_channels_state.items[1].pan, 1e-4);
+
+    // 乐器音量 / 声像
+    app.beginEditInstVol(0, "0.40", 0, 0, 60);
+    app.textInputCommit();
+    try std.testing.expectApproxEqAbs(@as(f32, 0.40), app.instruments.items[0].volume, 1e-4);
+    app.beginEditInstPan(0, "L100", 0, 0, 60);
+    app.textInputCommit();
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), app.instruments.items[0].pan, 1e-4);
+
+    // 普通乱写 → 值不变（不 panic）
+    app.beginEditChannelVol(1, "abc", 0, 0, 60);
+    app.textInputCommit();
+    try std.testing.expectApproxEqAbs(@as(f32, 0.62), app.mixer_channels_state.items[1].volume, 1e-4);
 }
 
 test "automation: LaneSnap（音频侧副本）与 view_lane.evalAt 逐点一致" {

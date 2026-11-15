@@ -131,6 +131,10 @@ pub const SavedBinding = struct {
     base: f32 = -1.0,
     bipolar: bool = false,
     enabled: bool = true,
+    /// **反向**（与 `bipolar` 独立；v9 引入）：贡献取负
+    invert: bool = false,
+    /// **极点追赶的平滑时间常数**（毫秒；0 = 不平滑；缺省 = v9 之前的默认 15ms）
+    smooth_ms: f32 = 15.0,
 };
 
 /// 存档中的音符
@@ -539,6 +543,8 @@ const binary_version_v6: u8 = 6;
 /// 一旦把当前版本从 8 抬到 9，`muted` 的引入版本也跟着飘到 9，
 /// 旧 v8 档会被判为“没有该字段”而跳过它 → **字节流错位**（v9 单位迁移时由新测试抓到）。
 const binary_version_v8: u8 = 8;
+/// **v9 引入的字段**（含自动化：曲线/绑定整个家族——v8 发布版根本没有这两个数组）。
+const binary_version_v9: u8 = 9;
 
 /// 某字段**首次出现的存档版本**（未登记 = 从首版就有 → null）。
 ///
@@ -569,10 +575,21 @@ fn introducedVersion(comptime T: type, comptime name: []const u8) ?u8 {
         if (comptime std.mem.eql(u8, name, "muted")) return binary_version_v8;
         return null;
     }
+    if (comptime std.mem.endsWith(u8, tn, "SavedBinding")) {
+        // 极点平滑时间常数 / 反向——均为 v9
+        if (comptime std.mem.eql(u8, name, "smooth_ms")) return binary_version_v9;
+        if (comptime std.mem.eql(u8, name, "invert")) return binary_version_v9;
+        return null;
+    }
     if (comptime std.mem.endsWith(u8, tn, "Project")) {
-        // 音频样式：v6；乐器显示顺序：v7（旧档缺失 → 默认空 = 按槽位顺序）
+        // 音频样式：v6；乐器显示顺序：v7（旧档缺失 → 默认空 = 按槽位顺序）；
+        // **自动化整套（曲线 + 绑定 + 选中 id）：v9**——v8 发布版没有这三个字段，
+        // 不登记就会在旧档末尾“多读三个字段” → 字节流错位（与 v5 事故同型）。
         if (comptime std.mem.eql(u8, name, "audio_styles")) return binary_version_v6;
         if (comptime std.mem.eql(u8, name, "instrument_order")) return 7;
+        if (comptime std.mem.eql(u8, name, "auto_lanes")) return binary_version_v9;
+        if (comptime std.mem.eql(u8, name, "auto_bindings")) return binary_version_v9;
+        if (comptime std.mem.eql(u8, name, "auto_sel")) return binary_version_v9;
         return null;
     }
     return null;
@@ -836,6 +853,17 @@ pub fn toBinary(allocator: std.mem.Allocator, project: Project) ![]u8 {
     errdefer w.buf.deinit(allocator);
     try w.put(binary_magic);
     try w.putByte(binary_version);
+    try binWriteValue(Project, &w, project);
+    return w.buf.toOwnedSlice(allocator);
+}
+
+/// 以指定**历史版本**的布局写出（测试用：真实旧档不会写“后续版本才有的字段”）。
+/// 生产永远用 `toBinary`。
+fn toBinaryAtVersion(allocator: std.mem.Allocator, project: Project, ver: u8) ![]u8 {
+    var w = BinWriter{ .a = allocator, .version = ver };
+    errdefer w.buf.deinit(allocator);
+    try w.put(binary_magic);
+    try w.putByte(ver);
     try binWriteValue(Project, &w, project);
     return w.buf.toOwnedSlice(allocator);
 }
@@ -1605,10 +1633,9 @@ test "persist: v9 单位迁移——步域 ×40、帧域/参数绝不动（含 3
         .notes = @constCast(&notes),
         .auto_lanes = @constCast(&lanes),
     };
-    const bytes = try toBinary(a, proj);
+    // **用 v8 布局写出**（自动化三字段是 v9 才有的，真实 v8 档里没有它们）
+    const bytes = try toBinaryAtVersion(a, proj, 8);
     defer a.free(bytes);
-    // 把版本字节改回 8（模拟旧档）——`toBinary` 永远写当前版本
-    bytes[binary_magic.len] = 8;
     var parsed = try fromBinary(a, bytes);
     defer parsed.deinit();
     const p = parsed.value;
@@ -1618,7 +1645,9 @@ test "persist: v9 单位迁移——步域 ×40、帧域/参数绝不动（含 3
     try std.testing.expectEqual(@as(i32, 24 * sc), p.clips[0].offset);
     try std.testing.expectEqual(@as(i32, 30 * sc), p.notes[0].step);
     try std.testing.expectEqual(@as(i32, 12 * sc), p.notes[0].len);
-    try std.testing.expectEqual(@as(i32, 18 * sc), p.auto_lanes[0].points[0].step);
+    // v8 档**没有自动化**（v9 才引入）→ 读出来应当是空的（字段跳过不丢字节）
+    try std.testing.expectEqual(@as(usize, 0), p.auto_lanes.len);
+    try std.testing.expectEqual(@as(usize, 0), p.auto_bindings.len);
     // 冗余的 steps_per_bar：**也是步域**（3/4 = 72 → 2880）
     try std.testing.expectEqual(model.stepsPerBarFor(3, 4), p.steps_per_bar);
     // 帧域 / 参数：**不动**
@@ -1627,6 +1656,21 @@ test "persist: v9 单位迁移——步域 ×40、帧域/参数绝不动（含 3
     try std.testing.expectEqual(@as(i32, 2), p.clips[1].audio_style);
     try std.testing.expectEqual(@as(i32, 3), p.time_num);
     try std.testing.expectEqual(@as(i32, 4), p.time_den);
+}
+
+test "persist: v9 迁移也把自动化曲线点换算（×40）——函数级直接验" {
+    const sc = model.unit_migration_scale;
+    var pts = [_]SavedLanePoint{ .{ .step = 18, .value = 0.5 }, .{ .step = 90, .value = 1 } };
+    var lanes = [_]SavedLane{.{ .points = @constCast(&pts) }};
+    var proj = Project{
+        .version = 8,
+        .steps_per_bar = 72,
+        .auto_lanes = @constCast(&lanes),
+    };
+    migrateUnitsToV5(&proj);
+    try std.testing.expectEqual(@as(i32, 18 * sc), proj.auto_lanes[0].points[0].step);
+    try std.testing.expectEqual(@as(i32, 90 * sc), proj.auto_lanes[0].points[1].step);
+    try std.testing.expectEqual(@as(f32, 0.5), proj.auto_lanes[0].points[0].value); // 值不换
 }
 
 test "persist: v5 旧布局兼容读（v5 之后追加的字段取默认值）" {

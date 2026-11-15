@@ -27,6 +27,7 @@ pub const FxBox = struct {
 };
 const synth = @import("synth.zig");
 const snapshot = @import("snapshot.zig");
+const model = @import("model.zig");
 const eq = @import("eq.zig");
 const fx = @import("effects.zig");
 const vst_host = @import("vst_host.zig");
@@ -113,9 +114,16 @@ pub const LaneSnap = struct {
     inst: bool = false,
     /// 0 = hold, 1 = linear, 2 = smooth（与 `view_lane.Interp` 同序）
     interp: u8 = 1,
-    /// 叠加深度（0..4）与极性（false = 单向，true = 双向）
+    /// 叠加深度（0..2）与极性（false = 单向，true = 双向）
     depth: f32 = 1.0,
     bipolar: bool = false,
+    /// **反向**（与 `bipolar` 独立）：贡献取负（单向+反向 = ducking）
+    invert: bool = false,
+    /// **极点追赶的平滑时间常数**（毫秒；0 = 不平滑）。同一个通道/乐器上多条绑定 → 取最大值。
+    smooth_ms: f32 = 15.0,
+    /// **槽位稳定指纹**（发布时由 `curve_id + target` 算出）：槽位被另一个绑定占用时
+    /// （增/删绑定 → `slotFor` 重新分配）→ 音频侧据此**重新播种**平滑状态。
+    key: u32 = 0,
     /// 0 = 增益（volume），1 = 声像（pan）
     kind: u8 = 0,
     /// **基线值**（叠加起点）：音量类 0，声像类 0.5
@@ -198,9 +206,13 @@ pub const LaneSnap = struct {
 };
 
 /// 一组 lane（同一段内按**通道**匹配；`n` = 有效项数）。一条曲线可绑多个目标 → 一次发布多条。
+/// **容量 16**：曾经是 4，第 5 条绑定起会被 `slotFor()` 默默丢掉（不报错、界面看不出来）。
+/// 每条 `LaneSnap` 约 1KB，16 × 3 缓冲 ≈ 50KB——可忽略。
 pub const LaneSet = struct {
+    /// 同时生效的绑定上限（超出 → `publishAutoLane` 打诊断日志并不发布）
+    pub const max_lanes: usize = 16;
     n: u32 = 0,
-    lanes: [4]LaneSnap = .{ .{}, .{}, .{}, .{} },
+    lanes: [max_lanes]LaneSnap = @splat(.{}),
 
     /// 找（或分配）该通道的一个空槽：同一通道可叠多条曲线。满了 → null
     pub fn slotFor(self: *LaneSet) ?*LaneSnap {
@@ -225,7 +237,9 @@ pub const LaneSet = struct {
         return k;
     }
 
-    /// 该座位的**叠加贡献**（单向 v，双向 2v−1，各乘深度后求和）
+    /// 该座位的**未平滑叠加贡献**（单向 v，双向 2v−1，各乘深度后求和）。
+    /// **生产路径不用它**（渲染走 `contributionSmooth`，逐绑定极点）；这里只给**测试/诊断**
+    /// 提供“这张快照在这一步的原始值”。
     pub fn contribution(self: *const LaneSet, ch: usize, step: f32, pan: bool, inst: bool) f32 {
         var sum: f32 = 0;
         var i: usize = 0;
@@ -237,6 +251,62 @@ pub const LaneSet = struct {
             sum += if (l.bipolar) (v - 0.5) * 2.0 * l.depth else v * l.depth;
         }
         return sum;
+    }
+
+    /// **逐绑定极点的块推进结果**：`before` = 推进前的合成贡献（= 本块起点，用作斜坡起点），
+    /// `after` = 推进后（= 本块终点，用作斜坡终点）。
+    pub const Contrib = struct { before: f32, after: f32 };
+
+    /// **设计 B：每条绑定各自按自己的 τ 平滑，然后求和**（用户拍定）。
+    ///
+    /// 状态 `state[i]` 是**槽位 i** 的平滑值；`keys[i]` = 槽位 i 当前绑定的指纹——
+    /// 槽位换了绑定（增/删 → `slotFor` 重新分配）就**重新播种**，否则要把别的绑定的值继承过来
+    /// （听感：删一条绑定，另一条的值突然跳一下）。
+    /// `tau = 0` → `k = 1`（无追赶）：本块贡献直接等于段末值，行为与“没有极点”一致。
+    /// 每个（通道 + 分组 + 空间）**每块只能调一次**（它会推进状态）。
+    pub fn contributionSmooth(
+        self: *const LaneSet,
+        ch: usize,
+        pan: bool,
+        inst: bool,
+        st0: f32,
+        st1: f32,
+        dt_s: f32,
+        state: []f32,
+        keys: []u32,
+    ) Contrib {
+        var before: f32 = 0;
+        var after: f32 = 0;
+        var i: usize = 0;
+        while (i < self.n and i < self.lanes.len) : (i += 1) {
+            const l = &self.lanes[i];
+            if (!l.active or l.n == 0 or l.ch != ch or l.inst != inst or (l.kind == 1) != pan) continue;
+            const v1 = l.evalAt(st1);
+            if (v1 < 0) continue; // 无曲线
+            const v0 = l.evalAt(st0);
+            if (i >= state.len or i >= keys.len) continue;
+            // 槽位换了绑定（或首次使用）→ 用本块起点值播种（不会“从 0 爬升”）
+            if (keys[i] != l.key or std.math.isNan(state[i])) {
+                keys[i] = l.key;
+                state[i] = if (v0 < 0) v1 else v0;
+            }
+            const prev = state[i];
+            const k: f32 = if (l.smooth_ms <= 0.0)
+                1.0
+            else blk: {
+                const tau_s: f32 = @max(1e-6, l.smooth_ms / 1000.0);
+                break :blk std.math.clamp(1.0 - @exp(-dt_s / tau_s), 0.0, 1.0);
+            };
+            const next = prev + (v1 - prev) * k;
+            state[i] = next;
+            // 缩放：单向 = v；双向 = 2v−1；**反向**再把符号翻过来（单向+反向 = 负向单向 = ducking）
+            const sign: f32 = if (l.invert) -1.0 else 1.0;
+            const c0 = (if (l.bipolar) (prev - 0.5) * 2.0 else prev) * l.depth * sign;
+            const c1 = (if (l.bipolar) (next - 0.5) * 2.0 else next) * l.depth * sign;
+            before += c0;
+            after += c1;
+        }
+        return .{ .before = before, .after = after };
     }
 
     /// 该座位该分组的**基线值**（有绑定 → 曲线自己定值；无 → null = 用静态推子/旋钮）
@@ -435,6 +505,8 @@ pub const Params = struct {
     lane_pub: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// 诊断：本块做过“块内斜坡”的通道数（UI 每秒汇总打印）
     dbg_lane_ramps: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// 诊断：绑定数超过 `LaneSet.max_lanes` 而被丢掉的次数（UI 每秒汇总打印）
+    dbg_lane_overflow: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// 通道声像（0-1；0.5 = 居中）
     channel_pan: []std.atomic.Value(f32) = &.{},
     /// 通道静音（增益已在 UI 侧合并——但保留独立标志以便 UI 同步）
@@ -764,6 +836,10 @@ pub const Engine = struct {
     /// 因此“旋钮拖动”和“自动化垂直断崖”走完全相同的润滑油。
     inst_gain_sm: []f32 = &.{},
     inst_pan_sm: []f32 = &.{},
+    /// **逐绑定的极点平滑状态**（仅音频线程读写）：索引 = `LaneSet` 的**槽位**。
+    /// `bind_sm_key` = 该槽位当前绑定的指纹；不一致 → 重新播种（NaN = 未使用）。
+    bind_sm_val: [LaneSet.max_lanes]f32 = @splat(std.math.nan(f32)),
+    bind_sm_key: [LaneSet.max_lanes]u32 = @splat(0),
     /// 鼓组层声部池（**惰性**：每乐器的 16 层池按需分配，见 `App.ensureKitPool`——
     /// 指针数组按容量维护；普通（非鼓组）乐器零开销，扩容拷贝量不再含声部状态）。
     kit_chunks: []std.atomic.Value(?*KitPool) = &.{},
@@ -2063,6 +2139,27 @@ fn handleGenChange(engine: *Engine, params: *Params, gen: u32, was_playing: bool
     }
 }
 
+/// **本块要收集的事件步窗口** `[s0, s1)`——**必须用积分器（`ref_step`）算**：
+/// `start_step + (abs0 − start_frame)/step_frames` 那个**锚点等式只在恒定 BPM 下成立**；
+/// BPM 自动化后它会拿新速率重算历史 → **落后于真实位置** → 本块该触发的音符没收进来，
+/// 下一块才收（迟到）——而迟到音符的 `end_step` 已经过去，
+/// 会被“本地到点释音”在同/下一块立刻关掉 → **只响一个音头**（实测：揉 tempo 曲线时吞音）。
+/// 曲线求值那侧早就改成“块参考系”了（见 `renderSegment` 的注释），这里当时漏了。
+const GatherWindow = struct { s0: i32, s1: i32 };
+fn gatherWindow(engine: *const Engine, abs0: u64, frames: u32, step_frames: f64) GatherWindow {
+    // 块内偏移（一般 = 0；分块渲染时也成立）
+    const seg_off: f64 = @floatFromInt(abs0 -| engine.blk_abs0);
+    const s_block0: f64 = engine.ref_step + seg_off / step_frames;
+    const s1f: f64 = s_block0 + @as(f64, @floatFromInt(frames)) / step_frames;
+    const s1: i32 = @intFromFloat(@ceil(s1f));
+    // 水位线：只有“本世代已经发到哪”才知道 → 未发过就从块首步开始
+    const s0: i32 = if (engine.snap_step >= 0)
+        engine.snap_step
+    else
+        @intFromFloat(@ceil(s_block0));
+    return .{ .s0 = s0, .s1 = @max(s1, s0) };
+}
+
 /// 按步序插入一个调度事件（保持 stash 有序）。
 ///
 /// 为什么不是追加：播放中补发的新增音符事件可能**早于**已 stash 的事件
@@ -2315,7 +2412,7 @@ pub fn balanceGains(pan: f32) [2]f32 {
 /// **每步多少帧**（唯一公式：`sr × 60 / (bpm × 每拍步数)`；BPM 可为小数）。
 /// 以前这段公式在 4 处各写一遍（容易漂），现在只此一处。
 pub fn stepFramesOf(sr: f32, bpm: f32, steps_per_beat: u32) f64 {
-    const b: f64 = @max(20.0, @as(f64, bpm));
+    const b: f64 = @max(model.bpm_min, @as(f64, bpm));
     const spb: f64 = @floatFromInt(@max(1, steps_per_beat));
     return @max(1.0, @as(f64, sr) * 60.0 / (b * spb));
 }
@@ -2323,7 +2420,7 @@ pub fn stepFramesOf(sr: f32, bpm: f32, steps_per_beat: u32) f64 {
 /// 当前段的宿主时间（ProcessContext：tempo/拍号/播放位置/ppq）
 fn currentHostTime(engine: *Engine, params: *Params) vst_host.HostTime {
     const playing = params.playing.load(.monotonic);
-    const bpm: f64 = @max(20.0, @as(f64, params.bpm.load(.monotonic)));
+    const bpm: f64 = @max(model.bpm_min, @as(f64, params.bpm.load(.monotonic)));
     const spb: u32 = @max(1, params.steps_per_beat.load(.monotonic));
     const start_frame = params.start_frame.load(.monotonic);
     const abs = engine.seg_abs0;
@@ -2481,9 +2578,8 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
     // 2) 乐器 → 各自通道的缓冲（**按通道路由分开渲染**——通道 EQ 必须逐通道）
     // **乐器级增益/声像的平滑系数：按“15ms 时间常数”换算**（= 1 − e^(−块时长/τ)），
     // 因此换声卡/换缓冲大小手感不变；块越长系数越大（大块自动近似直通）。
-    const inst_smooth_tau: f32 = 0.015; // 秒
+    const inst_smooth_tau: f32 = 0.015; // 秒——**默认**时间常数（无绑定时 / 静态旋钮拖动）
     const dt_blk: f32 = @as(f32, @floatFromInt(frames)) / @max(1.0, sr);
-    const k_inst_sm: f32 = std.math.clamp(1.0 - @exp(-dt_blk / inst_smooth_tau), 0.0, 1.0);
     for (0..engine.synths.len) |i| {
         const kind = params.instrument_kind[i].load(.monotonic);
         const ch: usize = @min(params.instrument_channel[i].load(.monotonic), if (n_ch > 0) n_ch - 1 else 0);
@@ -2492,21 +2588,30 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
         // 目标 = 有绑定 ? 曲线（基准 + 叠加） : 静态旋钮值；
         // 然后把平滑值从旧值推进到新值，**块内再线性插值** 旧值→新值。
         // 这样“旋钮拖动”与“自动化垂直断崖”走的是完全相同的润滑油（用户要求代码统一）。
-        const g_tgt: f32 = if (lane_on and lane_set.hasChannel(i, false, true))
-            std.math.clamp((lane_set.baseOf(i, false, true) orelse 0.0) +
-                lane_set.contribution(i, lane_st0, false, true), 0.0, 1.0)
+        // **乐器级增益/声像：逐绑定极点 + 块内斜坡**（所有乐器路径共用）：
+        // 有绑定 → 每条绑定按自己的 τ 平滑贡献（设计 B），基线另加；
+        // 无绑定 → 静态旋钮值走**默认 15ms** 极点（与历史行为一致）。
+        // 两种情形都把“本块应用值”记进 `inst_*_sm`，下一块从它起步（连续）。
+        const has_v = lane_on and lane_set.hasChannel(i, false, true);
+        const has_p = lane_on and lane_set.hasChannel(i, true, true);
+        const cv = lane_set.contributionSmooth(i, false, true, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key);
+        const cp = lane_set.contributionSmooth(i, true, true, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key);
+        const stat_pan = params.instrument_pan[i].load(.monotonic);
+        const k_stat: f32 = std.math.clamp(1.0 - @exp(-dt_blk / inst_smooth_tau), 0.0, 1.0);
+        const g_a: f32 = if (has_v)
+            std.math.clamp((lane_set.baseOf(i, false, true) orelse 0.0) + cv.before, 0.0, 1.0)
+        else if (i < engine.inst_gain_sm.len) engine.inst_gain_sm[i] else stat_g;
+        const pan_a: f32 = if (has_p)
+            std.math.clamp((lane_set.baseOf(i, true, true) orelse 0.5) + cp.before, 0.0, 1.0)
+        else if (i < engine.inst_pan_sm.len) engine.inst_pan_sm[i] else stat_pan;
+        const g_b: f32 = if (has_v)
+            std.math.clamp((lane_set.baseOf(i, false, true) orelse 0.0) + cv.after, 0.0, 1.0)
         else
-            stat_g;
-        const pan_tgt: f32 = if (lane_on and lane_set.hasChannel(i, true, true))
-            std.math.clamp((lane_set.baseOf(i, true, true) orelse 0.5) +
-                lane_set.contribution(i, lane_st0, true, true), 0.0, 1.0)
+            g_a + (stat_g - g_a) * k_stat;
+        const pan_b: f32 = if (has_p)
+            std.math.clamp((lane_set.baseOf(i, true, true) orelse 0.5) + cp.after, 0.0, 1.0)
         else
-            params.instrument_pan[i].load(.monotonic);
-        const g_a: f32 = if (i < engine.inst_gain_sm.len) engine.inst_gain_sm[i] else g_tgt;
-        const pan_a: f32 = if (i < engine.inst_pan_sm.len) engine.inst_pan_sm[i] else pan_tgt;
-        // 块率平滑：**固定 15ms 时间常数**（与缓冲大小无关，见 `k_inst_sm`）
-        const g_b: f32 = g_a + (g_tgt - g_a) * k_inst_sm;
-        const pan_b: f32 = pan_a + (pan_tgt - pan_a) * k_inst_sm;
+            pan_a + (stat_pan - pan_a) * k_stat;
         if (i < engine.inst_gain_sm.len) engine.inst_gain_sm[i] = g_b;
         if (i < engine.inst_pan_sm.len) engine.inst_pan_sm[i] = pan_b;
         const bg_a = balanceGains(pan_a);
@@ -2773,21 +2878,21 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
 
         const muted = params.channel_muted[ch_i].load(.monotonic);
         const stat = params.channel_gain[ch_i].load(.monotonic);
-        // **叠加语义**：静态推子 = 基准值；所有绑到本通道的曲线贡献求和（钳到 0..1）
+        // **叠加语义**：曲线基准（或静态推子）= 基线；每条绑定的贡献**各自极点平滑**后相加。
         const auto_this = lane_on and lane_set.hasChannel(ch_i, false, false);
+        const auto_pan = lane_on and lane_set.hasChannel(ch_i, true, false);
+        const cv = lane_set.contributionSmooth(ch_i, false, false, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key);
+        const cp = lane_set.contributionSmooth(ch_i, true, false, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key);
         const base_g = if (auto_this) (lane_set.baseOf(ch_i, false, false) orelse stat) else stat;
-        const g_a: f32 = if (muted) 0.0 else if (auto_this) std.math.clamp(base_g + lane_set.contribution(ch_i, lane_st0, false, false), 0.0, 1.0) else stat;
-        const g_b: f32 = if (muted) 0.0 else if (auto_this) std.math.clamp(base_g + lane_set.contribution(ch_i, lane_st1, false, false), 0.0, 1.0) else stat;
+        const g_a: f32 = if (muted) 0.0 else if (auto_this) std.math.clamp(base_g + cv.before, 0.0, 1.0) else stat;
+        const g_b: f32 = if (muted) 0.0 else if (auto_this) std.math.clamp(base_g + cv.after, 0.0, 1.0) else stat;
         // 声像：静态旋钮 = 基准，曲线贡献叠加——**段首/段尾各算一次**，
         // 块内对左右增益做线性斜坡：否则垂直断崖（同一步两个值）会变成
         // 一个采样点上的硬跳变 → 听感像“另一侧重新起了一个音”且带爆音（用户实测）。
-        var pan_a = std.math.clamp(params.channel_pan[ch_i].load(.monotonic), 0, 1);
-        var pan_b = pan_a;
-        if (lane_on and lane_set.hasChannel(ch_i, true, false)) {
-            const base_p = lane_set.baseOf(ch_i, true, false) orelse pan_a;
-            pan_a = std.math.clamp(base_p + lane_set.contribution(ch_i, lane_st0, true, false), 0.0, 1.0);
-            pan_b = std.math.clamp(base_p + lane_set.contribution(ch_i, lane_st1, true, false), 0.0, 1.0);
-        }
+        const stat_pan = std.math.clamp(params.channel_pan[ch_i].load(.monotonic), 0, 1);
+        const base_p = if (auto_pan) (lane_set.baseOf(ch_i, true, false) orelse stat_pan) else stat_pan;
+        const pan_a: f32 = if (auto_pan) std.math.clamp(base_p + cp.before, 0.0, 1.0) else stat_pan;
+        const pan_b: f32 = if (auto_pan) std.math.clamp(base_p + cp.after, 0.0, 1.0) else stat_pan;
         const ang_a = pan_a * (std.math.pi / 2.0);
         const ang_b = pan_b * (std.math.pi / 2.0);
         const cl_a = @cos(ang_a) * std.math.sqrt2;
@@ -2827,16 +2932,16 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
         const muted0 = params.channel_muted[0].load(.monotonic);
         const stat0 = params.channel_gain[0].load(.monotonic);
         const auto0 = lane_on and lane_set.hasChannel(0, false, false);
+        const auto0p = lane_on and lane_set.hasChannel(0, true, false);
+        const cv0 = lane_set.contributionSmooth(0, false, false, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key);
+        const cp0 = lane_set.contributionSmooth(0, true, false, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key);
         const base0 = if (auto0) (lane_set.baseOf(0, false, false) orelse stat0) else stat0;
-        const g0a: f32 = if (muted0) 0.0 else if (auto0) std.math.clamp(base0 + lane_set.contribution(0, lane_st0, false, false), 0.0, 1.0) else stat0;
-        const g0b: f32 = if (muted0) 0.0 else if (auto0) std.math.clamp(base0 + lane_set.contribution(0, lane_st1, false, false), 0.0, 1.0) else stat0;
-        var pan_a = std.math.clamp(params.channel_pan[0].load(.monotonic), 0, 1);
-        var pan_b = pan_a;
-        if (lane_on and lane_set.hasChannel(0, true, false)) {
-            const base_p0 = lane_set.baseOf(0, true, false) orelse pan_a;
-            pan_a = std.math.clamp(base_p0 + lane_set.contribution(0, lane_st0, true, false), 0.0, 1.0);
-            pan_b = std.math.clamp(base_p0 + lane_set.contribution(0, lane_st1, true, false), 0.0, 1.0);
-        }
+        const g0a: f32 = if (muted0) 0.0 else if (auto0) std.math.clamp(base0 + cv0.before, 0.0, 1.0) else stat0;
+        const g0b: f32 = if (muted0) 0.0 else if (auto0) std.math.clamp(base0 + cv0.after, 0.0, 1.0) else stat0;
+        const stat_pan0 = std.math.clamp(params.channel_pan[0].load(.monotonic), 0, 1);
+        const base_p0 = if (auto0p) (lane_set.baseOf(0, true, false) orelse stat_pan0) else stat_pan0;
+        const pan_a: f32 = if (auto0p) std.math.clamp(base_p0 + cp0.before, 0.0, 1.0) else stat_pan0;
+        const pan_b: f32 = if (auto0p) std.math.clamp(base_p0 + cp0.after, 0.0, 1.0) else stat_pan0;
         const ang_a = pan_a * (std.math.pi / 2.0);
         const ang_b = pan_b * (std.math.pi / 2.0);
         const cl_a = @cos(ang_a) * std.math.sqrt2 * master;
@@ -2869,8 +2974,7 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
     // 不是主输出全混。
     analyzeSpectrum(engine, params, sr);
 }
-/// 单通道效果链处理（EQ 系数重建 + 逐槽处理 + 频谱捕获）。
-/// 注：**无“无乐器跳过”优化**——混响/延迟的尾音需状态持续推进（空缓冲
+/// 单通道效果链处理（EQ 系数重建 + 逐槽处理 + 频谱捕获）。/// 注：**无“无乐器跳过”优化**——混响/延迟的尾音需状态持续推进（空缓冲
 /// 处理廉价）；主通道还会承载子通道汇入信号。
 fn processChannelChain(engine: *Engine, params: *Params, ch_i: usize, buf: []f32, frames: u32, sr: f32, tgt_ch: i32, tgt_slot: i32) void {
     // EQ 系数重建：参数变化版本号驱动（多槽共享同一份 EQ 参数对象）
@@ -2925,8 +3029,8 @@ fn processChannelChain(engine: *Engine, params: *Params, ch_i: usize, buf: []f32
                 const box: *FxBox = @ptrCast(@alignCast(raw));
                 var p: [fx.max_params]f32 = undefined;
                 for (0..fx.max_params) |pi| p[pi] = params.fxParam(ch_i, slot, pi).load(.monotonic);
-                // 每拍秒数（延迟卡拍用；BPM 已钳到 ≥20，与序列器换算同一口径）
-                const beat_secs: f32 = 60.0 / @max(20.0, params.bpm.load(.monotonic));
+                // 每拍秒数（延迟卡拍用；BPM 已钳到 ≥`model.bpm_min`，与序列器换算同一口径）
+                const beat_secs: f32 = 60.0 / @max(model.bpm_min, params.bpm.load(.monotonic));
                 // 按**盒内 kind** 分派（链 kind 与指针更新有帧间竞态；盒是自洽的）
                 switch (box.kind) {
                     2 => box.payload.reverb.process(buf, frames, sr, &p, mix),
@@ -3119,12 +3223,10 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
     const snap_raw2 = params.snapshot_ptr.load(.acquire);
     if (snap_raw2 != 0) {
         const snap2: *const snapshot.Snapshot = @ptrFromInt(snap_raw2);
-        const d1b: u64 = (abs0 + frames) -| start_frame;
-        const s1b: i32 = start_step + @as(i32, @intFromFloat(@ceil(@as(f64, @floatFromInt(d1b)) / step_frames)));
-        const s0b: i32 = if (engine.snap_step >= 0)
-            engine.snap_step
-        else
-            start_step + @as(i32, @intFromFloat(@ceil(@as(f64, @floatFromInt(abs0 -| start_frame)) / step_frames)));
+        // **用积分器算窗口**（锚点等式在 BPM 自动化下会落后 → 吞音头，见 `gatherWindow`）
+        const win = gatherWindow(engine, abs0, frames, step_frames);
+        const s1b: i32 = win.s1;
+        const s0b: i32 = win.s0;
         // **快照换代**（编辑提交后重建）：stash 里还没触发的事件来自**旧数据**，
         // 一律丢弃，并从当前块起点按新快照重发（不补 mid-on——在响的不重复触发）。
         const sg_now = params.snap_gen.load(.acquire);
@@ -3440,6 +3542,41 @@ test "audio: 软切换（sched_gen_soft）gen 变化不释放声部（保位模�
     try std.testing.expectEqual(@as(usize, 0), synth.activeCount(&engine.synths[0]));
 }
 
+test "audio: 事件收集窗口用**积分器**（BPM 自动化下不落后于真实位置）" {
+    var params = Params{};
+    var e = Engine{ .params = &params };
+    e.blk_abs0 = 0;
+    e.snap_step = -1;
+
+    // ① 恒速：ref_step = 100、25 帧/步、一块 256 帧 → [100, 111)
+    e.ref_step = 100.0;
+    {
+        const w = gatherWindow(&e, 0, 256, 25.0);
+        try std.testing.expectEqual(@as(i32, 100), w.s0);
+        try std.testing.expectEqual(@as(i32, 111), w.s1); // ceil(100 + 10.24)
+    }
+
+    // ② 变速（BPM 翻倍 → step_frames 减半）：积分器已到 140，
+    //    而锚点等式只会算出 ~120 —— 窗口必须跟积分器（否则事件晚到 → 吞音头）
+    e.ref_step = 140.0;
+    e.blk_abs0 = 12800; // 本块起点（块内偏移 = 0）
+    {
+        const w = gatherWindow(&e, 12800, 256, 12.5);
+        try std.testing.expectEqual(@as(i32, 140), w.s0);
+        try std.testing.expectEqual(@as(i32, 161), w.s1); // ceil(140 + 20.48)
+    }
+
+    // ③ 水位线（snap_step）优先：落后时从它补齐（不漏），超前时从它继续（不重复），且 s1 不倒退
+    e.snap_step = 135;
+    try std.testing.expectEqual(@as(i32, 135), gatherWindow(&e, 12800, 256, 12.5).s0);
+    e.snap_step = 200;
+    {
+        const w = gatherWindow(&e, 12800, 256, 12.5);
+        try std.testing.expectEqual(@as(i32, 200), w.s0);
+        try std.testing.expect(w.s1 >= w.s0);
+    }
+}
+
 test "audio: Params 默认值" {
     var p = Params{};
     try p.initCapacity(std.testing.allocator, 1, 1, 1);
@@ -3448,6 +3585,138 @@ test "audio: Params 默认值" {
     try std.testing.expect(!p.playing.load(.monotonic));
     try std.testing.expectEqual(@as(u32, 1), p.sched_gen.load(.monotonic));
     try std.testing.expect(p.synth_ptrs[0].load(.monotonic) == null);
+}
+
+test "audio: LaneSet.contributionSmooth——逐绑定极点（τ=0 直通 / 首次播种 / 槽位换绑重播 / 求和）" {
+    var set = LaneSet{};
+    var state: [LaneSet.max_lanes]f32 = @splat(std.math.nan(f32));
+    var keys: [LaneSet.max_lanes]u32 = @splat(0);
+    const dt: f32 = 256.0 / 48000.0; // ≈5.3ms 块
+
+    // 一条 lane：值从 0.2 线性到 1.0（两步之间），τ = 0 → 直通（after 等于段末值）
+    {
+        set = .{};
+        state = @splat(std.math.nan(f32));
+        keys = @splat(0);
+        const sn = set.slotFor().?;
+        sn.active = true;
+        sn.ch = 1;
+        sn.inst = false;
+        sn.kind = 0;
+        sn.interp = 1; // linear
+        sn.base = 0.0;
+        sn.depth = 1.0;
+        sn.bipolar = false;
+        sn.smooth_ms = 0.0;
+        sn.key = 42;
+        sn.n = 2;
+        sn.steps[0] = 0;
+        sn.vals[0] = 0.2;
+        sn.steps[1] = 960;
+        sn.vals[1] = 1.0;
+        sn.pivots[0] = 0.5;
+        sn.curves[0] = 0;
+        sn.pivots[1] = 0.5;
+        sn.curves[1] = 0;
+        const c = set.contributionSmooth(1, false, false, 0, 480, dt, &state, &keys);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.2), c.before, 1e-5); // 首次播种 = 段首值
+        try std.testing.expectApproxEqAbs(@as(f32, 0.6), c.after, 1e-5); // 960/2 处 = 0.6（无追赶）
+        try std.testing.expectEqual(@as(u32, 42), keys[0]);
+
+        const c2 = set.contributionSmooth(1, false, false, 480, 960, dt, &state, &keys);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.6), c2.before, 1e-5); // 与上一块连续
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), c2.after, 1e-5);
+    }
+
+    // τ = 15ms → 追赶（after 严格介于 before 与目标之间）
+    {
+        set = .{};
+        state = @splat(std.math.nan(f32));
+        keys = @splat(0);
+        const sn = set.slotFor().?;
+        sn.active = true;
+        sn.ch = 2;
+        sn.kind = 0;
+        sn.depth = 1.0;
+        sn.smooth_ms = 15.0;
+        sn.key = 7;
+        sn.n = 2;
+        sn.steps[0] = 0;
+        sn.vals[0] = 0.0;
+        sn.steps[1] = 960;
+        sn.vals[1] = 1.0;
+        sn.pivots[0] = 0.5;
+        sn.curves[0] = 0;
+        sn.pivots[1] = 0.5;
+        sn.curves[1] = 0;
+        const c = set.contributionSmooth(2, false, false, 0, 480, dt, &state, &keys);
+        const seg_end: f32 = 0.5; // 段末（st1 = 480）的目标值
+        try std.testing.expect(c.after > c.before);
+        try std.testing.expect(c.after < seg_end); // 没一步到位
+        const expect_after = c.before + (seg_end - c.before) * (1.0 - @exp(-dt / 0.015));
+        try std.testing.expectApproxEqAbs(expect_after, c.after, 1e-4);
+
+        // 槽位换绑定（key 变）→ 重新播种到新曲线段首值，不继承旧值
+        sn.key = 8;
+        sn.vals[0] = 0.9;
+        const c2 = set.contributionSmooth(2, false, false, 0, 480, dt, &state, &keys);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.9), c2.before, 1e-5);
+    }
+
+    // 同通道两条绑定（τ 各自独立）+ 双向 + 深度：求和
+    {
+        state = @splat(std.math.nan(f32));
+        keys = @splat(0);
+        for ([_]f32{ 0.0, 50.0 }) |ms| {
+            const sn = set.slotFor().?;
+            sn.active = true;
+            sn.ch = 3;
+            sn.kind = 0;
+            sn.depth = 0.5;
+            sn.bipolar = false;
+            sn.smooth_ms = ms;
+            sn.key = @as(u32, @intFromFloat(ms)) + 100;
+            sn.n = 1;
+            sn.steps[0] = 0;
+            sn.vals[0] = 1.0;
+            sn.pivots[0] = 0.5;
+            sn.curves[0] = 0;
+        }
+        const c = set.contributionSmooth(3, false, false, 0, 0, dt, &state, &keys);
+        // 两条都从 1.0 播种 → 各贡献 1.0*0.5 = 0.5，合计 1.0
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), c.before, 1e-5);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), c.after, 1e-5);
+    }
+    // **反向**（与极性独立）：单向+反向 = 负向单向（ducking）
+    {
+        set = .{};
+        state = @splat(std.math.nan(f32));
+        keys = @splat(0);
+        const sn = set.slotFor().?;
+        sn.active = true;
+        sn.ch = 4;
+        sn.kind = 0;
+        sn.depth = 1.0;
+        sn.bipolar = false;
+        sn.invert = true;
+        sn.smooth_ms = 0.0;
+        sn.key = 555;
+        sn.n = 1;
+        sn.steps[0] = 0;
+        sn.vals[0] = 1.0;
+        sn.pivots[0] = 0.5;
+        sn.curves[0] = 0;
+        const c = set.contributionSmooth(4, false, false, 0, 0, dt, &state, &keys);
+        try std.testing.expectApproxEqAbs(@as(f32, -1.0), c.after, 1e-5);
+
+        // 双向 + 反向 = 镜像：v=1（双向原为 +1）→ −1
+        sn.bipolar = true;
+        sn.key = 556;
+        state = @splat(std.math.nan(f32));
+        keys = @splat(0);
+        const c2 = set.contributionSmooth(4, false, false, 0, 0, dt, &state, &keys);
+        try std.testing.expectApproxEqAbs(@as(f32, -1.0), c2.after, 1e-5);
+    }
 }
 
 test "audio: stash 去重——同键更旧代被替换；同代重复保留" {
@@ -4137,7 +4406,6 @@ test "audio: VSTi panic——全 128 音高 note-off + 位图清零（state 恢�
 
 test "audio: 音频片段播放——块边界无阶跃（正弦素材；1kHz 的相邻样本差有界）" {
     const a = std.testing.allocator;
-    const model = @import("model.zig");
     // 素材：1 kHz 正弦、48k、0.5 s、**i16 立体声**（与真实 WAV 导入后的布局一致）
     const n_frames: usize = 24_000;
     const samples = try a.alloc(i16, n_frames * 2);

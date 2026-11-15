@@ -219,12 +219,13 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
         }
     }
 
-    // 旋钮右键菜单（乐器 音量 / 声像 共用）：恢复默认值 / 自动化…
+    // 旋钮右键菜单（乐器 音量 / 声像 共用）：**恢复默认值 > 输入值… > 自动化…**
+    // （全项目右键菜单统一这个上下顺序）
     if (app.rack.ctx_vol != null or app.rack.ctx_pan != null) {
         const is_vol = app.rack.ctx_vol != null;
         const pi = app.rack.ctx_vol orelse app.rack.ctx_pan.?;
         if (pi < app.instruments.items.len) {
-            const items = [_][]const u8{ "恢复默认值", "自动化…" };
+            const items = [_][]const u8{ "恢复默认值", "输入值…", "自动化…" };
             const mw2: i32 = 140;
             const mh2: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
             const mx = app.rack.ctx_x;
@@ -256,12 +257,22 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
                         inst.pan = 0.5; // 居中
                         app.commitHistory("恢复乐器声像");
                     }
+                } else if (k == 1) {
+                    // **输入值…**（音量按 0..1 小数；声像按 L/R/C 或数字）
+                    var vb: [16]u8 = undefined;
+                    if (is_vol) {
+                        const pre = std.fmt.bufPrint(&vb, "{d:.2}", .{inst.volume}) catch "";
+                        app.beginEditInstVol(pi, pre, mx + 4, my + 4, mw2 - 8);
+                    } else {
+                        const pre = view_lane.formatValue(.pan, inst.pan, &vb);
+                        app.beginEditInstPan(pi, pre, mx + 4, my + 4, mw2 - 8);
+                    }
                 } else {
                     const tgt = view_lane.Target{
                         .kind = if (is_vol) .inst_vol else .inst_pan,
                         .uid = inst.uid,
                     };
-                    app.auto_win = .{ .open = true, .x = 240, .y = 150, .target = tgt, .just_opened = true };
+                    app.openAutoWin(tgt);
                 }
                 app.rack.ctx_vol = null;
                 app.rack.ctx_pan = null;
@@ -312,9 +323,20 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, row: usize, x: i32, y: i32, w: i32, c
     cx += util.rack_mute_w + 8;
 
     // 声像旋钮 / 音量旋钮（拖动中 coalesce，松手时提交）
+    // **显示值 = 基准 + 曲线贡献**（与混音台同一套：自动化时旋钮跟着真实值走，拖动改的是基准）
     const ky = y + @divTrunc(util.rack_row_h - util.rack_knob_size, 2);
-    // 声像旋钮（x = cx）
-    if (ui.knob(4000 + @as(u64, idx) * 2, &inst.pan, cx, ky, util.rack_knob_size)) app.history_pending = "调整声像";
+    const cur_step: f32 = @floatFromInt(app.playback.cursorStep(true));
+    const pan_tgt = view_lane.Target{ .kind = .inst_pan, .uid = inst.uid };
+    const vol_tgt = view_lane.Target{ .kind = .inst_vol, .uid = inst.uid };
+    // 声像旋钮（x = cx）——自动化激活 → 进度弧/中心点变绿
+    {
+        const pan_eff = app.autoValueFor(pan_tgt, cur_step, inst.pan);
+        var pan = pan_eff;
+        if (ui.knobAuto(4000 + @as(u64, idx) * 2, &pan, cx, ky, util.rack_knob_size, app.enabledBindingCount(pan_tgt) > 0)) {
+            inst.pan = std.math.clamp(inst.pan + (pan - pan_eff), 0.0, 1.0);
+            app.history_pending = "调整声像";
+        }
+    }
     if (util.hitUI(ui, cx, ky, util.rack_knob_size, util.rack_knob_size) and ui.mouse_right_pressed) {
         app.rack.ctx_pan = idx;
         app.rack.ctx_vol = null;
@@ -325,7 +347,14 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, row: usize, x: i32, y: i32, w: i32, c
     cx += util.rack_knob_size + 6;
     // 音量旋钮（x = 前进后的 cx）——右键菜单用**音量旋钮自己的 x**（原来误用了声像的 x：
     // 右键声像弹出音量菜单、右键音量没反应，实测 bug）
-    if (ui.knob(4000 + @as(u64, idx) * 2 + 1, &inst.volume, cx, ky, util.rack_knob_size)) app.history_pending = "调整乐器音量";
+    {
+        const vol_eff = app.autoValueFor(vol_tgt, cur_step, inst.volume);
+        var vol = vol_eff;
+        if (ui.knobAuto(4000 + @as(u64, idx) * 2 + 1, &vol, cx, ky, util.rack_knob_size, app.enabledBindingCount(vol_tgt) > 0)) {
+            inst.volume = std.math.clamp(inst.volume + (vol - vol_eff), 0.0, 1.0);
+            app.history_pending = "调整乐器音量";
+        }
+    }
     if (util.hitUI(ui, cx, ky, util.rack_knob_size, util.rack_knob_size) and ui.mouse_right_pressed) {
         app.rack.ctx_vol = idx;
         app.rack.ctx_pan = null;

@@ -458,13 +458,8 @@ pub fn drawTimelineGrid(
             col: r_mod.Color,
         ) void {
             if (every <= 0 or step_ws_ <= 0) return;
-            var e: i32 = every;
-            var ws: f32 = step_ws_ * @as(f32, @floatFromInt(e));
-            // 减半直到间距达标（上限 2^20 步：纯防呆）
-            while (ws < min_px and e < (1 << 20)) {
-                e *= 2;
-                ws = step_ws_ * @as(f32, @floatFromInt(e));
-            }
+            const e: i32 = effectiveEvery(every, step_ws_, min_px);
+            const ws: f32 = step_ws_ * @as(f32, @floatFromInt(e));
             // **层级钳制**：减半后已到达/超过上一层（更粗）的步长 → 不画。
             // 否则细层会在“小节位置”上画出一套**另一条梯子**的线（实测：
             // 缩小时网格减半到 4 小节、小节线在 5 小节 → 两层小节线各画各的）。
@@ -486,10 +481,9 @@ pub fn drawTimelineGrid(
     // 1) 网格层（= 当前量化档位；最暗、1px）：不得越过拍线层
     // 2) 拍线（亮一档）：不得越过小节层
     var beat_limit: i32 = bar_steps;
-    // 先算拍线的**有效**步长（用于钳制网格层）
+    // 先算拍线的**有效**步长（用于钳制网格层）——与 `drawLayer` 内部同一条减半规则
     {
-        var e: i32 = @max(1, beat_steps);
-        while (step_ws * @as(f32, @floatFromInt(e)) < grid_min_px_beat and e < (1 << 20)) e *= 2;
+        const e = effectiveEvery(@max(1, beat_steps), step_ws, grid_min_px_beat);
         if (e < bar_steps) beat_limit = e;
     }
     drawLayer(ren, clip_x, view_w, lane_x, scroll_s, scroll_steps, step_ws, y, h, snap_steps, grid_min_px_snap, beat_limit, 1, theme.grid_snap);
@@ -868,8 +862,9 @@ fn gridTestRow(fb: *r_mod.Framebuffer, theme: *const Theme, snap_steps: i32, ste
     drawTimelineGrid(&ren, theme, 0, @intCast(fb.width), 0, @intCast(fb.height), 0, 0, zoom, step_w, 96, 24, snap_steps);
 }
 
-/// 测试辅助：某层在该缩放下**实际生效的步长**（按 `min_px` 门槛减半；与 `drawLayer` 同规则）。
-/// 用它写的断言不会因为门槛被调优而失效。
+/// 某层在该缩放下**实际生效的步长**（按 `min_px` 门槛减半）。
+/// **是 `drawLayer` 里那条减半循环的唯一真源**：`drawLayer` 内部与"拍线有效步长"
+/// （用于网格层的层级钳制）都调它，避免两处循环各自漂移。
 fn effectiveEvery(every: i32, step_px: f32, min_px: f32) i32 {
     var e: i32 = every;
     while (min_px > 0 and step_px * @as(f32, @floatFromInt(e)) < min_px and e < (1 << 20)) e *= 2;
