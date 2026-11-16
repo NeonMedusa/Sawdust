@@ -88,8 +88,6 @@ pub const Target = struct {
     /// **BPM 的归一化映射区间**（线性）：0 → 20，1 → 999
     pub const tempo_min: f32 = @import("model.zig").bpm_min;
     pub const tempo_span: f32 = @import("model.zig").bpm_max - tempo_min;
-    /// 音量推子的 **unity 位置**（0 dB）——与 `audio.fader_unity_pos` 必须一致（app 测试对拍）。
-    pub const unity_pos: f32 = 0.75;
     /// 曲线值（0..1）→ BPM
     pub fn bpmFromNorm(v: f32) f32 {
         return tempo_min + std.math.clamp(v, 0.0, 1.0) * tempo_span;
@@ -922,7 +920,7 @@ pub const Unit = enum {
     midi, // 0–127
     db, // **音量推子锥度**：40·log10(v)（= `audio.faderDb`），−60dB 及以下 = 静音
     bpm, // 20–999
-    pan, // L100 – C – R100
+    pan, // 0..1（0.50 = 居中）
 
     pub fn label(u: Unit) []const u8 {
         return switch (u) {
@@ -953,12 +951,8 @@ pub fn formatValue(u: Unit, v: f32, buf: []u8) []const u8 {
         },
         .bpm => std.fmt.bufPrint(buf, "{d}", .{@as(i32, @intFromFloat(@round(Target.bpmFromNorm(vc))))}) catch "",
         .pan => blk: {
-            const p: i32 = @intFromFloat(@round((vc * 2.0 - 1.0) * 100.0));
-            if (p == 0) break :blk "C";
-            break :blk if (p < 0)
-                std.fmt.bufPrint(buf, "L{d}", .{@as(i32, @intCast(-p))}) catch ""
-            else
-                std.fmt.bufPrint(buf, "R{d}", .{p}) catch "";
+            // **0..1，两位小数**（0.50 = 居中）——全项目一个声像域，不再用 L/R 百分比
+            break :blk std.fmt.bufPrint(buf, "{d:.2}", .{vc}) catch "";
         },
     };
 }
@@ -987,17 +981,9 @@ pub fn parseValue(u: Unit, text_in: []const u8) ?f32 {
             return std.math.clamp((x - 20.0) / 979.0, 0.0, 1.0);
         },
         .pan => {
-            if (text.len == 1 and (text[0] == 'C' or text[0] == 'c')) return 0.5;
-            var t2 = text;
-            var sign: f32 = 1.0;
-            if (t2[0] == 'L' or t2[0] == 'l') {
-                sign = -1.0;
-                t2 = t2[1..];
-            } else if (t2[0] == 'R' or t2[0] == 'r') {
-                t2 = t2[1..];
-            }
-            const x = std.fmt.parseFloat(f32, t2) catch return null;
-            return std.math.clamp((sign * x + 100.0) / 200.0, 0.0, 1.0);
+            // 0..1 浮点（0.5 = 居中）；**不再接受 L/R/C 别名**（用户拍板：只留一个声像域）
+            const x = std.fmt.parseFloat(f32, text) catch return null;
+            return std.math.clamp(x, 0.0, 1.0);
         },
     }
 }
@@ -1286,13 +1272,13 @@ test "unit: 归一化 ↔ 显示 往返稳定（dB 有舍入，其余精确）" 
     try std.testing.expectEqualStrings("120", formatValue(.bpm, bpm_v, &buf));
     try std.testing.expectApproxEqAbs(120.0, Target.bpmFromNorm(bpm_v), 1e-3);
 
-    // PAN：L/R/C
-    try std.testing.expectEqualStrings("C", formatValue(.pan, 0.5, &buf));
-    try std.testing.expectEqualStrings("L32", formatValue(.pan, 0.34, &buf));
-    try std.testing.expectApproxEqAbs(@as(f32, 0.34), parseValue(.pan, "L32").?, 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.66), parseValue(.pan, "R32").?, 1e-6);
-    try std.testing.expectEqual(@as(?f32, 0.5), parseValue(.pan, "C"));
-
+    // 声像：**0..1 两位小数**（0.50 = 居中）；不再接受 L/R/C 别名
+    // 声像：**0..1 两位小数**（0.50 = 居中）；不再接受 L/R/C 别名
+    try std.testing.expectEqualStrings("0.50", formatValue(.pan, 0.5, &buf));
+    try std.testing.expectEqualStrings("0.34", formatValue(.pan, 0.34, &buf));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.34), parseValue(.pan, "0.34").?, 1e-6);
+    try std.testing.expectEqual(@as(?f32, 1.0), parseValue(.pan, "9")); // 钳制
+    try std.testing.expectEqual(@as(?f32, null), parseValue(.pan, "C")); // 旧别名已废
     // 单位循环：按目标种类过滤
     var lane = Lane{ .target = .{ .kind = .mixer_vol, .uid = 1 } };
     var cyc: [4]Unit = undefined;

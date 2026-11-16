@@ -130,8 +130,8 @@ pub const SynthParams = struct {
 
 /// 默认力度（新音符；MIDI 惯例 100——柱条不顶格、有编辑余量）
 pub const default_velocity: u8 = 100;
-/// 默认声像（居中；= MIDI CC10 坐标）
-pub const default_pan: u8 = 64;
+/// 默认声像（居中；**0..1**，全项目统一一个声像域）
+pub const default_pan: f32 = 0.5;
 
 pub const EventKind = enum(u8) {
     /// 按下（分配新声部）
@@ -153,8 +153,8 @@ pub const NoteEvent = struct {
     end_step: i32 = -1,
     /// 力度（1-127；0 不允许）
     velocity: u8 = default_velocity,
-    /// 声像（0-127；64 = 居中）
-    pan: u8 = default_pan,
+    /// 声像（**0..1**；0.5 = 居中）
+    pan: f32 = default_pan,
 };
 
 /// 调度事件（序列器）：带**步时间戳**，音频线程按播放步边界触发
@@ -173,8 +173,8 @@ pub const SchedEvent = struct {
     /// 调度 generation（transport 变化时递增；旧事件作废）
     gen: u32 = 0,
     velocity: u8 = default_velocity,
-    /// 声像（0-127；64 = 居中）
-    pan: u8 = default_pan,
+    /// 声像（**0..1**；0.5 = 居中）
+    pan: f32 = default_pan,
 };
 
 /// 调度事件排序：步升序；**同一步 off 先于 on**（允许同音高快速重触发）。
@@ -367,7 +367,7 @@ fn allocVoice(state: anytype) *Voice {
 /// 音符开（分配声部）——公开：音频回调按事件路由调用。
 /// `velocity`：1-127（钳制；0 按 1 处理——力度 0 = 静音是 MIDI 的 note-on
 /// 退化语义，本项目不做）；`pan`：0-127（64 = 居中）。
-pub fn noteOn(state: anytype, pitch: u8, velocity: u8, pan: u8, at_step: i32, end_step: i32) bool {
+pub fn noteOn(state: anytype, pitch: u8, velocity: u8, pan: f32, at_step: i32, end_step: i32) bool {
     // 同一音符实例的重触发（重扫重发同一个 on）：先放掉同 (音高, 起点) 的旧声部，
     // 否则“双声部 + 只有一条 off”必然漏一个（实测：乱拖后出现两个实例同时响）。
     var retrig = false;
@@ -390,9 +390,9 @@ pub fn noteOn(state: anytype, pitch: u8, velocity: u8, pan: u8, at_step: i32, en
     v.release_from = 0;
     v.start_seq = state.note_counter;
     v.vel_gain = @as(f32, @floatFromInt(@max(1, velocity))) / 127.0;
-    // 等功率声像：t = -1..+1（64 = 中心），angle = (t+1)·π/4 →
+    // 等功率声像：t = -1..+1（0.5 = 中心），angle = (t+1)·π/4 →
     // 居中时 cos=sin=√2/2，×√2 = 1.0/1.0（与调音台通道声像同一公式）
-    const t = std.math.clamp(@as(f32, @floatFromInt(@as(i32, pan) - 64)) / 63.0, -1.0, 1.0);
+    const t = std.math.clamp((pan - 0.5) * 2.0, -1.0, 1.0);
     const ang = (t + 1.0) * (std.math.pi / 4.0);
     v.pan_l = @cos(ang) * std.math.sqrt2;
     v.pan_r = @sin(ang) * std.math.sqrt2;
@@ -740,7 +740,7 @@ test "synth: 合奏——立体声展开与响度量级（增益补偿）" {
 
     // ① 单副本（unison = 0）：居中声像 → L == R（与旧单声道实现一致）
     var st0 = Synth{};
-    _ = noteOn(&st0, 60, 127, 64, -1, -1);
+    _ = noteOn(&st0, 60, 127, 0.5, -1, -1);
     var buf0: [F * 2]f32 = undefined;
     render(&p, &st0, &buf0, F, 48000, 1.0, false);
     var e0: f64 = 0;
@@ -755,7 +755,7 @@ test "synth: 合奏——立体声展开与响度量级（增益补偿）" {
     // ② 合奏 8 副本：副本失谐 + 立体声展开 → L/R 不同；1/√copies 补偿保量级
     p.osc[0].unison.store(8, .monotonic);
     var st1 = Synth{};
-    _ = noteOn(&st1, 60, 127, 64, -1, -1);
+    _ = noteOn(&st1, 60, 127, 0.5, -1, -1);
     var buf1: [F * 2]f32 = undefined;
     render(&p, &st1, &buf1, F, 48000, 1.0, false);
     var e1: f64 = 0;
@@ -796,7 +796,7 @@ test "synth: 合奏散布——0% 无拍频（每窗电平恒定）、50% 明显
     for ([_]f32{ 0.0, 0.5 }, 0..) |det, di| {
         p.osc[0].unison_detune.store(det, .monotonic);
         var st = Synth{};
-        _ = noteOn(&st, 45, 127, 64, -1, -1); // A2（110Hz）：±25c 的最外对拍频 ≈3Hz——窗内可见
+        _ = noteOn(&st, 45, 127, 0.5, -1, -1); // A2（110Hz）：±25c 的最外对拍频 ≈3Hz——窗内可见
         var buf: [W * 2]f32 = undefined;
         var mn: f64 = std.math.inf(f64);
         var mx: f64 = 0;
@@ -849,7 +849,7 @@ test "synth: 散布功率——参数参与渲染（输出与线性不同）" {
     for (powers, 0..) |pwr, bi| {
         p.osc[0].detune_power.store(pwr, .monotonic);
         var st = Synth{};
-        _ = noteOn(&st, 45, 127, 64, -1, -1);
+        _ = noteOn(&st, 45, 127, 0.5, -1, -1);
         render(&p, &st, &bufs[bi], F, 48000, 1.0, false);
     }
     // 聚拢 vs 线性：波形明显不同（内圈副本位置变了）

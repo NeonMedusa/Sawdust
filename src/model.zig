@@ -55,8 +55,8 @@ pub const Note = struct {
     instrument: i32 = 0, // 所属乐器（通道机架槽位，0 起）
     /// 力度（1-127；默认 100 = MIDI 惯例）——影响发声响度
     velocity: i32 = default_velocity,
-    /// 声像（0-127；64 = 居中）——与 MIDI CC10 坐标一致
-    pan: i32 = default_pan,
+    /// 声像（**0..1**；0.5 = 居中）——全项目只有这一个声像域（MIDI 仅在导入/导出时换算）
+    pan: f32 = default_pan,
     /// 框选/批量操作选中（**瞬态**：不存档）
     selected: bool = false,
     /// 静音（**存档**；调度阶段跳过——“以后不再触发”，不追着掐正在响的音）
@@ -69,8 +69,20 @@ pub const default_velocity: i32 = 100;
 /// 不要再写字面量 20 / 999——曾乘 11 处）。
 pub const bpm_min: f32 = 10.0;
 pub const bpm_max: f32 = 999.0;
-/// 默认声像（居中；= MIDI CC10 坐标）
-pub const default_pan: i32 = 64;
+/// 默认声像（居中）
+pub const default_pan: f32 = 0.5;
+
+/// MIDI 0..127 声像 → 0..1（**64 精确映射成 0.5**，否则 64/127 = 0.5039 会让界面出现
+/// “R1” 这种不对称显示）。导入 CC10 与读旧存档（v5–v8 存的是 0..127）共用。
+pub fn panFromMidi(v: f32) f32 {
+    if (v == 64.0) return 0.5;
+    return std.math.clamp(v / 127.0, 0.0, 1.0);
+}
+
+/// 0..1 声像 → MIDI 0..127（四舍五入；0.5 → 64）
+pub fn panToMidi(v: f32) u8 {
+    return @intFromFloat(@round(std.math.clamp(v, 0.0, 1.0) * 127.0));
+}
 
 /// 乐器（通道机架中的一个槽位）。
 /// `synth` 指向该乐器自己的合成器参数（堆分配、地址稳定——音频线程可安全读取）。

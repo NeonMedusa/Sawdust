@@ -37,8 +37,7 @@
 | 变化 | 登记位置 | 读旧档时的动作 |
 |---|---|---|
 | **新增字段** | `introducedVersion(T, "field")` | `ver < intro` → 不读，取声明默认值 |
-| **删除字段** | `removed_fields`（`owner`/`before`/`T`/`removed_in`） | `ver < removed_in` → 按 `T` **读掉丢弃**（否则后面全错位） |
-| **类型变更**（同名不同类型） | `changed_fields`（`owner`/`name`/`old_T`/`changed_in`） | `ver < changed_in` → 按 `old_T` 读，再转成当前类型 |
+| **类型变更**（同名不同类型） | `changed_fields`（`owner`/`name`/`old_T`/`changed_in`[/`legacy_scale`]） | `ver < changed_in` → 按 `old_T` 读，再转成当前类型（`legacy_scale` = 旧档数值刻度，见 §v9 第 5 条） |
 | **含义/值域变更** | 读入唯一入口的迁移函数（先例：`migrateUnitsToV5`） | 读完后统一换算 |
 
 - 三张表都是**编译期表**（`inline for` + comptime 匹配），不加运行时开销；
@@ -220,7 +219,7 @@
 
 | 结构 | 字段 | 冻结默认 |
 |---|---|---|
-| SavedNote | velocity / pan | 100 / 64（本地常量，与 model 解耦） |
+| SavedNote | velocity / pan | 100 / **0.5**（本地常量，与 model 解耦；v9 起 pan 是 0..1） |
 | SavedNote | pattern / instrument | 0 / 0 |
 | SavedClip | start / len / offset | 0（bar/len_bars：v1 专用，永不写） |
 | SavedOsc | enabled / volume / waveform / unison / unison_detune / detune_power | false / 0.5 / 0 / 1 / 0.05 / 0 |
@@ -563,3 +562,23 @@ old_T=i32, changed_in=9}`，读旧档时按 `i32` 读再转 `f32`（写旧布局
 
 **教训（写进流程）**：`introducedVersion` 是**字节级契约**，写/读共用同一张表 →
 漏登记是“自洽”的，往返测试发现不了；只有真旧档 + 专门断言 `legacySkip` 才拦得住。
+
+### 5. `SavedNote.pan` 的值域变更（i32 0..127 → f32 0..1；`legacy_scale`）
+**动机**：全项目统一"一个声像域"。旧档/UI/MIDI 各用一套（0..127 / L100-R100 / 0..1），
+已经在悄悄出错：MIDI 导入 CC10=64 → `64/127 = 0.5039` → 按 L/R 百分比四舍五入后显示 **`R1`**。
+
+**做法**（`changed_fields` 加了 `legacy_scale` 字段，默认 1）：
+
+```zig
+.{ .owner = "SavedNote", .name = "pan", .old_T = i32, .changed_in = binary_version_v9, .legacy_scale = 127.0 }
+```
+
+- 读旧档：`新值 = convert(旧值) / legacy_scale` → 64 / 127 = 0.5039；
+- 读完后在 `fromBinary` 的唯一迁移入口再 `panFromMidi(...)` 把 **64 归成精确 0.5**（用户能"回正"）；
+- 写旧布局（仅测试用）：`旧值 = convert(新值 × legacy_scale)`，float→int 走**四舍五入**
+  （0.5 × 127 = 63.5 → 64；这也是 `bpm` 90.5 → 91 的行为）。
+
+**同批变化**：`model.Note.pan`、`synth.NoteEvent/SchedEvent.pan`、`sequencer`、`snapshot`、
+`view_note_lane` 全部改 0..1；`model.panFromMidi` / `model.panToMidi` 是**唯一**的
+MIDI 换算处（导入 CC10 与读旧存档共用，导出 CC10 同源）。
+

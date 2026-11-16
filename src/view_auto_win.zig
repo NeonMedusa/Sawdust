@@ -111,7 +111,7 @@ pub fn draw(ui: *Ui, app: *App) void {
             else
                 std.fmt.bufPrint(&sb, "游标处曲线值 {d:.2}  ·  驱动 {d} 个参数", .{ v, nbind }) catch "";
         } else blk: {
-            const base = app.baseForTarget(win.target);
+            const base = app.defaultBaseFor(win.target);
             const bipolar = view_lane.Target.defaultBipolar(win.target.kind);
             const v = app.autoValueFor(win.target, step, base);
             const kind_txt: []const u8 = switch (win.target.kind) {
@@ -125,6 +125,10 @@ pub fn draw(ui: *Ui, app: *App) void {
                 .none => "未绑定",
             };
             const pol_txt: []const u8 = if (bipolar) "双向" else "单向";
+            // **空曲线（已链接但还没画点）= 不接管**：状态行说清楚，否则用户会以为“链接了却没反应”
+            if (app.isTargetBound(win.target) and !app.isTargetDriven(win.target)) {
+                break :blk std.fmt.bufPrint(&sb, "已链接但**曲线为空** → 未接管（保持当前值，画一个点即开始）", .{}) catch "";
+            }
             break :blk if (win.target.kind == .tempo)
                 // BPM 用**真实的 bpm 数字**显示（归一化 0..1 对用户没意义）
                 (if (app.isTargetBound(win.target))
@@ -132,8 +136,8 @@ pub fn draw(ui: *Ui, app: *App) void {
                 else
                     std.fmt.bufPrint(&sb, "区间 {d:.0}~{d:.0} BPM  →  尚未链接曲线（当前 {d} BPM）", .{ model.bpm_min, model.bpm_max, app.bpm }) catch "")
             else if (app.isTargetBound(win.target)) blk2: {
-                // **音量类目标额外报 dB**（推子锥度：gain = p² ⇒ dB = 40·log10）；
-                // 自动化本身是 dB 域（深度 100% × 曲线 1.0 = +24 dB），所以“合成 dB”才是听感值。
+                // **音量类目标额外报 dB**（推子锥度：gain = (p/0.75)² ⇒ dB = 40·log10）；
+                // 自动化是**位置域叠加**（默认：曲线最低点 = 静音、最高点 = +5 dB），所以“合成 dB”才是听感值。
                 if (view_lane.Target.isVolume(win.target)) {
                     var db_buf: [16]u8 = undefined;
                     const dbt = view_lane.formatValue(.db, v, &db_buf);
@@ -227,12 +231,9 @@ pub fn draw(ui: *Ui, app: *App) void {
             ui.renderer.strokeRect(x + 8, by, bw1, 22, ui.theme.panel_border);
             ui.labelClipped("+ 新曲线并链接", x + 12, by + 5, bw1 - 8, ui.theme.text);
             if (hovered1 and ui.mouse_pressed) {
-                // **按参数名自动命名**（例：`通道1 · 音量`、`主通道 · 音量`），重名自动加 `(2)`
-                var nb: [48]u8 = undefined;
-                const cname = app.autoCurveNameFor(win.target, &nb);
-                const cid = app.addAutoCurve(cname);
-                if (cid != 0 and app.bindCurveTarget(cid, win.target)) {
-                    app.setToast("已新建曲线并链接");
+                // **新曲线 = 空曲线**：不猜用户想先在哪加点；空曲线不接管 → 听感不变
+                if (app.addAutoCurveForTarget(win.target) != null) {
+                    app.setToast("已新建空曲线并链接（画点开始生效）");
                     app.commitHistory("新建自动化曲线");
                 }
             }
@@ -344,7 +345,7 @@ fn drawRow(ui: *Ui, app: *App, bi: usize, label: []const u8, x: i32, y: i32, w: 
     // **基础值**（归一化 0..1，上下拖数字）：一律白字
     {
         const bx0 = x + Col.base;
-        var val: f32 = b.base orelse app.baseForTarget(b.target);
+        var val: f32 = b.base orelse app.defaultBaseFor(b.target);
         if (ui.dragNumberF(Ui.idOf("auto_win_base", 0) + bi, bx0, cy, Col.base_w, ctrl_h, &val, 0.0, 1.0, 1)) {
             b.base = val;
             app.history_pending = "调整自动化基础值";
@@ -497,7 +498,7 @@ fn drawRowCtxMenu(ui: *Ui, app: *App) void {
             var vb: [24]u8 = undefined;
             switch (win.ctx_field) {
                 .base => {
-                    const v = b.base orelse app.baseForTarget(b.target);
+                    const v = b.base orelse app.defaultBaseFor(b.target);
                     const pre = view_lane.formatValue(.percent, v, &vb);
                     app.beginEditAutomationBase(bi, pre, mx + 4, my + 4, menu_w - 8);
                 },

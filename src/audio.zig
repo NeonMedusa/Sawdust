@@ -200,11 +200,8 @@ pub const LaneSnap = struct {
     param_id: u32 = 0,
     /// `kind == 3` 专用：效果链槽位；`kind == 4` 专用：鼓组层**展平槽位**
     slot: u16 = 0,
-    /// **基线值**（叠加起点，推子/旋钮的**位置** 0..1）——仅 `has_base` 时有效
+    /// **基线值**（叠加起点，推子/旋钮的**位置** 0..1）
     base: f32 = 0.0,
-    /// `base` 是否有效。**false = 跟随静态推子/旋钮值**（`channel_gain` / `channel_pan`）——
-    /// 绑定没显式设“基础值”时就走这条路（否则旧码把音量基线当 0 → `faderGain(0)=0` → 静音）
-    has_base: bool = false,
     n: u32 = 0,
     steps: [64]i32 = @splat(0),
     vals: [64]f32 = @splat(0),
@@ -462,14 +459,13 @@ pub const LaneSet = struct {
     }
 
     /// 该座位该分组的**基线值**（有绑定 → 曲线自己定值；无 → null = 用静态推子/旋钮）
-    /// 该座位的**显式基线值**（只有 `has_base` 时非 null；null = 用静态推子/旋钮值）。
+    /// 该座位的**基线值**（绑定设为 `null` 时由 `publishAutoLane` 填上类型默认，永不为“空”）。
+    /// 返回 `null` = 该座位没有音量/声像车道（音频侧退回静态推子/旋钮值）。
     pub fn baseOf(self: *const LaneSet, ch: usize, pan: bool, inst: bool) ?f32 {
         var i: usize = 0;
         while (i < self.n and i < self.lanes.len) : (i += 1) {
             const l = &self.lanes[i];
-            if (l.active and l.n > 0 and l.kind <= 1 and l.ch == ch and l.inst == inst and (l.kind == 1) == pan) {
-                return if (l.has_base) l.base else null;
-            }
+            if (l.active and l.n > 0 and l.kind <= 1 and l.ch == ch and l.inst == inst and (l.kind == 1) == pan) return l.base;
         }
         return null;
     }
@@ -1774,9 +1770,8 @@ fn kitSamplerNoteOn(engine: *Engine, i: usize, l: usize, pitch: u8, velocity: u8
     const ts_n: usize = @intFromFloat(@as(f64, @floatFromInt(ts)) * kr);
     const end: usize = @min(total, @as(usize, @intFromFloat(@as(f64, @floatFromInt(@as(i64, @intCast(ts)) + tl)) * kr)));
     if (end <= ts_n) return;
-    // ⚠️ `balanceGains` 要的是 **0..1**，而这里拿到的 `pan` 是**音符级 0..127**
-    // （`effectivePan` 的返回）——直接传 → clamp 到 1.0 → **只有右耳**（实测 bug）。
-    const bg = balanceGains(pan / 127.0);
+    // `balanceGains` 要 **0..1**（与 `effectivePan` 的返回同一个域）
+    const bg = balanceGains(std.math.clamp(pan, 0.0, 1.0));
     const g: f32 = @as(f32, @floatFromInt(@max(1, velocity))) / 127.0;
     const spd = std.math.clamp(params.kit_layer_speed[i][l].load(.monotonic), 0.25, 4.0);
     v.* = .{
@@ -2044,7 +2039,7 @@ fn reconcileVoices(engine: *Engine, params: *Params, cur_step: i32, insts: []con
         }
         if (found) continue;
         if (it.start >= cur_step) continue; // 还没到起点 → 正常调度会发
-        _ = synth.noteOn(sy, @intCast(it.pitch), @intCast(@max(1, @min(127, it.velocity))), @intCast(@max(0, @min(127, it.pan))), it.start, it.end);
+        _ = synth.noteOn(sy, @intCast(it.pitch), @intCast(@max(1, @min(127, it.velocity))), std.math.clamp(it.pan, 0.0, 1.0), it.start, it.end);
     }
 }
 test "audio: A3b 换代对账——多余声部被精确释放，应该响的留着" {
@@ -2597,13 +2592,12 @@ fn publishSounding(engine: *Engine, params: *Params) void {
     }
 }
 
-/// 合成有效声像：乐器声像（0-1）为**基准**，音符级声像（0-127）是**偏移**
+/// 合成有效声像：乐器声像（**0..1**）为**基准**，音符级声像（**0..1**，0.5 = 不偏）是**偏移**
 /// （Sawdust 特色：MIDI 本身无音符级声像；导入的音符居中 → 完全跟随乐器）。
 /// 合成后走**单次**等功率渲染——避免两次声像串行（乐器偏左会“挡住”想上右的音符）。
-pub fn effectivePan(inst_pan: f32, note_pan: u8) u8 {
-    const base: f32 = std.math.clamp(inst_pan, 0.0, 1.0) * 127.0;
-    const v: f32 = base + @as(f32, @floatFromInt(note_pan)) - 64.0;
-    return @intFromFloat(@round(std.math.clamp(v, 0.0, 127.0)));
+pub fn effectivePan(inst_pan: f32, note_pan: f32) f32 {
+    const base = std.math.clamp(inst_pan, 0.0, 1.0);
+    return std.math.clamp(base + (note_pan - 0.5), 0.0, 1.0);
 }
 
 /// VSTi 立体声平衡（等功率）：插件输出当**立体声总线**处理，声像旋钮 0..1
@@ -2817,7 +2811,7 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
         const cp = lane_set.contributionSmooth(i, true, true, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key);
         const stat_pan = params.instrument_pan[i].load(.monotonic);
         const k_stat: f32 = std.math.clamp(1.0 - @exp(-dt_blk / inst_smooth_tau), 0.0, 1.0);
-        // 音量：**推子位置 → faderGain，自动化贡献走 dB 域**（声像不变，仍是位置域）
+        // 音量：推子位置 → faderGain；自动化贡献**位置域叠加**（声像同）
         // 基线：绑定显式设了“基础值”→ 用它；否则 = **静态旋钮值**（`stat_g` 是“音量×静音”，
         // 不能直接当位置用——这里取未静音的静态位置 `instrument_gain`）
         const stat_pos = if (i < params.instrument_gain.len) params.instrument_gain[i].load(.monotonic) else 0.0;
@@ -3147,7 +3141,7 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
         const cv = lane_set.contributionSmooth(ch_i, false, false, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key);
         const cp = lane_set.contributionSmooth(ch_i, true, false, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key);
         const base_g = if (auto_this) (lane_set.baseOf(ch_i, false, false) orelse stat) else stat;
-        // 音量：推子位置 → faderGain；自动化贡献走 dB 域（声像仍位置域）
+        // 音量：推子位置 → faderGain；自动化贡献**位置域叠加**（声像同）
         const g_a_raw: f32 = if (muted) 0.0 else if (auto_this) volumeGain(base_g, cv.before) else faderGain(stat);
         const g_b_raw: f32 = if (muted) 0.0 else if (auto_this) volumeGain(base_g, cv.after) else faderGain(stat);
         // **跳块平滑**：手动↔自动化切换/车道重排/基准编辑 会让本块目标跳一下（→ 爆音）
@@ -4567,16 +4561,16 @@ test "audio: 主通道效果链作用在汇总信号上（混响/延迟加入尾
 }
 
 test "audio: 有效声像合成——乐器基准 + 音符偏移（导入音符居中跟随乐器）" {
-    // 居中音符（64）完全跟随乐器基准
-    try std.testing.expectEqual(@as(u8, 64), effectivePan(0.5, 64));
-    try std.testing.expectEqual(@as(u8, 0), effectivePan(0.0, 64));
-    try std.testing.expectEqual(@as(u8, 127), effectivePan(1.0, 64));
-    // 音符偏移在基准上平移（含越界钳制）
-    try std.testing.expectEqual(@as(u8, 32), effectivePan(0.5, 32));
-    try std.testing.expectEqual(@as(u8, 95), effectivePan(0.25, 127));
-    try std.testing.expectEqual(@as(u8, 0), effectivePan(0.5, 0));
-    try std.testing.expectEqual(@as(u8, 127), effectivePan(1.0, 127));
-    try std.testing.expectEqual(@as(u8, 127), effectivePan(0.75, 127));
+    // 居中音符（0.5）完全跟随乐器基准
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), effectivePan(0.5, 0.5), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), effectivePan(0.0, 0.5), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), effectivePan(1.0, 0.5), 1e-6);
+    // 音符偏移在基准上平移（含越界钳制；两者都是 0..1）
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), effectivePan(0.5, 0.25), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), effectivePan(0.25, 1.0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), effectivePan(0.5, 0.0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), effectivePan(1.0, 1.0), 1e-6); // 钳到顶
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), effectivePan(0.75, 1.0), 1e-6); // 钳到顶
 }
 
 test "audio: VSTi 声像平衡——等功率（0.5 原样、两端满偏单侧、功率恒定）" {
@@ -5262,7 +5256,7 @@ test "audio: 鼓组采样器层——声像居中时左右声道都响（回归�
     env.params.kit_layer_kind[0][0].store(3, .monotonic);
 
     // 音符级声像 64 = 居中 → 左右都应出声
-    dispatchNote(&env.engine, synth.NoteEvent{ .kind = .on, .pitch = 36, .instrument = 0, .pan = 64 });
+    dispatchNote(&env.engine, synth.NoteEvent{ .kind = .on, .pitch = 36, .instrument = 0, .pan = 0.5 });
     var buf: [32 * 2]f32 = @splat(0);
     mixKitSamplerLayer(&env.engine, &env.params, &buf, buf.len, 0, 0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0);
     var pl: f32 = 0;

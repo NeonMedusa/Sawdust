@@ -47,12 +47,18 @@ const ChangedField = struct {
     old_T: type,
     /// 从这个版本开始是新类型（`ver < changed_in` 的档里是 `old_T`）
     changed_in: u8,
+    /// **旧档的数值刻度**（默认 1 = 纯类型变更）：`旧值 = 新值 × legacy_scale`。
+    /// 例：`SavedNote.pan` 旧档是 MIDI 0..127，新是 0..1 → scale = 127；
+    /// 读旧档：`新 = convert(旧) / scale`，写旧布局测试：`旧 = convert(新 × scale)`（取整）。
+    legacy_scale: f32 = 1.0,
 };
 
 const changed_fields = [_]ChangedField{
     // `Project.bpm`：v5..v8 是 **i32**（整数 BPM）；v9 起改 f32（支持小数）。
     // **不登记 = 把旧档的 `bpm` 当 4 字节 f32 读 → 后面全错位**（本次排查就是它）。
     .{ .owner = "Project", .name = "bpm", .old_T = i32, .changed_in = binary_version_v9 },
+    // `SavedNote.pan`：v5..v8 是 **i32 0..127**（MIDI 坐标）；v9 起改 f32 0..1（全项目一个声像域）。
+    .{ .owner = "SavedNote", .name = "pan", .old_T = i32, .changed_in = binary_version_v9, .legacy_scale = 127.0 },
 };
 
 /// **已删除字段**：旧档里存在、当前结构体里已不存在。
@@ -102,8 +108,8 @@ pub const default_file_name: []const u8 = "project.saw";
 // 绊线：下方「冻结默认值」测试；完整表见 docs/save-format.md《默认值冻结表》。
 /// 音符力度缺省（与 model.default_velocity 解耦：后者可随产品改动，本值不可）
 pub const note_default_velocity: i32 = 100;
-/// 音符声像缺省（同上，与 model.default_pan 解耦）
-pub const note_default_pan: i32 = 64;
+/// 音符声像缺省（同上，与 model.default_pan 解耦；v9 起 = **0.5 居中**）
+pub const note_default_pan: f32 = 0.5;
 /// 样式数量缺省（旧档无 pattern_names 且缺 pattern_count 时的重建依据）
 pub const pattern_count_default: i32 = 6;
 
@@ -137,8 +143,8 @@ pub const SavedNote = struct {
     instrument: i32 = 0,
     /// 力度（1-127；缺省 = `note_default_velocity`，冻结格式常量）
     velocity: i32 = note_default_velocity,
-    /// 声像（0-127；64 = 居中；缺省 = `note_default_pan`）
-    pan: i32 = note_default_pan,
+    /// 声像（**0..1**，0.5 = 居中；v5–v8 旧档是 i32 0..127，见 `changed_fields`）
+    pan: f32 = note_default_pan,
     /// 音符静音（v8；旧档缺失 → false）
     muted: bool = false,
 };
@@ -624,7 +630,7 @@ fn convertLegacyTo(comptime T: type, v: anytype) T {
         },
         .float => switch (comptime @typeInfo(T)) {
             .float => @floatCast(v),
-            .int => @intFromFloat(v),
+            .int => @intFromFloat(@round(v)), // 取整（非截断）：0.5×127 = 63.5 → 64
             else => @compileError("bin: 旧字段只能转数值：" ++ nameOf(T)),
         },
         else => @compileError("bin: 旧字段只能转数值：" ++ nameOf(F)),
@@ -756,9 +762,9 @@ fn binWriteValue(comptime T: type, w: *BinWriter, v: T) !void {
                 } else if (comptime isB64TextField(fname, FType)) {
                     try binWriteB64Field(w, @field(v, fname));
                 } else if (comptime changedFieldInfo(T, fname)) |cf| {
-                    // 旧档写**旧类型**（如 `bpm` 旧档是 i32）
+                    // 旧档写**旧类型**（如 `bpm` 旧档是 i32、`pan` 旧档是 0..127）
                     if (w.version < cf.changed_in) {
-                        try binWriteValue(cf.old_T, w, convertLegacyTo(cf.old_T, @field(v, fname)));
+                        try binWriteValue(cf.old_T, w, convertLegacyTo(cf.old_T, @field(v, fname) * cf.legacy_scale));
                     } else {
                         try binWriteValue(FType, w, @field(v, fname));
                     }
@@ -845,10 +851,10 @@ fn binReadValue(comptime T: type, r: *BinReader, a: std.mem.Allocator) !T {
                 } else if (comptime isB64TextField(fname, FType)) {
                     @field(out, fname) = try binReadB64Field(r, a);
                 } else if (comptime changedFieldInfo(T, fname)) |cf| {
-                    // 旧档里是旧类型（如 `bpm` 旧档是 i32）→ 读完再转成当前类型
+                    // 旧档里是旧类型（`bpm` 旧档 i32；`pan` 旧档 0..127）→ 读完再转成当前类型
                     if (r.version < cf.changed_in) {
                         const raw = try binReadValue(cf.old_T, r, a);
-                        @field(out, fname) = convertLegacyTo(FType, raw);
+                        @field(out, fname) = convertLegacyTo(FType, raw) / cf.legacy_scale;
                     } else {
                         @field(out, fname) = try binReadValue(FType, r, a);
                     }
@@ -942,7 +948,12 @@ pub fn fromBinary(allocator: std.mem.Allocator, data: []const u8) !std.json.Pars
     // v9：读完后按源版本换算时间单位（U=96 → 3840）——
     // 放在这处**唯一入口**，下游（App/UI/调度）只见新单位。
     var out = value;
-    if (ver < 9) migrateUnitsToV5(&out);
+    if (ver < 9) {
+        migrateUnitsToV5(&out);
+        // 音符声像：旧档是 MIDI 0..127（已经按 `changed_fields` 的 scale 除过 127，
+        // 但 64/127 = 0.5039 不是精确居中）→ 再用 `panFromMidi` 把 64 归成 0.5。
+        for (out.notes) |*n| n.pan = model.panFromMidi(n.pan * 127.0);
+    }
     return .{ .arena = arena, .value = out };
 }
 
@@ -1073,7 +1084,7 @@ test "persist: 合成器参数往返（导出 → 导入）" {
 
 test "persist: 冻结默认值（绊线——改动任意一项=破坏性格式变更，见 docs/save-format.md）" {
     try std.testing.expectEqual(@as(i32, 100), note_default_velocity);
-    try std.testing.expectEqual(@as(i32, 64), note_default_pan);
+    try std.testing.expectEqual(@as(f32, 0.5), note_default_pan);
     const n0 = SavedNote{ .step = 0, .len = 0, .pitch = 0 };
     try std.testing.expectEqual(@as(i32, 0), n0.pattern);
     try std.testing.expectEqual(@as(i32, 0), n0.instrument);
@@ -1168,7 +1179,7 @@ fn expectRoundtrip(comptime T: type, v: T) !void {
 
 test "persist: 全字段非默认往返（防手写序列化漏字段）" {
     try expectRoundtrip(SavedClip, .{ .track = 2, .start = 96, .len = 48, .pattern = 1, .offset = 12 });
-    try expectRoundtrip(SavedNote, .{ .step = 24, .len = 12, .pitch = 64, .pattern = 3, .instrument = 5, .velocity = 90, .pan = 20 });
+    try expectRoundtrip(SavedNote, .{ .step = 24, .len = 12, .pitch = 64, .pattern = 3, .instrument = 5, .velocity = 90, .pan = 0.157 });
     try expectRoundtrip(SavedOsc, .{ .enabled = true, .volume = 0.123, .waveform = 3, .unison = 7, .unison_detune = 0.456, .detune_power = -2.5 });
     try expectRoundtrip(SavedFilter, .{ .enabled = true, .cutoff = 0.876 });
     try expectRoundtrip(SavedSynth, .{
@@ -1288,7 +1299,7 @@ fn expectBinRoundtrip(comptime T: type, v: T) !void {
 }
 
 test "persist: v5 二进制往返（代表性子结构 + 全字段工程 + 空工程）" {
-    try expectBinRoundtrip(SavedNote, .{ .step = 24, .len = 12, .pitch = 64, .pattern = 3, .instrument = 5, .velocity = 90, .pan = 20 });
+    try expectBinRoundtrip(SavedNote, .{ .step = 24, .len = 12, .pitch = 64, .pattern = 3, .instrument = 5, .velocity = 90, .pan = 0.157 });
     try expectBinRoundtrip(SavedSynth, .{ .attack = 0.123, .osc = .{ .{ .enabled = true, .volume = 0.111, .unison = 3 }, .{}, .{}, .{} } });
     var lyrs = [_]SavedDrumLayer{.{ .kind = 1, .gain = 0.5, .source_preset = "kit/k" }};
     var pads = [_]SavedDrumPad{.{ .pitch = 36, .name = "Kick", .layers = &lyrs }};
@@ -1628,12 +1639,12 @@ test "persist: v6 / v7 / v8 三种旧布局都能读（字段门控不吞字节 
         var parsed = try fromBinary(a, bytes);
         defer parsed.deinit();
         try std.testing.expectEqual(@as(f32, 90.5), parsed.value.bpm);
-        // 写成旧布局（v8）时会截成整数——不报错、但精度丢失是该版本格式的固有约束
+        // 写成旧布局（v8）时按 **四舍五入** 落整数（90.5 → 91）——精度丢失是该版本格式的固有约束
         const old = try toBinaryAtVersion(a, .{ .bpm = 90.5 }, 8);
         defer a.free(old);
         var parsed_old = try fromBinary(a, old);
         defer parsed_old.deinit();
-        try std.testing.expectEqual(@as(f32, 90), parsed_old.value.bpm);
+        try std.testing.expectEqual(@as(f32, 91), parsed_old.value.bpm); // 四舍五入写入旧 i32 布局
     }
 }
 

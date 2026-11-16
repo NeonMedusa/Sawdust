@@ -354,7 +354,7 @@ fn drawParamRow(ui: *Ui, app: *App, pl: *vst_host.Plugin, pi: usize, id_base: u6
     const target = app.targetForSlotParam(ref, meta.id);
     const bound = if (target) |t| app.isTargetBound(t) else false;
     // 绿色 = 自动化**真的在驱动它**（同混音台/机架：绑了但全部停用就不算）
-    const active = if (target) |t| app.enabledBindingCount(t) > 0 else false;
+    const active = if (target) |t| app.isTargetDriven(t) else false;
     const rid: u64 = id_base + 1;
 
     const rw = w - menu_btn_w - 4;

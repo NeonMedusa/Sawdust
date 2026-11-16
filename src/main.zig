@@ -2900,7 +2900,7 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
     ui.labelCentered("BPM", x, by, bh, ui.theme.text_dim);
     x += @as(i32, @intFromFloat(ui.font.measure("BPM"))) + 8;
     {
-        const tempo_auto = app.isTargetBound(.{ .kind = .tempo });
+        const tempo_auto = app.isTargetDriven(.{ .kind = .tempo });
         // **显示有效 BPM**（有 tempo 自动化时数字跟随曲线——用户拍板的反馈感），
         // 但**拖/键入改的是文档值**（`bpm_doc`）：自动化挂住时数字会弹回曲线值，
         // 那是“被曲线接管”的正常表现（见 `docs/automation.md` §11.42 已知限制）。

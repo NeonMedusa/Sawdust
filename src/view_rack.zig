@@ -324,7 +324,7 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, row: usize, x: i32, y: i32, w: i32, c
     {
         const pan_eff = app.autoValueFor(pan_tgt, cur_step, inst.pan);
         var pan = pan_eff;
-        if (ui.knobAuto(4000 + @as(u64, idx) * 2, &pan, cx, ky, util.rack_knob_size, app.enabledBindingCount(pan_tgt) > 0)) {
+        if (ui.knobAuto(4000 + @as(u64, idx) * 2, &pan, cx, ky, util.rack_knob_size, app.isTargetDriven(pan_tgt))) {
             // 拖动期间手动接管；**写回 = 旋钮显示值本身**（不是“旧静态值 + 增量” → 起手跳一大下 = 爆音）
             inst.pan = app.dragWriteback(pan_tgt, pan);
             app.history_pending = "调整声像";
@@ -343,7 +343,7 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, row: usize, x: i32, y: i32, w: i32, c
     {
         const vol_eff = app.autoValueFor(vol_tgt, cur_step, inst.volume);
         var vol = vol_eff;
-        if (ui.knobAuto(4000 + @as(u64, idx) * 2 + 1, &vol, cx, ky, util.rack_knob_size, app.enabledBindingCount(vol_tgt) > 0)) {
+        if (ui.knobAuto(4000 + @as(u64, idx) * 2 + 1, &vol, cx, ky, util.rack_knob_size, app.isTargetDriven(vol_tgt))) {
             inst.volume = app.dragWriteback(vol_tgt, vol);
             app.history_pending = "调整乐器音量";
         }

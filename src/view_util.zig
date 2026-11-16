@@ -97,7 +97,7 @@ pub fn drawPluginParamList(
             // 自动化绑定：值跟着曲线走 → 只读；绿色 = 自动化真的在驱动它
             const target = app.targetForSlotParam(ref, meta.id);
             const bound = if (target) |t| app.isTargetBound(t) else false;
-            const active = if (target) |t| app.enabledBindingCount(t) > 0 else false;
+            const active = if (target) |t| app.isTargetDriven(t) else false;
             if (!read_only and !bound and hovered and ui.mouse_double) {
                 // 双击 → 恢复默认值（先于拖动判定：双击帧也会发按下，否则被拖动抢走）
                 app.setPluginParamHost(ref, p, idx, meta.default_norm);

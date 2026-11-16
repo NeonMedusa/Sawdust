@@ -1050,7 +1050,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             // 力度/声像沿用“上一个被点击/编辑音符”（无参考 → model 默认）；
             // 与长度同一交互逻辑（`rememberNote` 三件套）
             const new_vel: i32 = app.piano.last_note_velocity orelse model.default_velocity;
-            const new_pan: i32 = app.piano.last_note_pan orelse model.default_pan;
+            const new_pan: f32 = app.piano.last_note_pan orelse model.default_pan;
             {
                 app.addNote(.{ .step = snap_step, .len = new_len, .pitch = pitch_i, .pattern = pattern, .instrument = app.sel.instrument, .velocity = new_vel, .pan = new_pan });
                 app.piano.rememberNote(app.notes.items[app.notes.items.len - 1]); // 放置的音符本身成为“上一个”

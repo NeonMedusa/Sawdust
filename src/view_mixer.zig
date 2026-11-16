@@ -16,6 +16,7 @@ const app_mod = @import("app.zig");
 const App = app_mod.App;
 const util = @import("view_util.zig");
 const view_lane = @import("view_lane.zig");
+const audio = @import("audio.zig");
 const model = @import("model.zig");
 
 const win_title_h: i32 = 22;
@@ -295,11 +296,11 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     }
     // ── 声像旋钮右键菜单（恢复默认值 / 自动化…）──
     if (mw.ctx_pan) |pc| {
-        drawPanCtxMenu(ui, app, pc);
+        drawPanVolCtxMenu(ui, app, pc, false);
     }
     // ── 音量推子右键菜单（恢复默认值 / 自动化…）──
     if (mw.ctx_vol) |vc| {
-        drawVolCtxMenu(ui, app, vc);
+        drawPanVolCtxMenu(ui, app, vc, true);
     }
 
     return true;
@@ -358,7 +359,7 @@ fn drawStrip(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32) void
         const pan_eff = app.autoValueFor(pan_tgt, @floatFromInt(app.playback.cursorStep(true)), mc.pan);
         var pan = pan_eff;
         // **有启用中的自动化绑定 → 进度弧 + 中心点变绿**
-        const pan_bound = app.enabledBindingCount(pan_tgt) > 0;
+        const pan_bound = app.isTargetDriven(pan_tgt);
         if (ui.knobAuto(id_pan_base + @as(u64, ci), &pan, cx, ky, knob_size, pan_bound)) {
             // 同推子：拖动期间手动接管（写回 = 旋钮显示值本身）
             mc.pan = app.dragWriteback(pan_tgt, pan);
@@ -399,7 +400,7 @@ fn drawStrip(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32) void
         const vol_eff = app.autoValueFor(vol_tgt, @floatFromInt(app.playback.cursorStep(true)), mc.volume);
         var vol = vol_eff;
         // **有启用中的自动化绑定 → 填充段 + 把手变绿**
-        const vol_bound = app.enabledBindingCount(vol_tgt) > 0;
+        const vol_bound = app.isTargetDriven(vol_tgt);
         const tint: ?r_mod.Color = if (vol_bound) ui.theme.auto_active else null;
         if (ui.sliderTint(id_vol_base + @as(u64, ci), &vol, cx, sy, slider_w, 18, tint, tint)) {
             // 拖动期间“手动接管”（音频/UI 都暂不吃曲线，松手恢复）；
@@ -678,62 +679,13 @@ fn drawCtxMenuGeneric(ui: *Ui, app: *App, ch: usize, slot: ?usize, items: []cons
 /// 声像旋钮右键菜单（单项：恢复默认值 = 居中 0.5）。
 /// 与通用菜单同一套路：位置鉗制到窗口内（`ctxMenuPos`）、点外关闭。
 /// 音量推子右键菜单：`恢复默认值`（**0.75 = 0 dB**）/ `自动化…`（`mixer_vol` 或主通道 `master_vol`）
-fn drawVolCtxMenu(ui: *Ui, app: *App, ch: usize) void {
+/// 音量推子 / 声像旋钮**共用**的右键菜单：`恢复默认值` > `输入值…` > `自动化…`
+/// （全项目统一顺序）。`is_vol` 决定默认值（0.75 = 0 dB / 0.5 = 居中）、输入单位（dB / L-R-C）
+/// 与自动化目标（`master_vol`·`mixer_vol` / `mixer_pan`）。
+fn drawPanVolCtxMenu(ui: *Ui, app: *App, ch: usize, is_vol: bool) void {
     const mw_win = &app.mixer_win;
-    // **全项目统一的右键菜单顺序**：恢复默认值 > 输入值… > 自动化…
     const items = [_][]const u8{ "恢复默认值", "输入值…", "自动化…" };
     const menu_w: i32 = 140;
-    const menu_h: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
-    const pos = ctxMenuPos(mw_win, menu_w, menu_h);
-    const mx = pos[0];
-    const my = pos[1];
-    ui.renderer.fillRect(mx, my, menu_w, menu_h, ui.theme.panel);
-    ui.renderer.strokeRect(mx, my, menu_w, menu_h, ui.theme.accent);
-    ui.noteOverlayRect(mx, my, menu_w, menu_h);
-
-    var clicked: ?usize = null;
-    var inside = false;
-    for (items, 0..) |item, k| {
-        const iy = my + 2 + @as(i32, @intCast(k)) * util.menu_item_h;
-        const hovered = util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, menu_w - 2, util.menu_item_h);
-        if (hovered) {
-            inside = true;
-            ui.renderer.fillRect(mx + 1, iy, menu_w - 2, util.menu_item_h, ui.theme.item_hover);
-        }
-        ui.label(item, mx + 8, iy + 2, ui.theme.text);
-        if (hovered and ui.mouse_pressed) clicked = k;
-    }
-    if (clicked) |k| {
-        if (ch < app.mixer_channels_state.items.len) {
-            const mc = &app.mixer_channels_state.items[ch];
-            if (k == 0) {
-                if (mc.volume != 0.75) {
-                    mc.volume = 0.75;
-                    app.commitHistory("恢复通道音量");
-                }
-            } else if (k == 1) {
-                // **输入值…**（**dB**：与推子读数同一映射，0 = 满刻度，≤−60 = 静音）
-                var vb: [16]u8 = undefined;
-                const pre = view_lane.formatValue(.db, mc.volume, &vb);
-                app.beginEditChannelVol(ch, pre, mx + 4, my + 4, menu_w - 8);
-            } else {
-                const tgt = if (ch == 0)
-                    view_lane.Target{ .kind = .master_vol }
-                else
-                    view_lane.Target{ .kind = .mixer_vol, .uid = mc.uid };
-                app.openAutoWin(tgt);
-            }
-        }
-        mw_win.ctx_vol = null;
-    } else if (ui.mouse_pressed and !inside and !util.inRect(ui.mouse_x, ui.mouse_y, mx, my, menu_w, menu_h)) {
-        mw_win.ctx_vol = null;
-    }
-}
-fn drawPanCtxMenu(ui: *Ui, app: *App, ch: usize) void {
-    const mw_win = &app.mixer_win;
-    const menu_w: i32 = 140;
-    // **全项目统一的右键菜单顺序**：恢复默认值 > 输入值… > 自动化…
-    const items = [_][]const u8{ "恢复默认值", "输入值…", "自动化…" };
     const menu_h: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
     const pos = ctxMenuPos(mw_win, menu_w, menu_h);
     const mx = pos[0];
@@ -758,24 +710,32 @@ fn drawPanCtxMenu(ui: *Ui, app: *App, ch: usize) void {
         if (ch < app.mixer_channels_state.items.len) {
             const mc = &app.mixer_channels_state.items[ch];
             if (k == 0) {
-                if (mc.pan != 0.5) {
-                    mc.pan = 0.5; // 居中
-                    app.commitHistory("恢复通道声像");
+                // 恢复默认值：音量 0.75 = 0 dB（unity）；声像 0.5 = 居中
+                const dflt: f32 = if (is_vol) audio.fader_unity_pos else 0.5;
+                const cur = if (is_vol) mc.volume else mc.pan;
+                if (cur != dflt) {
+                    if (is_vol) mc.volume = dflt else mc.pan = dflt;
+                    app.commitHistory(if (is_vol) "恢复通道音量" else "恢复通道声像");
                 }
             } else if (k == 1) {
-                // **输入值…**（L/R/C 或数字，与旋钮读数同一套）
+                // 输入值…：音量按 **dB**（与推子读数同一映射，≤−60 = 静音）；声像按 L/R/C
                 var vb: [16]u8 = undefined;
-                const pre = view_lane.formatValue(.pan, mc.pan, &vb);
-                app.beginEditChannelPan(ch, pre, mx + 4, my + 4, menu_w - 8);
+                if (is_vol) {
+                    app.beginEditChannelVol(ch, view_lane.formatValue(.db, mc.volume, &vb), mx + 4, my + 4, menu_w - 8);
+                } else {
+                    app.beginEditChannelPan(ch, view_lane.formatValue(.pan, mc.pan, &vb), mx + 4, my + 4, menu_w - 8);
+                }
             } else {
-                // 声像自动化（`mixer_pan` 目标）
-                const tgt = view_lane.Target{ .kind = .mixer_pan, .uid = app.mixer_channels_state.items[ch].uid };
+                const tgt: view_lane.Target = if (is_vol)
+                    (if (ch == 0) .{ .kind = .master_vol } else .{ .kind = .mixer_vol, .uid = mc.uid })
+                else
+                    .{ .kind = .mixer_pan, .uid = mc.uid };
                 app.openAutoWin(tgt);
             }
         }
-        mw_win.ctx_pan = null;
+        if (is_vol) mw_win.ctx_vol = null else mw_win.ctx_pan = null;
     } else if (ui.mouse_pressed and !inside and !util.inRect(ui.mouse_x, ui.mouse_y, mx, my, menu_w, menu_h)) {
-        mw_win.ctx_pan = null;
+        if (is_vol) mw_win.ctx_vol = null else mw_win.ctx_pan = null;
     }
 }
 

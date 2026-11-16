@@ -83,7 +83,7 @@ pub const ClipboardNote = struct {
     len: i32,
     pitch: i32,
     velocity: i32 = model.default_velocity,
-    pan: i32 = model.default_pan,
+    pan: f32 = model.default_pan,
 };
 
 /// 批量拉伸快照项（拖选中音符期间；按音符数组顺序对应）
@@ -628,7 +628,7 @@ pub const PianoState = struct {
     last_note_len: i32 = 0,
     /// 同上：力度与声像（null = 无参考 → 用 model 默认）
     last_note_velocity: ?i32 = null,
-    last_note_pan: ?i32 = null,
+    last_note_pan: ?f32 = null,
 
     /// 量化/吸附网格档位（`model.snap_denoms` 下标；控制音符移动/拉伸对齐）
     snap: i32 = 4, // 默认 1/16（`snap_denoms` 下标 4；最常用）
@@ -686,7 +686,7 @@ pub const PianoState = struct {
     /// 若据此限制则从柱条起笔画曲线会失效（只刷那一根）。
     lane_paint_selected_only: bool = false,
     /// 拖动中：上次刷过的值（扫刷去重用；-1 = 未刷）
-    lane_last_val: i32 = -1,
+    lane_last_val: f32 = -1,
     /// 本次拖动是否已改动
     lane_drag_dirty: bool = false,
 
@@ -6124,9 +6124,6 @@ pub const App = struct {
                 (if (is_plugin) b.target.param_id *% 2654435761 else 0) ^
                 (@as(u32, @intCast(slot_now)) *% 40503);
             snap.base = b.base orelse self.defaultBaseFor(b.target);
-            // `base` 已解析成具体值（`null` → 类型默认：音量 0.75 = 0 dB），
-            // 音频侧不再需要 `orelse stat` 兜底（保留着当双保险）。
-            snap.has_base = true;
             snap.interp = switch (lc.interp) {
                 .hold => 0,
                 .linear => 1,
@@ -6144,16 +6141,6 @@ pub const App = struct {
                 snap.pivots[i] = p.pivot;
             }
         }
-    }
-
-    /// 该参数的**启用中**绑定数（>0 = 自动化真的在驱动它 —— UI 用它标绿旋钮/推子）
-    pub fn enabledBindingCount(self: *const App, target: view_lane.Target) usize {
-        var n: usize = 0;
-        for (self.auto_bindings.items) |b| {
-            if (!b.enabled) continue;
-            if (view_lane.Target.eql(b.target, target)) n += 1;
-        }
-        return n;
     }
 
     /// **打开自动化链接窗口**（唯一入口：打开即置顶）
@@ -6259,8 +6246,10 @@ pub const App = struct {
     /// 音量目标的默认基值 = 0、深度 = 100% → **曲线就是推子位置**：
     /// 最低点 = 静音、最高点 = +5 dB。
     ///
-    /// **基准**：第一条**启用**绑定的 `base`；没设 → 类型默认（`defaultBaseFor`）。
-    /// 一条启用的都没有（未绑定 / **全部禁用**）→ 原样返回静态值（可手动调整）。
+    /// **基准**：第一条**真有数据的**启用绑定的 `base`；没设 → 类型默认。
+    /// 一条都没有（未绑定 / 全部禁用 / **曲线为空**）→ 原样返回静态值（可手动调整）。
+    /// 注：`evalAt` 对空曲线返 **−1**（契约就是“无 lane → 调用方回落静态值”），
+    /// 音频侧也是“不发布车道 → 用静态值”；这里必须一致，否则推子会画到 0（静音）。
     pub fn autoValueFor(self: *const App, target: view_lane.Target, step: f32, base: f32) f32 {
         // 拖动中 = 手动接管：直接返回静态值（推子跟鼠标，也不吃曲线）
         if (self.isAutoDrag(target)) return base;
@@ -6270,18 +6259,49 @@ pub const App = struct {
         for (self.auto_bindings.items) |b| {
             if (!b.enabled) continue;
             if (!view_lane.Target.eql(b.target, target)) continue;
+            const i = self.curveIndexById(b.curve_id) orelse continue;
+            const v = self.auto_curves.items[i].evalAt(step);
+            if (v < 0) continue; // 曲线为空 = 没数据 → 不参与（既不接管也不加贡献）
             if (!any) {
                 any = true;
                 start = b.base orelse self.defaultBaseFor(target);
             }
-            const i = self.curveIndexById(b.curve_id) orelse continue;
-            const v = self.auto_curves.items[i].evalAt(step);
-            if (v < 0) continue;
             const sc = if (b.bipolar) (v - 0.5) * 2.0 else v;
             contrib += (if (b.invert) -sc else sc) * b.depth;
         }
-        if (!any) return base; // 全部禁用/未绑定 → 静态值（可手动拖）
+        if (!any) return base; // 未绑定/全部禁用/空曲线 → 静态值（可手动拖）
         return std.math.clamp(start + contrib, 0.0, 1.0);
+    }
+
+    /// 该目标此刻是否**真的被自动化驱动**（有启用绑定 **且** 曲线里有数据）。
+    ///
+    /// 用于绿色标记/状态行/参数只读——与音频侧同一判据（`publishAutoLane` 跳过空曲线）。
+    /// “有绑定”不等于“在驱动”：新建后还没画点的曲线、全部禁用的绑定都不算。
+    pub fn isTargetDriven(self: *const App, target: view_lane.Target) bool {
+        for (self.auto_bindings.items) |b| {
+            if (!b.enabled) continue;
+            if (!view_lane.Target.eql(b.target, target)) continue;
+            const i = self.curveIndexById(b.curve_id) orelse continue;
+            if (self.auto_curves.items[i].points.items.len > 0) return true;
+        }
+        return false;
+    }
+
+    /// **新建一条曲线并链接到目标**（“新曲线并链接”按钮的唯一实现）。
+    ///
+    /// 曲线**保持为空**：我们不猜用户想先在哪加点（自动插点反而要倒回去删）；
+    /// 空曲线按“不接管”处理 → 链接这一下**不会改变听感**，用户从哪里开始画都行。
+    /// 绑定失败（没内存）→ 回滚，不留下“建了但没链接”的残留曲线。
+    pub fn addAutoCurveForTarget(self: *App, target: view_lane.Target) ?u32 {
+        var nb: [48]u8 = undefined;
+        const id = self.addAutoCurve(self.autoCurveNameFor(target, &nb));
+        if (id == 0) return null;
+        if (!self.bindCurveTarget(id, target)) {
+            _ = self.removeAutoCurve(id);
+            return null;
+        }
+        self.auto_sel = id; // 让曲线编辑器直接停在它上面，方便马上画
+        return id;
     }
 
     /// **手动接管**：拖推子/旋钮期间，这个参数**暂时不吃自动化**——
@@ -6618,21 +6638,13 @@ pub const App = struct {
     }
 
     /// **绑定基准值的类型默认**（`Binding.base == null` 时用它）：
-    /// 音量 = **0.75（0 dB）**、声像 = 0.5（中心）、BPM = 0（曲线值直接就是速度）、
-    /// 插件参数 = 插件自己报的 `defaultNormalizedValue`。
-    /// 注意：**音量默认不是 0**——在 dB 域里基准 0 = 静音，乘任何曲线都是 0。
+    /// 音量 = **0**（曲线值直接就是推子位置）、声像 = 0.5（中心）、
+    /// BPM = 0（曲线值直接就是速度）、插件参数 = 插件自己报的 `defaultNormalizedValue`。
     pub fn defaultBaseFor(self: *const App, t: view_lane.Target) f32 {
         if (t.isPluginParam()) {
             if (self.pluginParamResolve(t)) |r| return @floatCast(r.pl.params[r.param_idx].default_norm);
         }
         return view_lane.Target.defaultBase(t.kind);
-    }
-
-    /// **基准值**（新建绑定播种 / `base == null` 时的兜底）：= 类型默认。
-    /// 以前这里是“跟随静态推子值”，会让“恢复默认值”显示成 0.5（= 推子位置）令人困惑；
-    /// 现在统一为类型默认（音量 = 0 dB）；“跟随当前值”改在**建绑定那一刻播种**。
-    pub fn baseForTarget(self: *const App, t: view_lane.Target) f32 {
-        return self.defaultBaseFor(t);
     }
 
     /// 插件参数类目标（`vst_param` / `fx_param` / `kit_param`）→ 插件实例 + 参数下标。
@@ -9697,7 +9709,7 @@ pub const App = struct {
             inst.midi_channel = @intCast(ch); // 记住来源通道
             // MIDI 声像是**通道级**的（无音符级声像）→ 映射为乐器的静态声像
             // （取该通道首个 CC10；动态曲线以后再做）
-            inst.pan = @as(f32, @floatFromInt(parsed.channel_pan[ch])) / 127.0;
+            inst.pan = model.panFromMidi(@floatFromInt(parsed.channel_pan[ch]));
             ch_to_inst[ch] = idx;
             inst_count += 1;
         }
@@ -9787,7 +9799,7 @@ pub const App = struct {
             const i = group * 16 + k;
             if (i >= rows.len) break;
             const inst = self.instruments.items[rows[i]];
-            out[k] = @intFromFloat(@round(std.math.clamp(inst.pan, 0.0, 1.0) * 127.0));
+            out[k] = model.panToMidi(inst.pan); // 0..1 → MIDI CC10
         }
         return out;
     }
@@ -10131,7 +10143,7 @@ pub const App = struct {
     /// 不积分的话，渐快工程会被截短、渐慢工程会多出一截静音（时长对不上）。
     fn exportBodyFrames(self: *const App, end_step: u64, step_frames_now: f64) f64 {
         const tgt = view_lane.Target{ .kind = .tempo };
-        if (!self.isTargetBound(tgt)) return @as(f64, @floatFromInt(end_step)) * step_frames_now;
+        if (!self.isTargetDriven(tgt)) return @as(f64, @floatFromInt(end_step)) * step_frames_now;
         const sr: f64 = @floatFromInt(self.params.sample_rate);
         const spb: f64 = @floatFromInt(@max(1, model.stepsPerBeat(self.time_den)));
         var frames: f64 = 0;
@@ -10159,7 +10171,7 @@ pub const App = struct {
             const n: u32 = @intCast(@min(@as(u64, obuf.len / 2), ew.total_frames - ew.done));
             // **导出也跟随 tempo 自动化**（与实时同一条曲线）：按积分器位置 + 块时长推极点，
             // 再同步给音频侧（它用 `params.bpm` 换算步宽）。不加这句，导出的速度永远是文档值。
-            if (self.isTargetBound(.{ .kind = .tempo })) {
+            if (self.isTargetDriven(.{ .kind = .tempo })) {
                 self.applyTempoAutomationAtBlock(n);
                 self.params.bpm.store(std.math.clamp(self.bpm, model.bpm_min, model.bpm_max), .monotonic);
             }
@@ -10387,7 +10399,7 @@ pub const App = struct {
     /// → 判定为“插件在回报输入队列的功效”，整条丢弃（不记历史、**不接管**）。
     /// 三种插件参数目标（乐器/效果器/鼓组层）共用。
     fn vstParamEchoByTarget(self: *const App, t: view_lane.Target, value: f64) bool {
-        if (self.enabledBindingCount(t) == 0) return false;
+        if (!self.isTargetDriven(t)) return false;
         const step: f32 = if (self.playing)
             self.params.play_step.load(.monotonic)
         else
@@ -10446,7 +10458,7 @@ pub const App = struct {
     /// 共同实现：曲线 → （极点）→ `self.bpm`
     fn applyTempoAt(self: *App, step: f32, dt_s: f32) void {
         const tgt = view_lane.Target{ .kind = .tempo };
-        if (!self.isTargetBound(tgt)) {
+        if (!self.isTargetDriven(tgt)) {
             self.bpm = self.bpm_doc;
             self.tempo_sm = std.math.nan(f32); // 下次挂上直接取曲线值
             return;
@@ -10467,7 +10479,7 @@ pub const App = struct {
     /// 设置**文档 BPM**（工具栏拖动/键入的唯一入口）：同步有效值（无绑定时才实时生效）
     pub fn setDocBpm(self: *App, v: f32) void {
         self.bpm_doc = std.math.clamp(v, model.bpm_min, model.bpm_max);
-        if (!self.isTargetBound(.{ .kind = .tempo })) self.bpm = self.bpm_doc;
+        if (!self.isTargetDriven(.{ .kind = .tempo })) self.bpm = self.bpm_doc;
     }
 
     /// 播放中的**小数步位置**（子步精度；未播放或域不匹配时 = 整数步）。
@@ -17645,7 +17657,7 @@ test "automation_value: 键入数值按显示单位解析（% / dB 静音 / 非�
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), app.autoCurve().?.points.items[0].value, 1e-6);
 }
 
-test "app: 右键输入值——通道/乐器 音量（dB）与声像（L/R/C）" {
+test "app: 右键输入值——通道/乐器 音量（dB）与声像（0..1）" {
     const alloc = std.testing.allocator;
     var app = App{ .allocator = alloc };
     defer app.clips.deinit(alloc);
@@ -17655,28 +17667,31 @@ test "app: 右键输入值——通道/乐器 音量（dB）与声像（L/R/C）
     _ = app.addInstrument("减法合成器");
 
     // 通道音量：**dB 输入**（推子锥度 gain = p² ⇒ 位置 = 10^(dB/40)）
-    // −12 dB → 位置 0.5012
     app.beginEditChannelVol(1, "-12.0", 0, 0, 60);
     app.textInputCommit();
     const p12 = 0.75 * std.math.pow(f32, 10.0, -12.0 / 40.0); // unity 0.75 · 10^(dB/40)
     try std.testing.expectApproxEqAbs(p12, app.mixer_channels_state.items[1].volume, 1e-4);
 
-    // 通道声像：L50 → 0.25；C → 0.5；R100 → 1.0
-    app.beginEditChannelPan(1, "L50", 0, 0, 60);
+    // 通道声像：**0..1 浮点**（0.5 = 居中；不再有 L/R/C 别名）
+    app.beginEditChannelPan(1, "0.25", 0, 0, 60);
     app.textInputCommit();
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), app.mixer_channels_state.items[1].pan, 1e-4);
-    app.beginEditChannelPan(1, "C", 0, 0, 60);
+    app.beginEditChannelPan(1, "0.5", 0, 0, 60);
     app.textInputCommit();
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), app.mixer_channels_state.items[1].pan, 1e-4);
-    app.beginEditChannelPan(1, "R100", 0, 0, 60);
+    app.beginEditChannelPan(1, "1.0", 0, 0, 60);
+    app.textInputCommit();
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), app.mixer_channels_state.items[1].pan, 1e-4);
+    // 旧别名已不接受 → 值不变
+    app.beginEditChannelPan(1, "C", 0, 0, 60);
     app.textInputCommit();
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), app.mixer_channels_state.items[1].pan, 1e-4);
 
-    // 乐器音量 / 声像（音量同样是 dB）
+    // 乐器音量 / 声像（音量同样是 dB；声像 0..1）
     app.beginEditInstVol(0, "0.0", 0, 0, 60);
     app.textInputCommit();
     try std.testing.expectApproxEqAbs(@as(f32, 0.75), app.instruments.items[0].volume, 1e-4); // 0 dB = 推子 0.75
-    app.beginEditInstPan(0, "L100", 0, 0, 60);
+    app.beginEditInstPan(0, "0.0", 0, 0, 60);
     app.textInputCommit();
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), app.instruments.items[0].pan, 1e-4);
 
@@ -18165,6 +18180,97 @@ test "automation: 拖动写回 = 推子显示值（起手不能从曲线值跳�
     try std.testing.expectApproxEqAbs(@as(f32, 0.7), app.autoValueFor(tgt, 0, w2), 1e-6);
 }
 
+test "automation: 空曲线不接管——UI 与音频一致（不跳静音 / BPM 不落到 10）" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.resetMixerChannels(2);
+    const uid1 = app.mixer_channels_state.items[1].uid;
+    const tgt = view_lane.Target{ .kind = .mixer_vol, .uid = uid1 };
+    app.mixer_channels_state.items[1].volume = 0.75;
+
+    // 绑定一条**没有点**的曲线
+    const cid = app.addAutoCurve("空");
+    try std.testing.expect(app.bindCurveTarget(cid, tgt));
+    // “有绑定”但**没在驱动**（两个概念分开：绑定 ≠ 在驱动）
+    try std.testing.expect(app.isTargetBound(tgt));
+    try std.testing.expect(!app.isTargetDriven(tgt));
+    // UI：回落静态值（旧行为会算成基准 0 → 推子画到静音）
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), app.autoValueFor(tgt, 0, 0.75), 1e-6);
+    // 音频：不发布车道 → 用静态推子（两边一致）
+    app.publishAutoLane();
+    {
+        const set = &app.params.lane_bufs[app.params.lane_pub.load(.monotonic)];
+        try std.testing.expectEqual(@as(usize, 0), set.countForChannel(1, false, false));
+    }
+
+    // tempo 同理：空曲线不应把 BPM 钉到 bpm_min
+    app.bpm_doc = 120;
+    app.bpm = 120;
+    const t_tempo = app.addAutoCurve("空速度");
+    try std.testing.expect(app.bindCurveTarget(t_tempo, .{ .kind = .tempo }));
+    try std.testing.expect(!app.isTargetDriven(.{ .kind = .tempo }));
+    app.applyTempoAt(0, 0.016);
+    try std.testing.expectApproxEqAbs(@as(f32, 120), app.bpm, 1e-3);
+
+    // 画上一个点 → 立刻“在驱动”（UI 与音频同时接管）
+    _ = app.curveById(cid).?.insertPoint(alloc, 0, 0.5);
+    try std.testing.expect(app.isTargetDriven(tgt));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), app.autoValueFor(tgt, 0, 0.75), 1e-6);
+    app.publishAutoLane();
+    {
+        const set = &app.params.lane_bufs[app.params.lane_pub.load(.monotonic)];
+        try std.testing.expectEqual(@as(usize, 1), set.countForChannel(1, false, false));
+    }
+}
+
+test "automation: 新建曲线并链接 → 曲线**为空**、参数不接管（用户自己决定在哪画）" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.resetMixerChannels(2);
+    const uid1 = app.mixer_channels_state.items[1].uid;
+    const tgt = view_lane.Target{ .kind = .mixer_vol, .uid = uid1 };
+    app.mixer_channels_state.items[1].volume = 0.4;
+
+    const cid = app.addAutoCurveForTarget(tgt) orelse return error.TestUnexpectedResult;
+    const lc = app.curveById(cid).?;
+    // **不自动插点**：我们猜不到用户想先在哪加（自动插了还得倒回去删）
+    try std.testing.expectEqual(@as(usize, 0), lc.points.items.len);
+    try std.testing.expect(app.isTargetBound(tgt));
+    try std.testing.expect(!app.isTargetDriven(tgt)); // 空曲线 = 未接管
+    // 链接前后完全一致：UI 用静态值、音频不发车道
+    inline for ([_]f32{ 0, 16, 500, 100000 }) |s| {
+        try std.testing.expectApproxEqAbs(@as(f32, 0.4), app.autoValueFor(tgt, s, 0.4), 1e-5);
+    }
+    app.publishAutoLane();
+    {
+        const set = &app.params.lane_bufs[app.params.lane_pub.load(.monotonic)];
+        try std.testing.expectEqual(@as(usize, 0), set.countForChannel(1, false, false));
+    }
+    // 曲线名按参数名自动生成；并自动选中它（编辑器直接停在这条上）
+    var name_buf: [48]u8 = undefined;
+    try std.testing.expect(lc.name(&name_buf).len > 0);
+    try std.testing.expectEqual(cid, app.auto_sel);
+
+    // 用户画下第一个点之后才接管
+    _ = app.curveById(cid).?.insertPoint(alloc, 24, 0.2);
+    try std.testing.expect(app.isTargetDriven(tgt));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), app.autoValueFor(tgt, 24, 0.4), 1e-5);
+
+    // tempo 同样：新建后曲线为空、BPM 不变（不会落到 10）
+    app.bpm_doc = 120;
+    app.bpm = 120;
+    const tcid = app.addAutoCurveForTarget(.{ .kind = .tempo }) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), app.curveById(tcid).?.points.items.len);
+    app.applyTempoAt(0, 0.016);
+    try std.testing.expectApproxEqAbs(@as(f32, 120), app.bpm, 1e-3);
+}
+
 test "automation: 新建曲线按参数名自动命名（重名加序号）" {
     const alloc = std.testing.allocator;
     var app = App{ .allocator = alloc };
@@ -18219,7 +18325,6 @@ test "automation: 基准值可编辑 + 控件右键恢复默认（base/bipolar�
     // 默认：base = null → **类型默认 0**（曲线就是推子位置）；极性单向
     try std.testing.expect(app.auto_bindings.items[bi].base == null);
     try std.testing.expectEqual(@as(f32, 0.0), view_lane.Target.defaultBase(tgt.kind));
-    try std.testing.expectEqual(audio.fader_unity_pos, view_lane.Target.unity_pos); // 位置↔dB 同源
     try std.testing.expect(!app.auto_bindings.items[bi].bipolar);
 
     // 合成值 = 0（基准）+ 0.5（曲线）= 0.5
