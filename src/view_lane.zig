@@ -50,9 +50,12 @@ pub const EditKind = enum {
 pub const Point = struct {
     step: i32,
     value: f32,
-    /// 本段（到下一个点）的弯曲量；0 = 直线。正 = 向上鼓
+    /// 本段（到下一个点）的弯曲量；0 = 直线。正 = 向上鼓。
+    /// **单位是值域**（不是归一化 0..1）：手柄会被夹到**两端值之间**，
+    /// 所以能拖出的极限就是“顶到 上/下 边界”（`curveFromHandle` 保证）。
     curve: f32 = 0,
-    /// 本段弯曲的**峰值位置**（0..1；0.5 = 正中）。左右拖曲率手柄改它
+    /// **曲率手柄的横向位置**（0..1；0.5 = 正中）。左右拖曲率手柄改它。
+    /// 它就是段形状的**控制点 x**：弯曲最鼓的地方大约在这里（不是严格的峰值坐标）。
     pivot: f32 = 0.5,
     /// **出生序号**：同一步可以有多个点（形成垂直断崖），组内顺序 = 出生顺序
     seq: u32 = 0,
@@ -300,49 +303,50 @@ const handle_half: i32 = 5; // 曲率手柄半宽（菱形）
 /// 理由：太小时手柄必然与锚点抢点击（用户实测“分不开”），不如直接让位给锚点。
 const handle_min_extent: f32 = 20;
 
-/// **段形状（主流 DAW 手感）**：折线 `A → H → B` + 在 H 处**倒圆角**。
-/// - H = `(pivot, 直连线值 + curve)`（即曲率手柄所在点）；
-/// - 两个锚点处是**真的折角**（拉到底时就是直角），只有 H 附近被抹圆；
-/// - `curve == 0` 时三点共线 → 整段直线。
-/// 旧实现是“平滑鼓包”（`bell`），它让两端零斜率 → 拉到底时两侧变成 S 形波浪，与主流 DAW 不符。
+/// **段形状（有理二次贝塞尔 / conic）**——曲率手柄是**控制点**（悬浮，**曲线不穿过它**）。
+///
+/// ```
+/// v(t) = 弦值(t) + φ(u)·d          φ(u) = 2w·u(1−u) / D(u)
+/// D(u) = (1−u)² + 2w·u(1−u) + u²   d = h − 弦值(pivot)   h = 控制点值（已夹在两端值内）
+/// ```
+///
+/// - 手柄仍是 `(pivot, 弦值+curve)`（旧公式不变）→ **交互/存档零变动**；
+/// - `u` 由 x = t 反解：`x(u)` 的控制点横坐标是 `(0, p, 1)`（单调）⇒ 有理贝塞尔保单调
+///   ⇒ 区间内**唯一根**，一次二次求根即可（不迭代）；
+/// - **`φ ≤ w/(w+1)`**（w=3 → 75%）：曲线最多弯到手柄偏移的 75%，**永不穿过手柄、永不越界**
+///   （conic 凸包：控制点值在两端值之间）；
+/// - `curve == 0`（手柄在弦上）→ d=0 → **整段直线**（与 w 无关）；
+/// - **单弧**：conic 无拐点。历史：v0 抛物鼓包（两端零斜率 → S 形）、
+///   “直线+倒圆角”（弯折集中 → 硬）、双三次两段（切向选择导致 S 形）都被它替掉。
 pub fn segEval(a: f32, b: f32, pivot: f32, curve: f32, t_in: f32) f32 {
     const p = std.math.clamp(pivot, 0.0, 1.0);
     const t = std.math.clamp(t_in, 0.0, 1.0);
-    // 折点值也被夹在两端值之间（**模型层就不过冲**；UI 已通过 `curveFromHandle` 预夹一次）
+    // 控制点值也夹在两端值之间（**模型层就不过冲**；UI 已通过 `curveFromHandle` 预夹一次）
     const lo = @min(a, b);
     const hi = @max(a, b);
     const h = std.math.clamp(a + (b - a) * p + curve, lo, hi);
-    // pivot 在两端 → 退化成从 H（或到 H）的直线（pivot=0 时相当于段首跳变）
-    if (p <= 1e-5) return h + (b - h) * t;
-    if (p >= 1.0 - 1e-5) return a + (h - a) * t;
-    // 倒角：两侧各取 25% 长度作为圆角过渡区
-    const f: f32 = 0.25;
-    const x1 = p * (1.0 - f);
-    const x2 = p + (1.0 - p) * f;
-    const v1 = a + (h - a) * (1.0 - f);
-    const v2 = h + (b - h) * f;
-    if (t <= x1) return a + (h - a) * (t / p); // A → H 的直线段
-    if (t >= x2) return h + (b - h) * ((t - p) / (1.0 - p)); // H → B 的直线段
-    // 圆角：以 (x1,v1) / (p,h) / (x2,v2) 为控制点的二次贝塞尔；
-    // 先由 t 反解 u（x(u) 单调），再取 v(u)。
-    const e2 = x1 - 2.0 * p + x2;
-    const e1 = 2.0 * (p - x1);
-    const e0 = x1 - t;
-    var u: f32 = 0.5;
-    if (@abs(e2) < 1e-6) {
-        u = if (@abs(e1) < 1e-6) 0.5 else -e0 / e1;
+    // **不要**在 `pivot` 贴边（p≈0/1）时另走直线分支——那会让曲线“突然变硬折线”（实测反馈）。
+    // conic 在 p=0/1 也有定义且与 p→0⁺/1⁻ **连续**，让它自己渐进即可。
+    // 权重：越大越贴手柄（φ_max = w/(w+1)）；3 → 75%
+    const w: f32 = 3.0;
+    // 由 x=t 反解参数 u：x(u) = [2wp·u(1−u) + u²] / D  →  A u² + B u + C = 0
+    const qa = 1.0 - 2.0 * w * p - 2.0 * t * (1.0 - w);
+    const qb = 2.0 * w * p - 2.0 * t * (w - 1.0);
+    var u: f32 = t;
+    if (@abs(qa) < 1e-6) {
+        if (@abs(qb) > 1e-6) u = t / qb;
     } else {
-        const disc = @max(0.0, e1 * e1 - 4.0 * e2 * e0);
+        const disc = @max(0.0, qb * qb + 4.0 * qa * t);
         const sq = @sqrt(disc);
-        const ur1 = (-e1 + sq) / (2.0 * e2);
-        const ur2 = (-e1 - sq) / (2.0 * e2);
-        u = if (ur1 >= -0.001 and ur1 <= 1.001) ur1 else ur2;
+        const r1 = (-qb + sq) / (2.0 * qa);
+        const r2 = (-qb - sq) / (2.0 * qa);
+        u = if (r1 >= -0.001 and r1 <= 1.001) r1 else r2;
     }
     u = std.math.clamp(u, 0.0, 1.0);
-    const w0 = (1.0 - u) * (1.0 - u);
-    const w1 = 2.0 * u * (1.0 - u);
-    const w2 = u * u;
-    return w0 * v1 + w1 * h + w2 * v2;
+    const dnom = 1.0 + (2.0 * w - 2.0) * u + (2.0 - 2.0 * w) * u * u;
+    const phi = (2.0 * w * u * (1.0 - u)) / @max(dnom, 1e-6);
+    const d = h - (a + (b - a) * p);
+    return a + (b - a) * t + phi * d;
 }
 
 /// 把值 0..1 映射到 y（1 在上）
@@ -419,8 +423,9 @@ fn handleTooSmall(a: Point, b: Point, x: i32, step_px: f32, zoom: f32, scroll_s:
     return @as(f32, @floatFromInt(h)) * @abs(b.value - a.value) < handle_min_extent;
 }
 
-/// 段内曲率手柄位置（主流 DAW 手感）：**x 由 `pivot` 决定**（左右可拖）、y = 曲线在该处的值。
-/// 手柄始终贴在曲线上，且被夹在两个锚点构成的平行四边形内（x ∈ [x1,x2]，值 ∈ [两端值]）。
+/// 段内曲率手柄位置：**x 由 `pivot` 决定**（左右可拖），y = **控制点值**（弦值 + `curve`）。
+/// 手柄被夹在两个锚点构成的平行四边形内（x ∈ [x1,x2]，值 ∈ [两端值]）；
+/// 它**不落在曲线上**——它是 conic 的**控制点**，曲线朝它鼓、最多弯到它 75% 处（w=3）。
 fn curveHandlePos(lane: *const Lane, i: usize, x: i32, y: i32, h: i32, step_px: f32, zoom: f32, scroll_s: f32) ?struct { x: i32, y: i32 } {
     const ps = lane.points.items;
     if (i + 1 >= ps.len) return null;
@@ -788,46 +793,77 @@ test "view_lane: 同一步多点 = 垂直断崖（左取组内最左、右取组
     try std.testing.expectApproxEqAbs(@as(f32, 0.1 + 0.4 * 0.5), lane.evalAt(72.0), 1e-6);
 }
 
-test "view_lane: 曲率手柄可左右挪（pivot）——折点跟着手柄走" {
+test "view_lane: 曲率手柄可左右挪（pivot）——弯曲最鼓处跟着手柄走" {
     const a = std.testing.allocator;
     var lane = Lane{ .interp = .smooth };
     defer lane.deinit(a);
     _ = lane.insertPoint(a, 0, 0.2);
     _ = lane.insertPoint(a, 96, 0.8);
     const p = &lane.points.items[0];
-    p.pivot = 0.25; // 手柄拖到左侧 1/4
-    p.curve = curveFromHandle(0.2, 0.8, 0.25, 0.65); // 手柄停在 0.65（直连线 0.35 + 0.3）
-    // 远离折点的两侧 = 向手柄的**直线**（不是向弦线）
-    try std.testing.expectApproxEqAbs(@as(f32, 0.29), lane.evalAt(4.8), 5e-3); // t=0.05：0.2+(0.65-0.2)*0.2
-    try std.testing.expectApproxEqAbs(@as(f32, 0.79), lane.evalAt(91.2), 5e-3); // t=0.95：0.65+(0.8-0.65)*0.9333
-    // 折点处被抬到 0.65 附近（手柄位置；倒圆角会让它略内收一点）
-    try std.testing.expectApproxEqAbs(@as(f32, 0.65), lane.evalAt(24.0), 6e-2);
-    // pivot 挪到 0.75：此时手柄落回直连线上 → 整段就是直线
+    // 端点精确穿过锚点
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), lane.evalAt(0), 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), lane.evalAt(96), 1e-5);
+
+    // 手柄（= 控制点）停在 0.65（弦值 + curve）；曲线朝它鼓，**最多弯到偏移的 75%**（w=3），
+    // 而且“最鼓的地方”跟着 pivot 走。
+    inline for ([_]f32{ 0.25, 0.4 }) |want_pivot| {
+        p.pivot = want_pivot;
+        p.curve = curveFromHandle(0.2, 0.8, want_pivot, 0.65);
+        var best_dev: f32 = -1;
+        var best_x: f32 = 0;
+        var st: f32 = 0;
+        while (st <= 96) : (st += 1) {
+            const chord = 0.2 + 0.6 * (st / 96.0);
+            const dev = lane.evalAt(st) - chord;
+            if (dev > best_dev) {
+                best_dev = dev;
+                best_x = st / 96.0;
+            }
+        }
+        const d = 0.65 - (0.2 + 0.6 * want_pivot); // 手柄离弦的距离
+        try std.testing.expectApproxEqAbs(d * 0.75, best_dev, 5e-3); // 75% 封顶
+        try std.testing.expect(@abs(best_x - want_pivot) < 0.10); // 最鼓处跟着 pivot
+    }
+
+    // pivot 挪到 0.75：手柄落回直连线上（curve = 0）→ 整段就是直线
     p.pivot = 0.75;
     p.curve = curveFromHandle(0.2, 0.8, 0.75, 0.65);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), p.curve, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0.65), lane.evalAt(72.0), 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.35), lane.evalAt(24.0), 1e-4);
 }
 
-test "view_lane: 段形状 = 折线 A→H→B + H 处倒圆角（主流 DAW 手感）" {
+test "view_lane: 段形状 = 有理二次（conic）——单弧、不过冲、手柄不穿过" {
     const a = std.testing.allocator;
     var lane = Lane{ .interp = .smooth };
     defer lane.deinit(a);
     _ = lane.insertPoint(a, 0, 0.8); // 左高
     _ = lane.insertPoint(a, 96, 0.2); // 右低
     lane.points.items[0].pivot = 0.5;
-    lane.points.items[0].curve = curveFromHandle(0.8, 0.2, 0.5, -9.9); // 拉到底 → H = 0.2
+    lane.points.items[0].curve = curveFromHandle(0.8, 0.2, 0.5, -9.9); // 拉到底 → 控制点被夹到 0.2
     // 两端精确穿过锚点
     try std.testing.expectApproxEqAbs(@as(f32, 0.8), lane.evalAt(0), 1e-5);
     try std.testing.expectApproxEqAbs(@as(f32, 0.2), lane.evalAt(96), 1e-5);
-    // **两侧是直线**（这才是主流 DAW 的手感；旧“平滑鼓包”会变成 S 形波浪）
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), lane.evalAt(24), 1e-3);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.2), lane.evalAt(72), 1e-3);
-    // 手柄处是**圆角**：比折点（0.2）略内收一点，既不是尖角也不是鼓包
-    const corner = lane.evalAt(48);
-    try std.testing.expect(corner > 0.2 and corner < 0.35);
+    // 手柄处只弯到偏移的 75%（w=3）：弦值 0.5 + 0.75×(0.2−0.5) = 0.275
+    try std.testing.expectApproxEqAbs(@as(f32, 0.275), lane.evalAt(48), 5e-3);
+    // **单弧**：离弦的**距离**从 0 涨到峰、再回 0（只有一个起伏 = 无反曲点）
+    var prev_mag: f32 = 0;
+    var rising = true;
+    var st: i32 = 1;
+    while (st <= 95) : (st += 1) {
+        const chord = 0.8 - 0.6 * (@as(f32, @floatFromInt(st)) / 96.0);
+        const mag = @abs(lane.evalAt(@floatFromInt(st)) - chord);
+        if (rising) {
+            if (mag < prev_mag - 1e-6) rising = false;
+        } else {
+            try std.testing.expect(mag <= prev_mag + 1e-6);
+        }
+        prev_mag = mag;
+    }
+    try std.testing.expect(!rising); // 既有上升段也有下降段（而不是一直单向）
     // 全程单调下降，且永不越出两端值（不过冲）
     var prev: f32 = 1.0;
-    var st: i32 = 0;
+    st = 0;
     while (st <= 96) : (st += 1) {
         const v = lane.evalAt(@floatFromInt(st));
         try std.testing.expect(v <= prev + 1e-6);
@@ -1373,11 +1409,10 @@ test "evalAt: 连续求值（小数步）——linear 段中点、smooth 鼓包�
         prev = v;
     }
 
-    // smooth：折点被抬到 0.9（手柄位置），圆角内收 → 中点略低于 0.9
+    // smooth：手柄抬到 0.9，conic 只弯到偏移的 75%（w=3）→ 中点 = 0.5 + 0.75×0.4 = 0.8
     lane.interp = .smooth;
     lane.points.items[0].curve = 0.4;
-    try std.testing.expect(lane.evalAt(@as(f32, 48)) > 0.8);
-    try std.testing.expect(lane.evalAt(@as(f32, 48)) < 0.9);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), lane.evalAt(@as(f32, 48)), 5e-3);
     // hold：整段保持左值
     lane.interp = .hold;
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), lane.evalAt(@as(f32, 95.9)), 1e-5);

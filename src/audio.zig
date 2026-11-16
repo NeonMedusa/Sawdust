@@ -153,40 +153,33 @@ pub const LaneSnap = struct {
     /// 峰值位置（0..1；0.5 = 正中）——与 `view_lane.Point.pivot` 同义
     pivots: [64]f32 = @splat(0.5),
 
-    /// **段形状**（与 `view_lane.segEval` 逐字一致）：折线 A→H→B + H 处倒圆角
+    /// **段形状**（与 `view_lane.segEval` 逐字一致）：有理二次贝塞尔（conic）——
+    /// 曲率手柄是**控制点**（曲线朝它鼓、最多弯到它的 75%，w=3），`curve == 0` 时退化成直线。
     fn segEval(a: f32, b: f32, pivot: f32, curve: f32, t_in: f32) f32 {
         const p = std.math.clamp(pivot, 0.0, 1.0);
         const t = std.math.clamp(t_in, 0.0, 1.0);
         const lo = @min(a, b);
         const hi = @max(a, b);
         const h = std.math.clamp(a + (b - a) * p + curve, lo, hi);
-        if (p <= 1e-5) return h + (b - h) * t;
-        if (p >= 1.0 - 1e-5) return a + (h - a) * t;
-        const f: f32 = 0.25;
-        const x1 = p * (1.0 - f);
-        const x2 = p + (1.0 - p) * f;
-        const v1 = a + (h - a) * (1.0 - f);
-        const v2 = h + (b - h) * f;
-        if (t <= x1) return a + (h - a) * (t / p);
-        if (t >= x2) return h + (b - h) * ((t - p) / (1.0 - p));
-        const e2 = x1 - 2.0 * p + x2;
-        const e1 = 2.0 * (p - x1);
-        const e0 = x1 - t;
-        var u: f32 = 0.5;
-        if (@abs(e2) < 1e-6) {
-            u = if (@abs(e1) < 1e-6) 0.5 else -e0 / e1;
+        // 不做 p≈0/1 的直线退化（与 `view_lane.segEval` 逐字一致：那会让曲线突然变折线）
+        const w: f32 = 3.0;
+        const qa = 1.0 - 2.0 * w * p - 2.0 * t * (1.0 - w);
+        const qb = 2.0 * w * p - 2.0 * t * (w - 1.0);
+        var u: f32 = t;
+        if (@abs(qa) < 1e-6) {
+            if (@abs(qb) > 1e-6) u = t / qb;
         } else {
-            const disc = @max(0.0, e1 * e1 - 4.0 * e2 * e0);
+            const disc = @max(0.0, qb * qb + 4.0 * qa * t);
             const sq = @sqrt(disc);
-            const ur1 = (-e1 + sq) / (2.0 * e2);
-            const ur2 = (-e1 - sq) / (2.0 * e2);
-            u = if (ur1 >= -0.001 and ur1 <= 1.001) ur1 else ur2;
+            const r1 = (-qb + sq) / (2.0 * qa);
+            const r2 = (-qb - sq) / (2.0 * qa);
+            u = if (r1 >= -0.001 and r1 <= 1.001) r1 else r2;
         }
         u = std.math.clamp(u, 0.0, 1.0);
-        const w0 = (1.0 - u) * (1.0 - u);
-        const w1 = 2.0 * u * (1.0 - u);
-        const w2 = u * u;
-        return w0 * v1 + w1 * h + w2 * v2;
+        const dnom = 1.0 + (2.0 * w - 2.0) * u + (2.0 - 2.0 * w) * u * u;
+        const phi = (2.0 * w * u * (1.0 - u)) / @max(dnom, 1e-6);
+        const d = h - (a + (b - a) * p);
+        return a + (b - a) * t + phi * d;
     }
 
     /// **连续**求值（小数步）；`n == 0` → -1（= 无曲线）。
