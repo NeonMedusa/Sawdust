@@ -121,8 +121,7 @@ fn findFirstModule(io: std.Io, alloc: std.mem.Allocator, dir_path: []const u8, e
 
 /// 解析 .vst3 目录包的模块路径：按 VST3 规范找 `Contents/<arch>/` 下的模块；
 /// 找不到 → 包根兜底（加载会失败，但错误对外可见）。
-fn addBundle(io: std.Io, alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(Candidate), bundle_root: []const u8) !void {
-    var found: ?[]u8 = null;
+fn resolveBundleDll(io: std.Io, alloc: std.mem.Allocator, bundle_root: []const u8) ![]u8 {
     for (bundle_subs) |sub| {
         var buf: [1024]u8 = undefined;
         const dir_path: []const u8 = if (sub.len == 0)
@@ -130,12 +129,28 @@ fn addBundle(io: std.Io, alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(
         else
             std.fmt.bufPrint(&buf, "{s}/{s}", .{ bundle_root, sub }) catch continue;
         for (module_exts) |ext| {
-            found = findFirstModule(io, alloc, dir_path, ext);
-            if (found != null) break;
+            if (findFirstModule(io, alloc, dir_path, ext)) |found| return found;
         }
-        if (found != null) break;
     }
-    const dll = found orelse try alloc.dupe(u8, bundle_root);
+    return alloc.dupe(u8, bundle_root);
+}
+
+/// **诊断入口用**：把用户给的路径归一成“可加载的模块路径”——
+/// 目录（`.vst3` 包）→ 包内 `Contents/<arch>/` 的模块；普通文件 → 自身。
+/// （扫描器内部走 `addBundle`；这里给 `--buses` 这类直接拿路径去 `dlopen` 的用法。）
+pub fn resolveModulePath(io: std.Io, alloc: std.mem.Allocator, path: []const u8) ![]u8 {
+    const is_dir = blk: {
+        var d = std.Io.Dir.cwd().openDir(io, path, .{}) catch break :blk false;
+        d.close(io);
+        break :blk true;
+    };
+    if (!is_dir) return alloc.dupe(u8, path);
+    return resolveBundleDll(io, alloc, path);
+}
+
+/// 解析 .vst3 目录包的模块路径（内部）：解析后作为候选加入
+fn addBundle(io: std.Io, alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(Candidate), bundle_root: []const u8) !void {
+    const dll = try resolveBundleDll(io, alloc, bundle_root);
     defer alloc.free(dll);
     try addCandidate(alloc, out, bundle_root, dll);
 }

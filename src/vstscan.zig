@@ -95,17 +95,24 @@ pub fn cliMain(init: std.process.Init) !u8 {
         };
         return 0;
     }
-    // `vstscan --buses <文件.vst3>`：打印音频总线布局
-    // （多输出插件支持前后的探测：总线数/类型/通道数/默认激活位）
+    // `vstscan --buses <路径>`：打印音频总线布局（多输出插件支持前后的探测：
+    // 总线数/类型/通道数/默认激活位）。路径可以是 `.vst3` **包目录**——
+    // 先解析成包内 `Contents/<arch>/` 的模块再加载（与扫描器同一套解析）。
     if (nd > 0 and std.mem.eql(u8, dirs[0], "--buses")) {
         const p = if (nd > 1) dirs[1] else {
-            std.debug.print("用法：Sawdust --vst-scan --buses <文件.vst3>\n", .{});
+            std.debug.print("用法：Sawdust --vst-scan --buses <文件.vst3 | .vst3 包目录 | 模块.so>", .{});
+            std.debug.print("\n", .{});
             return 1;
         };
-        const pz = alloc.dupeSentinel(u8, p, 0) catch return 1;
+        const module_path = vst_scan.resolveModulePath(io, alloc, p) catch {
+            std.debug.print("路径解析失败：{s}\n", .{p});
+            return 1;
+        };
+        defer alloc.free(module_path);
+        const pz = alloc.dupeSentinel(u8, module_path, 0) catch return 1;
         defer alloc.free(pz);
         host.dumpBuses(pz) catch |e| {
-            std.debug.print("探测失败：{s}\n", .{@errorName(e)});
+            std.debug.print("探测失败：{s}（路径 {s}）\n", .{ @errorName(e), module_path });
             return 1;
         };
         return 0;

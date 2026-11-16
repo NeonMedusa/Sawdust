@@ -8,6 +8,7 @@
 //! 软参数列表仅在**没有自带 GUI** 的插件正文里出现）。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const r_mod = @import("render.zig");
 const Ui = @import("ui.zig").Ui;
 const app_mod = @import("app.zig");
@@ -15,6 +16,7 @@ const App = app_mod.App;
 const eq = @import("eq.zig");
 const fx = @import("effects.zig");
 const util = @import("view_util.zig");
+const view_vst_auto = @import("view_vst_auto.zig");
 const model = @import("model.zig");
 
 const win_title_h: i32 = 22;
@@ -227,18 +229,41 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
 /// 参数面板（混响/延迟/压缩器）：纵列 = 名称 + 旋钮 + 数值
 /// 注：干湿（mix）不在此列——它在**调音台效果链行**的旋钮里（同一数据，避免两个入口）
 fn drawParamPanel(ui: *Ui, app: *App, es: *app_mod.EffectSlot, px: i32, py: i32, pw: i32, ph: i32) void {
-    // VST3 插件：界面已嵌在内容区（子窗口）时不画软层；否则头部信息 + 参数列表
     if (es.kind == .plugin) {
-        if (es.plugin) |p| {
-            if (p.view != null) return; // 嵌入中：子窗口覆盖内容区
+        // Windows：编辑器嵌在内容区（原生子窗口覆盖）→ 不画软层，直接让子窗口占满
+        // Linux：编辑器是**独立顶层窗口** → 正文照常画（UI 开关 + 自动化正文），与乐器面板对齐
+        if (comptime builtin.os.tag != .linux) {
+            if (es.plugin) |p| {
+                if (p.view != null) return;
+            }
         }
         const pl = es.plugin;
-        // ── 头部：名称；路径 · 延迟（无按钮：插件界面直接嵌在下方）──
+        var yy = py + 4;
+        // ── Linux：「打开 / 关闭插件 UI（独立窗口）」——没有它，用户关掉插件窗口后就回不来 ──
+        if (comptime builtin.os.tag == .linux) {
+            if (pl) |p| {
+                if (!p.editor_no_ui) {
+                    const is_open = app.vst_editor_owner == p;
+                    const label: []const u8 = if (is_open) "关闭插件 UI（独立窗口）" else "打开插件 UI（独立窗口）";
+                    if (ui.button(7901, label, px, yy, pw, 24)) {
+                        if (is_open) {
+                            p.setEditorVisible(false);
+                            app.vst_editor_owner = null;
+                        } else {
+                            p.showEditorAt(240, 200);
+                            app.vst_editor_owner = p;
+                        }
+                    }
+                    yy += 30;
+                }
+            }
+        }
+        // ── 头部：名称；路径 · 延迟 ──
         {
             const name_t = if (pl) |p| p.name() else "（未加载）";
-            ui.labelClipped(name_t, px + 8, py + 4, pw - 16, if (es.load_failed) ui.theme.danger else ui.theme.text);
+            ui.labelClipped(name_t, px + 8, yy, pw - 16, if (es.load_failed) ui.theme.danger else ui.theme.text);
         }
-        var yy = py + 28;
+        yy += 24;
         {
             var lb: [48]u8 = undefined;
             const lat_t = if (pl) |p| (std.fmt.bufPrint(&lb, " · 延迟 {d}", .{p.latency}) catch "") else "";
@@ -248,13 +273,18 @@ fn drawParamPanel(ui: *Ui, app: *App, es: *app_mod.EffectSlot, px: i32, py: i32,
         }
         yy += 18;
 
-        // 滚动状态挂在窗口面板引用上（切换效果槽时自动归零）
-        var dummy_scroll: i32 = 0;
-        const scroll_p: *i32 = if (app.mixer_win.panel) |*pref| &pref.scroll else &dummy_scroll;
         const ref: app_mod.PluginSlotRef = if (app.mixer_win.panel) |pref|
             .{ .kind = .fx, .a = @intCast(pref.ch), .b = @intCast(pref.slot) }
         else
             .{ .kind = .fx };
+        // Linux：正文直接放**自动化三段式**（与乐器面板同一份）——参数表/已链接/自动化全在一起
+        if (comptime builtin.os.tag == .linux) {
+            view_vst_auto.drawBody(ui, app, ref, 7902, px, yy, pw, py + ph - yy);
+            return;
+        }
+        // 滚动状态挂在窗口面板引用上（切换效果槽时自动归零）
+        var dummy_scroll: i32 = 0;
+        const scroll_p: *i32 = if (app.mixer_win.panel) |*pref| &pref.scroll else &dummy_scroll;
         util.drawPluginParamList(ui, app, pl, es.load_failed, scroll_p, ref, 7900, px, py, pw, ph, yy);
         return;
     }
