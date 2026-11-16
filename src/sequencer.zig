@@ -92,7 +92,7 @@ fn makeEv(nt: model.Note, kind: synth.EventKind, step: i32, sched: *const Schedu
         .end_step = end_step,
         .gen = sched.gen,
         .velocity = @intCast(std.math.clamp(nt.velocity, 1, 127)),
-        .pan = @intCast(std.math.clamp(nt.pan, 0, 127)),
+        .pan = std.math.clamp(nt.pan, 0.0, 1.0),
     };
 }
 
@@ -107,7 +107,7 @@ pub fn makeEvent(
     on_step: i32,
     end_step: i32,
     velocity: i32,
-    pan: i32,
+    pan: f32,
 ) synth.SchedEvent {
     return .{
         .kind = kind,
@@ -118,7 +118,7 @@ pub fn makeEvent(
         .end_step = end_step,
         .gen = sched.gen,
         .velocity = @intCast(std.math.clamp(velocity, 1, 127)),
-        .pan = @intCast(std.math.clamp(pan, 0, 127)),
+        .pan = std.math.clamp(pan, 0.0, 1.0),
     };
 }
 

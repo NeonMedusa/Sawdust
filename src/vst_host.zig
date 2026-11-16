@@ -420,13 +420,42 @@ pub const ParamMeta = struct {
     }
 };
 
-/// 宿主侧 IParamValueQueue：一条参数在本块内的单点（offset 0）
+/// 用户接管自动化的默认时长（块数）——按常见 128~512 帧块折算 ≈ 0.3~0.4s，
+/// 与 v1 的 400ms touch 窗口同量级。
+pub const user_takeover_blocks: u32 = 30;
+
+/// 宿主侧 IParamValueQueue：**一条参数在本段内的多个点**（v2：自动化要块内两点）。
+/// - 手动拧（UI → `pend` 环）：单点，offset 0（“本块一开头就生效”）；
+/// - 自动化（音频线程）：两点，offset 0 与 frames−1 → 插件自己块内插值。
 const ParamValueQueue = extern struct {
+    /// 每条队列的点数上限（≥ 2 个端点就够；留余量给“手动 + 自动化”共存）
+    pub const max_points: usize = 4;
+
     iface: ivstparameterchanges.IParamValueQueue = .{ .vtable = &vtable },
     ref_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
     id: u32 = 0,
-    value: f64 = 0,
-    used: bool = false,
+    n: u32 = 0,
+    offsets: [max_points]i32 = @splat(0),
+    values: [max_points]f64 = @splat(0),
+
+    pub fn reset(self: *ParamValueQueue, id_: u32) void {
+        self.id = id_;
+        self.n = 0;
+    }
+
+    /// 追加一个点（offset 必须不降；满了就丢——宁可丢最后一个点也不踩内存）
+    pub fn add(self: *ParamValueQueue, offset: i32, value: f64) void {
+        if (self.n >= max_points) {
+            // 满了：**覆盖最后一个**（保证“末端值”总是最新——自动化靠它收尾）
+            self.offsets[max_points - 1] = @max(offset, 0);
+            self.values[max_points - 1] = value;
+            return;
+        }
+        const i: usize = self.n;
+        self.offsets[i] = @max(offset, 0);
+        self.values[i] = value;
+        self.n += 1;
+    }
 
     fn owner(ptr: *anyopaque) *ParamValueQueue {
         return @fieldParentPtr("iface", @as(*ivstparameterchanges.IParamValueQueue, @ptrCast(@alignCast(ptr))));
@@ -450,13 +479,14 @@ const ParamValueQueue = extern struct {
         return owner(ptr).id;
     }
     fn getPointCount(ptr: *anyopaque) callconv(.c) btypes.int32 {
-        return if (owner(ptr).used) 1 else 0;
+        return @intCast(owner(ptr).n);
     }
     fn getPoint(ptr: *anyopaque, index: btypes.int32, sample_offset: *btypes.int32, value: *vsttypes.ParamValue) callconv(.c) btypes.tresult {
         const self = owner(ptr);
-        if (index != 0 or !self.used) return btypes.kResultFalse;
-        sample_offset.* = 0;
-        value.* = self.value;
+        if (index < 0 or @as(u32, @intCast(index)) >= self.n) return btypes.kResultFalse;
+        const i: usize = @intCast(index);
+        sample_offset.* = self.offsets[i];
+        value.* = self.values[i];
         return btypes.kResultOk;
     }
     fn addPoint(_: *anyopaque, _: btypes.int32, _: vsttypes.ParamValue, _: *btypes.int32) callconv(.c) btypes.tresult {
@@ -476,14 +506,17 @@ const ParamValueQueue = extern struct {
 
 /// 宿主侧 IParameterChanges：包住本块弹出的若干 ParamValueQueue
 const ParamChanges = struct {
+    /// 队列数上限（与 `Plugin.in_queues` 同尺寸）
+    pub const max_queues: usize = 16;
+
     iface: ivstparameterchanges.IParameterChanges = .{ .vtable = &vtable },
     ref_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
     count: u32 = 0,
-    queues: [8]*ivstparameterchanges.IParamValueQueue = undefined,
+    queues: [max_queues]*ivstparameterchanges.IParamValueQueue = undefined,
 
     /// 绑定所属 Plugin 的队列数组（地址稳定；加载时调一次）
-    fn setQueues(self: *ParamChanges, src: *[8]ParamValueQueue) void {
-        for (0..8) |i| self.queues[i] = &src[i].iface;
+    fn setQueues(self: *ParamChanges, src: *[max_queues]ParamValueQueue) void {
+        for (0..max_queues) |i| self.queues[i] = &src[i].iface;
     }
 
     fn owner(ptr: *anyopaque) *ParamChanges {
@@ -932,6 +965,9 @@ pub fn dumpBuses(path: [:0]const u8) !void {
     inline for ([_]struct { d: icomp.BusDirections, t: icomp.MediaTypes, label: []const u8 }{
         .{ .d = .kInput, .t = .kAudio, .label = "in" },
         .{ .d = .kOutput, .t = .kAudio, .label = "out" },
+        // **事件总线**（ports）：多端口/MIDI 多音色插件的“端口”就是它；我们宿主只开 1 条
+        .{ .d = .kInput, .t = .kEvent, .label = "ev-in" },
+        .{ .d = .kOutput, .t = .kEvent, .label = "ev-out" },
     }) |side| {
         const n = component.vtable.getBusCount(raw_component, @backingInt(side.t), @backingInt(side.d));
         std.debug.print("[{s}] 总线数 {d}\n", .{ side.label, n });
@@ -1025,9 +1061,17 @@ pub const Plugin = struct {
     pend: [8]ParamMsg = @splat(.{ .id = 0, .value = 0 }),
     pend_head: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     pend_tail: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    /// 音频线程组装 inputParameterChanges 的预分配容器
-    in_queues: [8]ParamValueQueue = @splat(.{}),
+    /// 音频线程组装 inputParameterChanges 的预分配容器（**16**：手动 + 自动化可能同一段里共存）
+    in_queues: [16]ParamValueQueue = @splat(.{}),
     in_changes: ParamChanges = .{},
+    /// **自动化暂存**（音频线程写、本段 `process` 消费）：每条 = 参数 + 段首/段末两个值
+    auto_n: usize = 0,
+    auto_ids: [16]u32 = @splat(0),
+    auto_v0: [16]f32 = @splat(0),
+    auto_v1: [16]f32 = @splat(0),
+    /// **用户接管闸门**（v2 touch 语义）：UI 手动拧了参数 → 置正数（= 跳过自动化的**块数**），
+    /// 音频线程每段递减；> 0 时本段不写自动化（手动值先赢）。
+    auto_skip_blocks: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// VSTi：本段输入事件（processInstrument 填充；段边界 = 事件时刻）
     in_events: EventList = .{},
     /// 每块填充的进程上下文（tempo/拍号/播放位置/ppq；复用同一实例）
@@ -1136,6 +1180,30 @@ pub const Plugin = struct {
         _ = c.vtable.setParamNormalized(rc, self.params[idx].id, v);
         self.pushParamMsg(self.params[idx].id, v);
         self.cacheSet(idx, v); // 缓存跟随宿主写入（编辑器侧由排空时同步）
+        // **touch 语义（v2）**：人一拧 → 自动化先让路（~0.35s）
+        self.noteUserTakeover();
+    }
+
+    /// 用户接管：让自动化停手若干块（约 0.35s；块大小变化下允许浮动）。
+    /// 音频线程每段递减到 0；UI 线程重复写入 = 续期。
+    pub fn noteUserTakeover(self: *Plugin) void {
+        self.auto_skip_blocks.store(user_takeover_blocks, .monotonic);
+    }
+
+    /// 音频侧自动化暂存：一条（参数 + 段首/段末值）。在 `processInstrument` **之前** 调用。
+    /// 每段开始时由调用方先 `clearAuto()`；满了就丢后面的（宁可少数自动化，不爆内存）。
+    pub fn queueAuto(self: *Plugin, param_id: u32, v0: f64, v1: f64) void {
+        if (self.auto_n >= self.auto_ids.len) return;
+        const i = self.auto_n;
+        self.auto_ids[i] = param_id;
+        self.auto_v0[i] = @floatCast(std.math.clamp(v0, 0, 1));
+        self.auto_v1[i] = @floatCast(std.math.clamp(v1, 0, 1));
+        self.auto_n += 1;
+    }
+
+    /// 清空本段自动化暂存（每段开始前由音频线程调）。
+    pub fn clearAuto(self: *Plugin) void {
+        self.auto_n = 0;
     }
 
     /// 当前归一化值
@@ -1718,13 +1786,41 @@ pub const Plugin = struct {
             }
         }
 
-        // 宿主待送参数变更 → 本块 inputParameterChanges（每参数单点，offset 0）
+        // ── 宿主待送参数变更 + **自动化** → 本段 inputParameterChanges ──
+        // 顺序语义：先手动（`pend`，offset 0），再自动化（offset 0 / frames−1）——
+        // 同 offset 时**后写的赢**，但用户接管期间（`auto_skip_blocks > 0`）自动化不写，
+        // 所以“人拧了旋钮”一定赢；接管结束后自动化从极点状态平滑接回。
         var n_q: usize = 0;
         while (n_q < self.in_queues.len) : (n_q += 1) {
             const m = self.popParamMsg() orelse break;
-            self.in_queues[n_q].id = m.id;
-            self.in_queues[n_q].value = m.value;
-            self.in_queues[n_q].used = true;
+            self.in_queues[n_q].reset(m.id);
+            self.in_queues[n_q].add(0, m.value);
+        }
+        // 自动化：本段暂存（`queueAuto` 在 `processInstrument` 之前由音频线程填）
+        // **接管闸门每段都递减**（即使本段没有自动化入队）——否则“暂停时拧了旋钮”
+        // 会把计数器一直挂着，恢复播放后再白白让路 30 块。
+        const skip = self.auto_skip_blocks.load(.monotonic);
+        if (skip > 0) self.auto_skip_blocks.store(skip - 1, .monotonic);
+        if (self.auto_n > 0) {
+            if (skip == 0) {
+                const last_off: i32 = @intCast(if (frames > 0) frames - 1 else 0);
+                var ai: usize = 0;
+                while (ai < self.auto_n) : (ai += 1) {
+                    const id = self.auto_ids[ai];
+                    var qi: usize = 0;
+                    while (qi < n_q) : (qi += 1) {
+                        if (self.in_queues[qi].id == id) break;
+                    }
+                    if (qi == n_q) {
+                        if (n_q >= self.in_queues.len) continue;
+                        self.in_queues[n_q].reset(id);
+                        n_q += 1;
+                    }
+                    self.in_queues[qi].add(0, self.auto_v0[ai]);
+                    self.in_queues[qi].add(last_off, self.auto_v1[ai]);
+                }
+            }
+            self.auto_n = 0; // 本段一定消费清空（否则下一段会重用陈旧值）
         }
         self.in_changes.count = @intCast(n_q);
 
@@ -2422,4 +2518,39 @@ test "vst_host: 覆盖矩形→子窗口 client 裁切坐标（SetWindowRgn 用�
     try std.testing.expectEqualSlices(i32, &.{ 0, 0, 20, 20 }, &r2); // 左上溢出→钳制
     try std.testing.expect(clipRectToClient(E.rc(0, 0, 100, 50), 100, 50, 200, 100) == null); // 贴边不相交
     try std.testing.expect(clipRectToClient(E.rc(400, 400, 10, 10), 100, 50, 200, 100) == null); // 在外
+}
+
+test "vst_host: IParamValueQueue 多点（v2：自动化段内两点 + 手动 offset 0）" {
+    const dummy: ?*anyopaque = null;
+    var q = ParamValueQueue{};
+    q.reset(0x42);
+    try std.testing.expectEqual(@as(u32, 0x42), q.id);
+    try std.testing.expectEqual(@as(btypes.int32, 0), ParamValueQueue.getPointCount(@ptrCast(&q)));
+
+    // 手动（offset 0）+ 自动化（0 / 尾部）共存：手动先、自动化两点在后
+    q.add(0, 0.1);
+    q.add(0, 0.2);
+    q.add(511, 0.9);
+    try std.testing.expectEqual(@as(btypes.int32, 3), ParamValueQueue.getPointCount(@ptrCast(&q)));
+    var off: btypes.int32 = 0;
+    var val: vsttypes.ParamValue = 0;
+    try std.testing.expectEqual(btypes.kResultOk, ParamValueQueue.getPoint(@ptrCast(&q), 0, &off, &val));
+    try std.testing.expectEqual(@as(i32, 0), off);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.1), val, 1e-12);
+    try std.testing.expectEqual(btypes.kResultOk, ParamValueQueue.getPoint(@ptrCast(&q), 1, &off, &val));
+    try std.testing.expectApproxEqAbs(@as(f64, 0.2), val, 1e-12);
+    try std.testing.expectEqual(btypes.kResultOk, ParamValueQueue.getPoint(@ptrCast(&q), 2, &off, &val));
+    try std.testing.expectEqual(@as(i32, 511), off);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.9), val, 1e-12);
+    // 越界 → False（插件乱读不会踩内存）
+    try std.testing.expectEqual(btypes.kResultFalse, ParamValueQueue.getPoint(@ptrCast(&q), 3, &off, &val));
+    try std.testing.expectEqual(btypes.kResultFalse, ParamValueQueue.getPoint(@ptrCast(&q), -1, &off, &val));
+
+    // 满了（max_points）：**覆盖最后一点**——保证“段末值”总是最新
+    while (q.n < ParamValueQueue.max_points) q.add(100, 0.5);
+    q.add(999, 0.75);
+    try std.testing.expectEqual(@as(u32, @intCast(ParamValueQueue.max_points)), q.n);
+    try std.testing.expectEqual(@as(i32, 999), q.offsets[ParamValueQueue.max_points - 1]);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.75), q.values[ParamValueQueue.max_points - 1], 1e-12);
+    _ = dummy;
 }

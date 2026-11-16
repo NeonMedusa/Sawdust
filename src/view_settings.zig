@@ -37,18 +37,9 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     ui.label("设置", x + 8, y + 4, ui.theme.text);
 
     // 关闭按钮
-    const close_x = x + ww - 22;
-    const close_hovered = util.hitUI(ui, close_x, y + 2, 20, title_h - 4);
-    ui.renderer.fillRect(close_x, y + 2, 20, title_h - 4, if (close_hovered) ui.theme.danger else ui.theme.panel);
-    ui.label("×", close_x + 6, y + 4, ui.theme.text);
-    if (close_hovered and ui.mouse_pressed) {
+    if (util.titleCloseButton(ui, x, y, ww, title_h)) {
         sw.open = false;
         return true;
-    }
-
-    // 点窗口内任意处 → 置顶（“点谁谁在上”）
-    if (util.inRect(ui.mouse_x, ui.mouse_y, x, y, ww, hh) and ui.mouse_pressed) {
-        app.bringToFront(&sw.z);
     }
 
     // 标题拖动
@@ -87,17 +78,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     ui.label("（拖动调整；实现为帧预算 = 1 秒 ÷ 帧率）", x + 14, yy + 44, ui.theme.text_dim);
     yy += 68;
 
-    // ── 数据交换（JSON 可读格式；说明放在这里有充足宽度——用户要求）──
-    ui.label("数据交换", x + 14, yy, ui.theme.text_dim);
-    if (ui.button(9523, "导入 JSON...", x + 14, yy + 16, 140, 24)) {
-        app.pending_file_action = .import_json;
-    }
-    if (ui.button(9524, "导出 JSON...", x + 162, yy + 16, 140, 24)) {
-        app.pending_file_action = .export_json;
-    }
-    ui.label("JSON：可读文本格式，便于迁移到其他 DAW。", x + 14, yy + 46, ui.theme.text_dim);
-    ui.label("导入 = 替换当前工程；导出 = 写出副本。", x + 14, yy + 60, ui.theme.text_dim);
-    yy += 84;
+    // ── 数据交换：JSON 通道已于 v9 删除（存档只剩二进制 `.saw`）──
 
     // ── 字体（当前实际生效的文件）──
     ui.label("字体（当前生效）", x + 14, yy, ui.theme.text_dim);

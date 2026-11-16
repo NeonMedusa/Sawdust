@@ -6,6 +6,7 @@ const Ui = @import("ui.zig").Ui;
 const App = @import("app.zig").App;
 const model = @import("model.zig");
 const util = @import("view_util.zig");
+const view_lane = @import("view_lane.zig");
 
 /// 片段在轨道内容区的绘制矩形（x / 宽；屏幕像素，含 zoom 换算）。
 /// **边缘与格子对齐**（不缩进）；起点/终点各自取整 → 并排片段严格相接、无 1px 缝。
@@ -24,12 +25,43 @@ pub fn clipXW(c: model.Clip, lane_x: i32, step_px: f32, scroll_x: i32, zoom: f32
     return .{ .x = px0, .w = @max(1, px1 - px0) };
 }
 
+/// 步 → 屏幕像素 x（**绝对**坐标：与 `clipXW` 的取整规则完全一致）
+pub fn stepToPx(step: i32, lane_x: i32, step_px: f32, scroll_x: i32, zoom: f32) i32 {
+    const xf: f32 = (@as(f32, @floatFromInt(step)) * step_px - @as(f32, @floatFromInt(scroll_x))) * zoom;
+    return lane_x + @as(i32, @intFromFloat(@round(xf)));
+}
+
+/// 片段内**音符预览**一行的像素区间（与片段矩形相交后才返回）。
+///
+/// `tl_step` / `tl_len` 是**时间轴**步（= `clip.start + (note.step - clip.offset)`）。
+///
+/// 关键：x 必须用**绝对步**换算（`stepToPx`），**不能用** `clip_x + trunc(s*clip_w/len)`。
+/// 后者用的是取整后的片段宽度，而 `clipXW` 里两条边各自 `round()`：U=3840 之后
+/// 每步像素（`step_px * zoom`）不再总是整数 → `clip_w/len` 带 ±0.5px 误差，且随左端
+/// 位置正负摆动 → **拖左右边缘时音符预览整体抖 ±1px**（实测反馈）。
+/// 绝对换算后音符位置不包含 `clip_x`/`clip_w`，拖边缘时纹丝不动。
+pub fn previewNoteSpan(tl_step: i32, tl_len: i32, clip_x: i32, clip_w: i32, lane_x: i32, step_px: f32, scroll_x: i32, zoom: f32) ?struct { x: i32, w: i32 } {
+    const xs = stepToPx(tl_step, lane_x, step_px, scroll_x, zoom);
+    const xe = stepToPx(tl_step + tl_len, lane_x, step_px, scroll_x, zoom);
+    var w = xe - xs;
+    if (w < 1) w = 1; // 极短音符缩到 0 像素时仍留一点火苗
+    const x0 = @max(xs, clip_x);
+    const x1 = @min(xs + w, clip_x + clip_w);
+    if (x1 <= x0) return null;
+    return .{ .x = x0, .w = x1 - x0 };
+}
+
 /// 样式配色（minimap / 片段色块）：按序号在色相上分布，保证相邻样式颜色可区分。
 /// 静音视觉（浅灰）：轨道名与片段整体变灰
 /// 片段自身静音（Ctrl+M）的灰
 pub const muted_gray: r_mod.Color = r_mod.rgb(150, 150, 154);
 /// **轨道静音**：比片段静音更暗（让用户一眼分辨"是自己静音了"还是"轨道静音了"）
 pub const muted_gray_track: r_mod.Color = r_mod.rgb(92, 92, 96);
+
+/// 曲线**重命名输入框的宽度**：行头列只有 90px（~6 个字），而名字存 32 字节
+/// （10 汉字 ≈ 150px）→ 框窄了就会横向滚动，拖选时“看到的末尾”与映射对不上。
+/// 输入框浮在最上层，本来就可以比列宽——直接给够。
+const rename_box_w: i32 = 200;
 
 pub fn patternColor(pattern: i32) r_mod.Color {
     const palette = [_]r_mod.Color{
@@ -124,7 +156,7 @@ pub fn hitAt(app: *const App, px: i32, py: i32) ?struct { track: i32, step: i32 
     if (py < g.tracks_y or py >= g.tracks_y + g.tracks_h) return null;
     const track = @divFloor(py - g.tracks_y + app.playlist.scroll, g.track_h);
     if (track < 0) return null;
-    const step_px: f32 = @floatFromInt(util.piano_step_w);
+    const step_px: f32 = util.pianoStepPx();
     const mouse_cx: f32 = @as(f32, @floatFromInt(app.playlist.scroll_x)) + @as(f32, @floatFromInt(px - g.lane_x)) / app.playlist.zoom;
     const step_i: i32 = @max(0, @as(i32, @intFromFloat(mouse_cx / step_px)));
     const snap_steps: i32 = model.snapSteps(app.playlist.snap);
@@ -163,10 +195,26 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 游标跳到鼠标位置）。
     const menu_click = (snap_menu_was_open or snap_clicked) and ui.mouse_pressed;
 
-    const header_w: i32 = 90; // 轨道名列宽
+    const header_w: i32 = util.piano_header_w; // 轨道名列宽（**与钢琴窗琴键列同宽**，用户约定）
     const ruler_h: i32 = 20; // 标尺行高 = 滚动条厚度（横条高 = 纵条宽）
     const list_y = y + util.title_h;
-    const list_h = h - util.title_h;
+    const list_h_full = h - util.title_h;
+    // ── **自动化面板**（`docs/automation.md` §九）：与钢琴窗一致的**上下真分隔** ──
+    // 先在总高度里扣出面板高度，再让 `list_h` 用剩余部分——
+    // 这样标尺/轨道/横纵滚动条（含其命中区域）**全部**自动不进入面板带，
+    // 不再是“盖在上面”（那样会点击穿透、滚动条滑进面板里）。
+    // 上限与钢琴窗**同一个基准**：都按「轨道/音符内容区（扣掉两行标尺）」的一半来算。
+    // 面板自己含一行目标切换按钮（hdr_h），所以要把这 20px 加回上限，
+    // 否则用户会看到“播放列表的编辑区能拉得更高”（多出来的正好是按钮行高，实测）。
+    // （按钮行高 20 已含在面板内部；上限不再额外加它）
+    // **与钢琴窗走同一份布局数学**（`view_lane.layoutPanel`），高度也共用 `app.auto_panel_h`
+    const lay = view_lane.layoutPanel(list_y + ruler_h * 2, list_y + list_h_full, 4, app.auto_panel_h, 60);
+    const auto_h: i32 = lay.panel_h;
+    // 分隔条：**与钢琴窗完全同款**——只让出自身厚度，只画这一条（不加“带子”底色）。
+    // 悬停/按下都严格限制在本体内（`ui.splitterH` 已改成不外扩）→ 不会误放片段。
+    // 粗细取 6px：4px 的横线视觉上明显比 4px 的竖线细，6px 才看起来等宽。
+    const splitter_h: i32 = 4;
+    const list_h = @max(1, list_h_full - auto_h - splitter_h);
 
     const main_x = x + 1;
     const main_w = w - 2 - ruler_h; // 主区宽（右侧留出滚动条列）
@@ -175,13 +223,21 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     const ruler_y = list_y + ruler_h; // 标尺行（右端为 □ 缺口：自然留空）
     const tracks_y = list_y + ruler_h * 2;
     const tracks_h = list_h - ruler_h * 2;
+
+    // ── **分隔条先处理**（在一切内容之前）：认领这次按下并吃掉它，
+    //    否则面板里的“点空白放片段 / 拖柱条改力度”会先吃到这一下（实测）。
+    {
+        const split_y0 = view_lane.layoutPanel(list_y + ruler_h * 2, list_y + list_h_full, 4, app.auto_panel_h, 60).split_y;
+        _ = ui.splitterH(Ui.idOf("playlist_auto_splitter", 0), &app.auto_panel_h, split_y0, main_x, @max(1, x + w - main_x), splitter_h, 60, view_lane.layoutPanel(list_y + ruler_h * 2, list_y + list_h_full, 4, app.auto_panel_h, 60).max_h);
+        app.auto_panel_h = view_lane.layoutPanel(list_y + ruler_h * 2, list_y + list_h_full, 4, app.auto_panel_h, 60).panel_h;
+    }
     const lane_x = main_x + header_w;
     const view_w = @max(1, main_w - header_w); // 轨道内容可视宽度
-    // 时间轴尺寸（与钢琴卷帘统一）：步 = U=96 单位；
-    // 每步内容像素宽固定（`piano_step_w`）→ 一小节的像素宽随拍号变化。
+    // 时间轴尺寸（与钢琴卷帘统一）：步 = `model.units_per_whole` 单位；
+    // 像素尺度由**全音符像素**（`piano_whole_note_px`）派生 → 一小节宽随拍号变化。
     const spb: i32 = app.steps_per_bar;
-    const step_px: f32 = @floatFromInt(util.piano_step_w);
-    const bar_w: i32 = spb * util.piano_step_w; // 一小节的像素宽（未含 zoom）
+    const step_px: f32 = util.pianoStepPx();
+    const bar_w: i32 = util.barPx(spb); // 一小节的像素宽（未含 zoom）
 
     // ── 时间轴长度与缩放下限（**同一个值**，否则会出现“滑块有行程但拖不动”）──
     // 时间轴 = 内容右缘（保底 4 小节）+ 右侧 3 小节留白。
@@ -224,7 +280,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             nmini += 1;
         }
         // 防误触：滑块外的单击 / 滚动条上的滚轮 = 移动"一个当前网格"（Ctrl+单击才是直接定位）
-        ui.scrollbar_nudge = model.snapSteps(app.playlist.snap) * util.piano_step_w;
+        // 注：步进像素不可为 0（最细网格 1 步 = 0.125 px）→ 兜底 4px
+        ui.scrollbar_nudge = @max(4, @as(i32, @intFromFloat(@round(@as(f32, @floatFromInt(model.snapSteps(app.playlist.snap))) * util.pianoStepPx()))));
         ui.scrollbar_target = &app.playlist.scroll_x_target; // 步进走补间（拖动仍直接写 scroll_x）
         _ = ui.scrollbarTimelineEx(8, x + 1, hsb_y, w - 2, ruler_h, &app.playlist.scroll_x, min_content, &app.playlist.zoom, view_w, dyn_zoom_min, 8.0, bars_right < util.overhang_map_limit, mini_buf[0..nmini]);
     }
@@ -253,7 +310,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         defer ui.renderer.popClip(saved);
         var bar: i32 = @divFloor(app.playlist.scroll_x, bar_w) + 1;
         // 小节数字**分级渲染**（1-2-5 系列）：标签太密时只显 1、2、5、10… 的切点
-        const label_step: i32 = util.barLabelStep(bar_ws, 40);
+        const label_step: i32 = util.barLabelEveryBars(bar_ws);
         while (true) : (bar += 1) {
             const bx = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(bar - 1)) * bar_ws - scroll_s));
             if (bx > main_x + main_w) break;
@@ -322,6 +379,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 行高必须在 □ 缩放块**之后**捕获：否则本帧会用「旧行高 + 新滚动偏移」绘制，
     // 每步缩放都会跳一帧（实测明显上下跳变），下一帧才恢复。
     const track_h: i32 = app.playlist.track_h;
+
     // 几何写回（拖入文件的落点换算用；与绘制同一套坐标）
     app.playlist.geom = .{ .lane_x = lane_x, .tracks_y = tracks_y, .view_w = view_w, .tracks_h = tracks_h, .track_h = track_h };
     // 可见行数（“行轴无限延伸”的可视化）：行照常铺到视口底——**悬空时视口下方的行
@@ -354,6 +412,12 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         while (i < @as(usize, @intCast(rows_draw))) : (i += 1) {
             if (ty + track_h > tracks_y and ty < tracks_y + tracks_h) {
                 const selected = app.sel.track == @as(i32, @intCast(i));
+                // **命中框夹到可见轨道区**：行可能只露出一半（下半被自动化面板盖住）
+                // ——绘制已由 pushClip 裁过，但 `listItem/toggleSquare` 的命中框是全行高：
+                // 不夹的话“点自动化行头列”会穿透选中轨道头（实测 bug）。
+                const vy0 = @max(ty, tracks_y);
+                const vy1 = @min(ty + track_h, tracks_y + tracks_h);
+                const in_row = vy1 > vy0 and ui.hitRect(main_x, vy0, header_w, vy1 - vy0);
                 // 轨道名（左列；底色加深与内容区区分）
                 // 注：Ctrl 按下时不响应（让位给“按行框选”——起点在轨道名列的手势）
                 const muted = app.trackMuted(i);
@@ -361,16 +425,23 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 const btn_sz: i32 = @min(track_h - 2, @max(12, @as(i32, @intFromFloat(ui.font.lineHeight()))));
                 const btn_x: i32 = main_x + header_w - btn_sz - 4;
                 const btn_y: i32 = ty + @divTrunc(track_h - btn_sz, 2);
-                const over_mute = util.inRect(ui.mouse_x, ui.mouse_y, btn_x, btn_y, btn_sz, btn_sz);
-                if (ui.listItem(3000 + i, app.trackName(i), main_x, ty, header_w, track_h, selected, i % 2 == 1, ui.theme.bg, if (muted) muted_gray else null) and !ui.mods_ctrl and !over_mute) {
+                const over_mute = in_row and util.inRect(ui.mouse_x, ui.mouse_y, btn_x, btn_y, btn_sz, btn_sz);
+                // 只用来画（返回值不再信：命中由 `in_row` 决定）
+                _ = ui.listItem(3000 + i, app.trackName(i), main_x, ty, header_w, track_h, selected, i % 2 == 1, ui.theme.bg, if (muted) muted_gray else null);
+                if (in_row and !over_mute and !ui.mods_ctrl and ui.mouse_pressed) {
                     app.sel.track = @intCast(i);
                 }
-                if (ui.toggleSquare(!muted, btn_x, btn_y, btn_sz)) { // 蓝=发声 / 灰=静音
+                // 静音方块：**每帧都画**——它是常显状态（蓝=发声/灰=静音），不是 hover 提示。
+                // `toggleSquare` 里同时“画 + 判点击”，所以**绝不能**塞进 `and` 的短路里：
+                // 曾经写成 `if (in_row and ui.toggleSquare(...))` → 鼠标不在该行就不画 →
+                // 开关变成“鼠标悬停才出现”（实测回归）。
+                const mute_clicked = ui.toggleSquare(!muted, btn_x, btn_y, btn_sz);
+                if (in_row and mute_clicked) {
                     app.setTrackMuted(i, !muted);
                     app.commitHistory(if (!muted) "静音轨道" else "取消静音轨道");
                 }
                 // 右键轨道头 → 重命名/清空菜单（位置快照；与样式右键同一模式）
-                if (ui.mouse_right_pressed and ui.hitRect(main_x, ty, header_w, track_h)) {
+                if (in_row and ui.mouse_right_pressed and util.inRect(ui.mouse_x, ui.mouse_y, main_x, ty, header_w, track_h)) {
                     app.panels.ctx_track = i;
                     app.panels.ctx_trk_x = ui.mouse_x;
                     app.panels.ctx_trk_y = ui.mouse_y;
@@ -515,10 +586,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                         // ── 片段内音符预览（minimap 风格）──
                         // 只画“片段可见窗口”（offset..offset+len）内的音符；
                         // 纵向用该样式的音域映射（与三处 minimap 同一规则）
-                        // 预览区**与片段边缘严格对齐**（不内缩）：
-                        // 否则与网格/边缘错位——拖边缘时音符看起来“漂移几像素”（实测 bug）
-                        const inner_x = clip_x;
-                        const inner_w = @max(1, clip_w);
+                        // 横向不用内缩矩形——直接与片段矩形求交（见 `previewNoteSpan`）
                         const inner_y = ty + 2 + label_h;
                         const inner_h = @max(2, track_h - 4 - label_h);
                         {
@@ -527,7 +595,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                             if (!thin and clip.pattern >= 0 and pi < pat_stat.len and pat_stat[pi].has_notes) {
                                 const range = model.rangeMap(pat_stat[pi].min_pitch, pat_stat[pi].max_pitch, 12);
                                 const win_lo = clip.offset;
-                                const win_steps = clip.len;
+                                const win_steps: i32 = @max(1, clip.len);
                                 // 画**全部**乐器、全部音符（**不做“画满 N 个就停”的截断**）。
                                 // 实测 bug：旧版有 `drawn >= 64` 截断——多乐器共用一个大样式时，
                                 // 数组顺序靠前的那个乐器往往就占满 64 个名额（实测工程：样式 3578 个
@@ -539,13 +607,12 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                                     if (n.pattern != clip.pattern) continue;
                                     const rel = n.step - win_lo;
                                     if (rel >= win_steps or rel + n.len <= 0) continue; // 不在可见窗口
-                                    const s = @max(0, rel);
-                                    const e = @min(win_steps, rel + n.len);
-                                    const nx = inner_x + @divTrunc(s * inner_w, win_steps);
-                                    const nw = @max(1, @divTrunc((e - s) * inner_w, win_steps));
+                                    // x/宽度全部用**时间轴绝对步**换算并与片段矩形求交（见 `previewNoteSpan` 注释）
+                                    // 注：`n.step` 是**样式内**步 → 先换成时间轴步（`clip.start + rel`）
+                                    const span = previewNoteSpan(clip.start + rel, n.len, clip_x, clip_w, lane_x, step_px, app.playlist.scroll_x, zoom) orelse continue;
                                     const y_norm = range.yOf(n.pitch);
                                     const ny = inner_y + inner_h - 2 - @as(i32, @intFromFloat(y_norm * @as(f32, @floatFromInt(inner_h - 2))));
-                                    ui.renderer.fillRect(nx, ny, nw, 2, inner_col);
+                                    ui.renderer.fillRect(span.x, ny, span.w, 2, inner_col);
                                 }
                             }
                         }
@@ -738,7 +805,11 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // ── 鼠标交互（轨道内容区）──
     // 左键空位：放置样式；左键片段：拖动移动；片段右缘：拉伸长度；右键片段：删除
     // （`menu_click` 门控已在函数顶部提前计算——标尺/轨道区都用它）
-    const in_lane = !menu_click and ui.hitRect(lane_x, tracks_y, view_w, tracks_h);
+    // **面板带（分割条 + 自动化面板）整块不属于轨道区**：显式排除，
+    // 不再依赖“tracks_h 已经减过 auto_h”这种间接保证（实测：点面板会落到轨道行上）。
+    const panel_top: i32 = list_y + list_h;
+    const in_panel = ui.mouse_y >= panel_top;
+    const in_lane = !menu_click and !in_panel and ui.hitRect(lane_x, tracks_y, view_w, tracks_h);
     const track_i = @divFloor(ui.mouse_y - tracks_y + app.playlist.scroll, track_h);
     // 鼠标 → 内容坐标（除以 zoom）→ **全局步**（U=96）
     const mouse_cx: f32 = @as(f32, @floatFromInt(app.playlist.scroll_x)) + @as(f32, @floatFromInt(ui.mouse_x - lane_x)) / zoom;
@@ -1192,7 +1263,13 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 中键拖动中：屏蔽滚轮（含 Ctrl/Shift 缩放）——缩放会让锚定比例失准、
     // 拖动跟随抽动（用户约定：拖动期间只平移，不缩放）
     // 网格区**和**纵向滚动条上都响应滚轮（鼠标停在滚动条上滚不动不符合直觉）
-    if (!app.playlist.nav_active and (ui.hitRect(main_x, tracks_y, main_w, tracks_h) or ui.hitRect(sb_x, tracks_y, ruler_h, tracks_h))) {
+    // **Ctrl+滚轮（横向缩放）的范围要把自动化面板也算进来**（与钢琴窗对齐：
+    // 钢琴窗的命中区是 `lane_h + splitter_h + editor_h`）。其余修饰键保持原范围，
+    // 以免面板里的滚轮被播放列表抢走。
+    const over_tracks = ui.hitRect(main_x, tracks_y, main_w, tracks_h);
+    const over_with_panel = ui.hitRect(main_x, tracks_y, main_w, tracks_h + splitter_h + auto_h);
+    const wheel_area = if (ui.wheel_ctrl) over_with_panel else over_tracks;
+    if (!app.playlist.nav_active and (wheel_area or ui.hitRect(sb_x, tracks_y, ruler_h, tracks_h))) {
         if (ui.wheel_ctrl) {
             // Ctrl+滚轮：横向缩放——**只更新补间目标**（滚轮离散，逐帧平滑逼近；
             // 补间块在本段之后；锚定用事件时的鼠标偏移，补间每一步都锚定）
@@ -1330,7 +1407,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         // 幽灵游标（PAT 无锚）不跟随：否则视角会追着第一小节的幻影跑
         const ghost = !app.sel.song_mode and app.patOriginClip() == null;
         if (pl.follow_playhead and app.playing and !nav and !ghost) {
-            const cur_px: f32 = app.cursorDisplay(true) * @as(f32, @floatFromInt(util.piano_step_w)); // 平滑小数步（同游标绘制）
+            const cur_px: f32 = app.cursorDisplay(true) * util.pianoStepPx(); // 平滑小数步（同游标绘制）
             // 锚点口径 = **内容区（网格区）**（用户确认以网格区为准）
             const off_screen: f32 = util.follow_anchor_frac * @as(f32, @floatFromInt(view_w));
             const vcw_f: f32 = @as(f32, @floatFromInt(view_w)) / pl.zoom;
@@ -1426,14 +1503,196 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                     app.commitHistory("粘贴片段");
                 }
             },
+            .quantize => {
+                // **绝对量化**：先整块搬左端上网格、再对齐右端（`offset`/`trim_start` 不动）
+                // （见 `model.quantizeClipSpan` / `App.quantizeSelectedClips`）。
+                if (app.selectedClipCount() == 0) {
+                    app.setToast("先用 Ctrl+拖框选要量化的片段");
+                } else {
+                    // 播放中：先记下旧窗口（改完要释掉不再命中的实例，口径同拖动）
+                    app.beginDragSnaps(null);
+                    const n = app.quantizeSelectedClips(snap_steps);
+                    const rescanned = app.syncDragSnaps();
+                    var qb: [24]u8 = undefined;
+                    if (n == 0) {
+                        app.playlist.drag_snaps.clearRetainingCapacity();
+                        app.setToastWith("选区已在网格上（{s}）", .{util.snapLabel(&qb, app.playlist.snap)});
+                    } else {
+                        if (rescanned) app.skip_next_edit_rescan = true;
+                        app.setToastWith("已量化 {d} 个片段（{s}）", .{ n, util.snapLabel(&qb, app.playlist.snap) });
+                        app.commitHistory("量化片段");
+                    }
+                }
+            },
         }
         app.pending_edit_op = null;
     }
 
+    // ── **自动化面板（v0 原型）**：与钢琴窗底部**同一套布局**（`docs/automation.md` §九）──
+    // 横向只覆盖**播放列表主区**（行头列 + 剪辑区），不压左侧样式栏/右侧历史栏；
+    // 行头列位置放**目标切换按钮**（对应钢琴窗的 力度/声像 toggle2）。
+    if (auto_h >= 48) {
+        const ay = lay.panel_y;
+        const panel_w = @max(1, x + w - lane_x); // 自动化区没有滚动条 → 铺到窗口右沿
+
+        // ── **共用外壳**（底色/顶线/分隔线/竖向网格/播放游标）——与钢琴窗编辑区同一份代码 ──
+        const cur_steps: f32 = app.cursorDisplay(true);
+        const ghost = !app.sel.song_mode and app.patOriginClip() == null;
+        view_lane.drawShell(ui, .{
+            .x = main_x,
+            .y = ay,
+            .w = @max(1, x + w - main_x),
+            .h = auto_h,
+            .lane_x = lane_x,
+            .step_w = util.pianoStepPx(),
+            .zoom = app.playlist.zoom,
+            .scroll_x = app.playlist.scroll_x,
+            .bar_steps = app.steps_per_bar,
+            .beat_steps = @max(1, @divTrunc(app.steps_per_bar, 4)),
+            .snap_steps = model.snapSteps(app.playlist.snap),
+            .cursor_step = if (ghost) null else cur_steps,
+            .playing = app.playing,
+        });
+
+        // 横向值参考线：与钢琴窗**同一个函数**（1/8 等分；中线只画一次、正好在 50%）
+        view_lane.drawValueGrid(ui, .{ .x = lane_x, .y = ay, .w = panel_w, .h = auto_h }, auto_h >= 64);
+
+        // 行头列顶部两行：单位按钮 + 当前点数值（与钢琴窗同一份代码）
+        const cur_lane = app.autoCurve() orelse return;
+        const hh = view_lane.drawValueHeader(ui, cur_lane, main_x, ay, util.piano_header_w);
+        if (hh.unit_changed) app.commitHistory("切换曲线显示单位");
+        if (hh.value_clicked) {
+            if (cur_lane.sel_idx) |si| {
+                var vb: [24]u8 = undefined;
+                const pre = view_lane.formatValue(cur_lane.display_unit, cur_lane.points.items[si].value, &vb);
+                app.beginEditAutomationValue(-1, si, pre, hh.rect.x, hh.rect.y, hh.rect.w);
+            }
+        }
+        // ── 行头列：**曲线列表**（显示曲线名）──
+        // 左键 = 选中编辑；双击 = 重命名；右键 = 菜单（重命名 / 删除曲线）
+        {
+            const n = @min(app.auto_curves.items.len, 32);
+            var names: [32][24]u8 = undefined;
+            var shown: [32][]const u8 = undefined;
+            var entries: [32]view_lane.ListEntry = undefined;
+            for (0..n) |k| {
+                const lc = &app.auto_curves.items[k];
+                shown[k] = lc.name(&names[k]);
+                entries[k] = .{ .text = shown[k], .active = app.auto_sel == lc.id, .dimmed = app.bindingCountOfCurve(lc.id) == 0 };
+            }
+            if (n == 0) {
+                entries[0] = .{ .text = "（点下方轨道右键 → 自动化…）", .active = false };
+            }
+            const list = if (n == 0) entries[0..1] else entries[0..n];
+            const lh = view_lane.drawList(ui, main_x, ay, auto_h, util.piano_header_w, 40, &app.auto_list_scroll, list);
+            if (n > 0) {
+                if (lh.index) |hi| {
+                    if (hi < n) app.auto_sel = app.auto_curves.items[hi].id;
+                }
+                if (lh.dbl) |hi| {
+                    if (hi < n) {
+                        const cid = app.auto_curves.items[hi].id;
+                        app.beginRenameAutoCurve(cid, main_x + 4, ay + 44 + 18, rename_box_w);
+                    }
+                }
+                // 右键 → **菜单**（不是直接删）；菜单本体在 `drawCurveMenu`（main 在所有面板之后调）
+                if (lh.right) |hi| {
+                    if (hi < n) {
+                        app.curve_menu = .{
+                            .open = true,
+                            .just_opened = true,
+                            .x = ui.mouse_x,
+                            .y = ui.mouse_y,
+                            .curve_id = app.auto_curves.items[hi].id,
+                            .rename_x = main_x + 4,
+                            .rename_y = ay + 44 + 18,
+                        };
+                    }
+                }
+            }
+        }
+
+        // 值轨本体（内容层）：与剪辑区同一横坐标映射。
+        const draw_lane = app.autoCurve() orelse return;
+        const er = view_lane.draw(ui, draw_lane, lane_x, ay, panel_w, auto_h, util.pianoStepPx(), app.steps_per_bar, app.playlist.scroll_x, app.playlist.zoom, app.allocator);
+        // **曲线编辑进历史（S5）**：不同动作不同提示（而不是笼统一句“编辑曲线”）；
+        // 原子操作立即提交，拖动类用 `history_pending` 合并到松手。
+        const er_label: []const u8 = switch (er.kind) {
+            .add_point => "添加自动化点",
+            .delete_point => "删除自动化点",
+            .move_point => "移动自动化点",
+            .curve_handle => "调整自动化曲率",
+            .reset_curve => "曲率复位",
+            .none => "编辑自动化曲线",
+        };
+        if (er.atomic) {
+            app.commitHistory(er_label);
+        } else if (er.changed) {
+            app.history_pending = er_label;
+        }
+        // **空曲线引导**（曲线还没有任何点 → 告诉用户怎么开始；加点后自然消失）
+        if (draw_lane.points.items.len == 0) drawEmptyCurveHint(ui, lane_x, ay, @max(1, x + w - lane_x), auto_h);
+    }
     // 吸附网格下拉（在**全部内容之后** → 绘制在最上层）
     if (app.playlist.snap_menu_open and snap_btn_x + 40 < x + w - 24) {
         _ = util.snapSelectorMenu(ui, snap_btn_x, y + util.title_h, &app.playlist.snap, &app.playlist.snap_menu_open, snap_clicked);
     }
+}
+
+/// **空曲线引导**：当前编辑的曲线一个点都没有时，在内容区居中画两行提示——
+/// 告诉用户“从哪里开始”（右键旋钮/推子 → 自动化…）+“这里就能画”（双击加第一个点）。
+/// 加点后 `points.len > 0` → 自动消失（不需要任何额外状态）。
+/// 文字必须经得住推敲：
+/// - 第一行给入口（右键菜单路径），否则新人不知道去哪建曲线；
+/// - 第二行给当前面板的直接动作（双击 = 加点，见 `view_lane.draw`）。
+fn drawEmptyCurveHint(ui: *Ui, x: i32, y: i32, w: i32, h: i32) void {
+    if (h < 56 or w < 180) return; // 面板太矮/太窄就不塞字了（会被截成二维码）
+    const l1 = "右键旋钮或推子 →「自动化…」新建或链接曲线";
+    const l2 = "双击这里添加点，右键删除点";
+    const w1: i32 = @intFromFloat(ui.font.measure(l1));
+    const w2: i32 = @intFromFloat(ui.font.measure(l2));
+    const lh: i32 = @intFromFloat(ui.font.lineHeight());
+    const cy = y + @divTrunc(h, 2) - lh;
+    // 行太长（窄面板）→ 能缩就缩（labelClipped 会末尾截断），不硬挤到行头列里
+    const max_w = w - 16;
+    ui.labelClipped(l1, x + @divTrunc(@max(0, w - @min(w1, max_w)), 2), cy, max_w, ui.theme.text);
+    ui.labelClipped(l2, x + @divTrunc(@max(0, w - @min(w2, max_w)), 2), cy + lh + 6, max_w, ui.theme.text_dim);
+}
+
+/// **曲线行右键菜单**（重命名 / 管理已链接项 / 删除曲线）。
+///
+/// 必须在 `drawApp` **之后**由 main 调（与其他右键菜单同一模式）：
+/// 1. 面板内的值轨是**后画**的，菜单若画在面板里就会被曲线盖住（实测）；
+/// 2. `curve_menu.open` 已计入 `menuIsOpen()` → 展开期间整层被模态遮住，
+///    不会“点菜单的同时又点到下面的曲线/轨道行”；
+/// 3. 菜单画在层外 → `input_blocked == false`，自己才点得到。
+pub fn drawCurveMenu(ui: *Ui, app: *App) void {
+    if (!app.curve_menu.open) return;
+    const cm = &app.curve_menu;
+    const items = [_][]const u8{ "重命名", "管理已链接项", "删除曲线" };
+    // 没链接任何参数时置灰（“管理空列表”无意义）
+    const en = [_]bool{ true, app.bindingCountOfCurve(cm.curve_id) > 0, true };
+    const bounds: @import("ui.zig").Rect = .{ .x = 0, .y = 0, .w = ui.renderer.logicalWidth(), .h = ui.renderer.logicalHeight() };
+    if (util.menuPanel(ui, &cm.x, &cm.y, &cm.open, cm.just_opened, .{ .cursor = {} }, bounds, &items, 128, &en)) |ci| {
+        const cid = cm.curve_id;
+        switch (ci) {
+            0 => app.beginRenameAutoCurve(cid, cm.rename_x, cm.rename_y, rename_box_w),
+            1 => app.openCurveLinksWin(cid), // 同一条曲线驱动哪些参数（自动化窗口的曲线视角）
+            else => {
+                if (app.bindingCountOfCurve(cid) > 1) {
+                    app.struct_del_req = .{ .auto_curve = cid };
+                    app.modal = .delete_auto_curve;
+                    app.modal_choice = null;
+                } else if (app.removeAutoCurve(cid)) {
+                    app.setToast("已删除曲线");
+                    app.commitHistory("删除自动化曲线");
+                }
+            },
+        }
+    }
+    // 遮挡插件子窗口 + 菜单展开期间禁掉插件编辑器（与其它右键菜单一致）
+    ui.noteOverlayRect(cm.x, cm.y, 128, @as(i32, @intCast(items.len)) * util.menu_item_h + 4);
+    cm.just_opened = false;
 }
 
 test "playlist: hitAt——落点换算（轨道行/吸附/缩放/滚动；区域外 null）" {
@@ -1447,28 +1706,31 @@ test "playlist: hitAt——落点换算（轨道行/吸附/缩放/滚动；区�
     app.playlist.zoom = 1.0;
     app.playlist.scroll = 0;
     app.playlist.scroll_x = 0;
-    app.playlist.snap = 11; // 1/96 → snapSteps = 1（不吸附，便于精确断言）
+    app.playlist.snap = model.snapIndex(3840); // 1/3840 → snapSteps = 1（不吸附，便于精确断言）
+    const pxs: f32 = util.pianoStepPx(); // 每步内容像素（U=3840 → 0.125）
 
     // 轨道行：第 2 行（0 起）→ py = 50 + 24*2 + 10
-    const h = hitAt(&app, 100 + 5 * 5, 50 + 24 * 2 + 10).?;
+    const off200: i32 = @intFromFloat(@round(200.0 * pxs)); // 200 步
+    const h = hitAt(&app, 100 + off200, 50 + 24 * 2 + 10).?;
     try std.testing.expectEqual(@as(i32, 2), h.track);
-    try std.testing.expectEqual(@as(i32, 5), h.step); // 每步 5px：x 偏移 25px → 第 5 步
+    try std.testing.expectEqual(@as(i32, 200), h.step);
 
     // 纵向滚动：滚过 1 行 → 同一个 py 命中第 3 行
     app.playlist.scroll = 24;
     try std.testing.expectEqual(@as(i32, 3), hitAt(&app, 100, 50 + 24 * 2 + 10).?.track);
     app.playlist.scroll = 0;
 
-    // 横向滚动 + 缩放：scroll_x=10 步、zoom=2 → 屏幕 25px = 内容 12.5px = 2.5 步
-    app.playlist.scroll_x = 10 * 5;
+    // 横向滚动 + 缩放：scroll_x = 1600 步的内容像素、zoom=2 →
+    // 屏幕 25px = 内容 12.5px = 100 步 → 1600 + 100 = 1700
+    app.playlist.scroll_x = @intFromFloat(@round(1600.0 * pxs));
     app.playlist.zoom = 2.0;
-    try std.testing.expectEqual(@as(i32, 12), hitAt(&app, 100 + 25, 60).?.step);
+    try std.testing.expectEqual(@as(i32, 1700), hitAt(&app, 100 + 25, 60).?.step);
     app.playlist.zoom = 1.0;
     app.playlist.scroll_x = 0;
 
-    // 吸附：1/4（24 步）→ 第 13 步吸到 24
+    // 吸附：1/4（起 U/4 步）→ 屏幕 125px（zoom 1）= 1000 步 → 吸到 U/4
     app.playlist.snap = 2;
-    try std.testing.expectEqual(@as(i32, 24), hitAt(&app, 100 + 13 * 5, 60).?.step);
+    try std.testing.expectEqual(@divTrunc(model.units_per_whole, 4), hitAt(&app, 100 + 125, 60).?.step);
     app.playlist.snap = 0;
 
     // 区域外：轨道名列 / 标题 / 下方空白
@@ -1476,4 +1738,65 @@ test "playlist: hitAt——落点换算（轨道行/吸附/缩放/滚动；区�
     try std.testing.expect(hitAt(&app, 120, 40) == null); // tracks_y 上方
     try std.testing.expect(hitAt(&app, 120, 50 + 300 + 1) == null); // tracks_h 下方
     try std.testing.expect(hitAt(&app, 100 + 400, 60) == null); // view_w 右侧
+}
+
+test "playlist: 片段内音符预览——拖左右边缘时逐像素不抖（绝对步换算）" {
+    // 历史 bug：预览 x 用过 `clip_x + trunc(s*clip_w/len)`，而 `clipXW` 两条边各自
+    // `round()`；U=3840 后每步像素不再总是整数 → 宽度带 ±0.5px 误差随左端位置搜动
+    // → 拖边缘时整片音符预览抖 ±1px（实测反馈）。
+    //
+    // 参数自检：第一组 `0.3 px/步` 是**旧写法必抖档**（实测 41 个拖动位置里出现 2~5 种 x），
+    // 用这组才能保证这个测试真能拦住回退。
+    const step_px: f32 = util.pianoStepPx(); // U=3840 → 0.125 px/步
+    const scroll_x: i32 = 0;
+    const configs = [_]struct { lane_x: i32, zoom: f32, start: i32, len: i32, notes: []const i32 }{
+        .{ .lane_x = 200, .zoom = 2.4, .start = 400, .len = 160, .notes = &.{ 0, 40, 100 } }, // 0.3 px/步（旧写法必抖）
+        .{ .lane_x = 200, .zoom = 20.0, .start = 3840, .len = 960, .notes = &.{ 0, 100, 480, 900 } }, // 2.5 px/步
+    };
+
+    inline for (configs) |cfg| {
+        const note_len: i32 = 40;
+        for (cfg.notes) |nstep| {
+            const tl: i32 = cfg.start + nstep; // 时间轴步（窗口从 0 起 → 无偏移）
+            const r0 = clipXW(.{ .track = 0, .start = cfg.start, .len = cfg.len, .pattern = 0, .offset = 0 }, cfg.lane_x, step_px, scroll_x, cfg.zoom);
+            const base = previewNoteSpan(tl, note_len, r0.x, r0.w, cfg.lane_x, step_px, scroll_x, cfg.zoom);
+            try std.testing.expect(base != null); // 防“两边都是 null → 空过”
+            // 左缘往外拖 d 步：start-d / len+d / offset-d（内容在时间轴上不动）
+            for (1..41) |di| {
+                const d: i32 = @intCast(di);
+                const rl = clipXW(.{ .track = 0, .start = cfg.start - d, .len = cfg.len + d, .pattern = 0, .offset = -d }, cfg.lane_x, step_px, scroll_x, cfg.zoom);
+                try std.testing.expectEqual(base, previewNoteSpan(tl, note_len, rl.x, rl.w, cfg.lane_x, step_px, scroll_x, cfg.zoom));
+            }
+            // 右缘往外拖 d 步：len+d（内容不动）
+            for (1..41) |di| {
+                const d: i32 = @intCast(di);
+                const rr = clipXW(.{ .track = 0, .start = cfg.start, .len = cfg.len + d, .pattern = 0, .offset = 0 }, cfg.lane_x, step_px, scroll_x, cfg.zoom);
+                try std.testing.expectEqual(base, previewNoteSpan(tl, note_len, rr.x, rr.w, cfg.lane_x, step_px, scroll_x, cfg.zoom));
+            }
+        }
+    }
+
+    // 撑出右端的音符：拖右缘只能“逐步露出来”，**左端不得飘**（旧写法会飘）
+    {
+        const cfg = configs[1];
+        const note_len: i32 = 120;
+        const r0 = clipXW(.{ .track = 0, .start = cfg.start, .len = cfg.len, .pattern = 0, .offset = 0 }, cfg.lane_x, step_px, scroll_x, cfg.zoom);
+        const base = previewNoteSpan(cfg.start + 955, note_len, r0.x, r0.w, cfg.lane_x, step_px, scroll_x, cfg.zoom).?;
+        for (1..61) |di| {
+            const d: i32 = @intCast(di);
+            const rr = clipXW(.{ .track = 0, .start = cfg.start, .len = cfg.len + d, .pattern = 0, .offset = 0 }, cfg.lane_x, step_px, scroll_x, cfg.zoom);
+            const sr = previewNoteSpan(cfg.start + 955, note_len, rr.x, rr.w, cfg.lane_x, step_px, scroll_x, cfg.zoom).?;
+            try std.testing.expectEqual(base.x, sr.x); // 左端不动
+            try std.testing.expect(sr.w >= base.w); // 只会变宽（露出来）
+        }
+    }
+
+    // 裁切：音符起点在片段左边缘之外 → 从 clip_x 起画（不超出片段）
+    const rc = clipXW(.{ .track = 0, .start = 3840, .len = 960, .pattern = 0, .offset = 0 }, 200, step_px, scroll_x, 20.0);
+    const clamped = previewNoteSpan(3640, 400, rc.x, rc.w, 200, step_px, scroll_x, 20.0).?;
+    try std.testing.expectEqual(rc.x, clamped.x);
+    try std.testing.expect(clamped.x + clamped.w <= rc.x + rc.w);
+    // 完全在片段之外 → null（不画）
+    try std.testing.expect(previewNoteSpan(3440, 300, rc.x, rc.w, 200, step_px, scroll_x, 20.0) == null);
+    try std.testing.expect(previewNoteSpan(4800, 100, rc.x, rc.w, 200, step_px, scroll_x, 20.0) == null);
 }

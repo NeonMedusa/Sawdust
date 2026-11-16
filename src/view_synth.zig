@@ -19,6 +19,7 @@ const synth = @import("synth.zig");
 const model = @import("model.zig");
 const util = @import("view_util.zig");
 const vst_host = @import("vst_host.zig");
+const view_vst_auto = @import("view_vst_auto.zig");
 const PluginSlotRef = @import("app.zig").PluginSlotRef;
 
 const win_title_h: i32 = 22;
@@ -85,6 +86,9 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
 
     // 标题栏
     ui.renderer.fillRect(x + 1, y + 1, ww - 2, win_title_h - 1, ui.theme.toolbar);
+    // 标题栏按钮本帧是否被点（点了就**不要**再在本帧把本窗口置顶——
+    // 否则刚打开的子窗口（VST 参数自动化）会被顶到下面去）
+    var title_btn_used = false;
     var tbuf: [192]u8 = undefined;
     const title: []const u8 = switch (sw.target) {
         .instrument => |ii| blk: {
@@ -130,12 +134,20 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     {
         const save_w: i32 = 62;
         const menu_w: i32 = 58;
+        const auto_w: i32 = 58;
         const gap: i32 = 6;
         const bx2 = x + ww - 22 - 6 - save_w;
         const bx1 = bx2 - gap - menu_w;
+        const bx0 = bx1 - gap - auto_w;
         const bh2: i32 = win_title_h - 6;
         const by2 = y + 3;
-        if (bx1 > x + 180) { // 标题放不下就不画（窄窗）
+        title_btn_used = false;
+        // `自动化` 按钮：**所有 VST3 插件容器**（乐器 / 鼓组层）——与效果器窗对齐（v3）
+        // Windows 才画：Linux 的面板正文**就是**自动化窗口，再开一个浮动窗就重复了
+        const show_auto_btn = target_is_vst3 and builtin.os.tag != .linux and switch (sw.target) {
+            .instrument, .kit_layer_replace => true,
+        };
+        if ((if (show_auto_btn) bx0 else bx1) > x + 180) { // 标题放不下就不画（窄窗）
             // [预设 ▾]
             const h1 = util.hitUI(ui, bx1, by2, menu_w, bh2);
             ui.renderer.fillRect(bx1, by2, menu_w, bh2, if (app.preset_browser.open) ui.theme.accent else if (h1) ui.theme.item_hover else ui.theme.slider_track);
@@ -155,6 +167,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
                 } else {
                     app.openPresetBrowser(.{ .replace = sw.target }); // 同插件限定
                 }
+                title_btn_used = true;
                 ui.active_id = 0; // 防误触发标题拖动（同一位置按下）
             }
             // [保存为…]
@@ -168,28 +181,47 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
                 const save_src = PresetSaveSource{ .params = sw.target };
                 app.beginRenamePreset(bx2 - 60, y + win_title_h + 4, save_src, app.presetPrefillName(save_src));
                 app.preset_browser.open = false;
+                title_btn_used = true;
                 ui.active_id = 0; // 防误触发标题拖动
+            }
+            // [自动化]：VST 参数自动化（v3：乐器 / 鼓组层同一套）
+            // 底色与 `预设/保存为…` 完全同款（不因“已打开”而常显蓝：那看着像开关）
+            if (show_auto_btn) {
+                const h0 = util.hitUI(ui, bx0, by2, auto_w, bh2);
+                ui.renderer.fillRect(bx0, by2, auto_w, bh2, if (h0) ui.theme.item_hover else ui.theme.slider_track);
+                ui.renderer.strokeRect(bx0, by2, auto_w, bh2, ui.theme.panel_border);
+                ui.label("自动化", bx0 + 5, by2 + 2, ui.theme.text);
+                if (h0 and ui.mouse_pressed) {
+                    switch (sw.target) {
+                        .instrument => |ii| app.openVstAutoWin(.{ .kind = .instrument, .a = @intCast(@max(0, ii)) }),
+                        .kit_layer_replace => |kr| {
+                            if (app.kitLayerSlot(@intCast(@max(0, kr.instrument)), kr.pitch, kr.layer)) |slot| {
+                                app.openVstAutoWin(.{
+                                    .kind = .kit_layer,
+                                    .a = @intCast(@max(0, kr.instrument)),
+                                    .b = @intCast(@min(slot, std.math.maxInt(u16))),
+                                });
+                            }
+                        },
+                    }
+                    title_btn_used = true; // 别让下面的“点窗口内任意处 → 置顶”把新窗口顶回去
+                    ui.active_id = 0; // 防误触发标题拖动
+                }
             }
         }
     }
 
     // 关闭按钮
-    const close_x = x + ww - 22;
-    const close_hovered = util.hitUI(ui, close_x, y + 2, 20, win_title_h - 4);
-    ui.renderer.fillRect(close_x, y + 2, 20, win_title_h - 4, if (close_hovered) ui.theme.danger else ui.theme.panel);
-    ui.label("×", close_x + 6, y + 4, ui.theme.text);
-    if (close_hovered and ui.mouse_pressed) {
+    if (util.titleCloseButton(ui, x, y, ww, win_title_h)) {
         sw.open = false;
         return true;
     }
 
-    // 点窗口内任意处 → 置顶（“点谁谁在上”）
-    if (util.inRect(ui.mouse_x, ui.mouse_y, x, y, ww, hh) and ui.mouse_pressed) {
-        app.bringToFront(&sw.z);
-    }
+    // 点窗口即置顶由 main.drawApp 统一处理（只提升最上层那个）：
+    // 标题栏按钮“刚打开子窗口”的置顶已在上面直接 `bringToFront`（z 更大 → 仍在上面）。
 
-    // 标题拖动（**排除右侧按钮区**：预设/保存为/关闭——否则按按钮也会启动拖动）
-    if (util.hitUI(ui, x, y, ww - 160, win_title_h) and ui.mouse_pressed) {
+    // 标题拖动（**排除右侧按钮区**：预设/保存为/自动化/关闭——否则按按钮也会启动拖动）
+    if (!title_btn_used and util.hitUI(ui, x, y, ww - 160, win_title_h) and ui.mouse_pressed) {
         ui.active_id = 5000;
         sw.grab_dx = ui.mouse_x - x;
         sw.grab_dy = ui.mouse_y - y;
@@ -373,6 +405,7 @@ fn drawVst3Body(
     if (pl_opt) |p| {
         if (p.view != null) {
             // Windows：编辑器嵌在面板里（原生子窗口覆盖内容区）→ 这里不用画
+            // （参数表/自动化走标题栏 `自动化`：那个窗口就是完整参数表 + 搜索）
             if (comptime builtin.os.tag != .linux) return;
             // Linux：编辑器是**独立顶层窗口**。按钮是开关——开关状态就是 `app.vst_editor_owner`
             // （用户用窗口自己的关闭按钮关掉时，main 每帧会把这个 owner 清空 → 状态自然同步）。
@@ -386,6 +419,12 @@ fn drawVst3Body(
                     p.showEditorAt(160, 120);
                     app.vst_editor_owner = p;
                 }
+            }
+            // Linux：正文直接是 **VST 参数自动化窗口**（编辑器在独立窗口，正文空着浪费）
+            if (comptime builtin.os.tag == .linux) {
+                // v3：乐器 / 鼓组层两种容器都直接嵌自动化正文
+                view_vst_auto.drawBody(ui, app, ref, id_base + 2000, x, y + win_title_h + 40, ww, hh - win_title_h - 40);
+                return;
             }
         }
     }

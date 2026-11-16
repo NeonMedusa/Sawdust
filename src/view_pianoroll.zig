@@ -16,6 +16,7 @@ const App = @import("app.zig").App;
 const model = @import("model.zig");
 const synth = @import("synth.zig");
 const util = @import("view_util.zig");
+const view_lane = @import("view_lane.zig");
 const view_note_lane = @import("view_note_lane.zig");
 const KeyMode = @import("app.zig").KeyMode;
 
@@ -130,25 +131,18 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 高度：会话态（`app.piano.lane_h`）；**0 = 未初始化** → 首帧 220px。
     // 每帧钳制 [min_h, min(35%·content, content−124)]（保证音符区至少 ~6 行）。
     // 分割条在**布局最前**处理（拖动后重算高度——本帧绘制/命中用新值，不滞后一帧）。
+    // **与播放列表走同一份布局数学**（`view_lane.layoutPanel`），高度也共用 `app.piano.lane_h`
     const splitter_h: i32 = 4;
-    const content_all = list_h - ruler_h * 2;
-    {
-        const max_by_frac: i32 = @intFromFloat(@as(f32, @floatFromInt(content_all)) * view_note_lane.max_frac);
-        const max_h: i32 = @min(max_by_frac, @max(view_note_lane.min_h, content_all - 124));
-        if (app.piano.lane_h <= 0) {
-            app.piano.lane_h = 220; // 默认高度（小窗时由下方 clamp 收窄）
-        }
-        app.piano.lane_h = std.math.clamp(app.piano.lane_h, view_note_lane.min_h, max_h);
-        // 分割条：**向上拖增高**；`sp_y` 随当前 lane_h 动（拖动中每帧重算 → 跟手）
-        const sp_y = lane_y + @max(48, content_all - splitter_h - app.piano.lane_h);
-        _ = ui.splitterH(7002, &app.piano.lane_h, sp_y, x + 1, w - 2, splitter_h, view_note_lane.min_h, max_h);
-        app.piano.lane_h = std.math.clamp(app.piano.lane_h, view_note_lane.min_h, max_h);
-    }
-    const editor_h: i32 = app.piano.lane_h;
-    const lane_h = @max(48, content_all - splitter_h - editor_h); // 音符区高度
+    if (app.piano.lane_h <= 0) app.piano.lane_h = 220;
+    var lay = view_lane.layoutPanel(lane_y, lane_y + (list_h - ruler_h * 2), splitter_h, app.piano.lane_h, view_note_lane.min_h);
+    _ = ui.splitterH(Ui.idOf("piano_splitter", 0), &app.piano.lane_h, lay.split_y, x + 1, w - 2, splitter_h, view_note_lane.min_h, lay.max_h);
+    lay = view_lane.layoutPanel(lane_y, lane_y + (list_h - ruler_h * 2), splitter_h, app.piano.lane_h, view_note_lane.min_h);
+    app.piano.lane_h = lay.panel_h;
+    const editor_h: i32 = lay.panel_h;
+    const lane_h = lay.content_h; // 音符区高度
     // 每小节步数由**拍号**决定（动态；App 字段）
     const spb: i32 = app.steps_per_bar;
-    const bar_w = spb * util.piano_step_w;
+    const bar_w = util.barPx(spb);
     // 量化/吸附格（步）——网格绘制、标尺/循环区拖动用它（**固定为配置档位**）。
     const snap_steps: i32 = model.snapSteps(app.piano.snap);
     // **编辑吸附**：按住 **Alt** = **1 步**（最细网格，1/96 小节）。
@@ -195,8 +189,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 if (nmini >= mini_buf.len) break;
                 if (n.pattern != pattern or n.instrument != app.sel.instrument) continue;
                 mini_buf[nmini] = .{
-                    .pos = n.step * util.piano_step_w,
-                    .len = @max(util.piano_step_w, n.len * util.piano_step_w),
+                    .pos = @intFromFloat(@round(@as(f32, @floatFromInt(n.step)) * util.pianoStepPx())),
+                    .len = @max(1, @as(i32, @intFromFloat(@round(@as(f32, @floatFromInt(n.len)) * util.pianoStepPx())))),
                     .kind = .note,
                     .y = 1.0 - range.yOf(n.pitch),
                     .color = ui.theme.waveform,
@@ -205,7 +199,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             }
         }
         // 防误触：滑块外单击 / 滚动条上滚轮 = 移动"一个当前网格"（Ctrl+单击才是直接定位）
-        ui.scrollbar_nudge = model.snapSteps(app.piano.snap) * util.piano_step_w;
+        // 注：步进像素不能为 0（最细网格 1 步 = 0.125 px）→ 兜底 4px，否则"点一下没反应"
+        ui.scrollbar_nudge = @max(4, @as(i32, @intFromFloat(@round(@as(f32, @floatFromInt(model.snapSteps(app.piano.snap))) * util.pianoStepPx()))));
         ui.scrollbar_target = &app.piano.scroll_x_target; // 步进走补间（拖动仍直接写 scroll_x）
         _ = ui.scrollbarTimelineEx(10, x + 1, hsb_y, w - 2, ruler_h, &app.piano.scroll_x, min_content, &app.piano.zoom, view_w, dyn_zoom_min, 8.0, bars_right < util.overhang_map_limit, mini_buf[0..nmini]);
     }
@@ -216,7 +211,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 横向滚动**帧首快照**：网格/编辑区共用一个口径（本帧横向缩放补间在绘制之后——
     // 若编辑区现读 `app.piano.scroll_x` 会领先一帧：左缘网格线闪动，实测“没有补间”感）
     const scroll_x0: i32 = app.piano.scroll_x;
-    const step_ws: f32 = @as(f32, @floatFromInt(util.piano_step_w)) * zoom; // 屏幕上的步宽
+    const step_ws: f32 = util.pianoStepPx() * zoom; // 屏幕上的步宽
     const bar_ws: f32 = @as(f32, @floatFromInt(bar_w)) * zoom; // 屏幕上的小节宽
     const scroll_s: f32 = @as(f32, @floatFromInt(app.piano.scroll_x)) * zoom; // 屏幕上的滚动量
 
@@ -253,7 +248,12 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     const mouseLocalStepSnap = struct {
         fn f(mx: i32, lx: i32, scroll_x: i32, zm: f32, spb_v: i32, bar_w_v: i32, snap: i32) i32 {
             const cpx: i32 = scroll_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(mx - lx)) / zm));
-            const raw: i32 = @max(0, @divFloor(cpx * spb_v, bar_w_v));
+            // **i64 中间值 + 安全上限**：缩得很小时 `cpx`（内容像素）可达数十万，× `spb`（3840）直接
+            // 冲出 i32（实测：缩到上万小节后乱画 → integer overflow panic）。
+            // 上限取 2^28 步（≈ 7 万小节）——留够余量给 `snapRound` 里的 `+ 半格` 与后续相加。
+            const step_cap: i64 = 1 << 28;
+            const raw64: i64 = @divFloor(@as(i64, @max(0, cpx)) * @as(i64, spb_v), @as(i64, @max(1, bar_w_v)));
+            const raw: i32 = @intCast(std.math.clamp(raw64, 0, step_cap));
             return @max(0, model.snapRound(raw, snap));
         }
     }.f;
@@ -265,7 +265,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         defer ui.renderer.popClip(saved);
         var bar: i32 = @divFloor(app.piano.scroll_x, bar_w) + 1;
         // 小节数字**分级渲染**（1-2-5 系列）：标签太密时只显 1、2、5、10… 的切点
-        const label_step: i32 = util.barLabelStep(bar_ws, 40);
+        const label_step: i32 = util.barLabelEveryBars(bar_ws);
         while (true) : (bar += 1) {
             const bx = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(bar - 1)) * bar_ws - scroll_s));
             if (bx > main_x + main_w) break;
@@ -343,7 +343,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // 垂直缩放的“缩到底”下限（□ / Shift+滚轮共用）：音高行数固定 128，
     // 行数多到 fit 低于固定最小值时退回 piano_key_h_min。当前行高已低于该值时
     // 以当前为准（下限只当刹车，不反向顶大）。
-    const zoom_min_h: i32 = @min(util.zoomOutFloor(util.piano_key_h_min, util.piano_key_h_max, app.piano.lane_h, 128), app.piano.key_h);
+    const zoom_min_h: i32 = @min(util.zoomOutFloor(util.piano_key_h_min, util.piano_key_h_max, lane_h, 128), app.piano.key_h);
 
     // □ 缺口：按住上下拖 = 音高行高缩放（方块本身固定不动；视口中心音高保持不动）
     {
@@ -476,9 +476,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             ui.renderer.hline(lane_x, py, view_w, if (@mod(p, 12) == 0) ui.theme.panel_border else ui.theme.grid);
         }
 
-        // 时间轴网格（与播放列表共用 `util.drawTimelineGrid`；U=96 对齐）。
+        // 时间轴网格（与播放列表共用 `util.drawTimelineGrid`）。
         // 该函数内部自行裁剪到音符区；网格层 = 当前量化档位（非固定步线），
-        // 拍线/小节线常显（各自按密度门槛降级）。
+        // 拍线/小节线常显；太密集时按“密度减半”分级（见 `drawLayer`）。
         util.drawTimelineGrid(
             &ui.renderer,
             &ui.theme,
@@ -489,7 +489,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             lane_x,
             scroll_x0,
             zoom,
-            @floatFromInt(util.piano_step_w),
+            util.pianoStepPx(), // 一步的**内容像素宽**（0.125；传整小节像素会把网格画到屏外）
             spb,
             model.stepsPerBeat(app.time_den),
             snap_steps,
@@ -813,7 +813,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     const in_lane = !menu_click and ui.hitRect(lane_x, lane_y, view_w, lane_h - 3);
     // 鼠标 → 内容坐标（除以 zoom）→ 步号
     const mouse_cx: i32 = app.piano.scroll_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(ui.mouse_x - lane_x)) / zoom));
-    const step_i = @divFloor(mouse_cx, util.piano_step_w);
+    const step_i: i32 = @intFromFloat(@floor(@as(f32, @floatFromInt(mouse_cx)) / util.pianoStepPx()));
     // 吸附后的步（放置/移动/拉伸/粘贴锚点都用它——受 Alt 细拖影响）
     const snap_step: i32 = @max(0, model.snapRound(step_i, edit_snap));
     const pitch_i = 127 - @divFloor(ui.mouse_y - lane_y + app.piano.scroll, app.piano.key_h);
@@ -1050,7 +1050,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             // 力度/声像沿用“上一个被点击/编辑音符”（无参考 → model 默认）；
             // 与长度同一交互逻辑（`rememberNote` 三件套）
             const new_vel: i32 = app.piano.last_note_velocity orelse model.default_velocity;
-            const new_pan: i32 = app.piano.last_note_pan orelse model.default_pan;
+            const new_pan: f32 = app.piano.last_note_pan orelse model.default_pan;
             {
                 app.addNote(.{ .step = snap_step, .len = new_len, .pitch = pitch_i, .pattern = pattern, .instrument = app.sel.instrument, .velocity = new_vel, .pan = new_pan });
                 app.piano.rememberNote(app.notes.items[app.notes.items.len - 1]); // 放置的音符本身成为“上一个”
@@ -1076,10 +1076,10 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
 
     // 拖动 / 拉伸更新（带**死区**：位移超过 3px 才真正编辑——
     // 否则单击音符会在按下当帧被吸附，位置/长度跳变）
-    // **拖动位移必须在按下处理之后再算**：`drag_down_x` 是按下时写的，
+    // **拖动位移必须在按下处理之后再算**：`drag_down_x/y` 是按下时写的，
     // 若在按下分支**之前**算，放置音符那一帧会用**上一次手势的旧锚点** →
     // 新音符先被挪到几格/一整小节之外（写进模型 → minimap 也跟错），下一帧才被拉回（实测“瞬移”）。
-    const px_per_step: f32 = @as(f32, @floatFromInt(util.piano_step_w)) * zoom;
+    const px_per_step: f32 = util.pianoStepPx() * zoom;
     const drag_steps: i32 = if (px_per_step <= 0)
         0
     else
@@ -1362,7 +1362,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         // 主动操作优先（纯即时：宽限/桥接已删）：中键/滚动条按住暂停，松手当帧恢复
         if (cur_step) |st| {
             if (app.playlist.follow_playhead and app.playing and !nav) {
-                const cur_px: f32 = st * @as(f32, @floatFromInt(util.piano_step_w));
+                const cur_px: f32 = st * util.pianoStepPx();
                 // 锚点口径 = **内容区（网格区）**（用户确认以网格区为准）
                 const off_screen: f32 = util.follow_anchor_frac * @as(f32, @floatFromInt(view_w));
                 const vcw_f: f32 = @as(f32, @floatFromInt(view_w)) / p.zoom;
@@ -1446,6 +1446,22 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                 const n = app.selectAllNotes(pattern, app.sel.instrument);
                 if (n > 0) app.setToastWith("已全选 {d} 个音符", .{n});
             },
+            .quantize => {
+                // **绝对量化**：两端**各自就近**上网格（右端看**原**右端，见 `model.quantizeNoteSpan`）。
+                // 与播放列表侧对称：都只认 `selected`（框选），空选区只提示不动。
+                if (app.selectedNoteCount() == 0) {
+                    app.setToast("先用 Ctrl+拖框选要量化的音符");
+                } else {
+                    const n = app.quantizeSelectedNotes(pattern, app.sel.instrument, snap_steps);
+                    var qb: [24]u8 = undefined;
+                    if (n > 0) {
+                        app.setToastWith("已量化 {d} 个音符（{s}）", .{ n, util.snapLabel(&qb, app.piano.snap) });
+                        app.commitHistory("量化音符");
+                    } else {
+                        app.setToastWith("选区已在网格上（{s}）", .{util.snapLabel(&qb, app.piano.snap)});
+                    }
+                }
+            },
         }
         app.pending_edit_op = null;
     }
@@ -1478,6 +1494,16 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         _ = util.titleSelectorMenu(ui, inst_btn_x, y + util.title_h, names, &app.sel.instrument, &app.piano.inst_menu_open, inst_clicked, 170);
         // 切换乐器 → 清选区（防跨乐器孤儿选区；见 App.setInstrument）
         if (app.sel.instrument != inst_before) app.clearNoteSelection();
+    }
+    // ── **分割条：收尾再跑一次**（本函数开头已调过，用于本帧布局）──
+    // 原因：开头那次认领的 `active_id` 会被后面音符区/编辑区的输入处理**抢走**
+    //（`ui.draggable` 等控件命中即赋值，不检查 active_id）→ 表现：拖不动、拖动中高亮消失。
+    // 同一帧里 `mouse_pressed` 仍为真 → 这里能把 active_id 抢回来；之后无人再抢。
+    // 播放列表那边是在 `draw()` 开头处理的（后面没有抢手），所以一直很丝滑。
+    {
+        const lay2 = view_lane.layoutPanel(lane_y, lane_y + (list_h - ruler_h * 2), splitter_h, app.piano.lane_h, view_note_lane.min_h);
+        _ = ui.splitterH(Ui.idOf("piano_splitter", 0), &app.piano.lane_h, lay2.split_y, x + 1, w - 2, splitter_h, view_note_lane.min_h, lay2.max_h);
+        app.piano.lane_h = view_lane.layoutPanel(lane_y, lane_y + (list_h - ruler_h * 2), splitter_h, app.piano.lane_h, view_note_lane.min_h).panel_h;
     }
 }
 

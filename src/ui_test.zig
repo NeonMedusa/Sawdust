@@ -7,6 +7,7 @@ const Ui = @import("ui.zig").Ui;
 const HBarMode = @import("ui.zig").HBarMode;
 const Font = @import("font.zig").Font;
 const view_util = @import("view_util.zig");
+const model = @import("model.zig");
 
 /// 构造一个"假 UI"（无字体依赖的控件测试用；slider 不需要字体）
 fn makeUi(fb: *r_mod.Framebuffer) Ui {
@@ -60,7 +61,7 @@ test "ui: 旋钮圆弧跟随 UI 缩放（DPI）——不能画到左上角原位
 test "view_util: 网格标签不带 ▾（字体缺字；箭头自绘）" {
     var buf: [24]u8 = undefined;
     try std.testing.expectEqualStrings("网格 1/2", view_util.snapLabel(&buf, 1));
-    try std.testing.expectEqualStrings("网格 1/12", view_util.snapLabel(&buf, 8));
+    try std.testing.expectEqualStrings("网格 1/12", view_util.snapLabel(&buf, model.snapIndex(12)));
     try std.testing.expect(std.mem.indexOf(u8, view_util.snapLabel(&buf, 3), "▾") == null);
 }
 
@@ -300,6 +301,51 @@ test "ui: 水平推子——按下并拖动应改变值" {
     ui.mouse_released = true;
     _ = ui.slider(1, &value, x, 0, w, 40);
     try std.testing.expectEqual(@as(u64, 0), ui.active_id);
+    ui.endFrame();
+}
+
+test "ui: 平推把手停在两端时，**外扩的半截**也能按住拖动（否则“鼠标在把手上却不响应”）" {
+    var buf: [200 * 40]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 200, .height = 40 };
+    var ui = makeUi(&fb);
+    const x: i32 = 50;
+    const w: i32 = 100;
+
+    // 值 = 0 → 把手中心在 `x`：左半（x−6..x）露在轨道外，也要能按中
+    var v0: f32 = 0.0;
+    ui.mouse_x = x - 4;
+    ui.mouse_y = 20;
+    ui.mouse_down = true;
+    ui.mouse_pressed = true;
+    _ = ui.slider(11, &v0, x, 0, w, 40);
+    try std.testing.expect(ui.active_id == 11);
+    ui.mouse_down = false;
+    ui.mouse_released = true;
+    _ = ui.slider(11, &v0, x, 0, w, 40);
+    ui.endFrame();
+
+    // 值 = 1 → 把手中心在 `x+w`：右半（x+w..x+w+6）同理
+    var v1: f32 = 1.0;
+    ui.mouse_x = x + w + 4;
+    ui.mouse_y = 20;
+    ui.mouse_down = true;
+    ui.mouse_pressed = true;
+    _ = ui.slider(12, &v1, x, 0, w, 40);
+    try std.testing.expect(ui.active_id == 12);
+    ui.mouse_down = false;
+    ui.mouse_released = true;
+    _ = ui.slider(12, &v1, x, 0, w, 40);
+    ui.endFrame();
+
+    // 外扩有限：再往外 10px 就不应命中（不能无限偷相邻控件的点击）
+    ui.mouse_x = x - 12;
+    ui.mouse_down = true;
+    ui.mouse_pressed = true;
+    _ = ui.slider(13, &v0, x, 0, w, 40);
+    try std.testing.expectEqual(@as(u64, 0), ui.active_id);
+    ui.mouse_down = false;
+    ui.mouse_released = true;
+    _ = ui.slider(13, &v0, x, 0, w, 40);
     ui.endFrame();
 }
 

@@ -55,8 +55,8 @@ pub const Note = struct {
     instrument: i32 = 0, // 所属乐器（通道机架槽位，0 起）
     /// 力度（1-127；默认 100 = MIDI 惯例）——影响发声响度
     velocity: i32 = default_velocity,
-    /// 声像（0-127；64 = 居中）——与 MIDI CC10 坐标一致
-    pan: i32 = default_pan,
+    /// 声像（**0..1**；0.5 = 居中）——全项目只有这一个声像域（MIDI 仅在导入/导出时换算）
+    pan: f32 = default_pan,
     /// 框选/批量操作选中（**瞬态**：不存档）
     selected: bool = false,
     /// 静音（**存档**；调度阶段跳过——“以后不再触发”，不追着掐正在响的音）
@@ -65,14 +65,32 @@ pub const Note = struct {
 
 /// 默认力度（新音符；MIDI 惯例 100——柱条不顶格、有编辑余量）
 pub const default_velocity: i32 = 100;
-/// 默认声像（居中；= MIDI CC10 坐标）
-pub const default_pan: i32 = 64;
+/// **BPM 范围**（全项目唯一定义：工具栏拖动 / 输入值 / 自动化归一化都引用它，
+/// 不要再写字面量 20 / 999——曾乘 11 处）。
+pub const bpm_min: f32 = 10.0;
+pub const bpm_max: f32 = 999.0;
+/// 默认声像（居中）
+pub const default_pan: f32 = 0.5;
+
+/// MIDI 0..127 声像 → 0..1（**64 精确映射成 0.5**，否则 64/127 = 0.5039 会让界面出现
+/// “R1” 这种不对称显示）。导入 CC10 与读旧存档（v5–v8 存的是 0..127）共用。
+pub fn panFromMidi(v: f32) f32 {
+    if (v == 64.0) return 0.5;
+    return std.math.clamp(v / 127.0, 0.0, 1.0);
+}
+
+/// 0..1 声像 → MIDI 0..127（四舍五入；0.5 → 64）
+pub fn panToMidi(v: f32) u8 {
+    return @intFromFloat(@round(std.math.clamp(v, 0.0, 1.0) * 127.0));
+}
 
 /// 乐器（通道机架中的一个槽位）。
 /// `synth` 指向该乐器自己的合成器参数（堆分配、地址稳定——音频线程可安全读取）。
 pub const Instrument = struct {
+    /// **稳定身份**（0 = 未分配）：自动化绑定用它而不是数组下标（删乐器会搬移下标）
+    uid: u32 = 0,
     name: []const u8, // 显示名（堆分配；由 App 管理生命周期）
-    volume: f32 = 0.8, // 0-1
+    volume: f32 = 0.75, // 推子位置（0..1；0 dB 在 0.75，见 audio.faderGain）
     pan: f32 = 0.5, // 0-1（0.5 = 居中）
     muted: bool = false,
     /// 混音通道（**0 起**，对应调音台通道序号 0..n-1）
@@ -177,6 +195,8 @@ pub const LayerKind = enum(u8) {
 /// **内嵌副本**（非按名引用）：鼓组自包含——工程不依赖 data 目录、
 /// 预设删改不悬空（见 `docs/drumkit.md` §5.3）。
 pub const DrumLayer = struct {
+    /// **稳定 uid**（v3：鼓组层参数自动化按它引用层；0 = 未分配）
+    uid: u32 = 0,
     /// 乐器类型（层 = 乐器槽；减法 / VST3——鼓组被禁）
     kind: LayerKind = .subtractive,
     /// 合成器参数（堆分配、地址稳定——音频线程读；VST3 层不读，字段统一仍分配）
@@ -324,12 +344,19 @@ pub fn routedInstrumentNames(insts: []const Instrument, ch: usize, buf: []u8) []
 }
 
 /// **每全音符的份数**（分辨率 `U`）：数据层的时间单位。
-/// `96 = 2⁵ × 3`——可精确表示的分母 = 96 的约数：
-/// {1,2,3,4,6,8,12,16,24,32,48,96}——涵盖二进制细分与三连音体系。
-/// `Note.step`、`Clip.start/len/offset` 均以它为单位。
-pub const units_per_whole: i32 = 96;
+/// `3840 = 2⁸ × 3 × 5`（= **960 PPQN**，主流 DAW 的常见上限档）。
+/// 可精确表示的分母 = 3840 的约数：二进制细分到 1/3840、三连音全系、
+/// **五连音**（3840/5 = 768）；7 / 11 连音为亚毫秒近似（主流 DAW 同样做不到整数 tick）。
+/// `Note.step`、`Clip.start/len/offset` 均以它为单位；120 BPM 下 1 步 ≈ 0.52 ms。
+///
+/// 迁移（U=96 → 3840）的完整清单与验收见 `docs/units-3840.md`；
+/// 旧存档在小节/步域字段上 ×40（`persist` 读入时按版本换算）。
+pub const units_per_whole: i32 = 3840;
 
-/// 默认每小节步数（4/4 → 96 步；实际用 `App.steps_per_bar`）
+/// 旧单位（U=96）与新单位的比值 = 存档迁移的乘数
+pub const unit_migration_scale: i32 = units_per_whole / 96; // = 40
+
+/// 默认每小节步数（4/4 → 3840 步；实际用 `App.steps_per_bar`）
 pub const steps_per_bar: i32 = units_per_whole;
 
 /// 样式数量上限（样式列表动态增长，但不超过此值）。
@@ -365,20 +392,24 @@ pub fn stepsPerBeat(denominator: i32) i32 {
     return @max(1, @divTrunc(units_per_whole, std.math.clamp(denominator, 1, units_per_whole)));
 }
 
-test "stepsPerBarFor / stepsPerBeat：常用拍号（U=96）" {
-    // 4/4 = 96 步；每拍 24
-    try std.testing.expectEqual(@as(i32, 96), stepsPerBarFor(4, 4));
-    try std.testing.expectEqual(@as(i32, 24), stepsPerBeat(4));
-    // 3/4 = 72 步；每拍 24
-    try std.testing.expectEqual(@as(i32, 72), stepsPerBarFor(3, 4));
-    // 6/8 = 6 × 12 = 72 步（= 3/4 的小节长度，正确的等价关系）
-    try std.testing.expectEqual(@as(i32, 72), stepsPerBarFor(6, 8));
-    try std.testing.expectEqual(@as(i32, 12), stepsPerBeat(8));
-    // 2/4 = 48；每拍 24
-    try std.testing.expectEqual(@as(i32, 48), stepsPerBarFor(2, 4));
-    // 4/2 = 192；每拍 48
-    try std.testing.expectEqual(@as(i32, 192), stepsPerBarFor(4, 2));
-    try std.testing.expectEqual(@as(i32, 48), stepsPerBeat(2));
+test "stepsPerBarFor / stepsPerBeat：常用拍号（以 `units_per_whole` 为基准）" {
+    const U = units_per_whole;
+    // 4/4 = U 步；每拍 U/4
+    try std.testing.expectEqual(U, stepsPerBarFor(4, 4));
+    try std.testing.expectEqual(@divTrunc(U, 4), stepsPerBeat(4));
+    // 3/4 = 3×U/4
+    try std.testing.expectEqual(@divTrunc(3 * U, 4), stepsPerBarFor(3, 4));
+    try std.testing.expectEqual(@divTrunc(U, 4), stepsPerBeat(4));
+    // 6/8 = 6 × U/8（= 3/4 的小节长度，正确的等价关系）
+    try std.testing.expectEqual(@divTrunc(6 * U, 8), stepsPerBarFor(6, 8));
+    try std.testing.expectEqual(@divTrunc(U, 8), stepsPerBeat(8));
+    // 2/4 = U/2；每拍 U/4
+    try std.testing.expectEqual(@divTrunc(U, 2), stepsPerBarFor(2, 4));
+    // 4/2 = 2U；每拍 U/2
+    try std.testing.expectEqual(2 * U, stepsPerBarFor(4, 2));
+    try std.testing.expectEqual(@divTrunc(U, 2), stepsPerBeat(2));
+    // 6/8 与 3/4 长度相等（拍号等价关系不随 U 变）
+    try std.testing.expectEqual(stepsPerBarFor(6, 8), stepsPerBarFor(3, 4));
 }
 
 /// 找该样式**最靠左**的片段（无则为 null）。
@@ -500,16 +531,56 @@ test "游标换算：最左片段 / 全局↔局部 / 折叠截断" {
     }
 }
 
-/// **量化/吸附网格**：分母（1/1 … 1/96）→ 步数（U=96 单位）。
-/// 只列可整除 U 的分母（1/64 不可整除故不含）。
-/// 0 = 关闭吸附（自由精度）。
-pub const snap_denoms = [_]i32{ 1, 2, 4, 8, 16, 32, 3, 6, 12, 24, 48, 96 };
+/// **量化/吸附网格**：分母（1/1 … 1/3840）→ 步数（`U` 单位）。
+///
+/// 分**四个族**，同族内是干净的 ×2 阶梯（见 `snap_groups`；菜单按族分列显示）：
+///   · 二等分 `2^a`：1/1、1/2、1/4、1/8…（最常用）
+///   · 三连音 `3·2^a`：1/3、1/6、1/12…（半拍三等分后继续二等分）
+///   · 五连音 `5·2^a`：1/5、1/10、1/20…（五等分后继续二等分）
+///   · 其他：复合 `15·2^a`（1/960）与逐 tick（1/3840）
+///
+/// 三族的分母形态互不相同（`2^a` / `3·2^a` / `5·2^a` **永不相等**）→ 档位不会重复。
+/// 每族都取到 `U = 3840 = 2⁸·3·5` 能**整除**的最细一档：
+/// 1/256（15 步）、1/768（5 步）、1/1280（3 步）；再细一档就是 7.5 / 2.5 / 1.5 步。
+pub const snap_denoms = [_]i32{
+    // 二等分（下标 0-8；下标 4 = 1/16 是两个 `snap` 默认值）
+    1,   2,    4,  8,  16, 32,  64,  128, 256,
+    // 三连音
+    3,   6,    12, 24, 48, 96,  192, 384, 768,
+    // 五连音
+    5,   10,   20, 40, 80, 160, 320, 640, 1280,
+    // 其他（不是“另一种连音”，而是两家叠起来 / 逐 tick）
+    960, 3840,
+};
+
+/// 网格族的菜单分组：`start/len` 必须**无缝隙地铺满** `snap_denoms`（有测试钉住）。
+pub const SnapGroup = struct {
+    title: []const u8,
+    start: usize,
+    len: usize,
+};
+
+pub const snap_groups = [_]SnapGroup{
+    .{ .title = "二等分", .start = 0, .len = 9 },
+    .{ .title = "三连音", .start = 9, .len = 9 },
+    .{ .title = "五连音", .start = 18, .len = 9 },
+    .{ .title = "其他", .start = 27, .len = 2 },
+};
 
 /// 档位下标 → 步数（每格多少步）
 pub fn snapSteps(idx: i32) i32 {
     if (idx < 0 or idx >= snap_denoms.len) return 1;
     const d = snap_denoms[@intCast(idx)];
-    return @max(1, @divTrunc(units_per_whole, d)); // 96/d：1/96→1 步、1/1→96 步
+    return @max(1, @divTrunc(units_per_whole, d)); // U/d：1/3840 → 1 步、1/1 → U 步
+}
+
+/// 分母 → 档位下标（找不到返回 -1）。
+/// **代码/测试里不要写死档位下标**：族重排或加档就会静默变义（实测踩过）。
+pub fn snapIndex(denom: i32) i32 {
+    for (snap_denoms, 0..) |d, i| {
+        if (d == denom) return @intCast(i);
+    }
+    return -1;
 }
 
 /// 把步对齐到网格（向下取整）；`steps` = 网格步数
@@ -524,16 +595,54 @@ pub fn snapRound(step: i32, steps: i32) i32 {
     return @divFloor(step + @divTrunc(steps, 2), steps) * steps;
 }
 
-/// 位移（步）→ **网格倍数**（四舍五入到最近格：过半格即换一格；负数对称）。
-/// 拉伸/拖动现在统一用 `GridRebase`（累积位移 + 网格重锚）；保留此函数仅作
-/// “位移→格数”换算的参考实现，**不要在编辑路径重新引入网格单位**（会导致松 Alt 时跳）。
-pub fn gridSteps(delta_steps: i32, grid: i32) i32 {
-    const g = @max(1, grid);
-    if (g <= 1) return delta_steps; // 自由精度
-    const half = @divTrunc(g, 2);
-    if (delta_steps >= 0) return @divTrunc(delta_steps + half, g);
-    return -@divTrunc(-delta_steps + half, g);
+/// 一次**绝对量化**的结果。
+pub const QuantizedSpan = struct {
+    start: i32,
+    len: i32,
+};
+
+/// 内部实现的两种“右端基准”。
+const EndBase = enum {
+    /// 右端看**原**右端（音符）
+    original,
+    /// 右端看**左端上网格之后**的右端（片段：先整块搬、再量右端）
+    after_move,
+};
+
+fn quantizeSpanWith(start: i32, len: i32, grid: i32, end: EndBase) QuantizedSpan {
+    const g: i32 = @max(1, grid);
+    const s0: i32 = @max(0, start);
+    const s: i32 = snapRound(s0, g); // ① 左端上网格
+    const base: i32 = if (end == .original) s0 else s;
+    const e: i32 = snapRound(base + @max(1, len), g); // ② 右端上网格
+    return .{ .start = s, .len = @max(g, e - s) }; // 两端不能重合 → 至少一格
 }
+
+/// **绝对量化：音符**（Ctrl+Q）。两端**各自就近**到网格线：
+/// ```
+/// s = snapRound(step, g)
+/// e = snapRound(step + len, g)     // 看**原**右端 → 每端移动量都 ≤ 半格
+/// len = max(g, e - s)
+/// ```
+/// 为何音符用“原右端”：这样**每一端相对原位置都只拿半格去换**（用户实测手感更好）；
+/// 若改成看“搬完后的右端”，短音符的尾端可能被拉回到原位置**之前**一整格（显得失真）。
+pub fn quantizeNoteSpan(step: i32, len: i32, grid: i32) QuantizedSpan {
+    return quantizeSpanWith(step, len, grid, .original);
+}
+
+/// **绝对量化：片段**（Ctrl+Q）。两步（用户拍定）：
+///   ① **整块移动**片段 → 左端上网格（调用方**不动** `offset`/`trim_start`，
+///      所以“左端 ↔ 内部内容”的映射不变，内容跟着片段一起走）；
+///   ② 再把**右端**上网格——看的是**①之后**的右端（`s + len`），不是原右端。
+/// 例：`g=240, start=100, len=300` → `[0, 240)`（看原右端会得 480）。
+/// 唯一硬边界是时间轴 0（0 是任何网格的网格点 → 对齐不会被破坏）。
+pub fn quantizeClipSpan(start: i32, len: i32, grid: i32) QuantizedSpan {
+    return quantizeSpanWith(start, len, grid, .after_move);
+}
+
+// 注：旧的 `model.gridSteps`（“位移 → 网格倍数”参考实现）已**删除**——
+// 它在生产路径上无人调用（编辑路径一律走 `GridRebase`），留着只会被误用。
+// 它的四舍五入语义（过半格即换一格、负数对称）由下面这条测试继续钉住。
 
 /// **拖动网格重锚**：拖动过程中吸附网格变了（按住/松开 Alt）时，保证**结果不跳**。
 /// 语义：`生效位移 = base + snapRound(raw - anchor, g)`；
@@ -685,27 +794,143 @@ test "trimFloorLen：Alt 缩出的 1/96 松 Alt 后能回去" {
     try std.testing.expectEqual(@as(i32, 6), trimFloorLen(6, g, false));
 }
 
-test "snapSteps / snapFloor / snapRound（U=96）" {
-    // 档位 → 步数：1/1 = 96、1/4 = 24、1/8 = 12、1/3 = 32、1/12 = 8、1/96 = 1
-    try std.testing.expectEqual(@as(i32, 96), snapSteps(0)); // 1/1
-    try std.testing.expectEqual(@as(i32, 24), snapSteps(2)); // 1/4
-    try std.testing.expectEqual(@as(i32, 12), snapSteps(3)); // 1/8
-    try std.testing.expectEqual(@as(i32, 32), snapSteps(6)); // 1/3（三连音）
-    try std.testing.expectEqual(@as(i32, 8), snapSteps(8)); // 1/12
-    try std.testing.expectEqual(@as(i32, 1), snapSteps(11)); // 1/96
+test "snapSteps / snapFloor / snapRound（以 `units_per_whole` 为基准）" {
+    const U = units_per_whole;
+    // 按**分母**查下标 → 步长（不写死下标：族重排/加档不会弄红测试）
+    const idxOf = snapIndex;
+    try std.testing.expectEqual(U, snapSteps(idxOf(1))); // 1/1
+    try std.testing.expectEqual(@divTrunc(U, 4), snapSteps(idxOf(4))); // 1/4
+    try std.testing.expectEqual(@divTrunc(U, 8), snapSteps(idxOf(8))); // 1/8
+    try std.testing.expectEqual(@divTrunc(U, 3), snapSteps(idxOf(3))); // 1/3（三连音）
+    try std.testing.expectEqual(@divTrunc(U, 12), snapSteps(idxOf(12))); // 1/12
+    try std.testing.expectEqual(@divTrunc(U, 96), snapSteps(idxOf(96))); // 1/96
+    try std.testing.expectEqual(@divTrunc(U, 64), snapSteps(idxOf(64))); // 1/64（U=3840 才能整除）
+    try std.testing.expectEqual(@divTrunc(U, 128), snapSteps(idxOf(128))); // 1/128
+    try std.testing.expectEqual(@divTrunc(U, 384), snapSteps(idxOf(384))); // 1/384
+    try std.testing.expectEqual(@as(i32, 1), snapSteps(idxOf(3840))); // 1/3840 = 1 步
+    try std.testing.expectEqual(@divTrunc(U, 5), snapSteps(idxOf(5))); // 1/5（五连音，精确）
+    // 越界/负数：当作 1 步（不 panic）
+    try std.testing.expectEqual(@as(i32, 1), snapSteps(-1));
+    try std.testing.expectEqual(@as(i32, 1), snapSteps(999));
+    // 默认档位（`app.piano.snap` / 量化 `snap` = 4）必须是 1/16
+    try std.testing.expectEqual(@as(i32, 16), snap_denoms[4]);
 
-    // 对齐：1/4 网格（24 步）
-    try std.testing.expectEqual(@as(i32, 0), snapFloor(5, 24));
-    try std.testing.expectEqual(@as(i32, 24), snapFloor(30, 24));
-    try std.testing.expectEqual(@as(i32, 24), snapRound(30, 24));
-    try std.testing.expectEqual(@as(i32, 48), snapRound(40, 24));
+    // 对齐：1/4 网格（U/4 步）
+    const g = @divTrunc(U, 4);
+    try std.testing.expectEqual(@as(i32, 0), snapFloor(5, g));
+    try std.testing.expectEqual(g, snapFloor(g + 6, g));
+    try std.testing.expectEqual(g, snapRound(g + 6, g));
+    try std.testing.expectEqual(2 * g, snapRound(g + g / 2, g));
     // 网格 = 1 步时不改动
     try std.testing.expectEqual(@as(i32, 37), snapFloor(37, 1));
     try std.testing.expectEqual(@as(i32, 37), snapRound(37, 1));
 }
 
-test "gridSteps / trimMinGridLen：位移→格数与拉伸下限" {
-    // 位移 → 格数：**四舍五入**（过半格即换一格；负数对称）；网格 = 1 步时直接跟随
+test "网格族：三族 ×2 阶梯 + 「其他」，无缺档/无重复/全整除 U" {
+    const U = units_per_whole;
+    // 1) 分组必须**无缝隙铺满**整个数组（菜单按下标分列，错位会点错档）
+    var next: usize = 0;
+    for (snap_groups) |gr| {
+        try std.testing.expectEqual(next, gr.start);
+        next += gr.len;
+    }
+    try std.testing.expectEqual(snap_denoms.len, next);
+
+    // 2) 三个主族：首项 1/2/3/5，之后逐项 ×2；末项是 U 能整除的**最细**一档
+    const bases = [_]i32{ 1, 3, 5 };
+    for (bases, 0..) |base, gi| {
+        const gr = snap_groups[gi];
+        try std.testing.expectEqual(base, snap_denoms[gr.start]);
+        for (0..gr.len) |k| {
+            try std.testing.expectEqual(base * (@as(i32, 1) << @intCast(k)), snap_denoms[gr.start + k]);
+        }
+        const last = snap_denoms[gr.start + gr.len - 1];
+        try std.testing.expectEqual(@as(i32, 0), @mod(U, last)); // 本档整除
+        try std.testing.expect(@mod(U, last * 2) != 0); // 再细一档就不整除了（到顶了）
+    }
+
+    // 3) 全表：每档都整除 U，且**无重复**（三家分母形态 2^a / 3·2^a / 5·2^a 永不相等）
+    for (snap_denoms, 0..) |d, i| {
+        try std.testing.expect(d > 0);
+        try std.testing.expectEqual(@as(i32, 0), @mod(U, d));
+        for (snap_denoms[i + 1 ..]) |d2| try std.testing.expect(d != d2);
+    }
+}
+
+test "quantizeNoteSpan / quantizeClipSpan：两端上网格（音符看原右端、片段看搬完之后）" {
+    const g: i32 = 240; // 1/16
+    // **两条规则的差别就在这一步**（同一个输入）：start=100、len=300（原右端 400）
+    {
+        // 音符：右端看**原**右端 400 → 480；每端移动量 ≤ 半格
+        const q = quantizeNoteSpan(100, 300, g);
+        try std.testing.expectEqual(@as(i32, 0), q.start);
+        try std.testing.expectEqual(@as(i32, 480), q.len);
+    }
+    {
+        // 片段：先整块搬到 0，再看搬完后的右端 300 → 240
+        const q = quantizeClipSpan(100, 300, g);
+        try std.testing.expectEqual(@as(i32, 0), q.start);
+        try std.testing.expectEqual(@as(i32, 240), q.len);
+    }
+    // 两端都已上网格时 → 两条规则给出同一结果（保留原长度）
+    {
+        const a = quantizeNoteSpan(480, 720, g);
+        const b = quantizeClipSpan(480, 720, g);
+        try std.testing.expectEqual(@as(i32, 480), a.start);
+        try std.testing.expectEqual(@as(i32, 720), a.len);
+        try std.testing.expectEqual(a.start, b.start);
+        try std.testing.expectEqual(a.len, b.len);
+    }
+    // 极短对象（1 步）落在粗网格上：两端会重合成 0 长 → 拉到**一格**（两条规则同）
+    {
+        inline for (.{ quantizeNoteSpan, quantizeClipSpan }) |f| {
+            const q = f(100, 1, g);
+            try std.testing.expectEqual(@as(i32, 0), q.start);
+            try std.testing.expectEqual(g, q.len);
+        }
+    }
+    // 时间轴 0：向左就近不越界（两条规则同）
+    {
+        inline for (.{ quantizeNoteSpan, quantizeClipSpan }) |f| {
+            const q = f(37, 500, g);
+            try std.testing.expectEqual(@as(i32, 0), q.start);
+            try std.testing.expect(q.len >= g);
+            try std.testing.expectEqual(@as(i32, 0), @mod(q.start + q.len, g));
+        }
+    }
+    // 不变里（两条规则都验）：两端在网格上 + 长度 ≥ 一格 + 起点非负 + **幂等**
+    const grids = [_]i32{ 15, 30, 45, 60, 240, 960, 3840 };
+    inline for (.{ quantizeNoteSpan, quantizeClipSpan }) |f| {
+        for (grids) |gg| {
+            var s: i32 = 0;
+            while (s < 4 * 3840) : (s += 337) {
+                var l: i32 = 1;
+                while (l < 3 * 3840) : (l = l * 3 + 7) {
+                    const q = f(s, l, gg);
+                    try std.testing.expectEqual(@as(i32, 0), @mod(q.start, gg));
+                    try std.testing.expectEqual(@as(i32, 0), @mod(q.start + q.len, gg));
+                    try std.testing.expect(q.len >= gg);
+                    try std.testing.expect(q.start >= 0);
+                    const q2 = f(q.start, q.len, gg);
+                    try std.testing.expectEqual(q.start, q2.start);
+                    try std.testing.expectEqual(q.len, q2.len);
+                }
+            }
+        }
+    }
+}
+
+test "trimMinGridLen / trimFloorLen：拉伸下限" {
+    // “位移 → 网格倍数”的四舍五入语义（过半格即换一格、负数对称）仍在此钉住；
+    // 生产代码不再直接用这个换算（一律走 `GridRebase`，见模型顶部注释）。
+    const gridSteps = struct {
+        fn f(delta: i32, grid: i32) i32 {
+            const g = @max(1, grid);
+            if (g <= 1) return delta;
+            const half = @divTrunc(g, 2);
+            return if (delta >= 0) @divTrunc(delta + half, g) else -@divTrunc(-delta + half, g);
+        }
+    }.f;
     try std.testing.expectEqual(@as(i32, 0), gridSteps(11, 24)); // 不足半格：不变
     try std.testing.expectEqual(@as(i32, 1), gridSteps(12, 24)); // 半格：进一格
     try std.testing.expectEqual(@as(i32, 1), gridSteps(35, 24));

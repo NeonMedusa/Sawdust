@@ -34,12 +34,16 @@ scoop install sawdust
 
 - **VST3 插件**：效果器、乐器与鼓组垫层（加载 / 插件界面 / 参数编辑 / 状态随工程存档与撤销 /
   BPM 同步），多输出 VSTi（如 SFLT），扫描管理器 + 预设浏览器
+  —— **已知限制**：宿主只开 **1 条事件总线 × 16 MIDI 通道**（VST3 **多端口 / multi-port
+  未实现**，多音色插件第 2 条以后的端口收不到事件）；**辅助音频输入（侧链）未接**。
+  详见 [`docs/plugin-hosting.md`](docs/plugin-hosting.md)
 - **音序器**：SONG / PAT 双模式（**保位无缝切换**：播放中切换不释音、不重击；
   锚片段映射与幽灵游标的完整规则见 [`docs/song-pat.md`](docs/song-pat.md)）、
   循环播放、BPM 与拍号（工具栏拖动调整）
 - **钢琴卷帘**：绘图 / 移动 / 复制音符，网格选择，力度与声像编辑轨
 - **播放列表**：多轨片段编排（拖拽 / 复制 / 裁剪），时间轴缩放与滚动
-- **调音台**：动态增删通道、声像 / 推子 / 静音；**每通道效果链**
+- **调音台**：动态增删通道、声像 / 推子 / 静音（**推子 dB 锥度**：0 dB 在 75% 行程、顶部 +5 dB，
+  读数与“输入值”都是 dB）；**每通道效果链**
   （EQ / 混响 / 延迟 / 压缩器）；**主通道聚合**——所有子通道汇入主通道，
   主推子与主通道效果作用于全体混音
 - **效果器**：
@@ -57,7 +61,7 @@ scoop install sawdust
   导出（轨首 CC10 = 乐器声像）；单测覆盖解析 / 写出的往返
 - **音频输出 / 导出**：设置页可选择后端与播放设备（重启生效）；离线导出 WAV、MP3、
   FLAC、OGG，MP3/OGG 可选码率、FLAC 可选压缩等级（压缩格式需系统 FFmpeg）
-- **工程**：`.saw`（JSON）保存 / 加载、打开 / 新建（空）的未保存提醒、
+- **工程**：`.saw`（二进制）保存 / 加载、打开 / 新建（空）的未保存提醒、
   **操作历史**（面板跳转 / Ctrl+Z / Ctrl+Alt+Z；播放中撤销不中断播放）
 
 界面自绘（零 GUI 框架）：窗口、控件、图标形状全部像素级绘制。
@@ -65,10 +69,17 @@ scoop install sawdust
 ## 路线图（下一步）
 - [x] VST3 插件（效果器 + 乐器：参数编辑 / 插件界面 / 状态存档与撤销 / BPM 同步 /
   多输出 VSTi（SFLT）/ 扫描管理器 + 预设浏览器）
+  —— **未做**：多端口（多条事件总线，目前只有 1 条 × 16 通道）、辅助音频输入（侧链）
 - [x] 音频文件（WAV/MP3）加载与波形缓存（音频样式 / 音频片段 / 波形窗 / 采样器层，
   见 `docs/audio-files.md`）
-- [ ] 自动化曲线（声像、音量、颤音、bpm变速等等等，还有 MIDI 通道声像的完整还原）
-  —— 🚧 正在 `automation` 分支上开发（未同步到 main）
+- [x] 自动化曲线，已实现：**音量·声像·插件参数·BPM** 四类目标（`automation` 分支已并入 main）
+  **仍是雏形**：
+  - [ ] **框选曲线上的点、批量移动**（目前只能一个点一个点拖）；
+  - [ ] **ALT + 鼠标划过直接画线**（划时按细采样落点、松手再量化简化，设计见 [`docs/automation.md`](docs/automation.md) §11.45）；
+  - 曲线点数与绑定数受**音频侧共享点池**约束：总预算 **16384 点**（单条曲线至多 4096 点）、
+  同时生效绑定 **64 条**；超出时跳过 + 计数 + 弹一次 Toast（不静默，见 `docs/automation.md` §11.45）；
+  - VST3 参数自动化：多端口/侧链未做；参数每块只有 2 个求值点（块内线性插值，听不出差）。
+  细节与已知限制见 [`docs/automation.md`](docs/automation.md)（§11.44 叠加语义定稿 / §11.45 雏形与两条未实现手势）
 - [ ] 更多效果器（合唱 / 失真 / 滤波器……）
 - [ ] 将自带的减法合成器升级成更强大的波表合成器，用合成器捏出一整套midi标准乐器音色
 - [ ] 音频录制（麦克风 / 线路输入 → 采样层与音频片段）
@@ -82,6 +93,19 @@ scoop install sawdust
   macOS 未开始
 - [x] **DPI 感知的 UI 缩放**（100%~300%；高分屏/系统缩放不再“全部很小”，见 [`docs/ui-scaling.md`](docs/ui-scaling.md)；
   `SAWDUST_UI_SCALE=1.5` 可手动指定）
+
+## 已知问题（已确认、尚未修复）
+
+- **BPM 自动化变速时，自带减法合成器会出杂音 / 爆音**。
+  复现：把 **BPM** 绑一条自动化曲线 → 播放中变速，正在发声的音会冒出短促杂音、咔哒甚至爆音。
+  **根因未定位，暂未修复**（记录于本版，待排查）。BPM 自动化的“文档 BPM / 有效 BPM /
+  逐绑定平滑”设计见 [`docs/bpm-automation.md`](docs/bpm-automation.md)。
+- **VST3**：多端口（multi-port）与辅助音频输入（侧链）未实现；参数自动化每块只有 2 个求值点。
+  见 [`docs/plugin-hosting.md`](docs/plugin-hosting.md)、[`docs/automation.md`](docs/automation.md) §11.45。
+- **自动化编辑器**：不能框选曲线上的点批量移动；“ALT + 鼠标划过画线”未实现；点数与同时生效
+  绑定数受音频侧共享点池预算限制（**16384 点 / 64 条绑定**，超出会跳过并弹一次 Toast）。
+  见 [`docs/automation.md`](docs/automation.md) §11.45。
+- **Linux**：只在 WSLg 上开发验证过，**尚未在真机 Linux 上实测**。见 [`docs/linux.md`](docs/linux.md)。
 
 ## 构建与运行
 
@@ -148,9 +172,9 @@ zig translate-c -I libs/stb       libs/stb/stb_truetype.h    > src/c/stb_truetyp
 | `src/synth.zig` | 减法合成器 + 鼓组层声部（复音管理/ADSR/滤波） |
 | `src/eq.zig` / `src/effects.zig` | 效果器 DSP：参数 EQ / 混响 / 延迟 / 压缩（含频谱分析） |
 | `src/sequencer.zig` | 音序器：事件调度、编辑重扫（播放中编辑水位线） |
-| `src/model.zig` | 数据模型：音符 / 片段 / 乐器 / 鼓组（U=96 步长单位） |
+| `src/model.zig` | 数据模型：音符 / 片段 / 乐器 / 鼓组（`U = 3840` = 960 PPQN 的步长单位） |
 | `src/midi.zig` | MIDI 导入/导出（SMF 解析 + 写出；纯逻辑可单测） |
-| `src/persist.zig` | 工程保存/加载（JSON `.saw`；版本迁移） |
+| `src/persist.zig` | 工程保存/加载（二进制 `.saw`；版本迁移与字段登记表） |
 | `src/preset.zig` | 预设库（扫描 / 读写 / 分类） |
 | `src/vst_host.zig` | VST3 宿主：加载 / 处理 / 参数 / 状态 / 编辑器窗口（见 `docs/plugin-hosting.md`） |
 | `src/vstscan.zig` | VST3 探测工具（枚举 / 试跑 / 参数 / 编辑器冒烟） |
@@ -163,9 +187,12 @@ VST3 宿主见 `docs/plugin-hosting.md`；**Zig 0.17 迁移实录**见 `docs/zig
 **播放中编辑的调度与释音协议**见 `docs/scheduler-protocol.md`（不变量 / 事件生命期 / 重扫门控 / 诊断字段）；
 **内存 / CPU / 二进制体积账本**见 `docs/resources.md`（池化现状 / 优化 backlog / 发布口径矩阵 / `.rodata` 初值镜像坑）；
 **UI 缩放（DPI）**见 `docs/ui-scaling.md`（逻辑像素单点乘算 / 字体按 DPI 光栅化 / 环境变量覆盖）；
-**拖动 / 吸附 / Alt 细调**见 `docs/drag-snap.md`（八条不变式 / `GridRebase` 量化与重锚 / 橡皮筋与饱和点 / 八条手势路径对照）；
+**拖动 / 吸附 / Alt 细调 / Ctrl+Q 绝对量化**见 `docs/drag-snap.md`（八条不变式 / `GridRebase` 量化与重锚 / 橡皮筋与饱和点 / 手势路径对照表 / §9 量化两步法）；
+**网格与时间分辨率（960 PPQN = U 3840）**见 `docs/units-3840.md`（四族网格档位 / 整除上限 / 存档 v9 迁移 / 实机问题录）；
+**命中判定**见 `docs/pianoroll-hit.md`（像素容差 `noteAtMousePx` / 边缘热区 / 手势帧序瞬移 / 播放列表片段命中与叠放轮换）；
 **SONG / PAT 双模式**见 `docs/song-pat.md`（两个播放域 / 锚片段与白环 / 两个方向的切换映射表 / 幽灵游标 / 点片段带游标 / 手工回归清单）；
 **自动化（参数曲线）的模型与计划**见 `docs/automation.md`（点 + 每段插值 / 两种编辑视图 / 存取与历史纪律）。
+**线性工作流改造（轨道 + 片段，线性 DAW 风格）的设计稿**见 `docs/linear-refactor.md`。
 
 **线程模型**：UI 在主线程，音频回调在 miniaudio 的实时线程；
 参数用 `std.atomic.Value` 传递（无锁，实时安全）；编辑提交走"重扫"机制
@@ -194,10 +221,10 @@ VST3 宿主见 `docs/plugin-hosting.md`；**Zig 0.17 迁移实录**见 `docs/zig
 - [zig-vst3](https://github.com/joshburgess/zig-vst3)（本项目 fork，submodule `libs/zig-vst3`）— MIT；
   VST3 绑定 + 插件侧框架（钉版 VST3 SDK v3.8.0 build 66；VST3 SDK 2025 起亦为 MIT）
 
+## 交流
+
+**Sawdust 编作曲交流群（QQ）：1130996634** —— 使用问题、报 bug、交流编曲都可以在这里（虽然群主经常失踪，但交流依然会比提issues更即时一些）。
+
 ## 许可证
 
 MIT
-
-## 交流
-
-**Sawdust 编作曲交流群（QQ）：1130996634** —— 使用问题、报 bug、提需求、交流编曲都可以在这里（虽然群主经常失踪，但交流依然会比提issues更即时一些）。

@@ -2,9 +2,13 @@
 //!
 //! 当前只有 EQ：**大尺寸频谱背景 + 包络曲线 + 4 个可拖控制点**（横 = 频率、
 //! 纵 = 增益）、4 段的频率/增益数值、Q 推子。
-//! 顶部还提供开关（旁通）与干湿比——与调音台里的行控制同步（同一数据）。
+//! **面板里没有开关/干湿**——那两项是**调音台效果链行**的职责（`view_mixer.drawEffectRow`：
+//! 左侧旁通小方块 + 右侧干湿旋钮，同一份数据）；面板只管“这个效果长什么样/参数怎么调”。
+//! 插件参数自动化统一从标题栏 `自动化` 进（那个窗口就是完整参数表 + 搜索，
+//! 软参数列表仅在**没有自带 GUI** 的插件正文里出现）。
 
 const std = @import("std");
+const builtin = @import("builtin");
 const r_mod = @import("render.zig");
 const Ui = @import("ui.zig").Ui;
 const app_mod = @import("app.zig");
@@ -12,6 +16,7 @@ const App = app_mod.App;
 const eq = @import("eq.zig");
 const fx = @import("effects.zig");
 const util = @import("view_util.zig");
+const view_vst_auto = @import("view_vst_auto.zig");
 const model = @import("model.zig");
 
 const win_title_h: i32 = 22;
@@ -63,16 +68,32 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     }) catch "效果器";
     ui.label(title, x + 8, y + 4, ui.theme.text);
 
-    // 预设按钮（标题栏右侧）：[预设 ▾][保存为…]——内置单效果与 VST3 效果都支持
+    // 预设按钮（标题栏右侧）：[自动化][预设 ▾][保存为…]——与乐器窗标题栏同一顺序/同款按钮
+    var title_btn_used = false;
     {
         const save_w: i32 = 62;
         const menu_w: i32 = 58;
+        const auto_w: i32 = 56;
         const gap: i32 = 6;
         const bx2 = x + ww - 22 - 6 - save_w;
         const bx1 = bx2 - gap - menu_w;
+        const bx0 = bx1 - gap - auto_w;
         const bh2: i32 = win_title_h - 6;
         const by2 = y + 3;
-        if (bx1 > x + 200 and es.kind != .empty) { // 标题放不下就不画（窄窗）
+        // `自动化`：与乐器窗一致——**只有 VST3 插件槽**才画（内置效果器没有插件参数）
+        const show_auto_btn = es.kind == .plugin;
+        if ((if (show_auto_btn) bx0 else bx1) > x + 200 and es.kind != .empty) { // 标题放不下就不画（窄窗）
+            if (show_auto_btn) {
+                const h0 = util.hitUI(ui, bx0, by2, auto_w, bh2);
+                ui.renderer.fillRect(bx0, by2, auto_w, bh2, if (h0) ui.theme.item_hover else ui.theme.slider_track);
+                ui.renderer.strokeRect(bx0, by2, auto_w, bh2, ui.theme.panel_border);
+                ui.label("自动化", bx0 + 5, by2 + 2, ui.theme.text);
+                if (h0 and ui.mouse_pressed) {
+                    app.openVstAutoWin(.{ .kind = .fx, .a = @intCast(panel.ch), .b = @intCast(panel.slot) });
+                    title_btn_used = true;
+                    ui.active_id = 0; // 防误触发标题拖动
+                }
+            }
             const h1 = util.hitUI(ui, bx1, by2, menu_w, bh2);
             ui.renderer.fillRect(bx1, by2, menu_w, bh2, if (app.preset_browser.open) ui.theme.accent else if (h1) ui.theme.item_hover else ui.theme.slider_track);
             ui.renderer.strokeRect(bx1, by2, menu_w, bh2, ui.theme.panel_border);
@@ -90,6 +111,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
                 } else {
                     app.openPresetBrowser(.{ .replace_effect = .{ .ch = panel.ch, .slot = panel.slot } });
                 }
+                title_btn_used = true;
                 ui.active_id = 0; // 防误触发标题拖动
             }
             const h2 = util.hitUI(ui, bx2, by2, save_w, bh2);
@@ -100,29 +122,22 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
                 const save_src = app_mod.PresetSaveSource{ .effect = .{ .ch = panel.ch, .slot = panel.slot } };
                 app.beginRenamePreset(bx2 - 60, y + win_title_h + 4, save_src, app.presetPrefillName(save_src));
                 app.preset_browser.open = false;
+                title_btn_used = true;
                 ui.active_id = 0;
             }
         }
     }
 
     // 关闭按钮
-    const close_x = x + ww - 22;
-    const close_hovered = util.hitUI(ui, close_x, y + 2, 20, win_title_h - 4);
-    ui.renderer.fillRect(close_x, y + 2, 20, win_title_h - 4, if (close_hovered) ui.theme.danger else ui.theme.panel);
-    ui.label("×", close_x + 6, y + 4, ui.theme.text);
-    if (close_hovered and ui.mouse_pressed) {
+    if (util.titleCloseButton(ui, x, y, ww, win_title_h)) {
         app.mixer_win.panel = null;
         ew.eq_drag = null;
         return true;
     }
 
     // 标题拖动
-    // 点窗口内任意处 → 置顶（“点谁谁在上”）
-    if (util.inRect(ui.mouse_x, ui.mouse_y, x, y, ww, hh) and ui.mouse_pressed) {
-        app.bringToFront(&ew.z);
-    }
 
-    if (util.hitUI(ui, x, y, ww - 24, win_title_h) and ui.mouse_pressed) {
+    if (!title_btn_used and util.hitUI(ui, x, y, ww - 24, win_title_h) and ui.mouse_pressed) {
         ui.active_id = 7600;
         ew.grab_dx = ui.mouse_x - x;
         ew.grab_dy = ui.mouse_y - y;
@@ -162,42 +177,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         ui.renderer.line(x + ww - 6, y + hh - 2, x + ww - 2, y + hh - 6, ui.theme.panel_border);
     }
 
-    var cy = y + win_title_h + 6;
-
-    // ── 顶部控制行：开关（左）…… 干湿比（**右对齐独立分组**）──
-    // 干湿**不能贴着“启用”**（否则两个控制读成“启用干湿”）；
-    // 它是独立的混合参数：0% = 完全旁通（等同关效果）、1 = 完全处理；
-    // 对 EQ 而言近似“EQ 强度”（对未来的混响/延迟才是核心参数）。
-    {
-        const sw: i32 = 16;
-        const sw_hovered = util.hitUI(ui, x + 10, cy + 2, sw, sw);
-        ui.renderer.fillRect(x + 10, cy + 2, sw, sw, if (es.enabled) ui.theme.accent else ui.theme.slider_track);
-        ui.renderer.strokeRect(x + 10, cy + 2, sw, sw, ui.theme.panel_border);
-        ui.label("启用", x + 10 + sw + 6, cy + 4, if (es.enabled) ui.theme.text else ui.theme.text_dim);
-        if (sw_hovered and ui.mouse_pressed) {
-            es.enabled = !es.enabled;
-            app.commitHistory("切换效果器开关");
-        }
-
-        // 干湿比（横向推子；右对齐到窗口右缘）——VST3 插件暂未接干湿混合（滑块隐藏，避免误导）
-        if (es.kind != .plugin) {
-            const pct_w: i32 = 44; // 预留 "100%" 文字宽度
-            const mix_w: i32 = @min(180, ww - 320);
-            if (mix_w > 60) {
-                const mix_x = x + ww - 12 - pct_w - 8 - mix_w;
-                ui.label("干湿", mix_x - 34, cy + 4, ui.theme.text_dim);
-                var mix = es.mix;
-                if (ui.slider(7602, &mix, mix_x, cy + 4, mix_w, 14)) {
-                    es.mix = mix;
-                    app.history_pending = "调整效果器干湿";
-                }
-                var mb: [16]u8 = undefined;
-                const mt = std.fmt.bufPrint(&mb, "{d:.0}%", .{es.mix * 100}) catch "";
-                ui.label(mt, mix_x + mix_w + 8, cy + 4, ui.theme.text_dim);
-            }
-        }
-    }
-    cy += 28;
+    const cy = y + win_title_h + 6;
 
     // ── 主区：EQ = 频谱图 + 频段控制；其它效果器 = 参数旋钮面板 ──
     if (es.kind == .eq) {
@@ -243,20 +223,43 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
 }
 
 /// 参数面板（混响/延迟/压缩器）：纵列 = 名称 + 旋钮 + 数值
-/// 注：干湿（mix）不在此列——顶部已有独立干湿滑块（同一参数，避免两个入口）
+/// 注：干湿（mix）不在此列——它在**调音台效果链行**的旋钮里（同一数据，避免两个入口）
 fn drawParamPanel(ui: *Ui, app: *App, es: *app_mod.EffectSlot, px: i32, py: i32, pw: i32, ph: i32) void {
-    // VST3 插件：界面已嵌在内容区（子窗口）时不画软层；否则头部信息 + 参数列表
     if (es.kind == .plugin) {
-        if (es.plugin) |p| {
-            if (p.view != null) return; // 嵌入中：子窗口覆盖内容区
+        // Windows：编辑器嵌在内容区（原生子窗口覆盖）→ 不画软层，直接让子窗口占满
+        // Linux：编辑器是**独立顶层窗口** → 正文照常画（UI 开关 + 自动化正文），与乐器面板对齐
+        if (comptime builtin.os.tag != .linux) {
+            if (es.plugin) |p| {
+                if (p.view != null) return;
+            }
         }
         const pl = es.plugin;
-        // ── 头部：名称；路径 · 延迟（无按钮：插件界面直接嵌在下方）──
+        var yy = py + 4;
+        // ── Linux：「打开 / 关闭插件 UI（独立窗口）」——没有它，用户关掉插件窗口后就回不来 ──
+        if (comptime builtin.os.tag == .linux) {
+            if (pl) |p| {
+                if (!p.editor_no_ui) {
+                    const is_open = app.vst_editor_owner == p;
+                    const label: []const u8 = if (is_open) "关闭插件 UI（独立窗口）" else "打开插件 UI（独立窗口）";
+                    if (ui.button(7901, label, px, yy, pw, 24)) {
+                        if (is_open) {
+                            p.setEditorVisible(false);
+                            app.vst_editor_owner = null;
+                        } else {
+                            p.showEditorAt(240, 200);
+                            app.vst_editor_owner = p;
+                        }
+                    }
+                    yy += 30;
+                }
+            }
+        }
+        // ── 头部：名称；路径 · 延迟 ──
         {
             const name_t = if (pl) |p| p.name() else "（未加载）";
-            ui.labelClipped(name_t, px + 8, py + 4, pw - 16, if (es.load_failed) ui.theme.danger else ui.theme.text);
+            ui.labelClipped(name_t, px + 8, yy, pw - 16, if (es.load_failed) ui.theme.danger else ui.theme.text);
         }
-        var yy = py + 28;
+        yy += 24;
         {
             var lb: [48]u8 = undefined;
             const lat_t = if (pl) |p| (std.fmt.bufPrint(&lb, " · 延迟 {d}", .{p.latency}) catch "") else "";
@@ -266,13 +269,18 @@ fn drawParamPanel(ui: *Ui, app: *App, es: *app_mod.EffectSlot, px: i32, py: i32,
         }
         yy += 18;
 
-        // 滚动状态挂在窗口面板引用上（切换效果槽时自动归零）
-        var dummy_scroll: i32 = 0;
-        const scroll_p: *i32 = if (app.mixer_win.panel) |*pref| &pref.scroll else &dummy_scroll;
         const ref: app_mod.PluginSlotRef = if (app.mixer_win.panel) |pref|
             .{ .kind = .fx, .a = @intCast(pref.ch), .b = @intCast(pref.slot) }
         else
             .{ .kind = .fx };
+        // Linux：正文直接放**自动化三段式**（与乐器面板同一份）——参数表/已链接/自动化全在一起
+        if (comptime builtin.os.tag == .linux) {
+            view_vst_auto.drawBody(ui, app, ref, 7902, px, yy, pw, py + ph - yy);
+            return;
+        }
+        // 滚动状态挂在窗口面板引用上（切换效果槽时自动归零）
+        var dummy_scroll: i32 = 0;
+        const scroll_p: *i32 = if (app.mixer_win.panel) |*pref| &pref.scroll else &dummy_scroll;
         util.drawPluginParamList(ui, app, pl, es.load_failed, scroll_p, ref, 7900, px, py, pw, ph, yy);
         return;
     }
@@ -295,8 +303,8 @@ fn drawParamPanel(ui: *Ui, app: *App, es: *app_mod.EffectSlot, px: i32, py: i32,
                 app.history_pending = "调整延迟节奏";
             }
             var mb: [24]u8 = undefined;
-            const bpm_c: i32 = @max(20, app.bpm);
-            const ms = fx.delay_tempos[@intCast(code)].beats * 60000.0 / @as(f32, @floatFromInt(bpm_c));
+            const bpm_c: f32 = @max(model.bpm_min, app.bpm);
+            const ms = fx.delay_tempos[@intCast(code)].beats * 60000.0 / bpm_c;
             ui.label(std.fmt.bufPrint(&mb, "{d:.0}ms", .{ms}) catch "", knob_x + 68, yy + @divTrunc(knob, 2) - 6, ui.theme.text);
             yy += row_h;
             continue;

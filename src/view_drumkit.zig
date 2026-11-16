@@ -117,22 +117,13 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     }
 
     // 关闭按钮
-    const close_x = x + ww - 22;
-    const close_hovered = util.hitUI(ui, close_x, y + 2, 20, win_title_h - 4);
-    ui.renderer.fillRect(close_x, y + 2, 20, win_title_h - 4, if (close_hovered) ui.theme.danger else ui.theme.panel);
-    ui.label("×", close_x + 6, y + 4, ui.theme.text);
-    if (close_hovered and ui.mouse_pressed) {
+    if (util.titleCloseButton(ui, x, y, ww, win_title_h)) {
         dw.open = false;
         if (dw.audition_pitch) |ap| {
             app.auditionOffInst(inst_idx, ap);
             dw.audition_pitch = null;
         }
         return true;
-    }
-
-    // 点窗口内任意处 → 置顶（“点谁谁在上”）
-    if (util.inRect(ui.mouse_x, ui.mouse_y, x, y, ww, hh) and ui.mouse_pressed) {
-        app.bringToFront(&dw.z);
     }
 
     // 标题拖动（排除右侧按钮区；按钮区≈150px）

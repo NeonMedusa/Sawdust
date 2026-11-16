@@ -500,6 +500,11 @@ UI 线程：编辑 → commitHistory → snap_dirty
           · snap_gen 变化 → 丢弃 stash 待触发事件 + snap_step = 本块起点 + **换代对账**
           · 从快照取 [snap_step, s1) 的事件 → stashInsert → 原有触发流水线
           · s1 用 **ceil**（`k*step_frames < D` ⇔ `k < ceil(D/step)`，floor 会每块错一位）
+          · **窗口必须用积分器 `ref_step` 算**（`gatherWindow()`），**不能**用锚点等式
+            `start_step + (abs0−start_frame)/step_frames`——后者只在恒定 BPM 下成立：
+            BPM 一自动化，它就拿新速率重算历史 → **落后于真实位置** → 本块该触发的音符
+            没收进来、下一块才补（迟到）；而迟到音符的 `end_step` 已过去，会被“本地到点释音”
+            立刻关掉 → **只响一个音头**（揉 tempo 曲线吞音的真正原因）。
 ```
 
 **不变量（现行）**
@@ -511,6 +516,10 @@ UI 线程：编辑 → commitHistory → snap_dirty
    内置合成器按 `(音高, on_step)` **精确**释放（不误切同音高实例）；VSTi 只能按音高（已知限制）；
 4. **off 仍然双保险**：`on` 自带 `end_step`，音频本地到点释音（与模型无关，保留）；
 5. **快照不可立即释放**：音频可能正在读旧快照 → 退休队列 30 帧（实测 block ≈10 ms）。
+6. **“步 ↔ 帧”只能有一个真源**：位置推进用**积分器** `ref_step`（每块按当时的 BPM 累加）。
+   凡“把帧换成步”的地方（事件收集窗口 / 自动化曲线求值 / 音频片段位置 / VST3 PPQ）**必须基于它**；
+   写 `start_step + (abs0−start_frame)/step_frames` 的地方都属于 BPM 自动化之前的历史遗留，
+   一旦有 tempo 曲线就会两边分家（已踩：吞音头）。
 
 **诊断（现行）**
 

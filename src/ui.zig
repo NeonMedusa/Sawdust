@@ -12,6 +12,7 @@ const Renderer = r_mod.Renderer;
 const Color = r_mod.Color;
 const Font = @import("font.zig").Font;
 const window = @import("window.zig");
+const text_edit = @import("text_edit.zig");
 
 /// 光标形状请求（每帧由 UI 设置，窗口层据此切换系统光标）
 pub const CursorKind = enum { arrow, resize_h, resize_v, size_all, hidden };
@@ -94,6 +95,8 @@ pub const Theme = struct {
     danger: Color = r_mod.rgb(160, 60, 60),
     /// 静音开关激活
     mute_on: Color = r_mod.rgb(190, 70, 70),
+    /// **自动化激活**（旋钮/推子被启用中的自动化曲线驱动 → 绿色标记）
+    auto_active: Color = r_mod.rgb(96, 210, 140),
     /// 琴键：白键 / 黑键 / 键上音名
     key_white: Color = r_mod.rgb(196, 200, 206),
     key_black: Color = r_mod.rgb(28, 30, 34),
@@ -160,6 +163,11 @@ pub const Ui = struct {
     /// - `7600-7900`：效果器窗口（窗口 7600/7601、干湿 7602、EQ 7800+、VST3 参数行 7900+）
     /// - `8100-8711`：调音台控件（声像 8100+ / 音量 8150+ / 干湿 8200+）
     active_id: u64 = 0,
+    /// Debug：本帧已认领的 id（撞车检测用；见 `claimActive`）
+    seen_ids: [128]u64 = @splat(0),
+    seen_n: usize = 0,
+    seen_frame: u64 = 0,
+    frame_n: u64 = 0,
     drag_anchor: f32 = 0,
     /// 拖动起始值（splitter 初值 / 滚动条的鼠标抓取偏移，像素）
     drag_start: i32 = 0,
@@ -315,8 +323,25 @@ pub const Ui = struct {
 
     /// 把文本裁剪到最多 max_px 像素宽（按字符累加，超出加 "…"）。
     /// 返回可直接绘制的切片（不做分配）。
+    /// 省略号字形：`…`（U+2026）优先；字体缺该码点（advance 为 0 → 渲染豆腐）则退回 `...`
+    fn ellipsisGlyph(self: *Ui) []const u8 {
+        return if (self.font.advanceLogical(0x2026) > 0) "…" else "...";
+    }
+
+    /// **按宽度截断到“能装下的前缀”**；需要截断时会**留出省略号的位置**
+    /// （调用方一般用 `labelClipped`，它会真的把省略号画上）。
     pub fn clipText(self: *Ui, text: []const u8, max_px: i32) []const u8 {
         if (max_px <= 0) return text[0..0];
+        const full = self.fitPrefix(text, @floatFromInt(max_px));
+        if (full == text.len) return text;
+        // 要截断 → 留出省略号宽度再截一次（省得省略号被切掉）
+        const ell_w = self.font.measure(self.ellipsisGlyph());
+        const budget: f32 = @max(0, @as(f32, @floatFromInt(max_px)) - ell_w);
+        return text[0..self.fitPrefix(text, budget)];
+    }
+
+    /// 在 `limit` 像素内能装下的**字节前缀长度**（不切码点）
+    fn fitPrefix(self: *Ui, text: []const u8, limit: f32) usize {
         var width: f32 = 0;
         var i: usize = 0;
         while (i < text.len) {
@@ -327,19 +352,89 @@ pub const Ui = struct {
                 continue;
             };
             const adv = self.font.advanceLogical(cp);
-            if (width + adv > @as(f32, @floatFromInt(max_px))) {
-                // 留出 "…" 的空间
-                return text[0..i];
-            }
+            if (width + adv > limit) return i;
             width += adv;
             i += n;
         }
-        return text;
+        return text.len;
     }
 
-    /// 绘制带裁剪的文本（超出宽度不绘制；调用方可自行加省略号）
+    /// **中段省略**：超宽时保留头尾、中间用省略号（`…` 优先，字体缺字则退回 `...`）。
+    ///
+    /// 算法：头尾**交替**从两边各吃一个码点（头先吃），直到预算用完 →
+    /// 纯中文名下自然得到“头 3 + … + 尾 2”（用户拍的 90px 列宽下），
+    /// ASCII 名按像素能显示更多字（不浪费宽度）。返回切片可能在 `buf` 里。
+    pub fn ellipsisMiddle(self: *Ui, text: []const u8, max_px: i32, buf: []u8) []const u8 {
+        if (max_px <= 0) return text[0..0];
+        const limit: f32 = @floatFromInt(max_px);
+        if (self.font.measure(text) <= limit) return text;
+        // 省略号：先探测 `…`（U+2026）——字体缺该码点时会得到 0 宽（`▾` 那次的教训）
+        const ell: []const u8 = if (self.font.advanceLogical(0x2026) > 0) "…" else "...";
+        const ell_w = self.font.measure(ell);
+        var budget: f32 = @max(0, limit - ell_w);
+
+        // 码点边界（左/右各一套），用于从两头吃
+        var left_ends: [64]usize = undefined;
+        var left_adv: [64]f32 = undefined;
+        var n_left: usize = 0;
+        {
+            var i: usize = 0;
+            while (i < text.len and n_left < left_ends.len) {
+                const n = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+                if (i + n > text.len) break;
+                const cp = std.unicode.utf8Decode(text[i .. i + n]) catch {
+                    i += n;
+                    continue;
+                };
+                left_ends[n_left] = i + n;
+                left_adv[n_left] = self.font.advanceLogical(cp);
+                n_left += 1;
+                i += n;
+            }
+        }
+        if (n_left == 0) return text;
+
+        // 交替分配：头一个、尾一个、头一个…（不切码点：两侧都用上面的边界表）
+        var head: usize = 0; // 已吃的头码点数
+        var tail: usize = 0; // 已吃的尾码点数
+        while (head + tail < n_left) {
+            if (left_adv[head] <= budget) {
+                budget -= left_adv[head];
+                head += 1;
+            } else break;
+            if (head + tail >= n_left) break;
+            const ti = n_left - tail - 1;
+            if (left_adv[ti] <= budget) {
+                budget -= left_adv[ti];
+                tail += 1;
+            } else break;
+        }
+        if (head + tail >= n_left) return text; // 其实装得下
+        const head_end: usize = if (head > 0) left_ends[head - 1] else 0;
+        const tail_start: usize = if (tail > 0) left_ends[n_left - tail - 1] else text.len;
+        const need = head_end + ell.len + (text.len - tail_start);
+        if (need > buf.len) return self.clipText(text, max_px); // 退化：只截头
+        @memcpy(buf[0..head_end], text[0..head_end]);
+        @memcpy(buf[head_end .. head_end + ell.len], ell);
+        @memcpy(buf[head_end + ell.len .. need], text[tail_start..]);
+        return buf[0..need];
+    }
+
+    /// 绘制带裁剪的文本（超出宽度不绘制；**需要截断时自动补省略号**）
     pub fn labelClipped(self: *Ui, text: []const u8, x: i32, y: i32, max_px: i32, color: Color) void {
         const shown = self.clipText(text, max_px);
+        const by: f32 = @floatFromInt(y + @as(i32, @intFromFloat(self.font.ascentL())));
+        self.font.draw(self.renderer, shown, @floatFromInt(x), by, color);
+        if (shown.len < text.len) {
+            const tx: i32 = x + @as(i32, @intFromFloat(self.font.measure(shown)));
+            self.font.draw(self.renderer, self.ellipsisGlyph(), @floatFromInt(tx), by, color);
+        }
+    }
+
+    /// 绘制带**中段省略**的文本（超宽 → `头…尾`）——曲线名这类“存长、显短”的字段用它
+    pub fn labelMiddle(self: *Ui, text: []const u8, x: i32, y: i32, max_px: i32, color: Color) void {
+        var buf: [96]u8 = undefined;
+        const shown = self.ellipsisMiddle(text, max_px, &buf);
         self.font.draw(self.renderer, shown, @floatFromInt(x), @floatFromInt(y + @as(i32, @intFromFloat(self.font.ascentL()))), color);
     }
 
@@ -481,7 +576,23 @@ pub const Ui = struct {
 
     /// 水平推子：直接修改 `value`（0-1），返回 true = 值变了
     pub fn slider(self: *Ui, id: u64, value: *f32, x: i32, y: i32, w: i32, h: i32) bool {
-        const hovered = self.hit(x, y, w, h);
+        return self.sliderTint(id, value, x, y, w, h, null, null);
+    }
+
+    /// 平推**把手宽**：把手的**中心**跟随值 → 在 0 / 1 时有一半露在轨道外，
+    /// 所以**命中区必须两端各外扩半个宽**（否则“鼠标已搁在把手上却不响应”——实测 bug）；
+    /// 绘制与命中共用这个常量，不得分叉。
+    const slider_knob_w: i32 = 12;
+    /// 竖推把手高（同理）
+    const slider_knob_h: i32 = 12;
+
+    /// 推子（可上色）：`fill_tint` = 已填充段颜色（null = 主题默认）；
+    /// `knob_tint` = 把手颜色（null = 默认白/悬停蓝）。
+    /// 自动化激活时传 `theme.auto_active` → “填充 + 把手”整体变绿。
+    pub fn sliderTint(self: *Ui, id: u64, value: *f32, x: i32, y: i32, w: i32, h: i32, fill_tint: ?Color, knob_tint: ?Color) bool {
+        // 命中区 = 轨道 + 两端各半个把手（把手停在端点时露在外面的那半截也算）
+        const half = @divTrunc(slider_knob_w, 2);
+        const hovered = self.hit(x - half, y, w + slider_knob_w, h);
         const changed = self.draggable(id, hovered, x, w, value);
 
         // 轨道
@@ -489,17 +600,20 @@ pub const Ui = struct {
         self.renderer.fillRect(x, track_y, w, 6, self.theme.slider_track);
         // 已填充部分
         const fill_w: i32 = @intFromFloat(value.* * @as(f32, @floatFromInt(w)));
-        self.renderer.fillRect(x, track_y, fill_w, 6, self.theme.slider_fill);
+        self.renderer.fillRect(x, track_y, fill_w, 6, fill_tint orelse self.theme.slider_fill);
         // 把手
-        const knob_x = x + fill_w - 6;
-        self.renderer.fillRect(knob_x, y, 12, h, if (hovered or self.active_id == id) self.theme.accent else r_mod.rgb(180, 186, 196));
-        self.renderer.strokeRect(knob_x, y, 12, h, self.theme.panel_border);
+        const knob_x = x + fill_w - half;
+        const kcol = knob_tint orelse (if (hovered or self.active_id == id) self.theme.accent else r_mod.rgb(180, 186, 196));
+        self.renderer.fillRect(knob_x, y, slider_knob_w, h, kcol);
+        self.renderer.strokeRect(knob_x, y, slider_knob_w, h, self.theme.panel_border);
         return changed;
     }
 
     /// 垂直推子（音量常用）：0 在底部
     pub fn vslider(self: *Ui, id: u64, value: *f32, x: i32, y: i32, w: i32, h: i32) bool {
-        const hovered = self.hit(x, y, w, h);
+        // 命中区 = 轨道 + 两端各半个把手高（同 `sliderTint` 的理由）
+        const half = @divTrunc(slider_knob_h, 2);
+        const hovered = self.hit(x, y - half, w, h + slider_knob_h);
         // 垂直方向：鼠标 y 向下增大 → 值减小
         const changed = self.draggableV(id, hovered, y, h, value);
 
@@ -507,9 +621,9 @@ pub const Ui = struct {
         self.renderer.fillRect(track_x, y, 6, h, self.theme.slider_track);
         const fill_h: i32 = @intFromFloat(value.* * @as(f32, @floatFromInt(h)));
         self.renderer.fillRect(track_x, y + h - fill_h, 6, fill_h, self.theme.slider_fill);
-        const knob_y = y + h - fill_h - 6;
-        self.renderer.fillRect(x, knob_y, w, 12, if (hovered or self.active_id == id) self.theme.accent else r_mod.rgb(180, 186, 196));
-        self.renderer.strokeRect(x, knob_y, w, 12, self.theme.panel_border);
+        const knob_y = y + h - fill_h - half;
+        self.renderer.fillRect(x, knob_y, w, slider_knob_h, if (hovered or self.active_id == id) self.theme.accent else r_mod.rgb(180, 186, 196));
+        self.renderer.strokeRect(x, knob_y, w, slider_knob_h, self.theme.panel_border);
         return changed;
     }
 
@@ -520,8 +634,18 @@ pub const Ui = struct {
         return self.knobRange(id, value, x, y, size, 0, 1);
     }
 
+    /// **自动化激活的旋钮**：进度弧与中心点换成绿色（其余与 `knob` 一致）
+    pub fn knobAuto(self: *Ui, id: u64, value: *f32, x: i32, y: i32, size: i32, auto_active: bool) bool {
+        return self.knobRangeTint(id, value, x, y, size, 0, 1, if (auto_active) self.theme.auto_active else null);
+    }
+
     /// 带值域的旋钮（如 Q 值 0.1..4.0）——绘制按 `(v - vmin) / (vmax - vmin)` 归一化。
     pub fn knobRange(self: *Ui, id: u64, value: *f32, x: i32, y: i32, size: i32, vmin: f32, vmax: f32) bool {
+        return self.knobRangeTint(id, value, x, y, size, vmin, vmax, null);
+    }
+
+    /// 旋钮的完整版：`tint` 非 null = **自动化激活色**（进度弧 + 中心点都用它）
+    pub fn knobRangeTint(self: *Ui, id: u64, value: *f32, x: i32, y: i32, size: i32, vmin: f32, vmax: f32, tint: ?Color) bool {
         const range = @max(1e-6, vmax - vmin);
         const hovered = self.hit(x, y, size, size);
         var changed = false;
@@ -555,10 +679,11 @@ pub const Ui = struct {
         const a1: f32 = pi / 2 + 2 * pi - gap / 2;
         self.renderer.arcRing(cx, cy, r, ring_w, a0, a1, self.theme.slider_track);
         if (norm > 0.002) {
-            const col = if (hovered or self.active_id == id) self.theme.accent else self.theme.slider_fill;
-            self.renderer.arcRing(cx, cy, r, ring_w, a0, a0 + (a1 - a0) * norm, col);
+            const base_col = if (hovered or self.active_id == id) self.theme.accent else self.theme.slider_fill;
+            self.renderer.arcRing(cx, cy, r, ring_w, a0, a0 + (a1 - a0) * norm, tint orelse base_col);
         }
-        self.renderer.fillRect(cx - 1, cy - 1, 2, 2, self.theme.text_dim);
+        // 中心小点：自动化激活时也是绿色（用户拍板：“弧度 + 中心点变绿”就够，不要外圈）
+        self.renderer.fillRect(cx - 1, cy - 1, 2, 2, tint orelse self.theme.text_dim);
         return changed;
     }
 
@@ -652,6 +777,28 @@ pub const Ui = struct {
             const cx = tx + @as(i32, @intFromFloat(self.font.measure(text[0..cursor])));
             self.renderer.vline(cx, y + 4, h - 8, self.theme.text);
         }
+    }
+
+    /// **文本输入框的“标准渲染一帧”**：把两条**必须成对出现**的规则收在一处：
+    /// 1. 拖动选区期间**冻结水平滚动**（否则 `光标 → view_off → 下一帧光标` 是反馈环，
+    ///    在框右缘附近会慢慢跑飞）；
+    /// 2. **有选区时不画闪烁光标**（否则光标每 500ms 在选区上闪 → 看着像“选区在闪”）。
+    /// 主输入框与文件选择器（路径栏 / 文件名）都走这里，别各写一遍。
+    pub fn textFieldInput(
+        self: *Ui,
+        text: []const u8,
+        cursor: usize,
+        sel: ?[2]usize,
+        dragging: bool,
+        view_off: *i32,
+        epoch_ms: i64,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+    ) void {
+        if (!dragging) view_off.* = self.textFieldSyncOffset(text, cursor, w, view_off.*);
+        self.textFieldEx(text, cursor, sel, view_off.*, x, y, w, h, sel == null and text_edit.blinkOnSince(epoch_ms));
     }
 
     /// 文本输入框：让**光标可见**的水平滚动偏移（px）。
@@ -827,6 +974,34 @@ pub const Ui = struct {
         return self.dragNumberEx(id, x, y, w, h, value, min_v, max_v, pixels_per_unit, 0, null);
     }
 
+    /// **浮点数值控件**（BPM 等；两位小数）：内部按 **1/100 单位（cents）** 驱动，
+    /// 复用整数拖拽的同一套步进/余数累积 → 手感与 `dragNumber` 一致；
+    /// 最小值/最大值也是浮点，但换算成 cents 后仍走整数夹取。
+    pub fn dragNumberF(
+        self: *Ui,
+        id: u64,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        value: *f32,
+        min_v: f32,
+        max_v: f32,
+        pixels_per_cent: i32,
+    ) bool {
+        var cents: i32 = @intFromFloat(@round(value.* * 100.0));
+        const lo: i32 = @intFromFloat(@round(min_v * 100.0));
+        const hi: i32 = @intFromFloat(@round(max_v * 100.0));
+        const changed = self.dragNumberEx(id, x, y, w, h, &cents, lo, hi, pixels_per_cent, 0, fmtCents);
+        if (changed) value.* = @as(f32, @floatFromInt(cents)) / 100.0;
+        return changed;
+    }
+
+    /// cents → “xxx.yy”文本（`dragNumberF` 专用）
+    fn fmtCents(v: i32, buf: []u8) []const u8 {
+        return std.fmt.bufPrint(buf, "{d}.{d:0>2}", .{ @divTrunc(v, 100), @abs(@rem(v, 100)) }) catch "---";
+    }
+
     /// `dragNumber` 的扩展版：支持**拖动值 ↔ 显示值解耦**。
     /// - `exp_scale` > 0 时：拖动的是“指数”（1 单位 = ×2，用于拍号分母等 2 的幂序列），
     ///   存储值是 `2^exponent`；拖动手感线性（不会因吸附写回而振荡）。
@@ -957,6 +1132,69 @@ pub const Ui = struct {
             self.zoom_rem = 0;
             self.mouse_capture = true;
         }
+        return changed;
+    }
+
+    /// **BPM 专用控件**：拖动只改**整数位**，保留三位小数；
+    /// 推到边界时小数**清零**（20.555 ↓ → 20.000；999 同理），之后整数增减不再带小数。
+    /// 小数只能通过右键「输入值…」键入（如 `120.555`）。
+    pub fn dragNumberBpm(
+        self: *Ui,
+        id: u64,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        value: *f32,
+        min_v: f32,
+        max_v: f32,
+        pixels_per_unit: i32,
+    ) bool {
+        const min_i: i32 = @intFromFloat(@round(min_v));
+        const max_i: i32 = @intFromFloat(@round(max_v));
+        const hovered = self.hit(x, y, w, h);
+        var changed = false;
+
+        var ip: i32 = @intFromFloat(@floor(value.*));
+        const frac: f32 = value.* - @as(f32, @floatFromInt(ip));
+
+        if (self.active_id == id) {
+            const dd = self.frozen_dy - self.zoom_last_dy;
+            self.zoom_last_dy = self.frozen_dy;
+            const r = zoomStep(ip, dd, self.zoom_rem, pixels_per_unit, min_i, max_i);
+            self.zoom_rem = r.rem;
+            ip = r.v;
+            const at_edge = ip <= min_i or ip >= max_i;
+            const nv: f32 = @as(f32, @floatFromInt(ip)) + (if (at_edge) 0.0 else frac);
+            if (nv != value.*) {
+                value.* = nv;
+                changed = true;
+            }
+            if (!self.mouse_down) {
+                self.active_id = 0;
+                self.mouse_capture = false;
+            }
+        } else if (hovered and self.mouse_pressed) {
+            self.active_id = id;
+            self.zoom_last_dy = self.frozen_dy;
+            self.zoom_rem = 0;
+            self.mouse_capture = true;
+        }
+
+        // 绘制：整数位 + 三位小数
+        const active = self.active_id == id;
+        const bg = if (active) self.theme.accent else if (hovered) self.theme.item_hover else self.theme.toolbar;
+        self.renderer.fillRect(x, y, w, h, bg);
+        self.renderer.strokeRect(x, y, w, h, self.theme.panel_border);
+        var buf: [16]u8 = undefined;
+        const v = value.*;
+        const iv: i32 = @intFromFloat(@floor(v));
+        const f3: i32 = @intFromFloat(@round((v - @as(f32, @floatFromInt(iv))) * 1000.0));
+        const t = std.fmt.bufPrint(&buf, "{d}.{d:0>3}", .{ iv, @abs(f3) }) catch "---";
+        const tw: i32 = @intFromFloat(self.font.measure(t));
+        const tx = x + @divTrunc(w - tw, 2);
+        self.font.draw(self.renderer, t, @floatFromInt(tx), @floatFromInt(self.centeredBaselineY(y, h)), self.theme.text);
+        if (hovered or active) self.cursor = .resize_v;
         return changed;
     }
 
@@ -1632,6 +1870,38 @@ pub const Ui = struct {
     // ── 内部：命中测试与拖动 ──
 
     /// 公开的命中测试（供调用方判断"鼠标是否在区域内"，如滚动处理）
+    /// **控件 id：编译期稳定、scope 内唯一**。
+    /// 立即式 UI 的 `active_id` 必须“跨帧稳定 + 同帧唯一”，所以不能用运行时自增：
+    /// 一旦某帧多/少一个控件（弹窗、列表长度、窗口 z 序变化），递增 id 会整体位移，
+    /// 正在拖的控件会突然变成别人。用 `id("scope", 序号)` 把 id 绑在**代码标签**上。
+    /// 用法：`ui.claimActive(Ui.idOf("note_lane_list", ii))`（编译期算好，运行时零成本）
+    pub fn idOf(comptime scope: []const u8, comptime idx: anytype) u64 {
+        return std.hash.Fnv1a_64.hash(scope) ^ (@as(u64, @intCast(idx)) *% 0x9E3779B97F4A7C15);
+    }
+
+    /// 认领 `active_id`（**所有设置 active_id 的地方都应走这里**）。
+    pub fn claimActive(self: *Ui, idv: u64) void {
+        const m = @import("builtin").mode;
+        if (m == .debug or m == .safe) { // Debug / ReleaseSafe 都做撞车检测（无分配、128 项）
+            if (self.seen_frame != self.frame_n) {
+                self.seen_frame = self.frame_n;
+                self.seen_n = 0;
+            }
+            var i: usize = 0;
+            while (i < self.seen_n) : (i += 1) {
+                if (self.seen_ids[i] == idv) {
+                    std.debug.print("[ui] 重复的控件 id（同帧内）：0x{x} —— 两个控件撞车了\n", .{idv});
+                    @panic("duplicate widget id");
+                }
+            }
+            if (self.seen_n < self.seen_ids.len) {
+                self.seen_ids[self.seen_n] = idv;
+                self.seen_n += 1;
+            }
+        }
+        self.active_id = idv;
+    }
+
     pub fn hitRect(self: *Ui, x: i32, y: i32, w: i32, h: i32) bool {
         return self.hit(x, y, w, h);
     }

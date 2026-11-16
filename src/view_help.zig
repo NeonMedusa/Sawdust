@@ -37,6 +37,7 @@ const rows = [_]Row{
     .{ .sec = false, .key = "Ctrl + C / Ctrl + V", .desc = "复制 / 粘贴到鼠标位置" },
     .{ .sec = false, .key = "Ctrl + X", .desc = "剪切选中内容" },
     .{ .sec = false, .key = "Ctrl + M", .desc = "静音 / 取消静音选中音符或片段" },
+    .{ .sec = false, .key = "Ctrl + Q", .desc = "量化选中音符 / 片段（两端上当前网格）" },
     .{ .sec = false, .key = "Ctrl + ↑ / ↓", .desc = "音符上 / 下移动八度" },
     .{ .sec = false, .key = "Shift + ↑ / ↓", .desc = "音符上 / 下移动半音" },
     .{ .sec = false, .key = "Ctrl / Shift + ← / →", .desc = "左 / 右移动一小节 / 网格" },
@@ -75,18 +76,9 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     ui.label("帮助 — 基本操作", x + 8, y + 4, ui.theme.text);
 
     // 关闭按钮
-    const close_x = x + ww - 22;
-    const close_hovered = util.hitUI(ui, close_x, y + 2, 20, title_h - 4);
-    ui.renderer.fillRect(close_x, y + 2, 20, title_h - 4, if (close_hovered) ui.theme.danger else ui.theme.panel);
-    ui.label("×", close_x + 6, y + 4, ui.theme.text);
-    if (close_hovered and ui.mouse_pressed) {
+    if (util.titleCloseButton(ui, x, y, ww, title_h)) {
         hw.open = false;
         return true;
-    }
-
-    // 点窗口内任意处 → 置顶（“点谁谁在上”）
-    if (util.inRect(ui.mouse_x, ui.mouse_y, x, y, ww, hh) and ui.mouse_pressed) {
-        app.bringToFront(&hw.z);
     }
 
     // 标题拖动

@@ -134,6 +134,126 @@ test "sched_stress: 随机编辑 × 快照换代（VSTi 位图路径）——不
     try runStress(std.testing.allocator, 2, 0xC0FFEE_02);
 }
 
+// **性能压测（opt-in：`SAWDUST_BENCH=1`）**：
+// 64 轨 × 32 音/轨 × 16 乐器（VSTi 路径，不载真插件——**只量宿主侧开销**：
+// 快照取事件 + stash + 事件构造/转发 + 每块诊断扫描；真插件的 DSP 不在本测里）。
+// 输出：每块微秒 + 占实时预算（512 帧 @48k = 10.67ms）的百分比。
+test "sched_stress: [bench] 64 轨密集事件——每块宿主侧开销" {
+    if (std.c.getenv("SAWDUST_BENCH") == null) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    // 乐器数可用 `SAWDUST_BENCH_CAP` 覆盖（折出“每乐器固定开销”）
+    var inst_cap: usize = 16;
+    if (std.c.getenv("SAWDUST_BENCH_CAP")) |s| {
+        var buf: [16]u8 = undefined;
+        const len = @min(std.mem.len(s), buf.len);
+        @memcpy(buf[0..len], s[0..len]);
+        inst_cap = std.fmt.parseInt(usize, buf[0..len], 10) catch 16;
+        inst_cap = std.math.clamp(inst_cap, 1, 32);
+    }
+    var params = audio.Params{};
+    try params.initCapacity(alloc, inst_cap, 2, 0);
+    defer params.deinit(alloc);
+
+    var imm_q = synth.EventQueue{};
+    params.events = &imm_q;
+
+    var engine = audio.Engine{ .params = &params };
+    engine.allocator = alloc;
+    try engine.setCapacity(inst_cap, 2, 0);
+    defer engine.deinit();
+
+    params.sample_rate = 48000;
+    params.bpm.store(120, .monotonic);
+    params.steps_per_beat.store(960, .monotonic); // 4/4 @ U=3840
+    params.time_num.store(4, .monotonic);
+    params.time_den.store(4, .monotonic);
+    params.channel_count.store(2, .monotonic);
+    params.playing.store(true, .monotonic);
+    params.start_frame.store(0, .monotonic);
+    params.start_step.store(0, .monotonic);
+    params.frames_played.store(0, .monotonic);
+    for (0..inst_cap) |i| {
+        params.instrument_kind[i].store(2, .monotonic); // VSTi 路径（无实例）
+        params.instrument_channel[i].store(@intCast(i % 2), .monotonic);
+        params.instrument_gain[i].store(0.8, .monotonic);
+        params.instrument_pan[i].store(0.5, .monotonic);
+    }
+
+    // 64 轨（= 64 个片段）→ 每轨 32 个 16 分音符，乐器轮流分给 16 个 VSTi
+    const n_tracks: usize = 64;
+    const per_track: usize = 32;
+    const bar: i32 = 3840;
+    var clips_buf: [n_tracks]model.Clip = undefined;
+    for (&clips_buf, 0..) |*c, ti| {
+        c.* = .{ .track = @intCast(ti), .start = 0, .len = bar, .pattern = 0 };
+    }
+    var notes_buf: [n_tracks * per_track]model.Note = undefined;
+    for (0..n_tracks) |ti| {
+        for (0..per_track) |k| {
+            notes_buf[ti * per_track + k] = .{
+                .step = @intCast(@as(usize, k) * 120), // 120 步 = 16 分（U=3840/32）
+                .len = 100,
+                .pitch = @intCast(36 + (ti + k) % 48),
+                .pattern = 0,
+                .instrument = @intCast(ti % inst_cap),
+                .velocity = 100,
+            };
+        }
+    }
+
+    var snap: ?snapshot.Snapshot = null;
+    defer if (snap) |*s| s.deinit();
+    publishSnapshot(alloc, &params, &clips_buf, &notes_buf, &snap);
+
+    var out: [512 * 2]f32 = undefined;
+    const blocks: usize = 1200; // ≈ 12.8 秒音频
+    // 预热（首块有换代对账/缓存冷）
+    @memset(&out, 0);
+    audio.renderBlock(&engine, &params, &out, 512, 48000);
+
+    const t0 = @import("port_io.zig").nowMs();
+    var b: usize = 0;
+    while (b < blocks) : (b += 1) {
+        @memset(&out, 0);
+        audio.renderBlock(&engine, &params, &out, 512, 48000);
+    }
+    const dt_ms = @import("port_io.zig").nowMs() - t0;
+    const per_block_us = @as(f64, @floatFromInt(dt_ms)) * 1000.0 / @as(f64, @floatFromInt(blocks));
+    // 分解：只跑 renderSegment（不含取事件/扫描）
+    const t1 = @import("port_io.zig").nowMs();
+    var b2: usize = 0;
+    while (b2 < blocks) : (b2 += 1) {
+        @memset(&out, 0);
+        engine.seg_abs0 = params.frames_played.load(.monotonic);
+        audio.renderSegment(&engine, &params, &out, 512, 48000, params.volume.load(.monotonic));
+    }
+    const seg_ms = @import("port_io.zig").nowMs() - t1;
+    const seg_us = @as(f64, @floatFromInt(seg_ms)) * 1000.0 / @as(f64, @floatFromInt(blocks));
+    std.debug.print("[bench] 分解：renderSegment {d:.1}us / 其他（取事件+扫描） {d:.1}us\n", .{ seg_us, per_block_us - seg_us });
+    // 微测：只跑 gatherRaw（快照取事件）
+    {
+        const tg = @import("port_io.zig").nowMs();
+        var gb: usize = 0;
+        var gsum: usize = 0;
+        var evb2: [256]synth.SchedEvent = undefined;
+        while (gb < blocks) : (gb += 1) {
+            const s0: i32 = @intCast(gb * 20);
+            if (snap.?.gatherRaw(&evb2, s0, s0 + 21, 1)) |n| gsum +%= n;
+        }
+        const g_ms = @import("port_io.zig").nowMs() - tg;
+        std.debug.print("[bench] 分解2：gatherRaw {d:.1}us/次（事件数合计 {d}）\n", .{
+            @as(f64, @floatFromInt(g_ms)) * 1000.0 / @as(f64, @floatFromInt(blocks)), gsum,
+        });
+    }
+    const budget_us: f64 = 512.0 / 48000.0 * 1_000_000.0; // 10.67ms
+    std.debug.print(
+        "\n[bench] 64轨×32音 / 16 VSTi：blocks={d} total={d}ms  per_block={d:.1}us  = {d:.1}% of 10.67ms\n",
+        .{ blocks, dt_ms, per_block_us, per_block_us / budget_us * 100.0 },
+    );
+    // 健壮性：不得挂音（压测同时也是正确性测试）
+    try std.testing.expectEqual(@as(u32, 0), params.dbg_overrun_peak.load(.monotonic));
+}
+
 test "sched_stress: 换代对账不误杀——切一个实例不得连带另一个同音高实例" {
     const alloc = std.testing.allocator;
     var params = audio.Params{};

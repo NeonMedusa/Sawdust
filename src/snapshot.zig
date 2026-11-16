@@ -18,7 +18,7 @@ pub const Inst = struct {
     start: i32,
     /// 发声参数（**原始值**，钳位在发事件时做——与 `sequencer.makeEvent` 同一处，防对拍假失败）
     velocity: i32,
-    pan: i32,
+    pan: f32,
     end: i32,
     pitch: i32,
     instrument: i32,
@@ -83,7 +83,7 @@ pub const Snapshot = struct {
                 .end_step = it.end,
                 .gen = gen,
                 .velocity = @intCast(std.math.clamp(it.velocity, 1, 127)),
-                .pan = @intCast(std.math.clamp(it.pan, 0, 127)),
+                .pan = std.math.clamp(it.pan, 0.0, 1.0),
             };
             n += 1;
         }
@@ -120,7 +120,7 @@ pub const Snapshot = struct {
                         .end_step = it.end,
                         .gen = gen,
                         .velocity = @intCast(std.math.clamp(it.velocity, 1, 127)),
-                        .pan = @intCast(std.math.clamp(it.pan, 0, 127)),
+                        .pan = std.math.clamp(it.pan, 0.0, 1.0),
                     };
                     n += 1;
                 }
@@ -140,7 +140,7 @@ pub const Snapshot = struct {
                         .end_step = -1,
                         .gen = gen,
                         .velocity = @intCast(std.math.clamp(it.velocity, 1, 127)),
-                        .pan = @intCast(std.math.clamp(it.pan, 0, 127)),
+                        .pan = std.math.clamp(it.pan, 0.0, 1.0),
                     };
                     n += 1;
                 }
@@ -376,7 +376,7 @@ test "snapshot: A1 对拍——与 gatherRange 逐事件一致（随机工程 ×
                 .pattern = @intCast(rnd.intRangeLessThan(i32, 0, 3)),
                 .instrument = @intCast(rnd.intRangeLessThan(i32, 0, 18)),
                 .velocity = @intCast(rnd.intRangeLessThan(i32, -3, 130)),
-                .pan = @intCast(rnd.intRangeLessThan(i32, -3, 130)),
+                .pan = @as(f32, @floatFromInt(rnd.intRangeLessThan(i32, -3, 130))) / 127.0,
                 .muted = rnd.intRangeLessThan(u32, 0, 6) == 0,
             });
         }

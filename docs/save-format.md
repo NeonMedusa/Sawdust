@@ -1,16 +1,67 @@
 # 工程存档格式与版本迁移——设计文档
 
-> 实现：`src/persist.zig`（序列化）、`src/main.zig`（读写路径）、`src/app.zig`（导出/导入）。
+> 实现：`src/persist.zig`（序列化）、`src/main.zig`（读写/升级路径）。
 > 迁移流程参考 SkyNet（`C:\Users\32182\Develop\SkyNet`，`src/db.zig` 的
 > `probeVersionMismatch` / `migrateIfNeeded` / `backupBeforeMigrate` 模式）。
 
+## 当前版本（**改本文任何内容前先看这里**）
+
+| 格式 | 当前版本常量 | 含义 | 已发布？ |
+|---|---|---|---|
+| **`.saw`（唯一工程格式）** | `persist.binary_version = 9` | v9 = 时间分辨率 `U` 96 → **3840**（960 PPQN）+ 自动化整套 + 清格式（见「v9 清格式」节） | ✅ v17/v18 写的是 v8 → **v8 及以前必须迁移** |
+
+> **工程存档只有二进制一种**。JSON 工程通道（`toJson`/`fromJson`、"导入 JSON"“导出 JSON”）
+> 已在 v9 这一轮**整条删掉**——理由与经过见「v9 清格式」节。预设、`settings.json` 仍是 JSON，
+> 那不属于工程存档。
+
+
+### 版本矩阵（各版本到底装了什么 / 读取时怎么处理）
+
+| 二进制版本 | 引入内容（引入于 main 的哪个提交） | 读到旧档时 |
+| --- | --- | --- |
+| v5 | 首版二进制（`f4a7960`） | 字段门控跳过后加的；步域 **×40** |
+| v6 | 鼓组 VST3 层 / 音频片段（`audio_style`/`trim_*`）/ `audio_styles`（`85f9bad`、`767c11e`） | 同上 |
+| v7 | `Project.instrument_order`（乐器上下移，`c47a6c3`） | `×40` + `instrument_order` 缺失 → 空（按槽位顺序） |
+| v8 | 音符/片段静音 `muted`（静音体系那一轮） | `×40` + `muted` 缺失 → `false` |
+| **v9（当前）** | **自动化整套**（`auto_lanes`/`auto_bindings`/`auto_sel`）+ `SavedBinding.smooth_ms·invert·param_id·target_slot` + `SavedInstrument/SavedMixerChannel/SavedEffectSlot/SavedDrumLayer.uid` + **单位 U 96→3840** + **清格式**（删 5 个死字段、`bpm` 改 f32、删 JSON 通道） | 不发迁移（已是新单位） |
+
+> 关键事实（免得再误判“空造版本”）：**v6/v7/v8 都是 main 真实发布过的**（v18 写 v8）。
+> automation 分支只新增了 **v9** 一个版本。读 v5–v8 时的 ×40 与字段默认值全在
+> `fromBinary` 一个入口里（`ver < 9 → migrateUnitsToV5`），**没有逐版本补丁函数**——
+> 这正是想要的形式：**加字段 = 登记一行；改语义 = 写一个迁移函数**。
+
+### 什么时候开始写“旧版→新版”补丁（判断标准）
+
+字段的**三种变化**各有一张登记表，外加“语义/值域变”才写迁移函数：
+
+| 变化 | 登记位置 | 读旧档时的动作 |
+|---|---|---|
+| **新增字段** | `introducedVersion(T, "field")` | `ver < intro` → 不读，取声明默认值 |
+| **类型变更**（同名不同类型） | `changed_fields`（`owner`/`name`/`old_T`/`changed_in`[/`legacy_scale`]） | `ver < changed_in` → 按 `old_T` 读，再转成当前类型（`legacy_scale` = 旧档数值刻度，见 §v9 第 5 条） |
+| **含义/值域变更** | 读入唯一入口的迁移函数（先例：`migrateUnitsToV5`） | 读完后统一换算 |
+
+- 三张表都是**编译期表**（`inline for` + comptime 匹配），不加运行时开销；
+  漏登记的后果都是“字节错位 → `CorruptProject`”，所以每张表都要配**旧布局往返测试**
+  （`toBinaryAtVersion(…, N)` 会对称地写旧布局：补写已删字段的零值、按旧类型写）。
+- **发布新版二进制之前**必须做的三件事（已就位）：
+  1. `probeVersion()` 能探出旧版本号（看 `SAWD` 魔数后的版本字节）——测试 `probeVersion` 守着；
+  2. 打开旧档 → **备份 `.bak.saw` + 原地升级**（`performUpgrade`）；
+  3. “版本过新”要拒绝并提示（不能让新版存档悄悄丢字段）。
+
+
+**当前迁移链**：二进制 `v5..v8 → v9`（字段跳过/读掉/类型转换三张表 + 值域换算）。
+升级永远 **单向**：打开旧档 → 弹窗“备份并升级”→ 改写为当前格式（见末尾章节）。
+
 ## 宗旨
 
-- **JSON 文本是承诺**：用户随时可以带着存档脱离 DAW（自己解析、自己改、自己转格式）；
-- 未来方向（用户设想）：**默认二进制 + 主动"导入/导出 JSON"双轨**——届时瘦身版 JSON
-  即导出格式。本文档的瘦身项与迁移机制对此都兼容。
+- **存档必须能被未来的自己读出来**：格式的每条规则都要写在这里，包括“为什么删这个字段”。
+- **不承诺可被第三方解析**：工程存档只此一种（二进制 `.saw`）；需要跨 DAW 搬运的内容
+  （MIDI 导出、WAV 导出）单独做，不从存档格式上找补。
 
-## 现状事实（file_version = 3）
+## 历史：现状事实（file_version = 3 时代）
+
+> 本节是当时（JSON 时代）的实测记录，保留作历史；**工程存档的 JSON 通道已于 v9 删除**，
+> 只作为“当年为什么走 ⼆进制”的依据留在这里。
 
 - 存档 = **带 `whitespace = .indent_2` 的缩进 JSON**（`persist.toJson`）：
   一条音符约 5 行 ≈ 100 字节（`project.saw` 实测）；
@@ -168,7 +219,7 @@
 
 | 结构 | 字段 | 冻结默认 |
 |---|---|---|
-| SavedNote | velocity / pan | 100 / 64（本地常量，与 model 解耦） |
+| SavedNote | velocity / pan | 100 / **0.5**（本地常量，与 model 解耦；v9 起 pan 是 0..1） |
 | SavedNote | pattern / instrument | 0 / 0 |
 | SavedClip | start / len / offset | 0（bar/len_bars：v1 专用，永不写） |
 | SavedOsc | enabled / volume / waveform / unison / unison_detune / detune_power | false / 0.5 / 0 / 1 / 0.05 / 0 |
@@ -268,13 +319,12 @@ Note 规则用 5% 的代码拿到了 88% 的收益（141.7KB / 160.5KB）——�
   （替换失败还会尝试把备份改回原名回滚）。
 - 二进制（v5）文件直接加载，无弹窗。
 
-### JSON 出入口（**设置窗口内**——用户拍板：说明有充足宽度）
-- 「选项」按钮维持原行为（单击直接开设置窗口，**无下拉**）；
-- 设置窗口新增「数据交换」区：「导入 JSON...」「导出 JSON...」两个按钮 +
-  两行说明（“JSON：可读文本格式，便于迁移到其他 DAW。导入 = 替换当前工程；导出 = 写出副本。”）；
-- 文件菜单保持原样（7 项，无 JSON 项）。
-- 导入 = 与"打开"同流程（旧档同样走升级弹窗）；导出 = 写 JSON 副本（可读、diff 友好），
-  不改工程路径 / 保存态。
+### JSON 出入口（**已删除**——v9 清格式时移走）
+
+> 历史：二进制 v5 落地后，设置窗口曾有「数据交换」区（“导入 JSON…”“导出 JSON…”），
+> 用于跨 DAW 迁移。**v9 这一轮整条删除**（用户拍板：两份格式=两份维护面，不划算），
+> 现在 `.saw` 只认二进制，`loadProjectFromPath` 遇到非 `SAWD` 文件直接拒绝。
+> 跨 DAW 搬运走 MIDI / WAV 导出。
 
 ### 待办记录
 - **预设二进制化：暂不做**——等出现"存了**一亿个预设**把硬盘存爆"的疯狂用户反馈再议
@@ -322,3 +372,211 @@ Note 规则用 5% 的代码拿到了 88% 的收益（141.7KB / 160.5KB）——�
 - 备份失败 / 改写失败 → toast 报错并**不打开**（原文件保持不动），绝不"升级到一半"。
 - 备份只做一次；同名备份已存在则加序号，**不覆盖历史备份**。
 - JSON v4 也弹窗：字段虽无迁移，但保存后同样变成不可回退的 v6 二进制，性质一致。
+
+## v9：时间分辨率 U=96 → 3840（2026-11，960 PPQN）
+
+**动机**：U=96（= 24 PPQN）做不出 1/64 / 1/128 网格，自动化精度也不够；
+目标 **3840 = 960 PPQN**（主流 DAW 的常见上限档）。完整清单见 `docs/units-3840.md`。
+
+**迁移方式（读入后一处统一换算，`migrateUnitsToV5`）**：源版本 `< 9` 时把**步域**字段 ×40
+（i64 中间值 + 饱和，防手改极端值溢出）。
+
+| 字段 | 域 | ×40？ |
+|---|---|---|
+| `Clip.start` / `Clip.len` / `Clip.offset` | 步 | ✅ |
+| `Note.step` / `Note.len` | 步 | ✅ |
+| 自动化曲线点 `SavedLanePoint.step` | 步 | ✅ |
+| 冗余的 `Project.steps_per_bar`（仅当 == 96） | 步 | ✅ |
+| `Clip.trim_start` / `trim_len` | **帧** | ❌ |
+| `speed` / `audio_style` / `bpm` / `time_num` / `time_den` | 参数/索引 | ❌ |
+| 乐器/效果器参数、调音台、各类索引 | — | ❌ |
+
+**两个坑（已踩过并修）**：
+1. `legacy_units_per_bar` 必须**冻结为 96**（v1 写档时的 U），**不能跟 `model.units_per_whole` 走**——
+   否则 v1 档会先按 3840 换成步、再 ×40，多乘 40 倍；
+2. JSON 必须**同步升到 `file_version = 5`**：JSON 是导入/导出通道，若仍写 v4，
+   导出再导入就会被×40 两次。
+
+**两个搬运过程中抳出来的冡（写在这里防再犯）**：
+- **`steps_per_bar` 是派生量**（= `stepsPerBarFor(拍号)`）。它是步域字段 → 迁移里**一律 ×40**
+  （不能只按 `== 96` 判定；3/4 档是 72）；而且**加载侧完全不信它**：
+  `importProject` / `applyHistoryState` 直接由拍号推导。否则旧值会让
+  `bar_w = spb × 480 / U` 错 40 倍——实测表现为“启动后一屏看到 70 小节”。
+- **字段引入版本必须钉死**：`introducedVersion` 里原本把 `muted` 的引入版本写成
+  “当前版本”（`binary_version`）——抬到 9 之后，旧 v8 档会被当成“无 `muted` 字段”
+  而跳过它 → **字节错位**。现固定为 `binary_version_v8 = 8`（与 v6 同型）；
+  新增测试用“写当前版本→版本字节改回 8→读”的路子守住这条。
+- **v9 引入的字段**（统一钉 `binary_version_v9 = 9`）：
+  `Project.auto_lanes` / `auto_bindings` / `auto_sel`（v8 发布版**没有**自动化整套——不登记就会在旧档末尾
+    “多读三个字段”→ 字节错位）、`SavedBinding.smooth_ms`、`SavedBinding.invert`、`SavedBinding.param_id`
+    （VST 参数自动化 v1）、`SavedBinding.target_slot`（v3：fx/kit 的子对象 uid）、
+    `SavedInstrument.uid` 与 `SavedMixerChannel.uid`（**稳定 uid**：
+    不落盘的话读档/撤销后 uid 重新编号 → 自动化绑定指向不存在的目标，“表面在、实际失效”）、
+    `SavedEffectSlot.uid` / `SavedDrumLayer.uid`（v3：效果槽/鼓组层的稳定 uid——效果链插入删除、
+    鼓组层增删会让**位置漂移**，绑定必须按 uid 引用）。
+  测试改用 `toBinaryAtVersion(…, 8)` **真实写出 v8 布局**（不再“写 v9 再改版本字节”——那种做法在有 v9 新字段时必炸），
+  曲线点 ×40 的迁移另用 `migrateUnitsToV5` 的函数级测试盖住。
+
+**连带修的真问题**（U 变大后误差被放大 40 倍）：
+- 导出时长：`exportAudioBegin` 原本“每步取整成整数帧再 × 步数”→ 改为 **f64 帧/步先乘后取整**
+  （否则 240BPM 下 12.5 帧/步写成 12，整曲短 4%）；
+- `App.framesPerStep()` 原来读的是给音频线程的原子镜像（`params.steps_per_beat`，
+  由 `main` 每帧同步）→ 改为 **直接用 model 推导**；
+- MIDI 导出 `export_tpq` 480 → **960**（不抬的话每步 0.5 tick，导出反而变粗）。
+
+## 版本与兼容纪律（**未发布 = 不存在**）——它如何落到存档上
+
+> 源头在 `AGENTS.md`（同名章节）。存档是这条纪律**最容易踩到的地方**，所以在这里再具体化一遍。
+
+**判据永远是“是否存在真实文件”，不是代码里的版本号**：
+
+| 状态 | 存档场景下的具体含义 | 该做什么 |
+|---|---|---|
+| 已发布 / 用户手上有文件 | 出过正式版本；或用户目录有该格式的 `.saw` | **必须**兼容 + 正式迁移（如 v8 → v9） |
+| 未提交 / 未发布 | 只存在于当前工作树或 git 历史 | **零兼容义务**：可直接改形、改版本号，**禁止**为它编迁移 |
+
+**本文件内的反面教材（2026-10 事故）**：v5 二进制追加字段却没递增 `binary_version`
+→ 老工程字节错位 panic（见上一节）。结论：**“值要迁移”和“布局要版本化”是两件事**——
+前者靠读入换算，后者靠版本号 + 字段跳过表，缺一个就会出事。
+
+**每次改存档的检查单**：
+1. 这个变更是否**动到已发布版本的字节/语义**？否 → 直接改，不造迁移。
+2. 是 → 递增版本号（**一次提交只升一级**）+ 登记字段跳过表（布局类）或写读入换算（值域类）。
+3. 两种都涉及 → **分两步提交**，别混在一起。
+4. 无论如何：加一个**读旧档**的回归测试（本项目已有：v5 旧布局、v6/v7/v8 三布局、v8→v9 单位、v9 清格式往返）。
+
+**v9 已随本版发布 → 格式从此刻起冻结**。以后任何改动（改形/加字段/改语义）都必须
+**抬到 v10** 并登记迁移；别再在 9 上揉。
+
+> 推论（排查时非常容易误判）：**开发中间状态产生的 `.saw` 不保证能被后续代码读回**。
+> 实测过三类“看着像 v8/v9 却读不开”的文件，**它们都不是发布版**：
+> ① 自动化分支早期（头部还写 v8，但 `bpm` 已是 f32）；② 其它 WIP 分支自造布局的档；
+> ③ 清格式之前的旧 v9 内测档（含已删字段 / `pan` 还是 i32）。遇到 `CorruptProject` 先用
+> `git show main:src/persist.zig` 对一下**该版本当时的字段布局**，别直接当迁移 bug 查。
+
+## v9 清格式：删 JSON 通道 + 删死字段 + `bpm` 改 f32（2026-11）
+
+**背景**：v9 开发期间尚未发布，所以下面这些都直接扣在 9 上；**已随本版发布并冻结**（不再回改）。
+
+### 1. 工程存档只留二进制
+
+删除 `persist.toJson` / `fromJson` / `probeJsonVersion` / `file_version` / 各结构的
+`jsonStringify`/`parseFromValue` 分支；`parseAuto` 现在**只接受二进制**
+（非 `SAWD` → `NotBinaryProject`）；设置窗口的「数据交换」区（导入/导出 JSON）一并删掉。
+
+> `settings.json`、预设/音色库仍是 JSON——它们不是工程存档，不属本次范围。
+> 跨 DAW 搬运用 MIDI / WAV 导出。
+>
+> **打开旧 JSON 工程怎么办**：读取器不恢复，只留一个**版本探针**
+> （`probeLegacyJsonVersion`，见本文末「打不开存档一律弹窗」）——
+> 提示用户用旧版程序（V16–V18）打开并另存为 `.saw`，再用本版操作。
+
+### 2. 删掉的死字段（`removed_fields`）
+
+| 结构体 | 旧字段 | 插在哪里 | 为什么删 |
+|---|---|---|---|
+| `Project` | `version: u32` | `bpm` 前 | JSON 时代的“文件版本”，二进制头里已有真版本 |
+| `Project` | `steps_per_bar: i32` | `pattern_count` 前 | 由拍号推导，加载侧**从来不信它** |
+| `Project` | `legacy_units_per_bar: i32` | `clips` 前 | 只服务 JSON v1 迁移 |
+| `SavedClip` | `bar`/`len_bars: ?i32` | 末尾 | v1 兼容残留，读入时已被 `start`/`len` 覆盖 |
+| `SavedLane` | `curve_kind: u8` | `points` 前 | 占位常量（恒 1） |
+
+读 `ver < 9` 的档时按旧类型**读掉丢弃**；写测试旧布局时对称地补写零值。
+
+### 3. `bpm` 的类型变更（`changed_fields`）—— **本次排查的主角**
+
+main（v5–v8）的 `Project.bpm` 是 **`i32`**（整数 BPM），automation 分支为支持小数 BPM
+改成了 **`f32`**，但**没登记**→ 旧档的 `bpm` 被按 4 字节 f32 读，后面全错位，
+**发布版 v5–v8 全部打不开**。修法：`changed_fields` 登记 `{owner=Project, name=bpm,
+old_T=i32, changed_in=9}`，读旧档时按 `i32` 读再转 `f32`（写旧布局测试时对称地
+`@intFromFloat`，小数在 v8 档里会被截成整数——那是该版本的固有约束）。
+
+> 教训：删字段会错位是被记住的，**“同名换类型”同样会错位**且更隐蔽（字段名还在，
+> 迁移检查表看上去“没动过”）。以后改任何字段的类型，第一件事是往 `changed_fields` 添一行。
+
+### 4. 实测（真实旧档，`zig build test` 外的临时探针，已删）
+
+| 文件 | 版本 | 结果 |
+|---|---|---|
+| `【示例工程】lulls[3].saw` | v5 | ✅ bpm=112、3578 音符 |
+| `【示例工程】lulls[2].saw` / `音频文件测试.saw` | v6 | ✅ bpm=105 / 120 |
+| `VST示例(…)-lulls[3].bak3.saw` | v7 | ✅ bpm=112 |
+| `VST示例(Vital+SFLT)-lulls[3].saw`（2.7MB）/ `project.saw` / `lulls[2]v2.saw` / `lulls[3]v4.saw` | v8 | ✅ 含 VST3 插件状态与鼓组 |
+| `project2.saw` / `线性化.saw` / `自动化 - 副本.saw` | v8（分支中间档） | ❌ 预期：`bpm` 已是 f32 但头写 8 → 不属发布格式 |
+| `15.saw` / `自动化.saw` | v9（清格式前内测） | ❌ 预期：含已删字段 |
+
+测试覆盖改用二进制往返（`persist: v6 / v7 / v8 三种旧布局都能读` 里同时验
+×40 迁移、字段门控、`bpm` 类型转换与小数保留）。
+
+
+## 打不开存档一律弹窗（不再是右下角 Toast）
+
+**实测反馈**：双击旧 JSON 工程 → 右下角 Toast 一闪就没了 → 用户以为「程序坏了」，
+根本不知道发生了什么。现在 `loadProjectFromPath` / `performUpgrade` 的**每条失败路径**
+都走**单按钮模态窗**（`ModalKind.notice`：标题「无法打开工程」+ 最多 4 行正文 + 「确定」，
+`App.setNotice` / `clearNotice`，Enter/Esc/点击均可关闭）：
+
+| 情况 | 正文（`\n` 分行） |
+|---|---|
+| 旧版 **JSON** 工程（v1–v5） | 存档版本过旧（旧版 JSON vN），本版已不支持打开。请用旧版程序（V16–V18）打开并「另存为」.saw，再用本版打开。 |
+| 非工程文件 | 这不是 Sawdust 工程文件。需要二进制 .saw 存档（旧版 JSON 工程需用 V16–V18 转换）。 |
+| 版本比本版新 | 存档版本过新（vN），本版打不开。请使用更新的 Sawdust。 |
+| 只有 magic 的截断文件 | 存档被截断（只有文件头），无法打开。文件可能拷贝/下载不完整。 |
+| 载荷损坏 | 存档无法解析：…（`parseErrorHint`） |
+| 升级任一步失败 | 升级失败：…。原文件未改动。 |
+
+- **只加探针，不恢复读取器**：`probeLegacyJsonVersion` 只读一个 `version` 字段，并要求
+  同时出现工程键（`"clips"`/`"notes"`）——`settings.json`、预设 JSON 没它们，
+  不会被误报成「旧版工程」。JSON 读/写通道保持删除。
+- **为什么不直接做"只读导入器"**：多一份解析器 = 多一份维护面，而升级**只需一次**——
+  旧版程序（V16–V18）都能打开 JSON 并写成 v6/v8 二进制，本版再升到 v9（链路已用真档验过）。
+  将来若真要做，读端当年是纯反射（`std.json.parseFromSlice(Project, …)`）+ 44 行迁移链，
+  成本约 200 行，写端永久不要。
+- 另一个坑（本次踩到）：`probeLegacyJsonVersion` 里**不能**用全量 `parseFromSlice(Project)`
+  ——已删字段会被 `ignore_unknown_fields` 吞掉，看上去"能解析"，但 v1 的
+  `bar`/`len_bars`/`legacy_units_per_bar` 已经没了，迁移链无从下手。
+- 回归测试：`main: 打不开的存档 → 弹窗（不是 Toast）：旧 JSON / 非工程 / 版本过新 / 升级失败`、
+  `persist: 旧版 JSON 探针——只认工程（settings/预设不误报）`。
+
+## 故障档案：v8 带鼓组工程读不了（`SavedDrumLayer.uid` 漏登记，2026-11）
+
+**现象**：V18 升级产生的 v8 `.saw`（带鼓组）在新分支打开 → 弹窗「升级失败：存档无法解析」。
+
+**根因**：v9 给 `SavedDrumLayer` 加了 `uid`（自动化按它引用鼓组层），但
+`introducedVersion` 里 `SavedDrumLayer` 的**第一段**（v6 的 VST3/采样器字段）以
+`return null` 结束，把后面那段 `SavedEffectSlot or SavedDrumLayer → uid=v9` 挡在门外 →
+读 v8 档时多读了 `uid` 的 1 字节 → 后面全部错位（表现为 `SavedOsc.unison` 变成大 varint、
+`waveform` 溢出 u8 → `CorruptProject`）。
+
+**修法**：`uid` 登记进 `SavedDrumLayer` 自己那段；`legacySkip` 去掉
+`comptime ... orelse return` 的写法（见 pitfalls）。
+
+**验证（真实旧档）**：
+
+| 文件 | 版本 | 结果 |
+|---|---|---|
+| `升级测试/1/【示例工程】lulls[3].saw` | v8（V18 升级，含 3 个鼓组层） | ✅ bpm=112 / clips=1 / notes=3578 / insts=7 / kit_layers=3 |
+| `测试工程/【VST示例Vital+SFLT】lulls[3].saw` | v6（2.69 MB，VST3 状态） | ✅ bpm=112 / clips=1 / notes=3578 / insts=7 |
+
+**教训（写进流程）**：`introducedVersion` 是**字节级契约**，写/读共用同一张表 →
+漏登记是“自洽”的，往返测试发现不了；只有真旧档 + 专门断言 `legacySkip` 才拦得住。
+
+### 5. `SavedNote.pan` 的值域变更（i32 0..127 → f32 0..1；`legacy_scale`）
+**动机**：全项目统一"一个声像域"。旧档/UI/MIDI 各用一套（0..127 / L100-R100 / 0..1），
+已经在悄悄出错：MIDI 导入 CC10=64 → `64/127 = 0.5039` → 按 L/R 百分比四舍五入后显示 **`R1`**。
+
+**做法**（`changed_fields` 加了 `legacy_scale` 字段，默认 1）：
+
+```zig
+.{ .owner = "SavedNote", .name = "pan", .old_T = i32, .changed_in = binary_version_v9, .legacy_scale = 127.0 }
+```
+
+- 读旧档：`新值 = convert(旧值) / legacy_scale` → 64 / 127 = 0.5039；
+- 读完后在 `fromBinary` 的唯一迁移入口再 `panFromMidi(...)` 把 **64 归成精确 0.5**（用户能"回正"）；
+- 写旧布局（仅测试用）：`旧值 = convert(新值 × legacy_scale)`，float→int 走**四舍五入**
+  （0.5 × 127 = 63.5 → 64；这也是 `bpm` 90.5 → 91 的行为）。
+
+**同批变化**：`model.Note.pan`、`synth.NoteEvent/SchedEvent.pan`、`sequencer`、`snapshot`、
+`view_note_lane` 全部改 0..1；`model.panFromMidi` / `model.panToMidi` 是**唯一**的
+MIDI 换算处（导入 CC10 与读旧存档共用，导出 CC10 同源）。
+
