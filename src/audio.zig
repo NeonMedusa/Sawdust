@@ -171,9 +171,17 @@ fn smoothChanGain(params: *Params, ch: usize, target_a: f32, target_b: f32, dt_b
 /// 由 `App.publishAutoLane` 从 UI 线程填充（3 缓冲轮转 + 下标原子发布），
 /// 音频线程每段 `acquire` 读一次，取**段首/段末**两个端点值做块内斜坡。
 /// 注：`evalAt` 与 `view_lane.Lane.evalAt` 是**同一套数学**（`app.zig` 里有逐点对拍测试）。
+/// **快照里的一个锚点**（AoS 16 B）：所有车道共用一块固定点池（`LaneSet.points`）。
+/// 用 AoS 而不是 4 条平行数组，是因为池子要按点切分给不同车道（每条只需 `off/n` 两个数）。
+pub const SnapPoint = struct {
+    step: i32 = 0,
+    value: f32 = 0,
+    curve: f32 = 0,
+    /// 峰值位置（0..1；0.5 = 正中）——与 `view_lane.Point.pivot` 同义
+    pivot: f32 = 0.5,
+};
+
 pub const LaneSnap = struct {
-    /// 每条曲线最多支持的锚点数（固定缓冲；超出部分忽略）
-    pub const capacity: usize = 64;
     /// 是否有曲线在驱动本通道（false → 用静态推子值）
     active: bool = false,
     /// 目标通道（0 = 主通道）；`inst == true` 时它是**乐器下标**
@@ -202,12 +210,10 @@ pub const LaneSnap = struct {
     slot: u16 = 0,
     /// **基线值**（叠加起点，推子/旋钮的**位置** 0..1）
     base: f32 = 0.0,
+    /// **点在 `LaneSet.points` 池中的起点与个数**（点数不再有固定上限，
+    /// 只受池的总预算 `LaneSet.pool_points` 约束）
+    off: u32 = 0,
     n: u32 = 0,
-    steps: [64]i32 = @splat(0),
-    vals: [64]f32 = @splat(0),
-    curves: [64]f32 = @splat(0),
-    /// 峰值位置（0..1；0.5 = 正中）——与 `view_lane.Point.pivot` 同义
-    pivots: [64]f32 = @splat(0.5),
 
     /// **段形状**（与 `view_lane.segEval` 逐字一致）：有理二次贝塞尔（conic）——
     /// 曲率手柄是**控制点**（曲线朝它鼓、最多弯到它的 75%，w=3），`curve == 0` 时退化成直线。
@@ -238,37 +244,34 @@ pub const LaneSnap = struct {
         return a + (b - a) * t + phi * d;
     }
 
-    /// **连续**求值（小数步）；`n == 0` → -1（= 无曲线）。
+    /// **连续**求值（小数步）；`n == 0`（或无池）→ -1（= 无曲线）。
+    /// `pts` = `LaneSet.points`（用 `off/n` 切出本车道的点）；**二分查找**（点按 step 升序）。
     /// 语义：同一 step 允许多点（**垂直断崖**）——取“最后一个 step ≤ 查询步”的点，
     /// 再与下一个点插值；因此断崖左侧 = 组内最左，右侧 = 组内最右。
-    pub fn evalAt(self: *const LaneSnap, step: f32) f32 {
+    pub fn evalAt(self: *const LaneSnap, pts: []const SnapPoint, step: f32) f32 {
         const n = self.n;
-        if (n == 0) return -1;
-        var i: usize = n;
-        while (i > 0) : (i -= 1) {
-            if (@as(f32, @floatFromInt(self.steps[i - 1])) <= step) break;
+        if (n == 0 or @as(usize, self.off) + n > pts.len) return -1;
+        const seg = pts[self.off..][0..n];
+        // 二分：`lo` = “step <= 查询步”的点数（= 旧线性扫的 `i`）
+        var lo: usize = 0;
+        var hi: usize = n;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            if (@as(f32, @floatFromInt(seg[mid].step)) <= step) lo = mid + 1 else hi = mid;
         }
-        if (i == 0) return self.vals[0];
-        const a = i - 1;
-        if (i >= n) return self.vals[a];
-        const a_step: f32 = @floatFromInt(self.steps[a]);
-        const b_step: f32 = @floatFromInt(self.steps[a + 1]);
+        if (lo == 0) return seg[0].value;
+        const a = lo - 1;
+        if (lo >= n) return seg[a].value;
+        const a_step: f32 = @floatFromInt(seg[a].step);
+        const b_step: f32 = @floatFromInt(seg[a + 1].step);
         const span: f32 = @max(1.0, b_step - a_step);
         const t: f32 = std.math.clamp((step - a_step) / span, 0.0, 1.0);
         const v = switch (self.interp) {
-            0 => self.vals[a], // hold
-            1 => self.vals[a] + (self.vals[a + 1] - self.vals[a]) * t, // linear
-            else => segEval(self.vals[a], self.vals[a + 1], self.pivots[a], self.curves[a], t), // smooth
+            0 => seg[a].value, // hold
+            1 => seg[a].value + (seg[a + 1].value - seg[a].value) * t, // linear
+            else => segEval(seg[a].value, seg[a + 1].value, seg[a].pivot, seg[a].curve, t), // smooth
         };
         return std.math.clamp(v, 0.0, 1.0);
-    }
-
-    /// 偏斜鼓包（与 `view_lane.bell` 逐字一致）：峰值 1 在 `pivot`、两端 0、两端零斜率
-    fn bell(t: f32, pivot: f32) f32 {
-        const p = std.math.clamp(pivot, 0.02, 0.98);
-        if (t <= 0.0 or t >= 1.0) return 0;
-        const u: f32 = if (t < p) t / p else (1.0 - t) / (1.0 - p);
-        return u * u * (3.0 - 2.0 * u);
     }
 };
 
@@ -276,21 +279,42 @@ pub const LaneSnap = struct {
 /// **容量 16**：曾经是 4，第 5 条绑定起会被 `slotFor()` 默默丢掉（不报错、界面看不出来）。
 /// 每条 `LaneSnap` 约 1KB，16 × 3 缓冲 ≈ 50KB——可忽略。
 pub const LaneSet = struct {
-    /// 同时生效的绑定上限（超出 → `publishAutoLane` 打诊断日志并不发布）
-    pub const max_lanes: usize = 16;
-    n: u32 = 0,
-    lanes: [max_lanes]LaneSnap = @splat(.{}),
+    /// **同时生效的绑定（车道）上限**——**一条绑定占一条车道**（不是“一个参数一条”），
+    /// 所以 N 个推子各挂 2 条曲线就是 2N 条。超出 → `publishAutoLane` 跳过 + 计数（UI 有提示）。
+    pub const max_lanes: usize = 64;
+    /// **锚点池总预算**（本缓冲内所有车道共享）：16384 点 × 16 B = 256 KB/缓冲（×3 轮转缓冲 ≈ 768 KB）。
+    /// 单条曲线的点数只受它约束；发布时按绑定顺序分配，装不下就跳过并计数（UI 有提示）。
+    pub const pool_points: usize = 16384;
 
-    /// 找（或分配）该通道的一个空槽：同一通道可叠多条曲线。满了 → null
+    n: u32 = 0,
+    /// 池已用点数（发布时每帧从 0 开始；池内旧数据不会被读到，**无需清池**）
+    used: u32 = 0,
+    lanes: [max_lanes]LaneSnap = @splat(.{}),
+    /// 锚点点池（由 `Params.initCapacity` 分配；**UI 线程写、音频线程只读**）
+    points: []SnapPoint = &.{},
+
+    /// 取一条空车道（**追加**语义：`n` 就是下一槽位）。满了 → null
     pub fn slotFor(self: *LaneSet) ?*LaneSnap {
-        var i: usize = 0;
-        while (i < self.lanes.len) : (i += 1) {
-            if (!self.lanes[i].active) {
-                if (self.n <= i) self.n = @intCast(i + 1);
-                return &self.lanes[i];
-            }
-        }
-        return null;
+        if (self.n >= max_lanes) return null;
+        const s = &self.lanes[self.n];
+        self.n += 1;
+        s.* = .{};
+        return s;
+    }
+
+    /// 从池里给一条车道分配 `n` 个点，返回池内起点下标；预算不足 → null
+    pub fn allocPoints(self: *LaneSet, n: usize) ?u32 {
+        if (@as(usize, self.used) + n > self.points.len) return null;
+        const off = self.used;
+        self.used += @intCast(n);
+        return off;
+    }
+
+    /// 某车道的点切片（测试/诊断用；渲染路径直接传 `self.points` 给 `evalAt`）
+    pub fn lanePoints(self: *const LaneSet, l: *const LaneSnap) []const SnapPoint {
+        if (@as(usize, l.off) >= self.points.len) return &.{};
+        const n = @min(l.n, self.points.len - l.off);
+        return self.points[l.off..][0..n];
     }
 
     /// 该座位已有多少条曲线（`pan` = 区分声像/增益；`inst` = 乐器空间）
@@ -315,7 +339,7 @@ pub const LaneSet = struct {
         while (i < self.n and i < self.lanes.len) : (i += 1) {
             const l = &self.lanes[i];
             if (!l.active or l.n == 0 or l.kind > 1 or l.ch != ch or l.inst != inst or (l.kind == 1) != pan) continue;
-            const v = l.evalAt(step);
+            const v = l.evalAt(self.points, step);
             if (v < 0) continue;
             // 与 `contributionSmooth` 逐字一致：单向 = v；双向 = 2v−1；**反向**再翻符号
             const sign: f32 = if (l.invert) -1.0 else 1.0;
@@ -352,9 +376,9 @@ pub const LaneSet = struct {
         while (i < self.n and i < self.lanes.len) : (i += 1) {
             const l = &self.lanes[i];
             if (!l.active or l.n == 0 or l.kind > 1 or l.ch != ch or l.inst != inst or (l.kind == 1) != pan) continue;
-            const v1 = l.evalAt(st1);
+            const v1 = l.evalAt(self.points, st1);
             if (v1 < 0) continue; // 无曲线
-            const v0 = l.evalAt(st0);
+            const v0 = l.evalAt(self.points, st0);
             if (i >= state.len or i >= keys.len) continue;
             // 槽位换了绑定（或首次使用）→ 用本块起点值播种（不会“从 0 爬升”）
             if (keys[i] != l.key or std.math.isNan(state[i])) {
@@ -418,9 +442,9 @@ pub const LaneSet = struct {
             if (!l.active or l.n == 0 or l.kind != space or l.ch != a) continue;
             // 乐器 lane 不看 slot（其 slot 恒 0）；fx/kit 要匹配子对象槽位
             if (space != 2 and l.slot != slot) continue;
-            const v1 = l.evalAt(st1);
+            const v1 = l.evalAt(self.points, st1);
             if (v1 < 0) continue; // 无曲线
-            const v0 = l.evalAt(st0);
+            const v0 = l.evalAt(self.points, st0);
             if (i >= state.len or i >= keys.len) continue;
             // 槽位换了绑定（或首次使用）→ 用段首值播种（不从 0 爬升）
             if (keys[i] != l.key or std.math.isNan(state[i])) {
@@ -729,6 +753,11 @@ pub const Params = struct {
         self.channels_cap = cc;
         self.slots_cap = sc;
         errdefer self.deinit(a);
+        // 自动化锚点池（3 缓冲轮转；UI 写、音频只读）：每条缓冲 `pool_points` 个点
+        for (&self.lane_bufs) |*set| {
+            if (set.points.len > 0) a.free(set.points);
+            set.points = try a.alloc(SnapPoint, LaneSet.pool_points);
+        }
         self.synth_ptrs = try allocAtomicArr(?*synth.SynthParams, a, ic, null);
         self.instrument_gain = try allocAtomicArr(f32, a, ic, 0.8);
         self.instrument_pan = try allocAtomicArr(f32, a, ic, 0.5);
@@ -797,6 +826,13 @@ pub const Params = struct {
         freeAtomicArr(f32, a, &self.channel_gain);
         if (self.chan_gain_sm.len > 0) a.free(self.chan_gain_sm);
         self.chan_gain_sm = &.{};
+        // 自动化锚点池
+        for (&self.lane_bufs) |*set| {
+            if (set.points.len > 0) a.free(set.points);
+            set.points = &.{};
+            set.n = 0;
+            set.used = 0;
+        }
         freeAtomicArr(f32, a, &self.channel_pan);
         freeAtomicArr(bool, a, &self.channel_muted);
         freeAtomicArr(u32, a, &self.channel_eq_version);
@@ -3132,58 +3168,8 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
     while (ch_i < n_ch) : (ch_i += 1) {
         const buf = engine.chan_bufs[ch_i * buf_stride ..][0..n];
         processChannelChain(engine, params, ch_i, buf, frames, sr, tgt_ch, tgt_slot, lane_set, lane_on, lane_st0, lane_st1, dt_blk);
-
-        const muted = params.channel_muted[ch_i].load(.monotonic);
-        const stat = params.channel_gain[ch_i].load(.monotonic);
-        // **叠加语义**：曲线基准（或静态推子）= 基线；每条绑定的贡献**各自极点平滑**后相加。
-        const auto_this = lane_on and lane_set.hasChannel(ch_i, false, false);
-        const auto_pan = lane_on and lane_set.hasChannel(ch_i, true, false);
-        const cv = lane_set.contributionSmooth(ch_i, false, false, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key);
-        const cp = lane_set.contributionSmooth(ch_i, true, false, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key);
-        const base_g = if (auto_this) (lane_set.baseOf(ch_i, false, false) orelse stat) else stat;
-        // 音量：推子位置 → faderGain；自动化贡献**位置域叠加**（声像同）
-        const g_a_raw: f32 = if (muted) 0.0 else if (auto_this) volumeGain(base_g, cv.before) else faderGain(stat);
-        const g_b_raw: f32 = if (muted) 0.0 else if (auto_this) volumeGain(base_g, cv.after) else faderGain(stat);
-        // **跳块平滑**：手动↔自动化切换/车道重排/基准编辑 会让本块目标跳一下（→ 爆音）
-        const gsm = smoothChanGain(params, ch_i, g_a_raw, g_b_raw, dt_blk);
-        const g_a = gsm[0];
-        const g_b = gsm[1];
-        // 声像：静态旋钮 = 基准，曲线贡献叠加——**段首/段尾各算一次**，
-        // 块内对左右增益做线性斜坡：否则垂直断崖（同一步两个值）会变成
-        // 一个采样点上的硬跳变 → 听感像“另一侧重新起了一个音”且带爆音（用户实测）。
-        const stat_pan = std.math.clamp(params.channel_pan[ch_i].load(.monotonic), 0, 1);
-        const base_p = if (auto_pan) (lane_set.baseOf(ch_i, true, false) orelse stat_pan) else stat_pan;
-        const pan_a: f32 = if (auto_pan) std.math.clamp(base_p + cp.before, 0.0, 1.0) else stat_pan;
-        const pan_b: f32 = if (auto_pan) std.math.clamp(base_p + cp.after, 0.0, 1.0) else stat_pan;
-        const ang_a = pan_a * (std.math.pi / 2.0);
-        const ang_b = pan_b * (std.math.pi / 2.0);
-        const cl_a = @cos(ang_a) * std.math.sqrt2;
-        const cr_a = @sin(ang_a) * std.math.sqrt2;
-        const cl_b = @cos(ang_b) * std.math.sqrt2;
-        const cr_b = @sin(ang_b) * std.math.sqrt2;
-        const dst = engine.chan_bufs[0..][0..n];
-        var f2: usize = 0;
-        if (g_a == g_b and cl_a == cl_b and cr_a == cr_b) {
-            // 无自动化（或段内值不变）→ 常量增益/声像（与旧路径完全相同，零额外开销）
-            const gl = cl_a * g_a;
-            const gr = cr_a * g_a;
-            while (f2 < frames) : (f2 += 1) {
-                dst[f2 * 2] += buf[f2 * 2] * gl;
-                dst[f2 * 2 + 1] += buf[f2 * 2 + 1] * gr;
-            }
-        } else {
-            // 自动化激活 → **块内线性斜坡**（增益与左右平衡同时斜）
-            const inv: f32 = 1.0 / @as(f32, @floatFromInt(@max(1, frames)));
-            while (f2 < frames) : (f2 += 1) {
-                const t = @as(f32, @floatFromInt(f2)) * inv;
-                const gg = g_a + (g_b - g_a) * t;
-                const ll = cl_a + (cl_b - cl_a) * t;
-                const rr = cr_a + (cr_b - cr_a) * t;
-                dst[f2 * 2] += buf[f2 * 2] * ll * gg;
-                dst[f2 * 2 + 1] += buf[f2 * 2 + 1] * rr * gg;
-            }
-            _ = params.dbg_lane_ramps.fetchAdd(1, .monotonic);
-        }
+        const g = channelGains(params, engine, ch_i, lane_set, lane_on, lane_st0, lane_st1, dt_blk, 1.0);
+        mixChanInto(engine.chan_bufs[0..][0..n], buf, frames, g, params);
     }
 
     // 4) **主通道（0）**：直连乐器 + 全部子通道汇入 → 效果链 → 主推子/声像 → 输出
@@ -3191,57 +3177,88 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
     if (n_ch > 0) {
         const buf = engine.chan_bufs[0..][0..n];
         processChannelChain(engine, params, 0, buf, frames, sr, tgt_ch, tgt_slot, lane_set, lane_on, lane_st0, lane_st1, dt_blk);
-        const muted0 = params.channel_muted[0].load(.monotonic);
-        const stat0 = params.channel_gain[0].load(.monotonic);
-        const auto0 = lane_on and lane_set.hasChannel(0, false, false);
-        const auto0p = lane_on and lane_set.hasChannel(0, true, false);
-        const cv0 = lane_set.contributionSmooth(0, false, false, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key);
-        const cp0 = lane_set.contributionSmooth(0, true, false, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key);
-        const base0 = if (auto0) (lane_set.baseOf(0, false, false) orelse stat0) else stat0;
-        const g0a_raw: f32 = if (muted0) 0.0 else if (auto0) volumeGain(base0, cv0.before) else faderGain(stat0);
-        const g0b_raw: f32 = if (muted0) 0.0 else if (auto0) volumeGain(base0, cv0.after) else faderGain(stat0);
-        // **跳块平滑**（同子通道）：主推子最容易吃到“拖动接管”的阶跃
-        const gsm0 = smoothChanGain(params, 0, g0a_raw, g0b_raw, dt_blk);
-        const g0a = gsm0[0];
-        const g0b = gsm0[1];
-        const stat_pan0 = std.math.clamp(params.channel_pan[0].load(.monotonic), 0, 1);
-        const base_p0 = if (auto0p) (lane_set.baseOf(0, true, false) orelse stat_pan0) else stat_pan0;
-        const pan_a: f32 = if (auto0p) std.math.clamp(base_p0 + cp0.before, 0.0, 1.0) else stat_pan0;
-        const pan_b: f32 = if (auto0p) std.math.clamp(base_p0 + cp0.after, 0.0, 1.0) else stat_pan0;
-        const ang_a = pan_a * (std.math.pi / 2.0);
-        const ang_b = pan_b * (std.math.pi / 2.0);
-        // 工具栏主音量也是**推子位置** → 过 `faderGain`（推子锥度）
-        const master_g = faderGain(master);
-        const cl_a = @cos(ang_a) * std.math.sqrt2 * master_g;
-        const cr_a = @sin(ang_a) * std.math.sqrt2 * master_g;
-        const cl_b = @cos(ang_b) * std.math.sqrt2 * master_g;
-        const cr_b = @sin(ang_b) * std.math.sqrt2 * master_g;
-        var f2: usize = 0;
-        if (g0a == g0b and cl_a == cl_b and cr_a == cr_b) {
-            const gl = cl_a * g0a;
-            const gr = cr_a * g0a;
-            while (f2 < frames) : (f2 += 1) {
-                out[f2 * 2] += buf[f2 * 2] * gl;
-                out[f2 * 2 + 1] += buf[f2 * 2 + 1] * gr;
-            }
-        } else {
-            const inv: f32 = 1.0 / @as(f32, @floatFromInt(@max(1, frames)));
-            while (f2 < frames) : (f2 += 1) {
-                const t = @as(f32, @floatFromInt(f2)) * inv;
-                const gg = g0a + (g0b - g0a) * t;
-                const ll = cl_a + (cl_b - cl_a) * t;
-                const rr = cr_a + (cr_b - cr_a) * t;
-                out[f2 * 2] += buf[f2 * 2] * ll * gg;
-                out[f2 * 2 + 1] += buf[f2 * 2 + 1] * rr * gg;
-            }
-            _ = params.dbg_lane_ramps.fetchAdd(1, .monotonic);
-        }
+        // 工具栏主音量也是**推子位置** → 过 `faderGain`（推子锥度），在主通道出口再乘一次
+        const g = channelGains(params, engine, 0, lane_set, lane_on, lane_st0, lane_st1, dt_blk, faderGain(master));
+        mixChanInto(out[0 .. frames * 2], buf, frames, g, params);
     }
 
     // 频谱分析（窗满时）——数据来自目标效果器的**输入点**（上面的捕获），
     // 不是主输出全混。
     analyzeSpectrum(engine, params, sr);
 }
+/// **一个通道路径本块要用的增益与左右平衡**（起点/终点成对，供块内斜坡）。
+///
+/// 子通道与主通道共用这一处（以前两段代码各写一遍≈35 行，改一处漏一处）。
+/// `master_g`：主通道出口再乘一次工具栏主音量（子通道传 1.0）。
+const ChanGains = struct { g_a: f32, g_b: f32, cl_a: f32, cl_b: f32, cr_a: f32, cr_b: f32 };
+
+fn channelGains(
+    params: *Params,
+    engine: *Engine,
+    ch: usize,
+    lane_set: *const LaneSet,
+    lane_on: bool,
+    lane_st0: f32,
+    lane_st1: f32,
+    dt_blk: f32,
+    master_g: f32,
+) ChanGains {
+    const muted = params.channel_muted[ch].load(.monotonic);
+    const stat = params.channel_gain[ch].load(.monotonic);
+    const auto_vol = lane_on and lane_set.hasChannel(ch, false, false);
+    const auto_pan = lane_on and lane_set.hasChannel(ch, true, false);
+    // **叠加语义**：曲线基准（或静态推子）= 基线；每条绑定的贡献各自极点平滑后相加
+    const cv = lane_set.contributionSmooth(ch, false, false, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key);
+    const cp = lane_set.contributionSmooth(ch, true, false, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key);
+    // 音量：推子位置 → faderGain；自动化贡献**位置域叠加**（声像同）
+    const base_g = if (auto_vol) (lane_set.baseOf(ch, false, false) orelse stat) else stat;
+    const g_a_raw: f32 = if (muted) 0.0 else if (auto_vol) volumeGain(base_g, cv.before) else faderGain(stat);
+    const g_b_raw: f32 = if (muted) 0.0 else if (auto_vol) volumeGain(base_g, cv.after) else faderGain(stat);
+    // **跳块平滑**：手动↔自动化切换/车道重排/基准编辑 会让本块目标跳一下（→ 爆音）
+    const gsm = smoothChanGain(params, ch, g_a_raw, g_b_raw, dt_blk);
+    // 声像：静态旋钮 = 基准，曲线贡献叠加——**段首/段尾各算一次**，块内对左右增益做线性斜坡：
+    // 否则垂直断崖（同一步两个值）会变成一个采样点上的硬跳变 → 听感像“另一侧重新起了一个音”且带爆音。
+    const stat_pan = std.math.clamp(params.channel_pan[ch].load(.monotonic), 0.0, 1.0);
+    const base_p = if (auto_pan) (lane_set.baseOf(ch, true, false) orelse stat_pan) else stat_pan;
+    const pan_a: f32 = if (auto_pan) std.math.clamp(base_p + cp.before, 0.0, 1.0) else stat_pan;
+    const pan_b: f32 = if (auto_pan) std.math.clamp(base_p + cp.after, 0.0, 1.0) else stat_pan;
+    const ang_a = pan_a * (std.math.pi / 2.0);
+    const ang_b = pan_b * (std.math.pi / 2.0);
+    return .{
+        .g_a = gsm[0],
+        .g_b = gsm[1],
+        .cl_a = @cos(ang_a) * std.math.sqrt2 * master_g,
+        .cl_b = @cos(ang_b) * std.math.sqrt2 * master_g,
+        .cr_a = @sin(ang_a) * std.math.sqrt2 * master_g,
+        .cr_b = @sin(ang_b) * std.math.sqrt2 * master_g,
+    };
+}
+
+/// 把 `src`（立体声交错）按上表的增益/平衡**累加**进 `dst`：
+/// 起点==终点 → 常量增益快路径（与旧路径相同）；否则逐样本线性斜坡。
+fn mixChanInto(dst: []f32, src: []const f32, frames: usize, g: ChanGains, params: *Params) void {
+    var f2: usize = 0;
+    if (g.g_a == g.g_b and g.cl_a == g.cl_b and g.cr_a == g.cr_b) {
+        const gl = g.cl_a * g.g_a;
+        const gr = g.cr_a * g.g_a;
+        while (f2 < frames) : (f2 += 1) {
+            dst[f2 * 2] += src[f2 * 2] * gl;
+            dst[f2 * 2 + 1] += src[f2 * 2 + 1] * gr;
+        }
+        return;
+    }
+    const inv: f32 = 1.0 / @as(f32, @floatFromInt(@max(1, frames)));
+    while (f2 < frames) : (f2 += 1) {
+        const t = @as(f32, @floatFromInt(f2)) * inv;
+        const gg = g.g_a + (g.g_b - g.g_a) * t;
+        const ll = g.cl_a + (g.cl_b - g.cl_a) * t;
+        const rr = g.cr_a + (g.cr_b - g.cr_a) * t;
+        dst[f2 * 2] += src[f2 * 2] * ll * gg;
+        dst[f2 * 2 + 1] += src[f2 * 2 + 1] * rr * gg;
+    }
+    _ = params.dbg_lane_ramps.fetchAdd(1, .monotonic);
+}
+
 /// 单通道效果链处理（EQ 系数重建 + 逐槽处理 + 频谱捕获）。/// 注：**无“无乐器跳过”优化**——混响/延迟的尾音需状态持续推进（空缓冲
 /// 处理廉价）；主通道还会承载子通道汇入信号。
 fn processChannelChain(engine: *Engine, params: *Params, ch_i: usize, buf: []f32, frames: u32, sr: f32, tgt_ch: i32, tgt_slot: i32, lane_set: *const LaneSet, lane_on: bool, lane_st0: f32, lane_st1: f32, dt_blk: f32) void {
@@ -3873,15 +3890,72 @@ test "audio: Params 默认值" {
     try std.testing.expect(p.synth_ptrs[0].load(.monotonic) == null);
 }
 
+/// 测试辅助：给车道塞 n 个点（从 set 的池里分配）
+fn testSeed(set: *LaneSet, l: *LaneSnap, pts: []const SnapPoint) void {
+    const off = set.allocPoints(pts.len) orelse unreachable;
+    @memcpy(set.points[off..][0..pts.len], pts);
+    l.off = off;
+    l.n = @intCast(pts.len);
+}
+
+/// 测试辅助：0 → `v0`、`s1` → `v1` 的两点线性段
+fn testSeed2(set: *LaneSet, l: *LaneSnap, s1: i32, v0: f32, v1: f32) void {
+    testSeed(set, l, &.{ .{ .step = 0, .value = v0 }, .{ .step = s1, .value = v1 } });
+}
+
+/// 测试辅助：单点（恒定值）
+fn testSeed1(set: *LaneSet, l: *LaneSnap, v: f32) void {
+    testSeed(set, l, &.{.{ .step = 0, .value = v }});
+}
+
+test "audio: 点池——单条曲线可超 64 点（二分求值），预算用尽返 null / 车道数也有上限" {
+    var pool: [512]SnapPoint = undefined;
+    var set = LaneSet{ .points = &pool };
+    // 车道数：到 `max_lanes` 后返回 null
+    var k: usize = 0;
+    while (k < LaneSet.max_lanes) : (k += 1) try std.testing.expect(set.slotFor() != null);
+    try std.testing.expect(set.slotFor() == null);
+
+    // 单条曲线 200 点（旧实现只能装 64）
+    set = .{ .points = &pool };
+    const l = set.slotFor().?;
+    l.active = true;
+    l.interp = 1; // linear
+    l.depth = 1.0;
+    l.n = 0;
+    const n_pts: usize = 200;
+    const off = set.allocPoints(n_pts).?;
+    for (0..n_pts) |i| {
+        set.points[off + i] = .{
+            .step = @intCast(i * 10),
+            .value = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n_pts - 1)),
+        };
+    }
+    l.off = off;
+    l.n = n_pts;
+    // 二分求值：1000 步处 = 第 100 个点（无插值偏移）
+    try std.testing.expectApproxEqAbs(@as(f32, 100.0) / 199.0, l.evalAt(set.points, 1000.0), 1e-5);
+    // 首点之前 / 尾点之后：保持两端值
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), l.evalAt(set.points, -50.0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), l.evalAt(set.points, 99999.0), 1e-6);
+    // 小数步插值（1005 步 = 两点中点）
+    try std.testing.expectApproxEqAbs((100.5 / 199.0), l.evalAt(set.points, 1005.0), 1e-5);
+
+    // 池预算：512 − 200 = 312
+    try std.testing.expect(set.allocPoints(312) != null);
+    try std.testing.expect(set.allocPoints(1) == null);
+}
+
 test "audio: LaneSet.contributionSmooth——逐绑定极点（τ=0 直通 / 首次播种 / 槽位换绑重播 / 求和）" {
-    var set = LaneSet{};
+    var pool: [64]SnapPoint = undefined;
+    var set = LaneSet{ .points = &pool };
     var state: [LaneSet.max_lanes]f32 = @splat(std.math.nan(f32));
     var keys: [LaneSet.max_lanes]u32 = @splat(0);
     const dt: f32 = 256.0 / 48000.0; // ≈5.3ms 块
 
     // 一条 lane：值从 0.2 线性到 1.0（两步之间），τ = 0 → 直通（after 等于段末值）
     {
-        set = .{};
+        set = .{ .points = &pool };
         state = @splat(std.math.nan(f32));
         keys = @splat(0);
         const sn = set.slotFor().?;
@@ -3895,15 +3969,7 @@ test "audio: LaneSet.contributionSmooth——逐绑定极点（τ=0 直通 / 首
         sn.bipolar = false;
         sn.smooth_ms = 0.0;
         sn.key = 42;
-        sn.n = 2;
-        sn.steps[0] = 0;
-        sn.vals[0] = 0.2;
-        sn.steps[1] = 960;
-        sn.vals[1] = 1.0;
-        sn.pivots[0] = 0.5;
-        sn.curves[0] = 0;
-        sn.pivots[1] = 0.5;
-        sn.curves[1] = 0;
+        testSeed2(&set, sn, 960, 0.2, 1.0);
         const c = set.contributionSmooth(1, false, false, 0, 480, dt, &state, &keys);
         try std.testing.expectApproxEqAbs(@as(f32, 0.2), c.before, 1e-5); // 首次播种 = 段首值
         try std.testing.expectApproxEqAbs(@as(f32, 0.6), c.after, 1e-5); // 960/2 处 = 0.6（无追赶）
@@ -3916,7 +3982,7 @@ test "audio: LaneSet.contributionSmooth——逐绑定极点（τ=0 直通 / 首
 
     // τ = 15ms → 追赶（after 严格介于 before 与目标之间）
     {
-        set = .{};
+        set = .{ .points = &pool };
         state = @splat(std.math.nan(f32));
         keys = @splat(0);
         const sn = set.slotFor().?;
@@ -3927,14 +3993,7 @@ test "audio: LaneSet.contributionSmooth——逐绑定极点（τ=0 直通 / 首
         sn.smooth_ms = 15.0;
         sn.key = 7;
         sn.n = 2;
-        sn.steps[0] = 0;
-        sn.vals[0] = 0.0;
-        sn.steps[1] = 960;
-        sn.vals[1] = 1.0;
-        sn.pivots[0] = 0.5;
-        sn.curves[0] = 0;
-        sn.pivots[1] = 0.5;
-        sn.curves[1] = 0;
+        testSeed2(&set, sn, 960, 0.0, 1.0);
         const c = set.contributionSmooth(2, false, false, 0, 480, dt, &state, &keys);
         const seg_end: f32 = 0.5; // 段末（st1 = 480）的目标值
         try std.testing.expect(c.after > c.before);
@@ -3944,7 +4003,7 @@ test "audio: LaneSet.contributionSmooth——逐绑定极点（τ=0 直通 / 首
 
         // 槽位换绑定（key 变）→ 重新播种到新曲线段首值，不继承旧值
         sn.key = 8;
-        sn.vals[0] = 0.9;
+        set.points[sn.off].value = 0.9;
         const c2 = set.contributionSmooth(2, false, false, 0, 480, dt, &state, &keys);
         try std.testing.expectApproxEqAbs(@as(f32, 0.9), c2.before, 1e-5);
     }
@@ -3963,10 +4022,7 @@ test "audio: LaneSet.contributionSmooth——逐绑定极点（τ=0 直通 / 首
             sn.smooth_ms = ms;
             sn.key = @as(u32, @intFromFloat(ms)) + 100;
             sn.n = 1;
-            sn.steps[0] = 0;
-            sn.vals[0] = 1.0;
-            sn.pivots[0] = 0.5;
-            sn.curves[0] = 0;
+            testSeed1(&set, sn, 1.0);
         }
         const c = set.contributionSmooth(3, false, false, 0, 0, dt, &state, &keys);
         // 两条都从 1.0 播种 → 各贡献 1.0*0.5 = 0.5，合计 1.0
@@ -3975,7 +4031,7 @@ test "audio: LaneSet.contributionSmooth——逐绑定极点（τ=0 直通 / 首
     }
     // **反向**（与极性独立）：单向+反向 = 负向单向（ducking）
     {
-        set = .{};
+        set = .{ .points = &pool };
         state = @splat(std.math.nan(f32));
         keys = @splat(0);
         const sn = set.slotFor().?;
@@ -3988,10 +4044,7 @@ test "audio: LaneSet.contributionSmooth——逐绑定极点（τ=0 直通 / 首
         sn.smooth_ms = 0.0;
         sn.key = 555;
         sn.n = 1;
-        sn.steps[0] = 0;
-        sn.vals[0] = 1.0;
-        sn.pivots[0] = 0.5;
-        sn.curves[0] = 0;
+        testSeed1(&set, sn, 1.0);
         const c = set.contributionSmooth(4, false, false, 0, 0, dt, &state, &keys);
         try std.testing.expectApproxEqAbs(@as(f32, -1.0), c.after, 1e-5);
 
@@ -4671,7 +4724,8 @@ test "audio: publishSounding——VSTi 直接发布 note-on 活跃位图" {
 }
 
 test "audio: VST 参数 lane 段推进（参数 ID / 基准 / 极性·反向 / 极点）" {
-    var set = LaneSet{};
+    var pool: [16]SnapPoint = undefined;
+    var set = LaneSet{ .points = &pool };
     const l = set.slotFor().?;
     l.active = true;
     l.inst = true;
@@ -4682,11 +4736,7 @@ test "audio: VST 参数 lane 段推进（参数 ID / 基准 / 极性·反向 / �
     l.depth = 1.0;
     l.smooth_ms = 0;
     l.interp = 1;
-    l.n = 2;
-    l.steps[0] = 0;
-    l.vals[0] = 0.0;
-    l.steps[1] = 96;
-    l.vals[1] = 1.0;
+    testSeed2(&set, l, 96, 0.0, 1.0);
 
     var st: [LaneSet.max_lanes]f32 = @splat(std.math.nan(f32));
     var keys: [LaneSet.max_lanes]u32 = @splat(0);
@@ -4722,7 +4772,8 @@ test "audio: VST 参数 lane 段推进（参数 ID / 基准 / 极性·反向 / �
 }
 
 test "audio: 效果器/鼓组层参数 lane 段推进（v3：按 space + 子对象槽位过滤）" {
-    var set = LaneSet{};
+    var pool: [32]SnapPoint = undefined;
+    var set = LaneSet{ .points = &pool };
     // 三条 lane：乐器参数 / 效果器参数（通道 1 · 槽 2）/ 鼓组层参数（乐器 0 · 层 3）
     {
         const l = set.slotFor().?;
@@ -4733,11 +4784,7 @@ test "audio: 效果器/鼓组层参数 lane 段推进（v3：按 space + 子对�
         l.base = 0;
         l.depth = 1.0;
         l.interp = 1;
-        l.n = 2;
-        l.steps[0] = 0;
-        l.vals[0] = 0.0;
-        l.steps[1] = 96;
-        l.vals[1] = 1.0;
+        testSeed2(&set, l, 96, 0.0, 1.0);
     }
     {
         const l = set.slotFor().?;
@@ -4749,11 +4796,7 @@ test "audio: 效果器/鼓组层参数 lane 段推进（v3：按 space + 子对�
         l.base = 0.5;
         l.depth = 1.0;
         l.interp = 1;
-        l.n = 2;
-        l.steps[0] = 0;
-        l.vals[0] = 0.0;
-        l.steps[1] = 96;
-        l.vals[1] = 1.0;
+        testSeed2(&set, l, 96, 0.0, 1.0);
     }
     {
         const l = set.slotFor().?;
@@ -4765,11 +4808,7 @@ test "audio: 效果器/鼓组层参数 lane 段推进（v3：按 space + 子对�
         l.base = 0.0;
         l.depth = 1.0;
         l.interp = 1;
-        l.n = 2;
-        l.steps[0] = 0;
-        l.vals[0] = 0.0;
-        l.steps[1] = 96;
-        l.vals[1] = 1.0;
+        testSeed2(&set, l, 96, 0.0, 1.0);
     }
 
     var st: [LaneSet.max_lanes]f32 = @splat(std.math.nan(f32));
@@ -4799,7 +4838,8 @@ test "audio: 效果器/鼓组层参数 lane 段推进（v3：按 space + 子对�
 }
 
 test "audio: 插件参数 lane **不参与**音量/声像叠加（v2 遗留 bug：kind≥2 被当成音量）" {
-    var set = LaneSet{};
+    var pool: [16]SnapPoint = undefined;
+    var set = LaneSet{ .points = &pool };
     {
         const l = set.slotFor().?;
         l.active = true;
@@ -4809,11 +4849,7 @@ test "audio: 插件参数 lane **不参与**音量/声像叠加（v2 遗留 bug�
         l.depth = 1.0;
         l.base = 0;
         l.interp = 1;
-        l.n = 2;
-        l.steps[0] = 0;
-        l.vals[0] = 0.0;
-        l.steps[1] = 96;
-        l.vals[1] = 1.0;
+        testSeed2(&set, l, 96, 0.0, 1.0);
     }
     var st: [LaneSet.max_lanes]f32 = @splat(std.math.nan(f32));
     var keys: [LaneSet.max_lanes]u32 = @splat(0);

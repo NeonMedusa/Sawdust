@@ -4999,8 +4999,34 @@ fn drawModal(ui: *Ui, app: *App) void {
     }
 }
 
-/// “存档无法打开/升级失败”提示（只有一个「确定」）。
-/// 打开/升级失败**一律走这里**，不用 Toast（右下角一闪就没了，用户经常看不到）。
+// ── 模态对话框的公共外框（居中 + 阴影 + 底/边框 + 遮罩登记）──
+
+const DialogBox = struct { dx: i32, dy: i32, w: i32, h: i32 };
+
+fn dialogChrome(ui: *Ui, dx: i32, dy: i32, dlg_w: i32, dlg_h: i32) void {
+    ui.noteOverlayRect(dx, dy, dlg_w + 4, dlg_h + 4); // 裁切插件子窗口（含阴影；仅对话框范围）
+    ui.renderer.fillRect(dx + 4, dy + 4, dlg_w, dlg_h, r_mod.rgb(12, 13, 16)); // 阴影
+    ui.renderer.fillRect(dx, dy, dlg_w, dlg_h, ui.theme.panel);
+    ui.renderer.strokeRect(dx, dy, dlg_w, dlg_h, ui.theme.accent);
+}
+
+/// **两行文案的确认框**（几乎所有模态框就这一个形态）：量文字 → 居中定尺寸 → 外框 → 写两行
+/// （第一行亮、第二行暗）。`btn_count`/`btn_w` 保证底部按钮排放得下。
+fn drawDialog2(ui: *Ui, screen_w: i32, screen_h: i32, line1: []const u8, line2: []const u8, btn_count: i32, btn_w: i32) DialogBox {
+    const tw1: i32 = @intFromFloat(ui.font.measure(line1));
+    const tw2: i32 = @intFromFloat(ui.font.measure(line2));
+    const gap: i32 = 10;
+    const dlg_w = @max(@max(tw1, tw2) + 48, btn_w * btn_count + gap * (btn_count - 1) + 32);
+    const dlg_h: i32 = 110;
+    const dx = @divTrunc(screen_w - dlg_w, 2);
+    const dy = @divTrunc(screen_h - dlg_h, 2);
+    dialogChrome(ui, dx, dy, dlg_w, dlg_h);
+    ui.label(line1, dx + @divTrunc(dlg_w - tw1, 2), dy + 18, ui.theme.text);
+    ui.label(line2, dx + @divTrunc(dlg_w - tw2, 2), dy + 40, ui.theme.text_dim);
+    return .{ .dx = dx, .dy = dy, .w = dlg_w, .h = dlg_h };
+}
+
+/// “无法打开工程”提示正文（多行 `\n`；标题 + 正文 + 一个「确定」）。
 fn drawNotice(ui: *Ui, app: *App, w: i32, h: i32) void {
     const text = app.notice_text orelse "";
     const title = "无法打开工程";
@@ -5021,11 +5047,8 @@ fn drawNotice(ui: *Ui, app: *App, w: i32, h: i32) void {
     const dlg_h: i32 = 60 + @as(i32, @intCast(@max(n, 1))) * 22;
     const dx = @divTrunc(w - dlg_w, 2);
     const dy = @divTrunc(h - dlg_h, 2);
-    ui.noteOverlayRect(dx, dy, dlg_w + 4, dlg_h + 4);
+    dialogChrome(ui, dx, dy, dlg_w, dlg_h);
 
-    ui.renderer.fillRect(dx + 4, dy + 4, dlg_w, dlg_h, r_mod.rgb(12, 13, 16));
-    ui.renderer.fillRect(dx, dy, dlg_w, dlg_h, ui.theme.panel);
-    ui.renderer.strokeRect(dx, dy, dlg_w, dlg_h, ui.theme.accent);
     const tw_title: i32 = @intFromFloat(ui.font.measure(title));
     ui.label(title, dx + @divTrunc(dlg_w - tw_title, 2), dy + 14, ui.theme.accent);
     var y: i32 = dy + 38;
@@ -5044,27 +5067,10 @@ fn drawNotice(ui: *Ui, app: *App, w: i32, h: i32) void {
 fn drawUpgradeConfirm(ui: *Ui, app: *App, w: i32, h: i32) void {
     var l1: [96]u8 = undefined;
     const line1 = std.fmt.bufPrint(&l1, "这是旧版存档（v{d}），升级为最新格式？", .{app.pending_upgrade_version}) catch "这是旧版存档，升级？";
-    const line2 = "会先备份原文件为 .bak.saw，然后原地升级。";
-    const tw1: i32 = @intFromFloat(ui.font.measure(line1));
-    const tw2: i32 = @intFromFloat(ui.font.measure(line2));
-    const text_w = @max(tw1, tw2);
-    const btn_w: i32 = 96;
-    const gap: i32 = 10;
-    const dlg_w = @max(text_w + 48, btn_w * 2 + gap + 32);
-    const dlg_h: i32 = 110;
-    const dx = @divTrunc(w - dlg_w, 2);
-    const dy = @divTrunc(h - dlg_h, 2);
-    ui.noteOverlayRect(dx, dy, dlg_w + 4, dlg_h + 4);
-
-    ui.renderer.fillRect(dx + 4, dy + 4, dlg_w, dlg_h, r_mod.rgb(12, 13, 16));
-    ui.renderer.fillRect(dx, dy, dlg_w, dlg_h, ui.theme.panel);
-    ui.renderer.strokeRect(dx, dy, dlg_w, dlg_h, ui.theme.accent);
-    ui.label(line1, dx + @divTrunc(dlg_w - tw1, 2), dy + 18, ui.theme.text);
-    ui.label(line2, dx + @divTrunc(dlg_w - tw2, 2), dy + 40, ui.theme.text_dim);
-
+    const b = drawDialog2(ui, w, h, line1, "会先备份原文件为 .bak.saw，然后原地升级。", 2, 96);
     const labels = [_][]const u8{ "备份并升级", "取消" };
     const choices = [_]QuitChoice{ .save, .cancel };
-    drawModalButtons(ui, app, dx, dy, dlg_w, dlg_h, &labels, &choices, 0, 0);
+    drawModalButtons(ui, app, b.dx, b.dy, b.w, b.h, &labels, &choices, 0, 0);
 }
 
 /// 脏确认框（保存/不保存/取消）——退出或打开其它工程前
@@ -5075,94 +5081,36 @@ fn drawDirtyConfirm(ui: *Ui, app: *App, w: i32, h: i32) void {
         .new => "是否保存后再新建空工程？",
         .quit => "是否保存后再退出？",
     };
-    const line1 = "当前工程有未保存的修改。";
-    const tw1: i32 = @intFromFloat(ui.font.measure(line1));
-    const tw2: i32 = @intFromFloat(ui.font.measure(line2));
-    const text_w = @max(tw1, tw2);
-    const btn_w: i32 = 84;
-    const gap: i32 = 10;
-    const dlg_w = @max(text_w + 48, btn_w * 3 + gap * 2 + 32);
-    const dlg_h: i32 = 110;
-    const dx = @divTrunc(w - dlg_w, 2);
-    const dy = @divTrunc(h - dlg_h, 2);
-    ui.noteOverlayRect(dx, dy, dlg_w + 4, dlg_h + 4); // 裁切插件子窗口（含阴影；仅对话框范围）
-
-    // 对话框背景 + 边框
-    ui.renderer.fillRect(dx + 4, dy + 4, dlg_w, dlg_h, r_mod.rgb(12, 13, 16)); // 阴影
-    ui.renderer.fillRect(dx, dy, dlg_w, dlg_h, ui.theme.panel);
-    ui.renderer.strokeRect(dx, dy, dlg_w, dlg_h, ui.theme.accent);
-
-    // 文字（两行）
-    ui.label(line1, dx + @divTrunc(dlg_w - tw1, 2), dy + 18, ui.theme.text);
-    ui.label(line2, dx + @divTrunc(dlg_w - tw2, 2), dy + 40, ui.theme.text_dim);
-
-    // 按钮：保存 / 不保存 / 取消
+    const b = drawDialog2(ui, w, h, "当前工程有未保存的修改。", line2, 3, 84);
     const labels = [_][]const u8{ "保存", "不保存", "取消" };
     const choices = [_]QuitChoice{ .save, .discard, .cancel };
-    drawModalButtons(ui, app, dx, dy, dlg_w, dlg_h, &labels, &choices, 0, 0);
+    drawModalButtons(ui, app, b.dx, b.dy, b.w, b.h, &labels, &choices, 0, 0);
 }
 
 /// 预设覆写确认框（覆写/取消）：预填名 + 回车直达；确认后重排保存（overwrite）
 fn drawPresetOverwrite(ui: *Ui, app: *App, w: i32, h: i32) void {
     const req = app.overwrite_req orelse return;
-    const name = req.name[0..req.name_len];
     var l1: [preset_mod.max_name_len + 32]u8 = undefined;
-    const line1 = std.fmt.bufPrint(&l1, "预设「{s}」已存在。", .{name}) catch "预设已存在。";
-    const line2 = "覆写后其它已加载它的乐器不受影响（需手动重新加载）。";
-    const tw1: i32 = @intFromFloat(ui.font.measure(line1));
-    const tw2: i32 = @intFromFloat(ui.font.measure(line2));
-    const text_w = @max(tw1, tw2);
-    const btn_w: i32 = 84;
-    const gap: i32 = 10;
-    const dlg_w = @max(text_w + 48, btn_w * 2 + gap + 32);
-    const dlg_h: i32 = 110;
-    const dx = @divTrunc(w - dlg_w, 2);
-    const dy = @divTrunc(h - dlg_h, 2);
-    ui.noteOverlayRect(dx, dy, dlg_w + 4, dlg_h + 4); // 裁切插件子窗口（含阴影；仅对话框范围）
-
-    ui.renderer.fillRect(dx + 4, dy + 4, dlg_w, dlg_h, r_mod.rgb(12, 13, 16));
-    ui.renderer.fillRect(dx, dy, dlg_w, dlg_h, ui.theme.panel);
-    ui.renderer.strokeRect(dx, dy, dlg_w, dlg_h, ui.theme.accent);
-    ui.label(line1, dx + @divTrunc(dlg_w - tw1, 2), dy + 18, ui.theme.text);
-    ui.label(line2, dx + @divTrunc(dlg_w - tw2, 2), dy + 40, ui.theme.text_dim);
-
-    // 按钮：覆写（主按钮 = .save）/ 取消
-    const labels = [_][]const u8{ "覆写", "取消" };
+    const line1 = std.fmt.bufPrint(&l1, "预设「{s}」已存在。", .{req.name[0..req.name_len]}) catch "预设已存在。";
+    const b = drawDialog2(ui, w, h, line1, "覆写后其它已加载它的乐器不受影响（需手动重新加载）。", 2, 84);
+    const labels = [_][]const u8{ "覆写", "取消" }; // 覆写 = 主按钮（.save）
     const choices = [_]QuitChoice{ .save, .cancel };
-    drawModalButtons(ui, app, dx, dy, dlg_w, dlg_h, &labels, &choices, 0, 0);
+    drawModalButtons(ui, app, b.dx, b.dy, b.w, b.h, &labels, &choices, 0, 0);
 }
 
 /// 预设删除确认框（删除/取消）：破坏性主按钮用红色；确认后重排删除。
 /// 文案说明副本语义：已加载它的乐器不受影响。
 fn drawPresetDelete(ui: *Ui, app: *App, w: i32, h: i32) void {
     const req = app.delete_req orelse return;
-    const name = req.name[0..req.name_len];
     var l1: [preset_mod.max_name_len + 32]u8 = undefined;
-    const line1 = std.fmt.bufPrint(&l1, "删除预设「{s}」？", .{name}) catch "删除预设？";
-    const line2 = "已加载它的乐器不受影响；文件删除后不可恢复。";
-    const tw1: i32 = @intFromFloat(ui.font.measure(line1));
-    const tw2: i32 = @intFromFloat(ui.font.measure(line2));
-    const text_w = @max(tw1, tw2);
-    const btn_w: i32 = 84;
-    const gap: i32 = 10;
-    const dlg_w = @max(text_w + 48, btn_w * 2 + gap + 32);
-    const dlg_h: i32 = 110;
-    const dx = @divTrunc(w - dlg_w, 2);
-    const dy = @divTrunc(h - dlg_h, 2);
-    ui.noteOverlayRect(dx, dy, dlg_w + 4, dlg_h + 4); // 裁切插件子窗口（含阴影；仅对话框范围）
-
-    ui.renderer.fillRect(dx + 4, dy + 4, dlg_w, dlg_h, r_mod.rgb(12, 13, 16));
-    ui.renderer.fillRect(dx, dy, dlg_w, dlg_h, ui.theme.panel);
-    ui.renderer.strokeRect(dx, dy, dlg_w, dlg_h, ui.theme.accent);
-    ui.label(line1, dx + @divTrunc(dlg_w - tw1, 2), dy + 18, ui.theme.text);
-    ui.label(line2, dx + @divTrunc(dlg_w - tw2, 2), dy + 40, ui.theme.text_dim);
-
-    const labels = [_][]const u8{ if (app.modal == .track_clear) "清空" else "删除", "取消" };
+    const line1 = std.fmt.bufPrint(&l1, "删除预设「{s}」？", .{req.name[0..req.name_len]}) catch "删除预设？";
+    const b = drawDialog2(ui, w, h, line1, "已加载它的乐器不受影响；文件删除后不可恢复。", 2, 84);
+    const labels = [_][]const u8{ "删除", "取消" };
     const choices = [_]QuitChoice{ .save, .cancel };
-    drawModalButtons(ui, app, dx, dy, dlg_w, dlg_h, &labels, &choices, 0, 1); // 删除/清空为主（红色）
+    drawModalButtons(ui, app, b.dx, b.dy, b.w, b.h, &labels, &choices, 0, 1); // 删除为主（红色）
 }
 
-/// 删除/清空确认（非空样式 / 轨道）——确认后由主循环的选择消费点执行（同样式的删除/取消）。
+/// 删除/清空确认（非空样式 / 轨道 / 自动化曲线）——确认后由主循环的选择消费点执行。
 fn drawDeleteConfirm(ui: *Ui, app: *App, w: i32, h: i32) void {
     const req = app.struct_del_req orelse return;
     var l1: [128]u8 = undefined;
@@ -5172,56 +5120,33 @@ fn drawDeleteConfirm(ui: *Ui, app: *App, w: i32, h: i32) void {
     switch (req) {
         .pattern => |pi| {
             const name = if (pi < app.pattern_items.items.len) app.pattern_items.items[pi] else "?";
-            const short = name[0..@min(name.len, 24)];
-            line1 = std.fmt.bufPrint(&l1, "删除样式「{s}」？", .{short}) catch "删除样式？";
+            line1 = std.fmt.bufPrint(&l1, "删除样式「{s}」？", .{name[0..@min(name.len, 24)]}) catch "删除样式？";
             const usage = app.patternUsage(pi);
             line2 = std.fmt.bufPrint(&l2, "该样式含 {d} 个音符、被 {d} 个片段引用；删除将一并移除（可 Ctrl+Z 撤销）。", .{ usage.notes, usage.clips }) catch "删除将一并移除内容。";
         },
         .track => |ti| {
             const name = app.trackName(ti);
-            const short = name[0..@min(name.len, 24)];
-            line1 = std.fmt.bufPrint(&l1, "清空轨道「{s}」？", .{short}) catch "清空轨道？";
+            line1 = std.fmt.bufPrint(&l1, "清空轨道「{s}」？", .{name[0..@min(name.len, 24)]}) catch "清空轨道？";
             line2 = std.fmt.bufPrint(&l2, "该轨道上有 {d} 个片段；清空将移除这些片段（行与名字保留，可 Ctrl+Z 撤销）。", .{app.trackUsage(ti)}) catch "清空将移除这些片段。";
         },
         .auto_curve => |cid| {
-            const ci = app.curveIndexById(cid);
             var nb: [24]u8 = undefined;
-            const nm = if (ci) |ii| app.auto_curves.items[ii].name(&nb) else "?";
-            const short = nm[0..@min(nm.len, 24)];
-            line1 = std.fmt.bufPrint(&l1, "删除曲线「{s}」？", .{short}) catch "删除曲线？";
+            const nm = if (app.curveIndexById(cid)) |ii| app.auto_curves.items[ii].name(&nb) else "?";
+            line1 = std.fmt.bufPrint(&l1, "删除曲线「{s}」？", .{nm[0..@min(nm.len, 24)]}) catch "删除曲线？";
             line2 = std.fmt.bufPrint(&l2, "这条曲线被 {d} 个参数链接；删除后这些链接一并移除（曲线数据无法恢复）。", .{app.bindingCountOfCurve(cid)}) catch "删除后链接一并移除。";
         },
         .track_row => |ti| {
             const name = app.trackName(ti);
-            const short = name[0..@min(name.len, 24)];
-            line1 = std.fmt.bufPrint(&l1, "删除轨道「{s}」？", .{short}) catch "删除轨道？";
+            line1 = std.fmt.bufPrint(&l1, "删除轨道「{s}」？", .{name[0..@min(name.len, 24)]}) catch "删除轨道？";
             line2 = std.fmt.bufPrint(&l2, "该轨道上有 {d} 个片段；删除将一并移除，下方轨道整体上移（可 Ctrl+Z 撤销）。", .{app.trackUsage(ti)}) catch "删除将一并移除内容。";
         },
     }
-    const tw1: i32 = @intFromFloat(ui.font.measure(line1));
-    const tw2: i32 = @intFromFloat(ui.font.measure(line2));
-    const text_w = @max(tw1, tw2);
-    const btn_w: i32 = 84;
-    const gap: i32 = 10;
-    const dlg_w = @max(text_w + 48, btn_w * 2 + gap + 32);
-    const dlg_h: i32 = 110;
-    const dx = @divTrunc(w - dlg_w, 2);
-    const dy = @divTrunc(h - dlg_h, 2);
-    ui.noteOverlayRect(dx, dy, dlg_w + 4, dlg_h + 4); // 裁切插件子窗口（含阴影；仅对话框范围）
-
-    ui.renderer.fillRect(dx + 4, dy + 4, dlg_w, dlg_h, r_mod.rgb(12, 13, 16));
-    ui.renderer.fillRect(dx, dy, dlg_w, dlg_h, ui.theme.panel);
-    ui.renderer.strokeRect(dx, dy, dlg_w, dlg_h, ui.theme.accent);
-    ui.label(line1, dx + @divTrunc(dlg_w - tw1, 2), dy + 18, ui.theme.text);
-    ui.label(line2, dx + @divTrunc(dlg_w - tw2, 2), dy + 40, ui.theme.text_dim);
-
+    const b = drawDialog2(ui, w, h, line1, line2, 2, 84);
     const labels = [_][]const u8{ "删除", "取消" };
     const choices = [_]QuitChoice{ .save, .cancel };
-    drawModalButtons(ui, app, dx, dy, dlg_w, dlg_h, &labels, &choices, 0, 1); // 删除为主（红色）
+    drawModalButtons(ui, app, b.dx, b.dy, b.w, b.h, &labels, &choices, 0, 1); // 删除为主（红色）
 }
 
-/// 对话框底部按钮排（居中一行；`primary` = 哪个用强调色主按钮样式；
-/// `danger` = 主按钮用危险色）
 fn drawModalButtons(
     ui: *Ui,
     app: *App,

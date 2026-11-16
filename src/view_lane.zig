@@ -198,7 +198,10 @@ pub const Lane = struct {
     points: std.ArrayListUnmanaged(Point) = .empty,
     /// 出生序号发生器（同一步的多个点靠它定序；只增不减）
     next_seq: u32 = 1,
-
+    /// **内容版本**：任何影响曲线形状的改动都 +1。发布节流（`publishAutoLane`）用它
+    /// 判断“要不要重建音频快照”；`draw` 在返回 `changed` 时统一 `touch()`→ 交互编辑全被覆盖；
+    /// 非交互写入（右键“输入值…”/读档/撤销）要自己调 `touch()`。
+    version: u32 = 0,
     drag_kind: DragKind = .none,
     drag_idx: usize = 0,
     /// 悬停中的点/段（每帧由 `draw` 更新；行头列顶部读数用）
@@ -227,6 +230,11 @@ pub const Lane = struct {
     pub fn name(self: *const Lane, buf: []u8) []const u8 {
         if (self.name_len > 0) return self.name_buf[0..self.name_len];
         return std.fmt.bufPrint(buf, "曲线{d}", .{self.id}) catch "曲线";
+    }
+
+    /// 标记本曲线内容已变（发布节流用）
+    pub fn touch(self: *Lane) void {
+        self.version +%= 1;
     }
 
     /// 设名字：**按码点截断**（绝不切出半个汉字——旧的按字节截断会把
@@ -275,14 +283,22 @@ pub const Lane = struct {
         return std.math.clamp(v, 0.0, 1.0);
     }
 
+    /// **单条曲线的点数上限** = 音频侧共享点池的 1/4（`audio.LaneSet.pool_points / 4`）。
+    /// 为什么不是整池：一条曲线吃满池会让其它曲线发布不出去（音频只载入前 16 K 点）。
+    /// 4 条满额曲线 = 刚好一池；超过时 `publishAutoLane` 跳过超出的绑定 + 弹一次 Toast。
+    pub const max_points: usize = @import("audio.zig").LaneSet.pool_points / 4;
+
     /// 插入锚点（按 `(step, seq)` 保序；**同一步已有点 → 追加到该组末尾**（出生顺序））。
     /// 同 step 且值几乎相同（双击重复点）→ 返回既有下标（不产生零高度断崖）。
+    /// 已到 `max_points` → **不插入**（返回既有下标 0；点数上限是硬约束，见上）。
     pub fn insertPoint(self: *Lane, alloc: std.mem.Allocator, step: i32, value: f32) usize {
         var i: usize = 0;
         while (i < self.points.items.len and self.points.items[i].step <= step) : (i += 1) {
             const p = self.points.items[i];
             if (p.step == step and @abs(p.value - value) < 0.002) return i;
         }
+        if (self.points.items.len >= max_points) return 0; // 满：宁可不动，也不让音频/UI 分叉
+        self.touch(); // 内容变了（发布节流用）
         const seq = self.next_seq;
         self.next_seq +%= 1;
         if (self.next_seq == 0) self.next_seq = 1;
@@ -293,6 +309,7 @@ pub const Lane = struct {
     pub fn removeAt(self: *Lane, idx: usize) void {
         if (idx >= self.points.items.len) return;
         _ = self.points.orderedRemove(idx);
+        self.touch();
     }
 };
 
@@ -764,6 +781,7 @@ pub fn draw(
             },
         }
     }
+    if (res.changed) lane.touch(); // 交互式编辑（拖点/改曲率/增删点）统一在这里标记
     return res;
 }
 
@@ -1315,6 +1333,21 @@ pub fn drawValueGrid(ui: *Ui, r: Rect, dense: bool) void {
             continue;
         ui.renderer.hline(r.x, vy, r.w, col);
     }
+}
+
+test "lane: 点数上限 = 音频快照容量（超出被拒绝，UI/音频不分叉）" {
+    const a = std.testing.allocator;
+    var lane = Lane{};
+    defer lane.deinit(a);
+    var k: usize = 0;
+    while (k < Lane.max_points) : (k += 1) _ = lane.insertPoint(a, @intCast(k * 2), 0.5);
+    try std.testing.expectEqual(Lane.max_points, lane.points.items.len);
+    // 第 65 个点：**拒绝**（音频侧只取前 64 个 → 允许多余的点就会“UI 画得细、听起来截断”）
+    _ = lane.insertPoint(a, @intCast(Lane.max_points * 2), 0.9);
+    try std.testing.expectEqual(Lane.max_points, lane.points.items.len);
+    // 同 step 同值仍返回既有下标（重复点不报错）
+    _ = lane.insertPoint(a, 0, 0.5);
+    try std.testing.expectEqual(Lane.max_points, lane.points.items.len);
 }
 
 test "lane: 曲线名——**按码点截断**（32 字节 = 10 汉字），自动命名不再切出非法 UTF-8" {

@@ -934,6 +934,11 @@ pub const DrumKitWindow = struct {
 
 /// 调音台通道数：**默认 2**（主通道 + 通道#1），可添加；上限见 `max_mixer_channels`
 pub const default_mixer_channels = 2;
+
+/// 发布节流的**强制重发周期**（帧）：漏判脏状态时最多晚这么多帧就兜底重发一次。
+/// 120 fps 下 16 帧 ≈ 0.13 s；稳态下发布频率从 120 Hz 降到 ~7.5 Hz（池拷贝量 16× 降低）。
+const lane_repub_interval: u32 = 16;
+
 /// 调音台通道**初始容量**（池化：按需增长/回收；起点 32）
 pub const max_mixer_channels = 32;
 /// 每通道效果器链**初始槽数**（同上；起点 32）
@@ -1818,6 +1823,12 @@ pub const App = struct {
     pending_upgrade_version: u32 = 0,
     /// `modal == .notice` 的正文（多行，`'\n'` 分隔；打开/升级失败时设置，关闭时释放）
     notice_text: ?[]u8 = null,
+    /// 自动化超预算的提示是否已弹过（一次性；不再超额时自动复位）
+    lane_warned: bool = false,
+    /// 发布节流：上次发布的内容签名 + 调用计数 + 是否发过
+    lane_sig_pub: u64 = 0,
+    lane_tick: u32 = 0,
+    lane_published: bool = false,
     /// **手动接管中的锚定目标**（拖推子/旋钮期间：该参数暂时不吃自动化，松手清空）
     auto_drag_target: ?view_lane.Target = null,
 
@@ -6053,6 +6064,48 @@ pub const App = struct {
         return true;
     }
 
+    /// **内容签名**（发布节流用）：曲线形状/插值 + 绑定的全部字段 + 车道解析数量 + 手动接管目标。
+    /// 只要它不变且没到强制重发周期，就不再重建音频快照（省掉每帧几百 KB 的池拷贝）。
+    fn laneSignature(self: *const App) u64 {
+        // FNV-1a 64（嵌入式便宜哈希；这里只要求“变了就不同”）
+        const mix = struct {
+            fn f(x: u64, v: u64) u64 {
+                return (x ^ v) *% 0x100000001b3;
+            }
+        }.f;
+        var h: u64 = 0xcbf29ce484222325;
+        h = mix(h, self.auto_curves.items.len);
+        h = mix(h, self.auto_bindings.items.len);
+        h = mix(h, self.mixer_channels_state.items.len);
+        h = mix(h, self.instruments.items.len);
+        for (self.auto_curves.items) |lc| {
+            h = mix(h, lc.id);
+            h = mix(h, lc.points.items.len);
+            h = mix(h, lc.version);
+            h = mix(h, @backingInt(lc.interp));
+        }
+        for (self.auto_bindings.items) |b| {
+            h = mix(h, b.curve_id);
+            h = mix(h, @as(u32, @backingInt(b.target.kind)));
+            h = mix(h, b.target.uid);
+            h = mix(h, b.target.slot);
+            h = mix(h, b.target.param_id);
+            h = mix(h, @as(u32, @bitCast(b.depth)));
+            h = mix(h, @as(u32, @bitCast(b.smooth_ms)));
+            h = mix(h, @as(u32, @bitCast(b.base orelse std.math.nan(f32))));
+            h = mix(h, @as(u32, @intFromBool(b.enabled)));
+            h = mix(h, @as(u32, @intFromBool(b.bipolar)));
+            h = mix(h, @as(u32, @intFromBool(b.invert)));
+        }
+        if (self.auto_drag_target) |t| { // 手动接管状态变了 → 也得重发（该车道要临时下线）
+            h = mix(h, 1);
+            h = mix(h, @as(u32, @backingInt(t.kind)));
+            h = mix(h, t.uid);
+            h = mix(h, t.slot);
+        }
+        return h;
+    }
+
     /// **工程自动化（A）**：把绑定**展开成每通道一组 lane** 发布给音频线程。
     ///
     /// 无锁发布：写在 `lane_pub` 之外的缓冲（3 缓冲轮转），写完后 `release` 发布下标；
@@ -6065,11 +6118,29 @@ pub const App = struct {
         if (self.instruments.items.len > 0 and self.instruments.items[0].uid == 0) self.ensureInstrumentUids();
         // 效果槽 / 鼓组层 uid 惰性补齐（v3：参数自动化按 uid 引用）
         self.ensureSlotUids();
+
+        // **发布节流**：内容没变就不重建快照（稳态下每帧几百 KB 的池拷贝是白费的）。
+        // 判定 = 内容签名（曲线 version/点数/插值 + 绑定字段 + 数量 + 手动接管）；
+        // 每 `lane_repub_interval` 次调用**强制重发一次**兜底（漏判最多晚 ~0.13 s，不会永久不生效）。
+        const sig = self.laneSignature();
+        const force = (self.lane_tick % lane_repub_interval) == 0;
+        self.lane_tick +%= 1;
+        if (self.lane_published and !force and sig == self.lane_sig_pub) return;
+        self.lane_sig_pub = sig;
+        self.lane_published = true;
+
         const cur = self.params.lane_pub.load(.monotonic);
         const next = (cur + 1) % 3;
         const set = &self.params.lane_bufs[next];
-        set.* = .{};
-        defer self.params.lane_pub.store(next, .release);
+        // **只重置计数**（不再 `set.* = .{}`——256 KB 的池子无需每帧清：
+        // 读者只走 `off..off+n`，旧数据永远不会被读到）
+        set.n = 0;
+        set.used = 0;
+        var budget_hit = false;
+        defer {
+            self.params.lane_pub.store(next, .release);
+            if (!budget_hit) self.lane_warned = false; // 不再超额 → 复位一次性提示
+        }
         if (self.auto_bindings.items.len == 0) return;
 
         for (self.auto_bindings.items) |b| {
@@ -6103,11 +6174,21 @@ pub const App = struct {
             const is_inst = is_vst or is_kit or b.target.kind == .inst_vol or b.target.kind == .inst_pan;
             const is_pan = b.target.kind == .mixer_pan or b.target.kind == .inst_pan;
             const lc = self.curveById(b.curve_id) orelse continue;
-            const n = @min(lc.points.items.len, audio.LaneSnap.capacity);
-            if (n == 0) continue;
+            const n_pts = lc.points.items.len;
+            if (n_pts == 0) continue;
             const snap = set.slotFor() orelse {
-                // 超过 `LaneSet.max_lanes` → 不再静默失效：记一次诊断（每秒汇总打印）
+                // 超过 `LaneSet.max_lanes`（车道数）→ 记诊断 + 弹窗提示
                 _ = self.params.dbg_lane_overflow.fetchAdd(1, .monotonic);
+                budget_hit = true;
+                self.warnLaneBudget();
+                continue;
+            };
+            // 从**共享点池**里切一段给这条曲线（总预算见 `LaneSet.pool_points`）
+            const off = set.allocPoints(n_pts) orelse {
+                set.n -= 1; // 回滚这个车道槽位（它是追加分配的最后一条）
+                _ = self.params.dbg_lane_overflow.fetchAdd(1, .monotonic);
+                budget_hit = true;
+                self.warnLaneBudget();
                 continue;
             };
             snap.active = true;
@@ -6133,14 +6214,21 @@ pub const App = struct {
             snap.bipolar = b.bipolar;
             snap.invert = b.invert;
             snap.smooth_ms = std.math.clamp(b.smooth_ms, 0.0, view_lane.smooth_ms_max);
-            snap.n = @intCast(n);
-            for (lc.points.items[0..n], 0..) |p, i| {
-                snap.steps[i] = p.step;
-                snap.vals[i] = p.value;
-                snap.curves[i] = p.curve;
-                snap.pivots[i] = p.pivot;
+            // 点拷进共享池（AoS，16 B/点）
+            snap.off = off;
+            snap.n = @intCast(@min(n_pts, std.math.maxInt(u32)));
+            const dst = set.points[off..][0..n_pts];
+            for (lc.points.items, 0..) |p, i| {
+                dst[i] = .{ .step = p.step, .value = p.value, .curve = p.curve, .pivot = p.pivot };
             }
         }
+    }
+
+    /// 曲线点/车道超出音频侧预算时的**一次性**提示（只用 Toast，不阻断）
+    fn warnLaneBudget(self: *App) void {
+        if (self.lane_warned) return;
+        self.lane_warned = true;
+        self.setToast("自动化：曲线点 / 绑定数超出音频预算，部分曲线暂不生效——减少点数或绑定数即可");
     }
 
     /// **打开自动化链接窗口**（唯一入口：打开即置顶）
@@ -8294,6 +8382,8 @@ pub const App = struct {
     fn applyHistoryState(self: *App, st: *const HistoryState, prev_idx: usize, target_idx: usize) void {
         // **A4**：撤销/重做/跳历史改了数据 → 必须重建快照，否则播放中听不到变化（实测：undo 后快照没变）
         self.snap_dirty = true;
+        // 曲线内容可能被快照整体替换（`version` 取自快照，可能碰巧相同）→ 强制 bump，
+        // 让发布节流（`publishAutoLane` 的内容签名）一定看到“变了”。
         // 播放中**不停播**：撤销/重做/跳转走“编辑重扫”（见 `publishHistoryRescan`）——
         // 停播会让编辑时音乐中断（回归 bug：Ctrl+Z / 点历史条目导致播放暂停）
         if (!self.playing) self.stopPlayback(); // 停止态：作废旧事件 + 清残留声部
@@ -8408,6 +8498,8 @@ pub const App = struct {
         self.importAutoSave(st.auto, st.auto_sel);
         // 目标/参数已不存在的绑定（乐器被换掉/删除等）→ 清理（曲线保留）
         _ = self.pruneAutoBindings();
+        // `version` 来自快照（可能碰巧相等）→ 强制 bump，保证发布节流一定看到“变了”
+        for (self.auto_curves.items) |*lc| lc.touch();
     }
 
     /// 撤销（Ctrl+Z）。返回是否成功。
@@ -11275,6 +11367,7 @@ pub const App = struct {
                 if (ti.index < lane.points.items.len) {
                     if (@import("view_lane.zig").parseValue(lane.display_unit, val)) |v| {
                         lane.points.items[ti.index].value = std.math.clamp(v, 0.0, 1.0);
+                        lane.touch(); // 就地改值 → 告诉发布节流“内容变了”
                         self.commitHistory("设置自动化点值");
                     }
                 }
@@ -17706,6 +17799,135 @@ test "app: 右键输入值——通道/乐器 音量（dB）与声像（0..1）"
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), app.mixer_channels_state.items[1].volume, 1e-6);
 }
 
+test "automation: 点池——发布一条 200 点曲线（旧上限 64），UI 与音频逐点一致" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.resetMixerChannels(3);
+    const uid1 = app.mixer_channels_state.items[1].uid;
+    const cid = app.addAutoCurve("长曲线");
+    app.auto_sel = cid;
+    // 200 点锯齿坡（超前旧 64 点上限）
+    var k: usize = 0;
+    while (k < 200) : (k += 1) {
+        const v: f32 = @as(f32, @floatFromInt(k % 37)) / 36.0;
+        _ = app.autoCurve().?.insertPoint(alloc, @intCast(k * 24), v);
+    }
+    try std.testing.expectEqual(@as(usize, 200), app.autoCurve().?.points.items.len);
+    try std.testing.expect(app.bindCurveTarget(cid, .{ .kind = .mixer_vol, .uid = uid1 }));
+    app.publishAutoLane();
+    {
+        const set = &app.params.lane_bufs[app.params.lane_pub.load(.monotonic)];
+        const snap = &set.lanes[0];
+        try std.testing.expectEqual(@as(u32, 200), snap.n); // **全部点都进去了**
+        try std.testing.expectEqual(@as(u32, 200), set.used);
+        // 抽查：UI 与音频逐点一致
+        var s: f32 = 0;
+        while (s < 24.0 * 200.0) : (s += 97.0) {
+            try std.testing.expectApproxEqAbs(app.autoCurve().?.evalAt(s), snap.evalAt(set.points, s), 1e-6);
+        }
+    }
+    // 超预算（池只有 `pool_points`）→ 计数 + 一次性提示，不崩、不静默
+    try std.testing.expectEqual(@as(u32, 0), app.params.dbg_lane_overflow.load(.monotonic));
+}
+
+test "automation: 发布节流——内容没变不重建快照；改点/改绑定/接管/超周期才重发" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.resetMixerChannels(3);
+    const uid1 = app.mixer_channels_state.items[1].uid;
+    const tgt = view_lane.Target{ .kind = .mixer_vol, .uid = uid1 };
+    const cid = app.addAutoCurve("节流");
+    app.auto_sel = cid;
+    _ = app.autoCurve().?.insertPoint(alloc, 0, 0.5);
+    try std.testing.expect(app.bindCurveTarget(cid, tgt));
+
+    // 第一次必发（`lane_published == false`）
+    app.publishAutoLane();
+    var prev = app.params.lane_pub.load(.monotonic);
+    // 内容没变 → 不重建（`lane_pub` 不跳）
+    app.publishAutoLane();
+    try std.testing.expectEqual(prev, app.params.lane_pub.load(.monotonic));
+    app.publishAutoLane();
+    try std.testing.expectEqual(prev, app.params.lane_pub.load(.monotonic));
+
+    // 改点（`insertPoint` 会 bump version）→ 重发
+    _ = app.autoCurve().?.insertPoint(alloc, 96, 0.9);
+    app.publishAutoLane();
+    try std.testing.expect(app.params.lane_pub.load(.monotonic) != prev);
+    prev = app.params.lane_pub.load(.monotonic);
+
+    // 改绑定字段（depth）→ 重发
+    app.auto_bindings.items[0].depth = 0.5;
+    app.publishAutoLane();
+    try std.testing.expect(app.params.lane_pub.load(.monotonic) != prev);
+    prev = app.params.lane_pub.load(.monotonic);
+
+    // 手动接管开始/结束 → 重发（该车道要临时下线 / 回来）
+    app.beginAutoDrag(tgt);
+    app.publishAutoLane();
+    try std.testing.expect(app.params.lane_pub.load(.monotonic) != prev);
+    prev = app.params.lane_pub.load(.monotonic);
+    app.clearAutoDrag();
+    app.publishAutoLane();
+    try std.testing.expect(app.params.lane_pub.load(.monotonic) != prev);
+    prev = app.params.lane_pub.load(.monotonic);
+
+    // 兜底：内容一直不变，但**周期到了必发**（漏判脏状态也不会永久不生效）
+    var forced = false;
+    var k: u32 = 0;
+    while (k < lane_repub_interval) : (k += 1) {
+        app.publishAutoLane();
+        if (app.params.lane_pub.load(.monotonic) != prev) forced = true;
+    }
+    try std.testing.expect(forced);
+}
+
+test "automation: 点池预算不足 → 跳过该绑定 + 计数 + 一次性 Toast（不静默失败）" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.resetMixerChannels(3);
+    const uid_a = app.mixer_channels_state.items[1].uid;
+    const uid_b = app.mixer_channels_state.items[2].uid;
+
+    // 两条各 4 点的曲线（预算会设成 5 点 → 第二条装不下）
+    const ca = app.addAutoCurve("A");
+    app.auto_sel = ca;
+    var k: usize = 0;
+    while (k < 4) : (k += 1) _ = app.autoCurve().?.insertPoint(alloc, @intCast(k * 100), @as(f32, @floatFromInt(k)) * 0.2);
+    try std.testing.expect(app.bindCurveTarget(ca, .{ .kind = .mixer_vol, .uid = uid_a }));
+    const cb = app.addAutoCurve("B");
+    app.auto_sel = cb;
+    k = 0;
+    while (k < 4) : (k += 1) _ = app.autoCurve().?.insertPoint(alloc, @intCast(k * 100), @as(f32, @floatFromInt(k)) * 0.2);
+    try std.testing.expect(app.bindCurveTarget(cb, .{ .kind = .mixer_vol, .uid = uid_b }));
+
+    // 把三个轮转缓冲的池子临时换成只装 5 点的（结束后必须换回，deinitAll 要 free 原池）
+    var saved: [3][]audio.SnapPoint = undefined;
+    for (0..3) |i| saved[i] = app.params.lane_bufs[i].points;
+    const tiny = try alloc.alloc(audio.SnapPoint, 5);
+    defer alloc.free(tiny);
+    for (&app.params.lane_bufs) |*st| st.points = tiny;
+
+    app.publishAutoLane();
+    // 第一条装进去了，第二条被跳过 → 计数 + 提示（不静默）
+    try std.testing.expectEqual(@as(u32, 1), app.params.dbg_lane_overflow.load(.monotonic));
+    try std.testing.expect(app.lane_warned);
+    try std.testing.expect(app.toast != null);
+    try std.testing.expectEqual(@as(u32, 1), app.params.lane_bufs[app.params.lane_pub.load(.monotonic)].n);
+
+    // 恢复池子（否则 deinitAll 会 free 掉栈/临时内存）
+    for (0..3) |i| app.params.lane_bufs[i].points = saved[i];
+}
+
 test "automation: LaneSnap（音频侧副本）与 view_lane.evalAt 逐点一致" {
     const alloc = std.testing.allocator;
     var app = App{ .allocator = alloc };
@@ -17733,7 +17955,7 @@ test "automation: LaneSnap（音频侧副本）与 view_lane.evalAt 逐点一致
         var s: f32 = -5.0;
         while (s < 105.0) : (s += 0.37) {
             const a = app.autoCurve().?.evalAt(s);
-            const b = snap.evalAt(s);
+            const b = snap.evalAt(set.points, s);
             try std.testing.expectApproxEqAbs(a, b, 1e-6);
         }
     }
