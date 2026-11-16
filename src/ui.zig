@@ -579,11 +579,20 @@ pub const Ui = struct {
         return self.sliderTint(id, value, x, y, w, h, null, null);
     }
 
+    /// 平推**把手宽**：把手的**中心**跟随值 → 在 0 / 1 时有一半露在轨道外，
+    /// 所以**命中区必须两端各外扩半个宽**（否则“鼠标已搁在把手上却不响应”——实测 bug）；
+    /// 绘制与命中共用这个常量，不得分叉。
+    const slider_knob_w: i32 = 12;
+    /// 竖推把手高（同理）
+    const slider_knob_h: i32 = 12;
+
     /// 推子（可上色）：`fill_tint` = 已填充段颜色（null = 主题默认）；
     /// `knob_tint` = 把手颜色（null = 默认白/悬停蓝）。
     /// 自动化激活时传 `theme.auto_active` → “填充 + 把手”整体变绿。
     pub fn sliderTint(self: *Ui, id: u64, value: *f32, x: i32, y: i32, w: i32, h: i32, fill_tint: ?Color, knob_tint: ?Color) bool {
-        const hovered = self.hit(x, y, w, h);
+        // 命中区 = 轨道 + 两端各半个把手（把手停在端点时露在外面的那半截也算）
+        const half = @divTrunc(slider_knob_w, 2);
+        const hovered = self.hit(x - half, y, w + slider_knob_w, h);
         const changed = self.draggable(id, hovered, x, w, value);
 
         // 轨道
@@ -593,16 +602,18 @@ pub const Ui = struct {
         const fill_w: i32 = @intFromFloat(value.* * @as(f32, @floatFromInt(w)));
         self.renderer.fillRect(x, track_y, fill_w, 6, fill_tint orelse self.theme.slider_fill);
         // 把手
-        const knob_x = x + fill_w - 6;
+        const knob_x = x + fill_w - half;
         const kcol = knob_tint orelse (if (hovered or self.active_id == id) self.theme.accent else r_mod.rgb(180, 186, 196));
-        self.renderer.fillRect(knob_x, y, 12, h, kcol);
-        self.renderer.strokeRect(knob_x, y, 12, h, self.theme.panel_border);
+        self.renderer.fillRect(knob_x, y, slider_knob_w, h, kcol);
+        self.renderer.strokeRect(knob_x, y, slider_knob_w, h, self.theme.panel_border);
         return changed;
     }
 
     /// 垂直推子（音量常用）：0 在底部
     pub fn vslider(self: *Ui, id: u64, value: *f32, x: i32, y: i32, w: i32, h: i32) bool {
-        const hovered = self.hit(x, y, w, h);
+        // 命中区 = 轨道 + 两端各半个把手高（同 `sliderTint` 的理由）
+        const half = @divTrunc(slider_knob_h, 2);
+        const hovered = self.hit(x, y - half, w, h + slider_knob_h);
         // 垂直方向：鼠标 y 向下增大 → 值减小
         const changed = self.draggableV(id, hovered, y, h, value);
 
@@ -610,9 +621,9 @@ pub const Ui = struct {
         self.renderer.fillRect(track_x, y, 6, h, self.theme.slider_track);
         const fill_h: i32 = @intFromFloat(value.* * @as(f32, @floatFromInt(h)));
         self.renderer.fillRect(track_x, y + h - fill_h, 6, fill_h, self.theme.slider_fill);
-        const knob_y = y + h - fill_h - 6;
-        self.renderer.fillRect(x, knob_y, w, 12, if (hovered or self.active_id == id) self.theme.accent else r_mod.rgb(180, 186, 196));
-        self.renderer.strokeRect(x, knob_y, w, 12, self.theme.panel_border);
+        const knob_y = y + h - fill_h - half;
+        self.renderer.fillRect(x, knob_y, w, slider_knob_h, if (hovered or self.active_id == id) self.theme.accent else r_mod.rgb(180, 186, 196));
+        self.renderer.strokeRect(x, knob_y, w, slider_knob_h, self.theme.panel_border);
         return changed;
     }
 

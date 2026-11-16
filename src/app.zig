@@ -415,6 +415,8 @@ pub const ModalKind = enum {
     delete_auto_curve,
     /// 旧版存档（二进制 v5–v8）打开 → “备份并升级”确认（③ 迁移流程）
     save_upgrade,
+    /// **存档无法打开/升级失败**提示（只有一个「确定」）——比右下角 Toast 不易漏看
+    notice,
 };
 
 /// 待确认的结构删除（`struct_del_req`；`modal == .pattern_delete/.track_clear/.track_delete` 时有效）
@@ -1061,7 +1063,8 @@ pub const effects_per_channel = max_effects_per_channel;
 
 /// 一个调音台通道：增益/声像/静音 + **效果器链**（插件式，动态列表）
 pub const MixerChannel = struct {
-    volume: f32 = 0.8, // 0-1（线性增益）
+    /// 推子位置（0..1；**0 dB 在 0.75**，顶部 = +5 dB——见 `audio.faderGain`）
+    volume: f32 = 0.75,
     pan: f32 = 0.5, // 0-1（0.5 = 居中）
     muted: bool = false,
     /// **稳定身份**（0 = 未分配，惰性分配）：自动化绑定按键靠它，而**不是数组下标**——
@@ -1813,6 +1816,10 @@ pub const App = struct {
     /// 待升级的旧版存档路径 + 版本（`modal == .save_upgrade` 时有效；取消即清理）
     pending_upgrade_path: ?[]u8 = null,
     pending_upgrade_version: u32 = 0,
+    /// `modal == .notice` 的正文（多行，`'\n'` 分隔；打开/升级失败时设置，关闭时释放）
+    notice_text: ?[]u8 = null,
+    /// **手动接管中的锚定目标**（拖推子/旋钮期间：该参数暂时不吃自动化，松手清空）
+    auto_drag_target: ?view_lane.Target = null,
 
     // ── 音频 ──
     params: audio.Params = .{},
@@ -4298,6 +4305,19 @@ pub const App = struct {
         self.pending_upgrade_version = 0;
     }
 
+    /// **存档打不开**要给弹窗，不是 Toast（右下角一闪就没了，用户经常根本没看到）。
+    /// 正文多行用 `'\n'`（渲染侧按行居中，最多 4 行）。
+    pub fn setNotice(self: *App, comptime fmt: []const u8, args: anytype) void {
+        self.clearNotice();
+        self.notice_text = std.fmt.allocPrint(self.allocator, fmt, args) catch null;
+        self.modal = .notice;
+        self.modal_choice = null;
+    }
+    pub fn clearNotice(self: *App) void {
+        if (self.notice_text) |t| self.allocator.free(t);
+        self.notice_text = null;
+    }
+
     /// 释放全部乐器（名字 + 合成器参数，含退役的）+ 保存相关字段——进程退出时调用
     pub fn deinitAll(self: *App) void {
         self.sched_log_pending.deinit(self.allocator); // 诊断缓冲（--sched-log 用）
@@ -4370,6 +4390,7 @@ pub const App = struct {
         self.title_applied_name = null;
         self.pending_open_path = null;
         self.clearPendingUpgrade();
+        self.clearNotice();
         self.clipboard_notes.deinit(self.allocator);
         self.clipboard_clips.deinit(self.allocator);
         self.playlist.draw_order.deinit(self.allocator);
@@ -6011,6 +6032,9 @@ pub const App = struct {
     pub fn bindCurveTarget(self: *App, curve_id: u32, target: view_lane.Target) bool {
         if (self.curveIndexById(curve_id) == null) return false;
         if (self.bindingIndex(curve_id, target) != null) return false;
+        // **不插种基准值**：默认 `null` → `Target.defaultBase`（音量 0）→
+        // “曲线就是推子位置”：最低点 = 静音、最高点 = +5 dB（深度默认 100%）。
+        // 想要“相对当前音量浮动”就自己改「基础值」。
         self.auto_bindings.append(self.allocator, .{
             .curve_id = curve_id,
             .target = target,
@@ -6051,6 +6075,8 @@ pub const App = struct {
         for (self.auto_bindings.items) |b| {
             if (!b.enabled) continue;
             if (b.target.kind == .none) continue;
+            // **手动接管中（拖动）**：不发布这条车道 → 音频侧用静态推子/旋钮值（跟手、不掺曲线）
+            if (self.isAutoDrag(b.target)) continue;
             // 目标 → 通道/乐器**当前下标**（按 uid 解析：上下移/重排后仍跟着走）
             const ch: usize = switch (b.target.kind) {
                 .master_vol => 0,
@@ -6098,6 +6124,9 @@ pub const App = struct {
                 (if (is_plugin) b.target.param_id *% 2654435761 else 0) ^
                 (@as(u32, @intCast(slot_now)) *% 40503);
             snap.base = b.base orelse self.defaultBaseFor(b.target);
+            // `base` 已解析成具体值（`null` → 类型默认：音量 0.75 = 0 dB），
+            // 音频侧不再需要 `orelse stat` 兜底（保留着当双保险）。
+            snap.has_base = true;
             snap.interp = switch (lc.interp) {
                 .hold => 0,
                 .linear => 1,
@@ -6223,32 +6252,66 @@ pub const App = struct {
         return removed;
     }
 
-    /// 该参数**所有**绑定的叠加值（UI 预览/状态行用；`step` 为工程步）
+    /// 该参数**所有启用绑定**的合成值（UI 推子/旋钮位置；`step` 为工程步）。
+    ///
+    /// **叠加语义（位置域）**：`值 = clamp(基准 + Σ贡献, 0, 1)`，
+    /// Σ贡献 = Σ（启用 × 深度 × 极性/反向处理后的曲线值）。
+    /// 音量目标的默认基值 = 0、深度 = 100% → **曲线就是推子位置**：
+    /// 最低点 = 静音、最高点 = +5 dB。
+    ///
+    /// **基准**：第一条**启用**绑定的 `base`；没设 → 类型默认（`defaultBaseFor`）。
+    /// 一条启用的都没有（未绑定 / **全部禁用**）→ 原样返回静态值（可手动调整）。
     pub fn autoValueFor(self: *const App, target: view_lane.Target, step: f32, base: f32) f32 {
-        // 有绑定 → 基准取**第一条绑定的 base**（未设则用类型默认：音量 0 / 声像 0.5）；无 → 静态推子/旋钮值
-        var sum: f32 = blk: {
-            for (self.auto_bindings.items) |b| {
-                if (!self.isTargetBound(target)) break :blk base;
-                if (view_lane.Target.eql(b.target, target)) {
-                    break :blk b.base orelse self.defaultBaseFor(target);
-                }
-            }
-            break :blk base;
-        };
+        // 拖动中 = 手动接管：直接返回静态值（推子跟鼠标，也不吃曲线）
+        if (self.isAutoDrag(target)) return base;
+        var start: f32 = base;
+        var contrib: f32 = 0;
+        var any = false;
         for (self.auto_bindings.items) |b| {
             if (!b.enabled) continue;
             if (!view_lane.Target.eql(b.target, target)) continue;
+            if (!any) {
+                any = true;
+                start = b.base orelse self.defaultBaseFor(target);
+            }
             const i = self.curveIndexById(b.curve_id) orelse continue;
-            const lc = &self.auto_curves.items[i];
-            const v = lc.evalAt(step);
+            const v = self.auto_curves.items[i].evalAt(step);
             if (v < 0) continue;
-            const contrib = blk: {
-                const sc = if (b.bipolar) (v - 0.5) * 2.0 else v;
-                break :blk (if (b.invert) -sc else sc) * b.depth;
-            };
-            sum += contrib;
+            const sc = if (b.bipolar) (v - 0.5) * 2.0 else v;
+            contrib += (if (b.invert) -sc else sc) * b.depth;
         }
-        return std.math.clamp(sum, 0.0, 1.0);
+        if (!any) return base; // 全部禁用/未绑定 → 静态值（可手动拖）
+        return std.math.clamp(start + contrib, 0.0, 1.0);
+    }
+
+    /// **手动接管**：拖推子/旋钮期间，这个参数**暂时不吃自动化**——
+    /// 音频用静态值（`channel_gain`/`instrument_gain`）、UI 用静态值，两边都跟鼠标。
+    /// 松手（`!ui.mouse_down`）就 `clearAutoDrag`，自动化重新接管。
+    ///
+    /// 为什么不用“拖动即改绑定基础值”：那是**每帧写绑定 + 反馈环**
+    /// （基础值→显示值→鼠标增量→基础值），实测会听到一卡一卡、松手冲到静音或 +5 dB。
+    /// 手动接管不碰任何绑定，只是一个“临时屏蔽开关”，无状态、无累加、无杂音。
+    pub fn beginAutoDrag(self: *App, target: view_lane.Target) void {
+        self.auto_drag_target = target;
+    }
+    pub fn clearAutoDrag(self: *App) void {
+        self.auto_drag_target = null;
+    }
+
+    /// **拖动写回**：推子/旋钮被手动拖动 → 返回应写入的**静态值**（同时开启手动接管）。
+    ///
+    /// 就是**推子的显示值本身**。为什么不是“旧静态值 + 鼠标增量”（即 `static + (val - eff)`）：
+    /// 自动化驱动时 `static`（`mc.volume`）早就**不参与显示**了（显示 = 基准 + 曲线），
+    /// 两者差着整条曲线 → 起手第一下会把静态值从 0.75 跳到“曲线值 + 微小增量”
+    /// → 音频从曲线增益秒切到这个值 = **每次拖动只爆一次、就在起手后一点**（实测反馈）。
+    pub fn dragWriteback(self: *App, target: view_lane.Target, pos: f32) f32 {
+        self.beginAutoDrag(target);
+        return std.math.clamp(pos, 0.0, 1.0);
+    }
+    /// 该目标此刻是否处于“手动接管”（拖动中）
+    pub fn isAutoDrag(self: *const App, target: view_lane.Target) bool {
+        const d = self.auto_drag_target orelse return false;
+        return view_lane.Target.eql(d, target);
     }
 
     pub fn initQueues(self: *App) void {
@@ -6554,13 +6617,22 @@ pub const App = struct {
         return std.fmt.bufPrint(buf, "{s} · {s}", .{ self.instruments.items[r.inst_idx].name, r.pl.params[r.param_idx].name() }) catch "插件参数";
     }
 
-    /// **绑定基准值的类型默认值**：插件参数取插件自己报的 `defaultNormalizedValue`
-    /// （否则滤波截止这类参数会被拉到 0 → 直接没声音），其余走 `Target.defaultBase`。
+    /// **绑定基准值的类型默认**（`Binding.base == null` 时用它）：
+    /// 音量 = **0.75（0 dB）**、声像 = 0.5（中心）、BPM = 0（曲线值直接就是速度）、
+    /// 插件参数 = 插件自己报的 `defaultNormalizedValue`。
+    /// 注意：**音量默认不是 0**——在 dB 域里基准 0 = 静音，乘任何曲线都是 0。
     pub fn defaultBaseFor(self: *const App, t: view_lane.Target) f32 {
         if (t.isPluginParam()) {
             if (self.pluginParamResolve(t)) |r| return @floatCast(r.pl.params[r.param_idx].default_norm);
         }
         return view_lane.Target.defaultBase(t.kind);
+    }
+
+    /// **基准值**（新建绑定播种 / `base == null` 时的兜底）：= 类型默认。
+    /// 以前这里是“跟随静态推子值”，会让“恢复默认值”显示成 0.5（= 推子位置）令人困惑；
+    /// 现在统一为类型默认（音量 = 0 dB）；“跟随当前值”改在**建绑定那一刻播种**。
+    pub fn baseForTarget(self: *const App, t: view_lane.Target) f32 {
+        return self.defaultBaseFor(t);
     }
 
     /// 插件参数类目标（`vst_param` / `fx_param` / `kit_param`）→ 插件实例 + 参数下标。
@@ -9068,14 +9140,23 @@ pub const App = struct {
     /// **穿透到下层**（实测 bug：文件→保存穿透点到左栏“操作历史”条目，
     /// 因为文件菜单正好盖在历史列表上方；历史面板用 `ui.listItem`（观 hit）
     /// 先于菜单绘制、当时又未被屏蔽）。
+    ///
+    /// 另一种表现（更隐蔽）：菜单没计入 → 不声明全屏模态层 → 菜单底下的**推子**
+    /// 也收到这次点击 → 拖动被启动（`active_id`）→ 下一帧把“恢复默认值”顶回去
+    /// （实测：混音台音量推子右键“恢复默认值”点好几次才生效一次）。
+    /// 回归测试：`app: menuIsOpen——每种菜单都必须计入`。
     pub fn menuIsOpen(self: *const App) bool {
         return self.rack.ctx_instrument != null or
+            self.rack.ctx_vol != null or self.rack.ctx_pan != null or
             self.file_menu_open or self.panels.ctx_pattern != null or self.panels.ctx_audio_style != null or
             self.panels.ctx_track != null or self.panels.ctx_bpm or
             self.preset_browser.open or
             // VST 参数行内 `自动化` 菜单 / 播放列表曲线行菜单：不遮就变成“点菜单 = 同时点到下面的内容”
             self.vst_auto.menu_open or self.curve_menu.open or
-            self.mixer_win.ctx_effect != null or self.mixer_win.ctx_channel != null or self.mixer_win.ctx_pan != null;
+            // 自动化链接窗口的**行内右键菜单**（参数行本身是拖动条，同推子）
+            self.auto_win.ctx_row != null or
+            self.mixer_win.ctx_effect != null or self.mixer_win.ctx_channel != null or
+            self.mixer_win.ctx_pan != null or self.mixer_win.ctx_vol != null;
     }
 
     /// 设置状态栏提示（覆盖旧的；默认显示约 3 秒）
@@ -11127,8 +11208,8 @@ pub const App = struct {
             },
             .channel_vol => {
                 if (ti.index < self.mixer_channels_state.items.len) {
-                    const v = std.fmt.parseFloat(f32, val) catch return;
-                    const nv = std.math.clamp(v, 0.0, 1.0);
+                    // **dB 输入**（与推子读数/`formatValue(.db)` 同一映射；≤−60 = 静音）
+                    const nv = view_lane.parseValue(.db, val) orelse return;
                     const mc = &self.mixer_channels_state.items[ti.index];
                     if (@abs(nv - mc.volume) > 0.0005) {
                         mc.volume = nv;
@@ -11148,8 +11229,8 @@ pub const App = struct {
             },
             .inst_vol => {
                 if (ti.index < self.instruments.items.len) {
-                    const v = std.fmt.parseFloat(f32, val) catch return;
-                    const nv = std.math.clamp(v, 0.0, 1.0);
+                    // **dB 输入**（与推子读数/`formatValue(.db)` 同一映射；≤−60 = 静音）
+                    const nv = view_lane.parseValue(.db, val) orelse return;
                     const inst = &self.instruments.items[ti.index];
                     if (@abs(nv - inst.volume) > 0.0005) {
                         inst.volume = nv;
@@ -11681,7 +11762,7 @@ test "app: 手势历史顺序（新操作起手先钉 → 撤销按因果顺序�
 
     // 撤销：先回音量（BPM 仍 110）→ 再回 BPM
     try std.testing.expect(app.undo());
-    try std.testing.expectApproxEqAbs(@as(f32, 0.8), app.mixer_channels_state.items[0].volume, 0.001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), app.mixer_channels_state.items[0].volume, 0.001); // 默认推子位置 = 0 dB
     try std.testing.expectEqual(@as(i32, 110), app.bpm);
     try std.testing.expect(app.undo());
     try std.testing.expectEqual(@as(i32, 120), app.bpm); // 回到基线
@@ -13355,17 +13436,25 @@ test "app: menuIsOpen——每种菜单都必须计入（漏项会穿透下层�
     try std.testing.expect(app.menuIsOpen());
     app.file_menu_open = false;
 
-    // 机架右键菜单（乐器）
+    // 机架右键菜单（乐器 / **音量·声像旋钮**）
     app.rack.ctx_instrument = 0;
     try std.testing.expect(app.menuIsOpen());
     app.rack.ctx_instrument = null;
+    app.rack.ctx_vol = 0;
+    try std.testing.expect(app.menuIsOpen());
+    app.rack.ctx_vol = null;
+    app.rack.ctx_pan = 0;
+    try std.testing.expect(app.menuIsOpen());
+    app.rack.ctx_pan = null;
 
     // 预设面板（统一选择器：模态）
     app.preset_browser.open = true;
     try std.testing.expect(app.menuIsOpen());
     app.preset_browser.open = false;
 
-    // 调音台右键菜单（通道/效果器/声像）——实测 bug：漏项 → 点击穿透到通道条
+    // 调音台右键菜单（通道/效果器/声像/**音量推子**）——实测 bug：漏项 → 点击穿透到通道条；
+    // **`ctx_vol` 漏项的表现是“恢复默认值点不生效”**：菜单底下的推子也收到这次点击 →
+    // `draggable` 启动拖动（`active_id` 记下）→ 下一帧按拖动位置重算 → 把 0.75 顶回去。
     app.mixer_win.ctx_channel = 0;
     try std.testing.expect(app.menuIsOpen());
     app.mixer_win.ctx_channel = null;
@@ -13375,6 +13464,28 @@ test "app: menuIsOpen——每种菜单都必须计入（漏项会穿透下层�
     app.mixer_win.ctx_pan = 0;
     try std.testing.expect(app.menuIsOpen());
     app.mixer_win.ctx_pan = null;
+    app.mixer_win.ctx_vol = 0;
+    try std.testing.expect(app.menuIsOpen());
+    app.mixer_win.ctx_vol = null;
+
+    // 自动化链接窗口的行内右键菜单
+    app.auto_win.ctx_row = 0;
+    try std.testing.expect(app.menuIsOpen());
+    app.auto_win.ctx_row = null;
+
+    // 其余菜单（VST 参数行内 / 播放列表曲线 / 面板右键 / BPM）
+    app.vst_auto.menu_open = true;
+    try std.testing.expect(app.menuIsOpen());
+    app.vst_auto.menu_open = false;
+    app.curve_menu.open = true;
+    try std.testing.expect(app.menuIsOpen());
+    app.curve_menu.open = false;
+    app.panels.ctx_pattern = 0;
+    try std.testing.expect(app.menuIsOpen());
+    app.panels.ctx_pattern = null;
+    app.panels.ctx_bpm = true;
+    try std.testing.expect(app.menuIsOpen());
+    app.panels.ctx_bpm = false;
 
     // 全部关闭 → 无菜单
     try std.testing.expect(!app.menuIsOpen());
@@ -13687,7 +13798,7 @@ test "app: 重命名调音台通道——空串恢复默认占位名" {
     try std.testing.expectEqualStrings("鼓组", app.mixer_channels_state.items[1].displayName(1, &nb));
 }
 
-test "automation: 乐器音量/声像目标 → 发布到乐器空间的 lane（inst=true，基准 0/0.5）" {
+test "automation: 乐器音量/声像目标 → 发布到乐器空间的 lane（inst=true；基准默认 0/0.5）" {
     var app = App{ .allocator = std.testing.allocator };
     defer app.deinitAll();
     app.resetMixerChannels(default_mixer_channels);
@@ -13707,8 +13818,8 @@ test "automation: 乐器音量/声像目标 → 发布到乐器空间的 lane（
         // 乐器空间命中、通道空间不命中
         try std.testing.expectEqual(@as(usize, 1), set.countForChannel(0, false, true));
         try std.testing.expectEqual(@as(usize, 0), set.countForChannel(0, false, false));
-        // 音量基准 = 0（不是旋钮当前值）
-        try std.testing.expectApproxEqAbs(@as(f32, 0.0), set.baseOf(0, false, true).?, 1e-6);
+        // 基准默认 **0**（曲线就是推子位置）；不会落到“没基准”而丢掉控制
+        try std.testing.expectEqual(@as(f32, 0.0), set.baseOf(0, false, true).?);
         try std.testing.expectApproxEqAbs(@as(f32, 0.5), set.contribution(0, 0, false, true), 1e-6);
     }
 
@@ -13723,7 +13834,18 @@ test "automation: 乐器音量/声像目标 → 发布到乐器空间的 lane（
     {
         const set = &app.params.lane_bufs[app.params.lane_pub.load(.monotonic)];
         try std.testing.expectEqual(@as(usize, 1), set.countForChannel(0, true, true));
-        try std.testing.expectApproxEqAbs(@as(f32, 0.5), set.baseOf(0, true, true).?, 1e-6);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.5), set.baseOf(0, true, true).?, 1e-6); // 插种 = 静态声像（居中）
+    }
+
+    // 显式设了“基础值” → 发布它（音频侧直接拿它当基线）
+    {
+        const bi = app.bindingIndex(cv, .{ .kind = .inst_vol, .uid = inst_uid }).?;
+        app.auto_bindings.items[bi].base = 0.25;
+    }
+    app.publishAutoLane();
+    {
+        const set = &app.params.lane_bufs[app.params.lane_pub.load(.monotonic)];
+        try std.testing.expectApproxEqAbs(@as(f32, 0.25), set.baseOf(0, false, true).?, 1e-6);
     }
 }
 
@@ -16177,7 +16299,7 @@ test "撤销：VST3 乐器状态未变时跳过重放（pending 不设）" {
     try std.testing.expect(inst.kind == .vst3);
     try std.testing.expect(inst.pending_state == null); // 状态未变 → 不重放
     try std.testing.expect(inst.pending_state_ctrl == null);
-    try std.testing.expectEqual(@as(f32, 0.8), inst.volume); // 其它字段照常回退
+    try std.testing.expectEqual(@as(f32, 0.75), inst.volume); // 其它字段照常回退（音量默认 = 0 dB）
 }
 
 test "VST3 编辑队列：多条排空/最后一条兼容/溢出降级" {
@@ -17523,7 +17645,7 @@ test "automation_value: 键入数值按显示单位解析（% / dB 静音 / 非�
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), app.autoCurve().?.points.items[0].value, 1e-6);
 }
 
-test "app: 右键输入值——通道/乐器 音量与声像（0..1 与 L/R/C）" {
+test "app: 右键输入值——通道/乐器 音量（dB）与声像（L/R/C）" {
     const alloc = std.testing.allocator;
     var app = App{ .allocator = alloc };
     defer app.clips.deinit(alloc);
@@ -17532,10 +17654,12 @@ test "app: 右键输入值——通道/乐器 音量与声像（0..1 与 L/R/C�
     app.resetMixerChannels(default_mixer_channels);
     _ = app.addInstrument("减法合成器");
 
-    // 通道音量：十进制 0..1（与推子读数一致）
-    app.beginEditChannelVol(1, "0.62", 0, 0, 60);
+    // 通道音量：**dB 输入**（推子锥度 gain = p² ⇒ 位置 = 10^(dB/40)）
+    // −12 dB → 位置 0.5012
+    app.beginEditChannelVol(1, "-12.0", 0, 0, 60);
     app.textInputCommit();
-    try std.testing.expectApproxEqAbs(@as(f32, 0.62), app.mixer_channels_state.items[1].volume, 1e-4);
+    const p12 = 0.75 * std.math.pow(f32, 10.0, -12.0 / 40.0); // unity 0.75 · 10^(dB/40)
+    try std.testing.expectApproxEqAbs(p12, app.mixer_channels_state.items[1].volume, 1e-4);
 
     // 通道声像：L50 → 0.25；C → 0.5；R100 → 1.0
     app.beginEditChannelPan(1, "L50", 0, 0, 60);
@@ -17548,18 +17672,23 @@ test "app: 右键输入值——通道/乐器 音量与声像（0..1 与 L/R/C�
     app.textInputCommit();
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), app.mixer_channels_state.items[1].pan, 1e-4);
 
-    // 乐器音量 / 声像
-    app.beginEditInstVol(0, "0.40", 0, 0, 60);
+    // 乐器音量 / 声像（音量同样是 dB）
+    app.beginEditInstVol(0, "0.0", 0, 0, 60);
     app.textInputCommit();
-    try std.testing.expectApproxEqAbs(@as(f32, 0.40), app.instruments.items[0].volume, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), app.instruments.items[0].volume, 1e-4); // 0 dB = 推子 0.75
     app.beginEditInstPan(0, "L100", 0, 0, 60);
     app.textInputCommit();
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), app.instruments.items[0].pan, 1e-4);
 
+    // ≤ −60 dB → 静音（位置 0）
+    app.beginEditChannelVol(1, "-60", 0, 0, 60);
+    app.textInputCommit();
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), app.mixer_channels_state.items[1].volume, 1e-6);
+
     // 普通乱写 → 值不变（不 panic）
     app.beginEditChannelVol(1, "abc", 0, 0, 60);
     app.textInputCommit();
-    try std.testing.expectApproxEqAbs(@as(f32, 0.62), app.mixer_channels_state.items[1].volume, 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), app.mixer_channels_state.items[1].volume, 1e-6);
 }
 
 test "automation: LaneSnap（音频侧副本）与 view_lane.evalAt 逐点一致" {
@@ -17843,14 +17972,15 @@ test "automation: 一参数叠两条曲线——深度 / 极性 / 启用 / 钳�
     app.publishAutoLane();
     const set = &app.params.lane_bufs[app.params.lane_pub.load(.monotonic)];
     try std.testing.expectEqual(@as(usize, 2), set.countForChannel(1, false, false)); // 同一通道叠了两条
-    // 基准 0.2 + 0.5 + 0.5 = 1.2 → 音频侧钳到 1.0
+    // Σ贡献 = 0.5（A 单向 100%）+ 0.5（B 双向 50%）= 1.0；**位置域叠加**：
+    // 位置 = 基准 0 + 1.0 = 1.0（推子顶端 = +5 dB）
     const contrib = set.contribution(1, 0, false, false);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), contrib, 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), std.math.clamp(0.2 + contrib, 0.0, 1.0), 1e-5);
-    // UI 侧预览值与音频侧一致
-    try std.testing.expectApproxEqAbs(std.math.clamp(0.0 + contrib, 0.0, 1.0), app.autoValueFor(tgt, 0, 0.2), 1e-5);
+    const pos = app.autoValueFor(tgt, 0, 0.2);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), pos, 1e-5);
+    try std.testing.expectApproxEqAbs(audio.volumeGain(0.0, contrib), audio.faderGain(pos), 1e-5);
 
-    // 禁用 B → 只剩 A 的 +0.5
+    // 禁用 B → 只剩 A 的 0.5
     {
         const i = app.bindingIndex(cb, tgt).?;
         app.auto_bindings.items[i].enabled = false;
@@ -17858,7 +17988,10 @@ test "automation: 一参数叠两条曲线——深度 / 极性 / 启用 / 钳�
     app.publishAutoLane();
     const set2 = &app.params.lane_bufs[app.params.lane_pub.load(.monotonic)];
     try std.testing.expectEqual(@as(usize, 1), set2.countForChannel(1, false, false));
-    // 有绑定 → 基准 = 类型默认（音量 0）；只剩 A 的 +0.5\n    try std.testing.expectApproxEqAbs(@as(f32, 0.5), app.autoValueFor(tgt, 0, 0.2), 1e-5);
+    // 基准 0（默认）→ 位置 = 0.5
+    const pos2 = app.autoValueFor(tgt, 0, 0.2);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), pos2, 1e-5);
+    try std.testing.expectApproxEqAbs(audio.volumeGain(0.0, 0.5), audio.faderGain(pos2), 1e-5);
 
     // 全部解绑 → 发布为空、参数回到基准值
     try std.testing.expect(app.unbindCurveTarget(ca, tgt));
@@ -17867,6 +18000,169 @@ test "automation: 一参数叠两条曲线——深度 / 极性 / 启用 / 钳�
     app.publishAutoLane();
     try std.testing.expectEqual(@as(u32, 0), app.params.lane_bufs[app.params.lane_pub.load(.monotonic)].n);
     try std.testing.expectApproxEqAbs(@as(f32, 0.2), app.autoValueFor(tgt, 0, 0.2), 1e-5);
+}
+
+test "automation: 主通道绑曲线 → 增益不再是 0（基准 = 插种的 0.75，不是 0）" {
+    // 实测事故：主通道绑一条曲线 → 播放**完全没声**，推子却在跟着曲线跑。
+    // 原因：音量基准被当成 0 → `faderGain(0) = 0` → 不管曲线怎么跑，增益恒为 0。
+    // 现在：建绑定时**插种 = 当前静态推子值**（主通道默认 0.75 = 0 dB）。
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.resetMixerChannels(default_mixer_channels);
+
+    const tgt = view_lane.Target{ .kind = .master_vol };
+    const stat = app.mixer_channels_state.items[0].volume; // 主通道静态推子（默认 0.75 = 0 dB）
+    try std.testing.expectApproxEqAbs(audio.fader_unity_pos, stat, 1e-6);
+
+    const cid = app.addAutoCurve("m");
+    app.auto_sel = cid;
+    _ = app.autoCurve().?.insertPoint(alloc, 0, 0.5); // 曲线恒 0.5
+    try std.testing.expect(app.bindCurveTarget(cid, tgt));
+    app.publishAutoLane();
+
+    // 基准 = 默认 0（曲线就是推子位置）→ 曲线 0.5 ⇒ 位置 0.5（−7 dB）
+    const set = &app.params.lane_bufs[app.params.lane_pub.load(.monotonic)];
+    const base_v = set.baseOf(0, false, false) orelse 0.0;
+    try std.testing.expectEqual(@as(f32, 0.0), base_v);
+    const sum_c = set.contribution(0, 0, false, false);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), sum_c, 1e-5);
+
+    // 增益真的不是 0（能听到）
+    const g = audio.volumeGain(base_v, sum_c);
+    try std.testing.expect(g > 0.4);
+    // UI 推子位置与音频增益**同律**（这是之前两边各算一套的地方）
+    const pos = app.autoValueFor(tgt, 0, stat);
+    try std.testing.expectApproxEqAbs(g, audio.faderGain(pos), 2e-3);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), pos, 1e-4);
+
+    // **曲线拉到底 = 静音 / 拉到顶 = +5 dB**（用户要的默认映射）
+    app.auto_bindings.items[app.bindingIndex(cid, tgt).?].invert = true; // 反向 ⇒ 曲线 0.5 → −0.5
+    app.publishAutoLane();
+    const set2 = &app.params.lane_bufs[app.params.lane_pub.load(.monotonic)];
+    try std.testing.expectApproxEqAbs(@as(f32, -0.5), set2.contribution(0, 0, false, false), 1e-5);
+    try std.testing.expectEqual(@as(f32, 0.0), app.autoValueFor(tgt, 0, stat)); // 钳到 0 = 静音
+    try std.testing.expectEqual(@as(f32, 0.0), audio.volumeGain(0.0, -0.5));
+    var blk_buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("静音", view_lane.formatValue(.db, 0.0, &blk_buf));
+    try std.testing.expectApproxEqAbs(audio.fader_max_gain, audio.volumeGain(0.0, 1.0), 1e-6); // 顶上 = +5 dB
+}
+
+test "automation: 全部绑定禁用 → 参数回到静态值（推子可手动调、不回弹）" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.resetMixerChannels(2);
+    const uid1 = app.mixer_channels_state.items[1].uid;
+    const tgt = view_lane.Target{ .kind = .mixer_vol, .uid = uid1 };
+
+    const cid = app.addAutoCurve("c");
+    app.auto_sel = cid;
+    _ = app.autoCurve().?.insertPoint(alloc, 0, 0.8);
+    try std.testing.expect(app.bindCurveTarget(cid, tgt));
+    const bi = app.bindingIndex(cid, tgt).?;
+
+    // 启用时：位置 = 基准 0（默认）+ 0.8 = 0.8（曲线就是位置）
+    const on = app.autoValueFor(tgt, 0, 0.3);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), on, 1e-5);
+
+    // **禁用（全部）** → 原样返回静态值：每帧拖到哪就是哪，不再“拖了又弹回去”
+    app.auto_bindings.items[bi].enabled = false;
+    try std.testing.expectApproxEqAbs(@as(f32, 0.3), app.autoValueFor(tgt, 0, 0.3), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), app.autoValueFor(tgt, 0, 0.2), 1e-6);
+    // 音频侧同理：不发布车道 → 用静态推子
+    app.publishAutoLane();
+    const set = &app.params.lane_bufs[app.params.lane_pub.load(.monotonic)];
+    try std.testing.expectEqual(@as(usize, 0), set.countForChannel(1, false, false));
+    try std.testing.expect(set.baseOf(1, false, false) == null);
+}
+
+test "automation: 拖动中「手动接管」——UI 与音频都暂不吃曲线，松手恢复" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.resetMixerChannels(2);
+    const uid1 = app.mixer_channels_state.items[1].uid;
+    const tgt = view_lane.Target{ .kind = .mixer_vol, .uid = uid1 };
+    app.mixer_channels_state.items[1].volume = 0.4;
+
+    const cid = app.addAutoCurve("c");
+    app.auto_sel = cid;
+    _ = app.autoCurve().?.insertPoint(alloc, 0, 0.5);
+    try std.testing.expect(app.bindCurveTarget(cid, tgt));
+    const bi = app.bindingIndex(cid, tgt).?;
+    const base_before = app.auto_bindings.items[bi].base; // null = 类型默认（0）
+
+    // 自动化生效：位置 = 基准 0 + 曲线 0.5 = 0.5
+    const auto_v = app.autoValueFor(tgt, 0, 0.4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), auto_v, 1e-5);
+
+    // 开始拖动 → 手动接管：UI 返回静态值（跟鼠标），车道不再发布（音频用静态）
+    app.beginAutoDrag(tgt);
+    try std.testing.expect(app.isAutoDrag(tgt));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.4), app.autoValueFor(tgt, 0, 0.4), 1e-6);
+    app.publishAutoLane();
+    {
+        const set = &app.params.lane_bufs[app.params.lane_pub.load(.monotonic)];
+        try std.testing.expectEqual(@as(usize, 0), set.countForChannel(1, false, false));
+    }
+    // 拖动只改静态值，**不碰绑定**（没有反馈环 → 不会冲到 0/1）
+    app.mixer_channels_state.items[1].volume = 0.25;
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), app.autoValueFor(tgt, 0, 0.25), 1e-6);
+    try std.testing.expect(app.auto_bindings.items[bi].base == base_before);
+    try std.testing.expectEqual(@as(usize, 1), app.auto_bindings.items.len);
+
+    // 松手（clearAutoDrag）→ 自动化重新接管（基准 = 拖动后的静态值）
+    app.clearAutoDrag();
+    try std.testing.expect(!app.isAutoDrag(tgt));
+    app.publishAutoLane();
+    {
+        const set = &app.params.lane_bufs[app.params.lane_pub.load(.monotonic)];
+        try std.testing.expectEqual(@as(usize, 1), set.countForChannel(1, false, false));
+        try std.testing.expectEqual(@as(f32, 0.0), set.baseOf(1, false, false).?); // 基准仍为默认 0
+    }
+    // 松手后：位置 = 0 + 曲线 0.5 = 0.5（与拖动值无关——曲线接管）
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), app.autoValueFor(tgt, 0, 0.25), 1e-5);
+    // 其它目标不受影响
+    const other = view_lane.Target{ .kind = .mixer_pan, .uid = uid1 };
+    try std.testing.expect(!app.isAutoDrag(other));
+}
+
+test "automation: 拖动写回 = 推子显示值（起手不能从曲线值跳回旧静态值——爆音根因）" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.resetMixerChannels(2);
+    const uid1 = app.mixer_channels_state.items[1].uid;
+    const tgt = view_lane.Target{ .kind = .mixer_vol, .uid = uid1 };
+    app.mixer_channels_state.items[1].volume = 0.75; // 静态值（自动化下不参与显示）
+
+    const cid = app.addAutoCurve("c");
+    app.auto_sel = cid;
+    _ = app.autoCurve().?.insertPoint(alloc, 0, 0.5);
+    try std.testing.expect(app.bindCurveTarget(cid, tgt));
+
+    // 自动化驱动：显示（= 音频用的）是 0.5，而静态值还是 0.75
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), app.autoValueFor(tgt, 0, 0.75), 1e-5);
+
+    // 起手拖一点点（推子值 = 0.52）：写回的静态值必须是 **0.52**
+    // （旧公式 `static + (val − eff)` 会算出 0.75+0.02 = 0.77 → 音频从 0.5 秒切到 0.77 = 爆音）
+    const w = app.dragWriteback(tgt, 0.52);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.52), w, 1e-6);
+    try std.testing.expect(app.isAutoDrag(tgt));
+    // 接管后：显示值 = 静态值（跟手，不再吃曲线）
+    try std.testing.expectApproxEqAbs(@as(f32, 0.52), app.autoValueFor(tgt, 0, w), 1e-6);
+    // 继续拖 → 依然跟手
+    const w2 = app.dragWriteback(tgt, 0.7);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7), app.autoValueFor(tgt, 0, w2), 1e-6);
 }
 
 test "automation: 新建曲线按参数名自动命名（重名加序号）" {
@@ -17920,13 +18216,14 @@ test "automation: 基准值可编辑 + 控件右键恢复默认（base/bipolar�
     try std.testing.expect(app.bindCurveTarget(cid, tgt));
     const bi = app.bindingIndex(cid, tgt).?;
 
-    // 默认：base = null → 类型默认（音量 0）；极性单向
+    // 默认：base = null → **类型默认 0**（曲线就是推子位置）；极性单向
     try std.testing.expect(app.auto_bindings.items[bi].base == null);
     try std.testing.expectEqual(@as(f32, 0.0), view_lane.Target.defaultBase(tgt.kind));
+    try std.testing.expectEqual(audio.fader_unity_pos, view_lane.Target.unity_pos); // 位置↔dB 同源
     try std.testing.expect(!app.auto_bindings.items[bi].bipolar);
 
     // 合成值 = 0（基准）+ 0.5（曲线）= 0.5
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), app.autoValueFor(tgt, 0, 0.9), 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), app.autoValueFor(tgt, 0, 0.3), 1e-5);
 
     // 键入基准 30% → 合成 = 0.3 + 0.5 = 0.8
     app.beginEditAutomationBase(bi, "30", 0, 0, 60);
@@ -17934,14 +18231,14 @@ test "automation: 基准值可编辑 + 控件右键恢复默认（base/bipolar�
     for ("30") |ch| app.textInputAppend(ch);
     app.textInputCommit();
     try std.testing.expectApproxEqAbs(@as(f32, 0.3), app.auto_bindings.items[bi].base.?, 1e-5);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.8), app.autoValueFor(tgt, 0, 0.9), 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), app.autoValueFor(tgt, 0, 0.3), 1e-5);
 
-    // 右键恢复默认 → base 回到 null，合成回到 0.5；极性恢复默认仍是单向
+    // 右键恢复默认（base = null）→ 回到类型默认 0，合成回到 0.5
     app.auto_bindings.items[bi].base = null;
     app.auto_bindings.items[bi].bipolar = true;
     app.auto_bindings.items[bi].bipolar = view_lane.Target.defaultBipolar(tgt.kind);
     try std.testing.expect(!app.auto_bindings.items[bi].bipolar);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), app.autoValueFor(tgt, 0, 0.9), 1e-5);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), app.autoValueFor(tgt, 0, 0.3), 1e-5);
 
     // 声像：默认基准 0.5、默认双向
     const pt = view_lane.Target{ .kind = .mixer_pan, .uid = uid1 };

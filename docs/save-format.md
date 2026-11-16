@@ -465,11 +465,14 @@ Note 规则用 5% 的代码拿到了 88% 的收益（141.7KB / 160.5KB）——�
 
 删除 `persist.toJson` / `fromJson` / `probeJsonVersion` / `file_version` / 各结构的
 `jsonStringify`/`parseFromValue` 分支；`parseAuto` 现在**只接受二进制**
-（非 `SAWD` → `NotBinaryProject`）；`loadProjectFromPath` 拒绝非 `SAWD` 文件；
-设置窗口的「数据交换」区（导入/导出 JSON）一并删掉。
+（非 `SAWD` → `NotBinaryProject`）；设置窗口的「数据交换」区（导入/导出 JSON）一并删掉。
 
 > `settings.json`、预设/音色库仍是 JSON——它们不是工程存档，不属本次范围。
 > 跨 DAW 搬运用 MIDI / WAV 导出。
+>
+> **打开旧 JSON 工程怎么办**：读取器不恢复，只留一个**版本探针**
+> （`probeLegacyJsonVersion`，见本文末「打不开存档一律弹窗」）——
+> 提示用户用旧版程序（V16–V18）打开并另存为 `.saw`，再用本版操作。
 
 ### 2. 删掉的死字段（`removed_fields`）
 
@@ -508,3 +511,55 @@ old_T=i32, changed_in=9}`，读旧档时按 `i32` 读再转 `f32`（写旧布局
 测试覆盖改用二进制往返（`persist: v6 / v7 / v8 三种旧布局都能读` 里同时验
 ×40 迁移、字段门控、`bpm` 类型转换与小数保留）。
 
+
+## 打不开存档一律弹窗（不再是右下角 Toast）
+
+**实测反馈**：双击旧 JSON 工程 → 右下角 Toast 一闪就没了 → 用户以为「程序坏了」，
+根本不知道发生了什么。现在 `loadProjectFromPath` / `performUpgrade` 的**每条失败路径**
+都走**单按钮模态窗**（`ModalKind.notice`：标题「无法打开工程」+ 最多 4 行正文 + 「确定」，
+`App.setNotice` / `clearNotice`，Enter/Esc/点击均可关闭）：
+
+| 情况 | 正文（`\n` 分行） |
+|---|---|
+| 旧版 **JSON** 工程（v1–v5） | 存档版本过旧（旧版 JSON vN），本版已不支持打开。请用旧版程序（V16–V18）打开并「另存为」.saw，再用本版打开。 |
+| 非工程文件 | 这不是 Sawdust 工程文件。需要二进制 .saw 存档（旧版 JSON 工程需用 V16–V18 转换）。 |
+| 版本比本版新 | 存档版本过新（vN），本版打不开。请使用更新的 Sawdust。 |
+| 只有 magic 的截断文件 | 存档被截断（只有文件头），无法打开。文件可能拷贝/下载不完整。 |
+| 载荷损坏 | 存档无法解析：…（`parseErrorHint`） |
+| 升级任一步失败 | 升级失败：…。原文件未改动。 |
+
+- **只加探针，不恢复读取器**：`probeLegacyJsonVersion` 只读一个 `version` 字段，并要求
+  同时出现工程键（`"clips"`/`"notes"`）——`settings.json`、预设 JSON 没它们，
+  不会被误报成「旧版工程」。JSON 读/写通道保持删除。
+- **为什么不直接做"只读导入器"**：多一份解析器 = 多一份维护面，而升级**只需一次**——
+  旧版程序（V16–V18）都能打开 JSON 并写成 v6/v8 二进制，本版再升到 v9（链路已用真档验过）。
+  将来若真要做，读端当年是纯反射（`std.json.parseFromSlice(Project, …)`）+ 44 行迁移链，
+  成本约 200 行，写端永久不要。
+- 另一个坑（本次踩到）：`probeLegacyJsonVersion` 里**不能**用全量 `parseFromSlice(Project)`
+  ——已删字段会被 `ignore_unknown_fields` 吞掉，看上去"能解析"，但 v1 的
+  `bar`/`len_bars`/`legacy_units_per_bar` 已经没了，迁移链无从下手。
+- 回归测试：`main: 打不开的存档 → 弹窗（不是 Toast）：旧 JSON / 非工程 / 版本过新 / 升级失败`、
+  `persist: 旧版 JSON 探针——只认工程（settings/预设不误报）`。
+
+## 故障档案：v8 带鼓组工程读不了（`SavedDrumLayer.uid` 漏登记，2026-11）
+
+**现象**：V18 升级产生的 v8 `.saw`（带鼓组）在新分支打开 → 弹窗「升级失败：存档无法解析」。
+
+**根因**：v9 给 `SavedDrumLayer` 加了 `uid`（自动化按它引用鼓组层），但
+`introducedVersion` 里 `SavedDrumLayer` 的**第一段**（v6 的 VST3/采样器字段）以
+`return null` 结束，把后面那段 `SavedEffectSlot or SavedDrumLayer → uid=v9` 挡在门外 →
+读 v8 档时多读了 `uid` 的 1 字节 → 后面全部错位（表现为 `SavedOsc.unison` 变成大 varint、
+`waveform` 溢出 u8 → `CorruptProject`）。
+
+**修法**：`uid` 登记进 `SavedDrumLayer` 自己那段；`legacySkip` 去掉
+`comptime ... orelse return` 的写法（见 pitfalls）。
+
+**验证（真实旧档）**：
+
+| 文件 | 版本 | 结果 |
+|---|---|---|
+| `升级测试/1/【示例工程】lulls[3].saw` | v8（V18 升级，含 3 个鼓组层） | ✅ bpm=112 / clips=1 / notes=3578 / insts=7 / kit_layers=3 |
+| `测试工程/【VST示例Vital+SFLT】lulls[3].saw` | v6（2.69 MB，VST3 状态） | ✅ bpm=112 / clips=1 / notes=3578 / insts=7 |
+
+**教训（写进流程）**：`introducedVersion` 是**字节级契约**，写/读共用同一张表 →
+漏登记是“自洽”的，往返测试发现不了；只有真旧档 + 专门断言 `legacySkip` 才拦得住。

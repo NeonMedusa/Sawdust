@@ -64,11 +64,6 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
         return true;
     }
 
-    // 点窗口内任意处 → 置顶（“点谁谁在上”；在层系统判定前提升，本帧即生效）
-    if (rk.open and util.inRect(ui.mouse_x, ui.mouse_y, x, y, ww, hh) and ui.mouse_pressed) {
-        app.bringToFront(&rk.z);
-    }
-
     // 标题拖动
     const title_hovered = util.hitUI(ui, x, title_y, ww - 24, util.rack_title_h);
     if (title_hovered and ui.mouse_pressed) {
@@ -150,8 +145,8 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
     // 注：VST3 乐器的「浏览文件」入口已移入**插件管理**（单文件条目）——
     // 预设面板中的 VST3 分类来自扫描缓存（用户拍板，2026-10）
 
-    // 右键菜单（重命名 / 更换乐器… / 删除乐器）——同理：仅在展开时取消屏蔽
-    if (app.rack.ctx_instrument != null or app.rack.ctx_pan != null) ui.input_blocked = false;
+    // 右键菜单（重命名 / 更换乐器… / 删除乐器 / 音量·声像的恢复默认值）——同理：仅在展开时取消屏蔽
+    if (app.rack.ctx_instrument != null or app.rack.ctx_pan != null or app.rack.ctx_vol != null) ui.input_blocked = false;
     if (app.rack.ctx_instrument) |ci| {
         if (ci < app.instruments.items.len) {
             const is_vst3 = app.instruments.items[ci].kind == .vst3;
@@ -245,8 +240,8 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
                 const inst = &app.instruments.items[pi];
                 if (k == 0) {
                     if (is_vol) {
-                        if (inst.volume != 0.8) {
-                            inst.volume = 0.8;
+                        if (inst.volume != 0.75) {
+                            inst.volume = 0.75; // 0 dB（推子位置 0.75 = unity）
                             app.commitHistory("恢复乐器音量");
                         }
                     } else if (inst.pan != 0.5) {
@@ -257,7 +252,8 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
                     // **输入值…**（音量按 0..1 小数；声像按 L/R/C 或数字）
                     var vb: [16]u8 = undefined;
                     if (is_vol) {
-                        const pre = std.fmt.bufPrint(&vb, "{d:.2}", .{inst.volume}) catch "";
+                        // **dB**（与推子/混音台读数同一映射）；直输 0 = 满刻度，≤−60 = 静音
+                        const pre = view_lane.formatValue(.db, inst.volume, &vb);
                         app.beginEditInstVol(pi, pre, mx + 4, my + 4, mw2 - 8);
                     } else {
                         const pre = view_lane.formatValue(.pan, inst.pan, &vb);
@@ -329,7 +325,8 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, row: usize, x: i32, y: i32, w: i32, c
         const pan_eff = app.autoValueFor(pan_tgt, cur_step, inst.pan);
         var pan = pan_eff;
         if (ui.knobAuto(4000 + @as(u64, idx) * 2, &pan, cx, ky, util.rack_knob_size, app.enabledBindingCount(pan_tgt) > 0)) {
-            inst.pan = std.math.clamp(inst.pan + (pan - pan_eff), 0.0, 1.0);
+            // 拖动期间手动接管；**写回 = 旋钮显示值本身**（不是“旧静态值 + 增量” → 起手跳一大下 = 爆音）
+            inst.pan = app.dragWriteback(pan_tgt, pan);
             app.history_pending = "调整声像";
         }
     }
@@ -347,7 +344,7 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, row: usize, x: i32, y: i32, w: i32, c
         const vol_eff = app.autoValueFor(vol_tgt, cur_step, inst.volume);
         var vol = vol_eff;
         if (ui.knobAuto(4000 + @as(u64, idx) * 2 + 1, &vol, cx, ky, util.rack_knob_size, app.enabledBindingCount(vol_tgt) > 0)) {
-            inst.volume = std.math.clamp(inst.volume + (vol - vol_eff), 0.0, 1.0);
+            inst.volume = app.dragWriteback(vol_tgt, vol);
             app.history_pending = "调整乐器音量";
         }
     }

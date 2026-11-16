@@ -281,7 +281,8 @@ pub const SavedInstrument = struct {
     /// **稳定 uid**（v9 引入；自动化绑定按它引用乐器）。0 = 旧存档/未分配
     uid: u32 = 0,
     name: []const u8 = "",
-    volume: f32 = 0.8,
+    /// 推子位置（0..1；**0 dB 在 0.75**，顶部 = +5 dB——见 audio.faderGain）
+    volume: f32 = 0.75,
     pan: f32 = 0.5,
     muted: bool = false,
     /// 混音通道（**0 起**；v3 起。v1/v2 存档是 1 起——加载时减 1）
@@ -342,7 +343,8 @@ pub const SavedMixerChannel = struct {
     uid: u32 = 0,
     /// 自定义名字（UTF-8；空 = 无自定义名——用默认占位名）
     name: []const u8 = "",
-    volume: f32 = 0.8,
+    /// 推子位置（0..1；**0 dB 在 0.75**，顶部 = +5 dB——见 audio.faderGain）
+    volume: f32 = 0.75,
     pan: f32 = 0.5,
     muted: bool = false,
     /// 有效效果器数（0 = 旧存档：按 kind != 0 推断）
@@ -491,10 +493,18 @@ pub const binary_magic = "SAWD";
 /// 否则会吞掉下一字段/下一元素的字节（v5 事故：`integer does not fit…` 崩溃）。
 /// 按**结构体名 + 字段名**双重匹配（`plugin_path` 在 `SavedInstrument`
 /// 里是 v5 之前就有的，不能误跳）。
+/// 字段首次出现的存档版本（未登记 = 从 v5 起就一直存在）。
+///
+/// 每个类型**一个分支**，分支内列出它所有“新字段”——**分支里的清单必须完整**：
+/// 漏登一个 v9 字段 → 读 v8 档时多读几个字节 → 整档错位报 `CorruptProject`。
+/// （实测：`SavedDrumLayer.uid` 曾漏登，导致 V18 升级来的**带鼓组** 工程打不开；
+/// 不带鼓组的工程看不见，因为该结构只在鼓组层里才被读到。）
+/// 回归测试：`persist: 版本门控——v9 新字段在 v8 档里必须全部跳过`。
 fn introducedVersion(comptime T: type, comptime name: []const u8) ?u8 {
     const tn = @typeName(T);
     if (comptime std.mem.endsWith(u8, tn, "SavedDrumLayer")) {
-        // 85f9bad（层 VST3）+ 音频 P1（采样器层字段）——均为 v6
+        // **稳定 uid（v9）**；层 VST3 + 采样器字段（v6）
+        if (comptime std.mem.eql(u8, name, "uid")) return binary_version_v9;
         inline for (.{ "plugin_path", "plugin_cid", "plugin_state", "plugin_state_ctrl", "asset_path", "trim_start", "trim_len", "speed" }) |fn_name| {
             if (comptime std.mem.eql(u8, name, fn_name)) return binary_version_v6;
         }
@@ -514,16 +524,15 @@ fn introducedVersion(comptime T: type, comptime name: []const u8) ?u8 {
         return null;
     }
     if (comptime std.mem.endsWith(u8, tn, "SavedBinding")) {
-        // 极点平滑时间常数 / 反向 / 插件参数 ID——均为 v9
+        // 极点平滑时间常数 / 反向 / 插件参数 ID / 子对象 uid——均为 v9
         if (comptime std.mem.eql(u8, name, "smooth_ms")) return binary_version_v9;
         if (comptime std.mem.eql(u8, name, "invert")) return binary_version_v9;
         if (comptime std.mem.eql(u8, name, "param_id")) return binary_version_v9;
-        // v3：fx_param / kit_param 的子对象 uid（效果槽 / 鼓组层）
         if (comptime std.mem.eql(u8, name, "target_slot")) return binary_version_v9;
         return null;
     }
-    if (comptime std.mem.endsWith(u8, tn, "SavedEffectSlot") or std.mem.endsWith(u8, tn, "SavedDrumLayer")) {
-        // **稳定 uid**（v9）：效果槽/鼓组层的参数自动化按它引用（位置会因插入/删除而漂）
+    if (comptime std.mem.endsWith(u8, tn, "SavedEffectSlot")) {
+        // **稳定 uid**（v9）：效果槽的参数自动化按它引用（位置会因插入/删除而漂）
         if (comptime std.mem.eql(u8, name, "uid")) return binary_version_v9;
         return null;
     }
@@ -549,8 +558,12 @@ fn introducedVersion(comptime T: type, comptime name: []const u8) ?u8 {
 
 /// 读 `ver` 版本存档时，字段 `name` 是否应**跳过不读**（比它首次出现的版本更旧）。
 fn legacySkip(ver: u8, comptime T: type, comptime name: []const u8) bool {
-    const intro = comptime introducedVersion(T, name) orelse return false;
-    return ver < intro;
+    // 注：不能写 `comptime introducedVersion(...) orelse return false`——`comptime`
+    // 会把 `orelu return` 一起包进去，整句在 comptime 求值时又会因
+    // “called at runtime cannot return value at comptime”报错（全 comptime 实参的
+    // 调用会被直接 comptime 求值，测试里就撞上了）。
+    const intro = comptime (introducedVersion(T, name) orelse 0);
+    return intro != 0 and ver < intro;
 }
 
 /// 已删字段匹配：结构体相同且插在当前字段 `before` 之前
@@ -906,12 +919,7 @@ fn toBinaryAtVersion(allocator: std.mem.Allocator, project: Project, ver: u8) ![
 
 /// 以 **v5 旧布局**写出（测试/兼容验证用；生产永远写当前版本）
 pub fn toBinaryLegacyV5(allocator: std.mem.Allocator, project: Project) ![]u8 {
-    var w = BinWriter{ .a = allocator, .version = binary_version_legacy };
-    errdefer w.buf.deinit(allocator);
-    try w.put(binary_magic);
-    try w.putByte(binary_version_legacy);
-    try binWriteValue(Project, &w, project);
-    return w.buf.toOwnedSlice(allocator);
+    return toBinaryAtVersion(allocator, project, binary_version_legacy);
 }
 
 /// v5 二进制 → 工程。返回值与 `fromJson` 同型（`.value` / `.deinit()`）——
@@ -962,7 +970,36 @@ pub fn probeVersion(allocator: std.mem.Allocator, data: []const u8) ?u32 {
     return data[binary_magic.len];
 }
 
+/// 旧版 **JSON** 存档的版本探针（v1–v5）。
+///
+/// **只用于打不开时的提示**（“这是旧版 JSON 工程，请用旧版程序另存为 .saw”）——
+/// JSON 读写通道已于 v9 删除，这里**不**解析工程，只读一个 `version` 字段。
+/// 要求同时出现工程键（`"clips"`/`"notes"`）：`settings.json`、预设 JSON 没它们，
+/// 不会被误报成“旧版工程”。
+pub fn probeLegacyJsonVersion(allocator: std.mem.Allocator, data: []const u8) ?u32 {
+    if (std.mem.indexOf(u8, data, "\"clips\"") == null and std.mem.indexOf(u8, data, "\"notes\"") == null) return null;
+    const Probe = struct { version: u32 = 1 };
+    var parsed = std.json.parseFromSlice(Probe, allocator, data, .{ .ignore_unknown_fields = true }) catch return null;
+    defer parsed.deinit();
+    return parsed.value.version;
+}
+
 // ── 测试 ──
+
+test "persist: 旧版 JSON 探针——只认工程（settings/预设不误报）" {
+    const a = std.testing.allocator;
+    // 工程 JSON（带 version）→ 原样返回
+    try std.testing.expectEqual(@as(?u32, 3), probeLegacyJsonVersion(a, "{\"version\":3,\"bpm\":112,\"clips\":[],\"notes\":[]}"));
+    // 缺 version → v1 语义（与旧 fromJson 的默认一致）
+    try std.testing.expectEqual(@as(?u32, 1), probeLegacyJsonVersion(a, "{\"clips\":[]}"));
+    // settings.json / 预设 JSON：没有工程键 → 不误报成“旧版工程”
+    try std.testing.expectEqual(@as(?u32, null), probeLegacyJsonVersion(a, "{\"fps\":90,\"last_project\":\"\"}"));
+    // 随便一个文件 / 坏 JSON → null
+    try std.testing.expectEqual(@as(?u32, null), probeLegacyJsonVersion(a, "这不是 JSON"));
+    try std.testing.expectEqual(@as(?u32, null), probeLegacyJsonVersion(a, "{\"version\":3,\"clips\":[}"));
+    // 二进制存档 → null（不是 JSON）
+    try std.testing.expectEqual(@as(?u32, null), probeLegacyJsonVersion(a, "SAWD\x09\x00"));
+}
 
 /// 乐器/Layer 的**默认音色基准**（预设面板“重置音色”与新建乐器共用同一份）——
 /// **不能用 `SavedSynth{}`**：它的字段默认是“全振荡器关闭”（静音），与
@@ -1059,7 +1096,7 @@ test "persist: 冻结默认值（绊线——改动任意一项=破坏性格式�
     try std.testing.expectEqual(@as(u32, 0), dl.kind);
     try std.testing.expectEqual(@as(f32, 1.0), dl.gain);
     const inst = SavedInstrument{};
-    try std.testing.expectEqual(@as(f32, 0.8), inst.volume);
+    try std.testing.expectEqual(@as(f32, 0.75), inst.volume); // 推子位置 0.75 = 0 dB（v9 默认改为 unity）
     try std.testing.expectEqual(@as(f32, 0.5), inst.pan);
     try std.testing.expectEqual(@as(i32, 0), inst.mixer);
     try std.testing.expectEqual(@as(i32, -1), inst.midi_channel);
@@ -1071,7 +1108,7 @@ test "persist: 冻结默认值（绊线——改动任意一项=破坏性格式�
     try std.testing.expect(es.enabled);
     try std.testing.expectEqual(@as(f32, 1.0), es.mix);
     const mc = SavedMixerChannel{};
-    try std.testing.expectEqual(@as(f32, 0.8), mc.volume);
+    try std.testing.expectEqual(@as(f32, 0.75), mc.volume); // 推子位置 0.75 = 0 dB
     try std.testing.expectEqual(@as(f32, 0.5), mc.pan);
     try std.testing.expectEqual(@as(i32, 6), pattern_count_default);
 }
@@ -1654,6 +1691,80 @@ test "persist: 二进制往返——SavedDrumLayer 的 plugin_state（版本门�
     try std.testing.expectEqualStrings(layer.plugin_state, got.plugin_state);
     try std.testing.expectEqualStrings(layer.plugin_state_ctrl, got.plugin_state_ctrl);
     try std.testing.expectApproxEqAbs(layer.gain, got.gain, 1e-6);
+}
+
+test "persist: 版本门控——v9 新字段在 v8 档里必须全部跳过（鼓组层 uid 曾漏登 → 整档错位）" {
+    // **这是“字节级”不变量**：漏登一个字段 = 旧档多读/少读字节 → 全档错位。
+    // 即使读写两侧共用同一张表（往返测试对称），真实旧档也会挂——所以直接锁表。
+    try std.testing.expect(legacySkip(8, SavedDrumLayer, "uid")); // ← 本次事故
+    try std.testing.expect(legacySkip(8, SavedEffectSlot, "uid"));
+    try std.testing.expect(legacySkip(8, SavedInstrument, "uid"));
+    try std.testing.expect(legacySkip(8, SavedMixerChannel, "uid"));
+    try std.testing.expect(legacySkip(8, Project, "auto_lanes"));
+    try std.testing.expect(legacySkip(8, Project, "auto_bindings"));
+    try std.testing.expect(legacySkip(8, Project, "auto_sel"));
+    try std.testing.expect(legacySkip(8, SavedBinding, "smooth_ms"));
+    try std.testing.expect(legacySkip(8, SavedBinding, "invert"));
+    try std.testing.expect(legacySkip(8, SavedBinding, "param_id"));
+    try std.testing.expect(legacySkip(8, SavedBinding, "target_slot"));
+    // 当前版本当然照读
+    try std.testing.expect(!legacySkip(9, SavedDrumLayer, "uid"));
+    try std.testing.expect(!legacySkip(9, Project, "auto_lanes"));
+    // v6/v8 字段的门控也不能错
+    try std.testing.expect(legacySkip(5, SavedClip, "audio_style"));
+    try std.testing.expect(!legacySkip(6, SavedClip, "audio_style"));
+    try std.testing.expect(!legacySkip(8, SavedClip, "muted"));
+    try std.testing.expect(!legacySkip(8, SavedNote, "muted"));
+    try std.testing.expect(legacySkip(6, Project, "instrument_order"));
+    try std.testing.expect(!legacySkip(7, Project, "instrument_order"));
+    // 从未登记过的老字段：任何版本都读
+    try std.testing.expect(!legacySkip(5, SavedOsc, "volume"));
+    try std.testing.expect(!legacySkip(5, SavedDrumLayer, "kind"));
+    try std.testing.expect(!legacySkip(5, SavedDrumLayer, "synth"));
+}
+
+test "persist: v8 档带鼓组层——读写对称（v9 的 uid 不得进 v8）" {
+    // 关键断言：v8 没有 `SavedDrumLayer.uid` → 读回来必须是 0（默认值）。
+    // 万一 `introducedVersion` 漏登 uid（历史上真漏过）→ 写/读都算上它，
+    // 这里会得到 7 而不是 0 → 测试抳住（真旧档则是整档错位 → `CorruptProject`）。
+    const a = std.testing.allocator;
+    var layers = [_]SavedDrumLayer{
+        .{ .uid = 7, .kind = 2, .gain = 0.5, .source_preset = "VST/某音色", .plugin_path = "X.vst3", .plugin_state = "AAAA", .speed = 1.5 },
+        .{ .uid = 8, .kind = 3, .asset_path = "kick.wav", .trim_start = 12, .trim_len = 34 },
+    };
+    var pads = [_]SavedDrumPad{.{ .pitch = 36, .name = "Kick", .layers = &layers }};
+    var insts = [_]SavedInstrument{.{ .uid = 3, .name = "Kit", .kind = 1, .mixer = 1, .kit = .{ .pads = &pads } }};
+    const proj = Project{ .bpm = 112, .instruments = &insts };
+
+    const bytes = try toBinaryAtVersion(a, proj, 8);
+    defer a.free(bytes);
+    try std.testing.expectEqual(@as(u8, 8), bytes[4]);
+    var parsed = try fromBinary(a, bytes);
+    defer parsed.deinit();
+    const p = parsed.value;
+    try std.testing.expectEqual(@as(usize, 1), p.instruments.len);
+    try std.testing.expectEqual(@as(u32, 0), p.instruments[0].uid); // v8 无 uid
+    try std.testing.expectEqualStrings("Kit", p.instruments[0].name);
+    try std.testing.expectEqual(@as(usize, 1), p.instruments[0].kit.pads.len);
+    const pad = p.instruments[0].kit.pads[0];
+    try std.testing.expectEqual(@as(u32, 36), pad.pitch);
+    try std.testing.expectEqual(@as(usize, 2), pad.layers.len);
+    try std.testing.expectEqual(@as(u32, 0), pad.layers[0].uid); // ← v9 字段在 v8 必须为默认
+    try std.testing.expectEqual(@as(u32, 2), pad.layers[0].kind);
+    try std.testing.expectEqualStrings("X.vst3", pad.layers[0].plugin_path);
+    try std.testing.expectEqualStrings("AAAA", pad.layers[0].plugin_state);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), pad.layers[0].speed, 1e-6);
+    try std.testing.expectEqual(@as(u32, 3), pad.layers[1].kind);
+    try std.testing.expectEqualStrings("kick.wav", pad.layers[1].asset_path);
+    try std.testing.expectEqual(@as(i32, 12), pad.layers[1].trim_start);
+    try std.testing.expectEqual(@as(i32, 34), pad.layers[1].trim_len);
+    // 当前版本仍要带着 uid 往返（别为了兼容把 v9 也跳了）
+    const cur = try toBinary(a, proj);
+    defer a.free(cur);
+    var p2 = try fromBinary(a, cur);
+    defer p2.deinit();
+    try std.testing.expectEqual(@as(u32, 7), p2.value.instruments[0].kit.pads[0].layers[0].uid);
+    try std.testing.expectEqual(@as(u32, 3), p2.value.instruments[0].uid);
 }
 
 test "persist: 整数溢出 → error.CorruptProject（不再 panic）" {

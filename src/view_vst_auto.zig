@@ -50,9 +50,6 @@ pub fn draw(ui: *Ui, app: *App) void {
     const w = W;
     const h = H;
 
-    // 点窗口内任意处 → 置顶（“点谁谁在上”）
-    if (util.inRect(ui.mouse_x, ui.mouse_y, x, y, w, h) and ui.mouse_pressed) app.bringToFront(&st.z);
-
     // 目标插件槽没了（乐器/通道/槽/层被删）→ 自动关闭
     if (app.slotParamIdentity(st.ref) == null) {
         st.open = false;

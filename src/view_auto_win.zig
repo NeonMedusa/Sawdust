@@ -65,8 +65,6 @@ pub fn draw(ui: *Ui, app: *App) void {
     const x = win.x;
     const y = win.y;
 
-    const mouse_in_win = util.inRect(ui.mouse_x, ui.mouse_y, x, y, w, h);
-
     // 窗口底 + 边框 + 标题栏
     ui.renderer.fillRect(x, y, w, h, ui.theme.panel);
     ui.renderer.strokeRect(x, y, w, h, ui.theme.accent);
@@ -98,9 +96,8 @@ pub fn draw(ui: *Ui, app: *App) void {
     if (util.titleCloseButton(ui, x, y, w, util.title_h)) win.open = false;
 
     // ── 状态行 ──
-    // `by_target`：基准值 + 游标处合成值。**基准 = 目标类型的标准基准**，不是推子/旋钮当前值：
-    // 音量类 = 0（曲线值直接就是音量）、声像类 = 0.5（双向：中心不动，可上可下）；
-    // VST3 参数 = 插件自己报的 `defaultNormalizedValue`（见 `App.defaultBaseFor`）。
+    // `by_target`：基准值 + 游标处合成值。**基准 = 绑定自己设的 `base`；没设 → 静态推子/旋钮值**
+    // （音量/声像/插件参数都是这个规矩：链接曲线**不应改变**当前的值）。
     // `by_curve`：没有单一目标 → 显示**游标处曲线值** + 驱动了几个参数。
     {
         var sb: [160]u8 = undefined;
@@ -114,7 +111,7 @@ pub fn draw(ui: *Ui, app: *App) void {
             else
                 std.fmt.bufPrint(&sb, "游标处曲线值 {d:.2}  ·  驱动 {d} 个参数", .{ v, nbind }) catch "";
         } else blk: {
-            const base = app.defaultBaseFor(win.target);
+            const base = app.baseForTarget(win.target);
             const bipolar = view_lane.Target.defaultBipolar(win.target.kind);
             const v = app.autoValueFor(win.target, step, base);
             const kind_txt: []const u8 = switch (win.target.kind) {
@@ -134,10 +131,16 @@ pub fn draw(ui: *Ui, app: *App) void {
                     std.fmt.bufPrint(&sb, "区间 {d:.0}~{d:.0} BPM  →  此刻 {d:.0} BPM", .{ model.bpm_min, model.bpm_max, view_lane.Target.bpmFromNorm(v) }) catch ""
                 else
                     std.fmt.bufPrint(&sb, "区间 {d:.0}~{d:.0} BPM  →  尚未链接曲线（当前 {d} BPM）", .{ model.bpm_min, model.bpm_max, app.bpm }) catch "")
-            else if (app.isTargetBound(win.target))
-                std.fmt.bufPrint(&sb, "基准 {d:.2}（{s} · {s}）  →  合成 {d:.2}", .{ base, kind_txt, pol_txt, v }) catch ""
-            else
-                std.fmt.bufPrint(&sb, "基准 {d:.2}（{s} · {s}）  →  尚未链接曲线（旋钮静值 {d:.2}）", .{ base, kind_txt, pol_txt, baseValueOf(app, win.target) }) catch "";
+            else if (app.isTargetBound(win.target)) blk2: {
+                // **音量类目标额外报 dB**（推子锥度：gain = p² ⇒ dB = 40·log10）；
+                // 自动化本身是 dB 域（深度 100% × 曲线 1.0 = +24 dB），所以“合成 dB”才是听感值。
+                if (view_lane.Target.isVolume(win.target)) {
+                    var db_buf: [16]u8 = undefined;
+                    const dbt = view_lane.formatValue(.db, v, &db_buf);
+                    break :blk2 std.fmt.bufPrint(&sb, "基准 {d:.2}（{s} · {s}）  →  合成 {d:.2}（{s} dB）", .{ base, kind_txt, pol_txt, v, dbt }) catch "";
+                }
+                break :blk2 std.fmt.bufPrint(&sb, "基准 {d:.2}（{s} · {s}）  →  合成 {d:.2}", .{ base, kind_txt, pol_txt, v }) catch "";
+            } else std.fmt.bufPrint(&sb, "基准 {d:.2}（{s} · {s}）  →  尚未链接曲线（旋钮静值 {d:.2}）", .{ base, kind_txt, pol_txt, baseValueOf(app, win.target) }) catch "";
         };
         ui.labelClipped(st, x + 8, y + util.title_h + 4, w - 16, ui.theme.text_dim);
     }
@@ -266,10 +269,10 @@ pub fn draw(ui: *Ui, app: *App) void {
         }
     }
 
-    // **点到谁谁在上**（与其他浮动窗口一致）：本帧在窗口内按下 → 置顶
-    if (mouse_in_win and ui.mouse_pressed) app.bringToFront(&win.z);
-
     // 行内右键菜单：**最后一次绘制**（盖在行/底部按钮之上，不会被它们挡或抢命中）
+    // 展开时解除全局屏蔽——`menuIsOpen()` 计入 `ctx_row`，不解除的话菜单自己点不到
+    // （菜单本体用裸 `inRect` 收点击；上方行控件用 `hitUI` 已被屏蔽）。
+    if (app.auto_win.ctx_row != null) ui.input_blocked = false;
     drawRowCtxMenu(ui, app);
 }
 
@@ -341,7 +344,7 @@ fn drawRow(ui: *Ui, app: *App, bi: usize, label: []const u8, x: i32, y: i32, w: 
     // **基础值**（归一化 0..1，上下拖数字）：一律白字
     {
         const bx0 = x + Col.base;
-        var val: f32 = b.base orelse app.defaultBaseFor(b.target);
+        var val: f32 = b.base orelse app.baseForTarget(b.target);
         if (ui.dragNumberF(Ui.idOf("auto_win_base", 0) + bi, bx0, cy, Col.base_w, ctrl_h, &val, 0.0, 1.0, 1)) {
             b.base = val;
             app.history_pending = "调整自动化基础值";
@@ -494,7 +497,7 @@ fn drawRowCtxMenu(ui: *Ui, app: *App) void {
             var vb: [24]u8 = undefined;
             switch (win.ctx_field) {
                 .base => {
-                    const v = b.base orelse app.defaultBaseFor(b.target);
+                    const v = b.base orelse app.baseForTarget(b.target);
                     const pre = view_lane.formatValue(.percent, v, &vb);
                     app.beginEditAutomationBase(bi, pre, mx + 4, my + 4, menu_w - 8);
                 },

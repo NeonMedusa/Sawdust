@@ -217,11 +217,8 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         return true;
     }
 
-    // 点窗口内任意处 → 置顶（“点谁谁在上”）
-    // 注：点标题栏按钮的那一帧**跳过**（否则会把刚打开的子窗口顶回去）
-    if (!title_btn_used and util.inRect(ui.mouse_x, ui.mouse_y, x, y, ww, hh) and ui.mouse_pressed) {
-        app.bringToFront(&sw.z);
-    }
+    // 点窗口即置顶由 main.drawApp 统一处理（只提升最上层那个）：
+    // 标题栏按钮“刚打开子窗口”的置顶已在上面直接 `bringToFront`（z 更大 → 仍在上面）。
 
     // 标题拖动（**排除右侧按钮区**：预设/保存为/自动化/关闭——否则按按钮也会启动拖动）
     if (!title_btn_used and util.hitUI(ui, x, y, ww - 160, win_title_h) and ui.mouse_pressed) {

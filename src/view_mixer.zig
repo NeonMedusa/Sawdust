@@ -110,11 +110,6 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     ui.renderer.fillRect(x + 1, y + 1, ww - 2, win_title_h - 1, ui.theme.toolbar);
     ui.label("调音台 (Mixer)", x + 8, y + 4, ui.theme.text);
 
-    // 点窗口内任意处 → 置顶（“点谁谁在上”——与其他浮动窗口一致）
-    if (util.inRect(ui.mouse_x, ui.mouse_y, x, y, ww, hh) and ui.mouse_pressed) {
-        app.bringToFront(&mw.z);
-    }
-
     // 关闭按钮
     if (util.titleCloseButton(ui, x, y, ww, win_title_h)) {
         mw.open = false;
@@ -365,7 +360,8 @@ fn drawStrip(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32) void
         // **有启用中的自动化绑定 → 进度弧 + 中心点变绿**
         const pan_bound = app.enabledBindingCount(pan_tgt) > 0;
         if (ui.knobAuto(id_pan_base + @as(u64, ci), &pan, cx, ky, knob_size, pan_bound)) {
-            mc.pan = std.math.clamp(mc.pan + (pan - pan_eff), 0.0, 1.0);
+            // 同推子：拖动期间手动接管（写回 = 旋钮显示值本身）
+            mc.pan = app.dragWriteback(pan_tgt, pan);
             app.history_pending = "调整通道声像";
             consumed = true;
         }
@@ -406,7 +402,9 @@ fn drawStrip(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32) void
         const vol_bound = app.enabledBindingCount(vol_tgt) > 0;
         const tint: ?r_mod.Color = if (vol_bound) ui.theme.auto_active else null;
         if (ui.sliderTint(id_vol_base + @as(u64, ci), &vol, cx, sy, slider_w, 18, tint, tint)) {
-            mc.volume = std.math.clamp(mc.volume + (vol - vol_eff), 0.0, 1.0);
+            // 拖动期间“手动接管”（音频/UI 都暂不吃曲线，松手恢复）；
+            // **写回 = 推子显示值本身**（不是“旧静态值 + 增量” → 那会让音量起手跳一大下 = 爆音）
+            mc.volume = app.dragWriteback(vol_tgt, vol);
             app.history_pending = "调整通道音量";
             consumed = true;
         }
@@ -422,9 +420,10 @@ fn drawStrip(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32) void
             app.mixer_win.ctx_menu_y = ui.mouse_y;
             right_consumed = true;
         }
-        // 数值（右对齐；自动化驱动 → 绿色）
+        // 数值（右对齐；自动化驱动 → 绿色）——**显示合成后的实际值**（= 推子位置；
+        // 以前显示的是静态 `mc.volume`→ “推子在跑、数字不动”，实测反馈）
         var vb: [16]u8 = undefined;
-        const vt = std.fmt.bufPrint(&vb, "{d:.2}", .{mc.volume}) catch "";
+        const vt = view_lane.formatValue(.db, vol, &vb);
         const vtw: i32 = @intFromFloat(ui.font.measure(vt));
         ui.label(vt, x + w - vtw - 6, y + 4, if (vol_bound) ui.theme.auto_active else ui.theme.text_dim);
     }
@@ -678,7 +677,7 @@ fn drawCtxMenuGeneric(ui: *Ui, app: *App, ch: usize, slot: ?usize, items: []cons
 
 /// 声像旋钮右键菜单（单项：恢复默认值 = 居中 0.5）。
 /// 与通用菜单同一套路：位置鉗制到窗口内（`ctxMenuPos`）、点外关闭。
-/// 音量推子右键菜单：`恢复默认值`（0.80）/ `自动化…`（`mixer_vol` 或主通道 `master_vol`）
+/// 音量推子右键菜单：`恢复默认值`（**0.75 = 0 dB**）/ `自动化…`（`mixer_vol` 或主通道 `master_vol`）
 fn drawVolCtxMenu(ui: *Ui, app: *App, ch: usize) void {
     const mw_win = &app.mixer_win;
     // **全项目统一的右键菜单顺序**：恢复默认值 > 输入值… > 自动化…
@@ -708,14 +707,14 @@ fn drawVolCtxMenu(ui: *Ui, app: *App, ch: usize) void {
         if (ch < app.mixer_channels_state.items.len) {
             const mc = &app.mixer_channels_state.items[ch];
             if (k == 0) {
-                if (mc.volume != 0.8) {
-                    mc.volume = 0.8;
+                if (mc.volume != 0.75) {
+                    mc.volume = 0.75;
                     app.commitHistory("恢复通道音量");
                 }
             } else if (k == 1) {
-                // **输入值…**（按 0..1 小数；与推子上显示的数值一致）
+                // **输入值…**（**dB**：与推子读数同一映射，0 = 满刻度，≤−60 = 静音）
                 var vb: [16]u8 = undefined;
-                const pre = std.fmt.bufPrint(&vb, "{d:.2}", .{mc.volume}) catch "";
+                const pre = view_lane.formatValue(.db, mc.volume, &vb);
                 app.beginEditChannelVol(ch, pre, mx + 4, my + 4, menu_w - 8);
             } else {
                 const tgt = if (ch == 0)

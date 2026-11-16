@@ -78,7 +78,7 @@ pub const Instrument = struct {
     /// **稳定身份**（0 = 未分配）：自动化绑定用它而不是数组下标（删乐器会搬移下标）
     uid: u32 = 0,
     name: []const u8, // 显示名（堆分配；由 App 管理生命周期）
-    volume: f32 = 0.8, // 0-1
+    volume: f32 = 0.75, // 推子位置（0..1；0 dB 在 0.75，见 audio.faderGain）
     pan: f32 = 0.5, // 0-1（0.5 = 居中）
     muted: bool = false,
     /// 混音通道（**0 起**，对应调音台通道序号 0..n-1）

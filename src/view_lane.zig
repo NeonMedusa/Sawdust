@@ -88,6 +88,8 @@ pub const Target = struct {
     /// **BPM 的归一化映射区间**（线性）：0 → 20，1 → 999
     pub const tempo_min: f32 = @import("model.zig").bpm_min;
     pub const tempo_span: f32 = @import("model.zig").bpm_max - tempo_min;
+    /// 音量推子的 **unity 位置**（0 dB）——与 `audio.fader_unity_pos` 必须一致（app 测试对拍）。
+    pub const unity_pos: f32 = 0.75;
     /// 曲线值（0..1）→ BPM
     pub fn bpmFromNorm(v: f32) f32 {
         return tempo_min + std.math.clamp(v, 0.0, 1.0) * tempo_span;
@@ -113,9 +115,10 @@ pub const Target = struct {
         return self.kind == .vst_param or self.kind == .fx_param or self.kind == .kit_param;
     }
 
-    /// **默认基准值**（新建绑定时的叠加起点）。对齐 VST3 的 `ParameterInfo.defaultNormalizedValue`。
-    /// 音量类 = 0（曲线 0..1 直接就是音量），声像类 = 0.5（中心），
-    /// **BPM 也是 0**（曲线 0 → 20 BPM、1 → 999 BPM，即“曲线值直接就是速度”）。
+    /// **默认基准值**（新绑定的叠加起点）——音量类 **0 = 曲线值直接就是推子位置**：
+    /// 曲线最低点 → 位置 0 → **静音**；最高点 → 位置 1 → **+5 dB**。
+    /// 其他映射关系就自己调「基础值 / 深度」（深度默认 100%）。
+    /// 声像类 = 0.5（中心）；**BPM 也是 0**（曲线 0 → 20 BPM、1 → 999 BPM）。
     pub fn defaultBase(kind: Kind) f32 {
         return switch (kind) {
             .master_vol, .mixer_vol, .inst_vol => 0.0,
@@ -917,7 +920,7 @@ pub const Rect = struct { x: i32, y: i32, w: i32, h: i32 };
 pub const Unit = enum {
     percent, // 0–100
     midi, // 0–127
-    db, // 20·log10(v)，−60dB 及以下 = 静音
+    db, // **音量推子锥度**：40·log10(v)（= `audio.faderDb`），−60dB 及以下 = 静音
     bpm, // 20–999
     pan, // L100 – C – R100
 
@@ -940,7 +943,11 @@ pub fn formatValue(u: Unit, v: f32, buf: []u8) []const u8 {
         .midi => std.fmt.bufPrint(buf, "{d}", .{@as(i32, @intFromFloat(@round(vc * 127.0)))}) catch "",
         .db => blk: {
             if (vc <= 0.0005) break :blk "静音";
-            const db = 20.0 * std.math.log10(vc);
+            // **与音量推子锥度同一映射**（gain = (v/0.75)² ⇒ dB = 40·log10(v/0.75)；
+            // v=0.75 → 0 dB，v=1 → +5 dB）：否则推子读数与曲线 dB 单位会打架。
+            const db = 40.0 * std.math.log10(vc / 0.75);
+            // ≤ −60 dB 就叫静音（与 `parseValue` “≤−60 = 0”对称，否则会显示“−120.0”却听着是静音）
+            if (db <= -59.95) break :blk "静音";
             const dbc = std.math.clamp(db, -60.0, 6.0);
             break :blk std.fmt.bufPrint(buf, "{d:.1}", .{dbc}) catch "";
         },
@@ -972,7 +979,8 @@ pub fn parseValue(u: Unit, text_in: []const u8) ?f32 {
         .db => {
             const x = std.fmt.parseFloat(f32, text) catch return null;
             if (x <= -60.0) return 0.0; // −60dB 及以下 = 静音（用户拍板）
-            return std.math.clamp(std.math.pow(f32, 10.0, x / 20.0), 0.0, 1.0);
+            // 与 `formatValue(.db)` 同式（推子锥度：位置 = 0.75 · 10^(dB/40)，+5 dB 封顶）
+            return std.math.clamp(0.75 * std.math.pow(f32, 10.0, x / 40.0), 0.0, 1.0);
         },
         .bpm => {
             const x = std.fmt.parseFloat(f32, text) catch return null;
@@ -1264,9 +1272,11 @@ test "unit: 归一化 ↔ 显示 往返稳定（dB 有舍入，其余精确）" 
     try std.testing.expectEqualStrings("64", formatValue(.midi, midi_v, &buf));
     try std.testing.expectApproxEqAbs(midi_v, parseValue(.midi, "64").?, 1e-6);
 
-    // dB：0.5 ≈ −6.0dB；−60dB 及以下 = 静音（用户拍板）
-    try std.testing.expectEqualStrings("-6.0", formatValue(.db, 0.5, &buf));
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), parseValue(.db, "-6.0").?, 0.01);
+    // dB：**推子锥度**（位置 0.75 = 0 dB，顶部 1.0 = +5.0）；−60dB 及以下 = 静音（用户拍板）
+    try std.testing.expectEqualStrings("-7.0", formatValue(.db, 0.5, &buf));
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), parseValue(.db, "-7.0").?, 0.01);
+    try std.testing.expectEqualStrings("0.0", formatValue(.db, 0.75, &buf));
+    try std.testing.expectEqualStrings("5.0", formatValue(.db, 1.0, &buf));
     try std.testing.expectEqualStrings("静音", formatValue(.db, 0.0, &buf));
     try std.testing.expectEqual(@as(?f32, 0.0), parseValue(.db, "-60"));
     try std.testing.expectEqual(@as(?f32, 0.0), parseValue(.db, "-80"));

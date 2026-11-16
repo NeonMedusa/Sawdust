@@ -136,10 +136,6 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     }
 
     // 标题拖动
-    // 点窗口内任意处 → 置顶（“点谁谁在上”）
-    if (util.inRect(ui.mouse_x, ui.mouse_y, x, y, ww, hh) and ui.mouse_pressed) {
-        app.bringToFront(&ew.z);
-    }
 
     if (!title_btn_used and util.hitUI(ui, x, y, ww - 24, win_title_h) and ui.mouse_pressed) {
         ui.active_id = 7600;

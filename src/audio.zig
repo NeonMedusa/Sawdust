@@ -111,6 +111,62 @@ pub fn poleStep(prev: f32, target: f32, smooth_ms: f32, dt_s: f32) f32 {
     return prev + (target - prev) * k;
 }
 
+/// **音量推子的锥度**（完整版“dB 域”）：推子位置 0..1 → 线性增益。
+///
+/// `gain = (p / fader_unity_pos)²`（平方律，unity 在 **75% 行程**）⇒ 刻度：
+/// `1.00 → +5.0 dB`、`0.75 → 0.0`、`0.50 → −7.0`、`0.375 → −12.0`、`0.25 → −19.1`、`→0 → −∞`。
+/// 一乘即可；**不做任何吸附/档位**（精确值靠右键“输入值…/恢复默认值”）。
+/// 模块级：音频线程（增益）与 UI（推子读数）共用一套。
+pub const fader_unity_pos: f32 = 0.75;
+/// 推子顶端的增益（≈ +5.0 dB）；自动化封顶也用它
+pub const fader_max_gain: f32 = 1.0 / (fader_unity_pos * fader_unity_pos);
+
+pub fn faderGain(p: f32) f32 {
+    const c = std.math.clamp(p, 0.0, 1.0) / fader_unity_pos;
+    return c * c;
+}
+
+/// `faderGain` 的反函数：推子位置 → dB（0 附近视为 −∞，返回 −200 以免 log(0)）
+pub fn faderDb(p: f32) f32 {
+    const c = std.math.clamp(p, 0.0, 1.0);
+    if (c <= 1e-5) return -200.0;
+    return 40.0 * std.math.log10(c / fader_unity_pos);
+}
+
+/// 音量目标：**基准 + 叠加贡献**（位置域）→ 线性增益。
+///
+/// `增益 = faderGain(clamp(base + sum, 0, 1))`——与 UI 的 `autoValueFor` **同一律**：
+/// 默认基准 0、深度 100% ⇒ **曲线就是推子位置**：最低点 = 静音，最高点 = +5 dB。
+pub fn volumeGain(base_pos: f32, sum: f32) f32 {
+    return faderGain(std.math.clamp(base_pos + sum, 0.0, 1.0));
+}
+
+/// **跨块增益平滑**的时间常数（秒）：手动↔自动化切换 / 车道重排 / 基准编辑
+/// 都会让“本块要用的增益”跳一下；直接跳 = **爆音**（实测：松手那一下）。
+/// 20 ms：听不出延迟，但能把大跳变抹成斜坡（8 ms 在 20 ms 大小的块上几乎等于没抹）。
+pub const chan_gain_tau: f32 = 0.02;
+
+/// **通道增益跨块平滑**（文件级：`Params` 与 `Engine` 之外，两个通道路径共用）。
+///
+/// 把本块目标（起点/终点）经一个极点，使其与**上一块实际应用的终点**连续。
+/// 为什么需要：块内已有 `g_a→g_b` 的线性斜坡，但**块与块之间**没有约束——一旦“本块起点目标”
+/// 与上块终点不等（手动↔自动化接管、车道重排、基准编辑、读档…），就会在一个采样点上跳变 → 爆音。
+/// τ = `chan_gain_tau`（8ms）：无阶跃时完全透明（本块起点 = 上块终点），有阶跃时抹成斜坡。
+/// 返回 `{ 起点, 终点 }`；`chan_gain_sm` 为 NaN（首块/新建通道）→ 直写目标。
+fn smoothChanGain(params: *Params, ch: usize, target_a: f32, target_b: f32, dt_blk: f32) [2]f32 {
+    if (ch >= params.chan_gain_sm.len) return .{ target_a, target_b };
+    const prev = params.chan_gain_sm[ch];
+    if (std.math.isNan(prev)) {
+        params.chan_gain_sm[ch] = target_b;
+        return .{ target_a, target_b };
+    }
+    const k: f32 = std.math.clamp(1.0 - @exp(-dt_blk / chan_gain_tau), 0.0, 1.0);
+    const a = prev + (target_a - prev) * k;
+    const b = a + (target_b - target_a); // 块内变化原样保留
+    params.chan_gain_sm[ch] = b;
+    return .{ a, b };
+}
+
 /// 工程作用域自动化曲线的**音频侧副本**（无锁发布）。
 /// 由 `App.publishAutoLane` 从 UI 线程填充（3 缓冲轮转 + 下标原子发布），
 /// 音频线程每段 `acquire` 读一次，取**段首/段末**两个端点值做块内斜坡。
@@ -144,8 +200,11 @@ pub const LaneSnap = struct {
     param_id: u32 = 0,
     /// `kind == 3` 专用：效果链槽位；`kind == 4` 专用：鼓组层**展平槽位**
     slot: u16 = 0,
-    /// **基线值**（叠加起点）：音量类 0，声像类 0.5
+    /// **基线值**（叠加起点，推子/旋钮的**位置** 0..1）——仅 `has_base` 时有效
     base: f32 = 0.0,
+    /// `base` 是否有效。**false = 跟随静态推子/旋钮值**（`channel_gain` / `channel_pan`）——
+    /// 绑定没显式设“基础值”时就走这条路（否则旧码把音量基线当 0 → `faderGain(0)=0` → 静音）
+    has_base: bool = false,
     n: u32 = 0,
     steps: [64]i32 = @splat(0),
     vals: [64]f32 = @splat(0),
@@ -261,7 +320,9 @@ pub const LaneSet = struct {
             if (!l.active or l.n == 0 or l.kind > 1 or l.ch != ch or l.inst != inst or (l.kind == 1) != pan) continue;
             const v = l.evalAt(step);
             if (v < 0) continue;
-            sum += if (l.bipolar) (v - 0.5) * 2.0 * l.depth else v * l.depth;
+            // 与 `contributionSmooth` 逐字一致：单向 = v；双向 = 2v−1；**反向**再翻符号
+            const sign: f32 = if (l.invert) -1.0 else 1.0;
+            sum += (if (l.bipolar) (v - 0.5) * 2.0 else v) * l.depth * sign;
         }
         return sum;
     }
@@ -401,11 +462,14 @@ pub const LaneSet = struct {
     }
 
     /// 该座位该分组的**基线值**（有绑定 → 曲线自己定值；无 → null = 用静态推子/旋钮）
+    /// 该座位的**显式基线值**（只有 `has_base` 时非 null；null = 用静态推子/旋钮值）。
     pub fn baseOf(self: *const LaneSet, ch: usize, pan: bool, inst: bool) ?f32 {
         var i: usize = 0;
         while (i < self.n and i < self.lanes.len) : (i += 1) {
             const l = &self.lanes[i];
-            if (l.active and l.n > 0 and l.kind <= 1 and l.ch == ch and l.inst == inst and (l.kind == 1) == pan) return l.base;
+            if (l.active and l.n > 0 and l.kind <= 1 and l.ch == ch and l.inst == inst and (l.kind == 1) == pan) {
+                return if (l.has_base) l.base else null;
+            }
         }
         return null;
     }
@@ -598,6 +662,9 @@ pub const Params = struct {
     // ── 调音台：每通道参数（UI 写、音频线程读）──
     /// 通道增益（0-1）
     channel_gain: []std.atomic.Value(f32) = &.{},
+    /// **通道（含主通道）增益的跳块平滑值**（仅音频线程读写；NaN = 未初始化）。
+    /// 消除 手动↔自动化切换 / 车道重排 / 基准编辑 / 读档 造成的增益阶跃（爆音）——见 `Params.smoothChanGain`。
+    chan_gain_sm: []f32 = &.{},
     /// 工程自动化曲线：**3 缓冲轮转**（UI 写非当前缓冲 → release 发布下标；音频 acquire 读）
     lane_bufs: [3]LaneSet = .{ .{}, .{}, .{} },
     /// 当前已发布的缓冲下标
@@ -732,6 +799,8 @@ pub const Params = struct {
         freeAtomicArr(u64, a, &self.sounding_lo);
         freeAtomicArr(u64, a, &self.sounding_hi);
         freeAtomicArr(f32, a, &self.channel_gain);
+        if (self.chan_gain_sm.len > 0) a.free(self.chan_gain_sm);
+        self.chan_gain_sm = &.{};
         freeAtomicArr(f32, a, &self.channel_pan);
         freeAtomicArr(bool, a, &self.channel_muted);
         freeAtomicArr(u32, a, &self.channel_eq_version);
@@ -782,6 +851,15 @@ pub const Params = struct {
             try growAtomicArr(f32, a, &self.channel_gain, cc, 0.8);
             try growAtomicArr(f32, a, &self.channel_pan, cc, 0.5);
             try growAtomicArr(bool, a, &self.channel_muted, cc, false);
+            // 通道增益跳块平滑状态（NaN = 未初始化 → 首块直写目标，不从 0 追）
+            {
+                const ng = try a.alloc(f32, cc);
+                @memset(ng, std.math.nan(f32));
+                const keep = @min(cc, self.chan_gain_sm.len);
+                @memcpy(ng[0..keep], self.chan_gain_sm[0..keep]);
+                if (self.chan_gain_sm.len > 0) a.free(self.chan_gain_sm);
+                self.chan_gain_sm = ng;
+            }
             const nq = try a.alloc([]eq.BandParams, cc);
             @memset(nq, &.{});
             errdefer {
@@ -2739,16 +2817,21 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
         const cp = lane_set.contributionSmooth(i, true, true, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key);
         const stat_pan = params.instrument_pan[i].load(.monotonic);
         const k_stat: f32 = std.math.clamp(1.0 - @exp(-dt_blk / inst_smooth_tau), 0.0, 1.0);
+        // 音量：**推子位置 → faderGain，自动化贡献走 dB 域**（声像不变，仍是位置域）
+        // 基线：绑定显式设了“基础值”→ 用它；否则 = **静态旋钮值**（`stat_g` 是“音量×静音”，
+        // 不能直接当位置用——这里取未静音的静态位置 `instrument_gain`）
+        const stat_pos = if (i < params.instrument_gain.len) params.instrument_gain[i].load(.monotonic) else 0.0;
+        const base_v = lane_set.baseOf(i, false, true) orelse stat_pos;
         const g_a: f32 = if (has_v)
-            std.math.clamp((lane_set.baseOf(i, false, true) orelse 0.0) + cv.before, 0.0, 1.0)
-        else if (i < engine.inst_gain_sm.len) engine.inst_gain_sm[i] else stat_g;
+            volumeGain(base_v, cv.before)
+        else if (i < engine.inst_gain_sm.len) engine.inst_gain_sm[i] else faderGain(stat_g);
         const pan_a: f32 = if (has_p)
             std.math.clamp((lane_set.baseOf(i, true, true) orelse 0.5) + cp.before, 0.0, 1.0)
         else if (i < engine.inst_pan_sm.len) engine.inst_pan_sm[i] else stat_pan;
         const g_b: f32 = if (has_v)
-            std.math.clamp((lane_set.baseOf(i, false, true) orelse 0.0) + cv.after, 0.0, 1.0)
+            volumeGain(base_v, cv.after)
         else
-            g_a + (stat_g - g_a) * k_stat;
+            g_a + (faderGain(stat_g) - g_a) * k_stat;
         const pan_b: f32 = if (has_p)
             std.math.clamp((lane_set.baseOf(i, true, true) orelse 0.5) + cp.after, 0.0, 1.0)
         else
@@ -3064,8 +3147,13 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
         const cv = lane_set.contributionSmooth(ch_i, false, false, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key);
         const cp = lane_set.contributionSmooth(ch_i, true, false, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key);
         const base_g = if (auto_this) (lane_set.baseOf(ch_i, false, false) orelse stat) else stat;
-        const g_a: f32 = if (muted) 0.0 else if (auto_this) std.math.clamp(base_g + cv.before, 0.0, 1.0) else stat;
-        const g_b: f32 = if (muted) 0.0 else if (auto_this) std.math.clamp(base_g + cv.after, 0.0, 1.0) else stat;
+        // 音量：推子位置 → faderGain；自动化贡献走 dB 域（声像仍位置域）
+        const g_a_raw: f32 = if (muted) 0.0 else if (auto_this) volumeGain(base_g, cv.before) else faderGain(stat);
+        const g_b_raw: f32 = if (muted) 0.0 else if (auto_this) volumeGain(base_g, cv.after) else faderGain(stat);
+        // **跳块平滑**：手动↔自动化切换/车道重排/基准编辑 会让本块目标跳一下（→ 爆音）
+        const gsm = smoothChanGain(params, ch_i, g_a_raw, g_b_raw, dt_blk);
+        const g_a = gsm[0];
+        const g_b = gsm[1];
         // 声像：静态旋钮 = 基准，曲线贡献叠加——**段首/段尾各算一次**，
         // 块内对左右增益做线性斜坡：否则垂直断崖（同一步两个值）会变成
         // 一个采样点上的硬跳变 → 听感像“另一侧重新起了一个音”且带爆音（用户实测）。
@@ -3116,18 +3204,24 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
         const cv0 = lane_set.contributionSmooth(0, false, false, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key);
         const cp0 = lane_set.contributionSmooth(0, true, false, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key);
         const base0 = if (auto0) (lane_set.baseOf(0, false, false) orelse stat0) else stat0;
-        const g0a: f32 = if (muted0) 0.0 else if (auto0) std.math.clamp(base0 + cv0.before, 0.0, 1.0) else stat0;
-        const g0b: f32 = if (muted0) 0.0 else if (auto0) std.math.clamp(base0 + cv0.after, 0.0, 1.0) else stat0;
+        const g0a_raw: f32 = if (muted0) 0.0 else if (auto0) volumeGain(base0, cv0.before) else faderGain(stat0);
+        const g0b_raw: f32 = if (muted0) 0.0 else if (auto0) volumeGain(base0, cv0.after) else faderGain(stat0);
+        // **跳块平滑**（同子通道）：主推子最容易吃到“拖动接管”的阶跃
+        const gsm0 = smoothChanGain(params, 0, g0a_raw, g0b_raw, dt_blk);
+        const g0a = gsm0[0];
+        const g0b = gsm0[1];
         const stat_pan0 = std.math.clamp(params.channel_pan[0].load(.monotonic), 0, 1);
         const base_p0 = if (auto0p) (lane_set.baseOf(0, true, false) orelse stat_pan0) else stat_pan0;
         const pan_a: f32 = if (auto0p) std.math.clamp(base_p0 + cp0.before, 0.0, 1.0) else stat_pan0;
         const pan_b: f32 = if (auto0p) std.math.clamp(base_p0 + cp0.after, 0.0, 1.0) else stat_pan0;
         const ang_a = pan_a * (std.math.pi / 2.0);
         const ang_b = pan_b * (std.math.pi / 2.0);
-        const cl_a = @cos(ang_a) * std.math.sqrt2 * master;
-        const cr_a = @sin(ang_a) * std.math.sqrt2 * master;
-        const cl_b = @cos(ang_b) * std.math.sqrt2 * master;
-        const cr_b = @sin(ang_b) * std.math.sqrt2 * master;
+        // 工具栏主音量也是**推子位置** → 过 `faderGain`（推子锥度）
+        const master_g = faderGain(master);
+        const cl_a = @cos(ang_a) * std.math.sqrt2 * master_g;
+        const cr_a = @sin(ang_a) * std.math.sqrt2 * master_g;
+        const cl_b = @cos(ang_b) * std.math.sqrt2 * master_g;
+        const cr_b = @sin(ang_b) * std.math.sqrt2 * master_g;
         var f2: usize = 0;
         if (g0a == g0b and cl_a == cl_b and cr_a == cr_b) {
             const gl = cl_a * g0a;
@@ -4338,7 +4432,7 @@ test "audio: 鼓组——层增益生效（渲染能量随 gain 放大）" {
             params.volume.store(1.0, .monotonic);
             params.synth_ptrs[0].store(&gate, .monotonic);
             params.instrument_channel[0].store(0, .monotonic);
-            params.instrument_gain[0].store(1.0, .monotonic);
+            params.instrument_gain[0].store(fader_unity_pos, .monotonic);
             env.setLayers(&.{35}, &.{&lp0});
             params.kit_layer_gain[0][0].store(gain, .monotonic);
 
@@ -4348,7 +4442,7 @@ test "audio: 鼓组——层增益生效（渲染能量随 gain 放大）" {
             var i: usize = 0;
             while (i < 8) : (i += 1) {
                 @memset(&out, 0);
-                renderSegment(engine, params, &out, 1024, 48000, 1.0);
+                renderSegment(engine, params, &out, 1024, 48000, fader_unity_pos);
                 for (out) |s| total += @as(f64, s) * s;
             }
             return total;
@@ -4373,12 +4467,12 @@ test "audio: 主通道聚合——子通道音频必经主通道（主推子/静
     // 乐器 → 通道 1（子通道）；通道 0（主）无直连乐器
     var sp0 = synth.SynthParams{};
     params.channel_count.store(2, .monotonic);
-    params.volume.store(1.0, .monotonic);
+    params.volume.store(fader_unity_pos, .monotonic);
     params.synth_ptrs[0].store(&sp0, .monotonic);
     params.instrument_channel[0].store(1, .monotonic);
-    params.instrument_gain[0].store(1.0, .monotonic);
-    params.channel_gain[0].store(1.0, .monotonic);
-    params.channel_gain[1].store(1.0, .monotonic);
+    params.instrument_gain[0].store(fader_unity_pos, .monotonic);
+    params.channel_gain[0].store(fader_unity_pos, .monotonic);
+    params.channel_gain[1].store(fader_unity_pos, .monotonic);
 
     _ = synth.noteOn(&engine.synths[0], 69, synth.default_velocity, synth.default_pan, -1, -1);
     var out: [1024 * 2]f32 = undefined;
@@ -4388,7 +4482,7 @@ test "audio: 主通道聚合——子通道音频必经主通道（主推子/静
             var k: usize = 0;
             while (k < 8) : (k += 1) {
                 @memset(o[0 .. 1024 * 2], 0);
-                renderSegment(e, p, o, 1024, 48000, 1.0);
+                renderSegment(e, p, o, 1024, 48000, fader_unity_pos);
                 for (o[0 .. 1024 * 2]) |s| total += @as(f64, s) * s;
             }
             return total;
@@ -4401,18 +4495,20 @@ test "audio: 主通道聚合——子通道音频必经主通道（主推子/静
     // ① 主推子归零 → **全部** 静音（即使子通道推子在 1.0）——证明必经主通道
     params.channel_gain[0].store(0.0, .monotonic);
     try std.testing.expectEqual(@as(f64, 0), run(engine, params, &out));
-    params.channel_gain[0].store(1.0, .monotonic);
+    params.channel_gain[0].store(fader_unity_pos, .monotonic);
 
     // ② 主通道静音同理
     params.channel_muted[0].store(true, .monotonic);
     try std.testing.expectEqual(@as(f64, 0), run(engine, params, &out));
     params.channel_muted[0].store(false, .monotonic);
 
-    // ③ 主推子减半 → 能量 ∝ 0.25
+    // ③ 主推子拉到 0.5 → 平方律锥度：增益 = 0.25 → 能量 ∝ 0.0625
+    //（旧行为是“推子值就是增益”→ 能量 0.25；现在推子是 dB 域位置，见 `faderGain`）
     params.channel_gain[0].store(0.5, .monotonic);
     const e_half = run(engine, params, &out);
-    params.channel_gain[0].store(1.0, .monotonic);
-    try std.testing.expect(@abs(e_half / e_ok - 0.25) < 0.05);
+    params.channel_gain[0].store(fader_unity_pos, .monotonic);
+    const expect_ratio: f64 = @floatCast(faderGain(0.5) * faderGain(0.5)); // 能量 = 增益²
+    try std.testing.expect(@abs(e_half / e_ok - expect_ratio) < 0.02);
 }
 
 test "audio: 主通道效果链作用在汇总信号上（混响/延迟加入尾音）" {
@@ -4435,7 +4531,7 @@ test "audio: 主通道效果链作用在汇总信号上（混响/延迟加入尾
     params.volume.store(1.0, .monotonic);
     params.synth_ptrs[0].store(&sp0, .monotonic);
     params.instrument_channel[0].store(1, .monotonic);
-    params.instrument_gain[0].store(1.0, .monotonic);
+    params.instrument_gain[0].store(fader_unity_pos, .monotonic);
     params.channel_gain[0].store(1.0, .monotonic);
     params.channel_gain[1].store(1.0, .monotonic);
     params.effect_count[0].store(1, .monotonic);
@@ -4452,7 +4548,7 @@ test "audio: 主通道效果链作用在汇总信号上（混响/延迟加入尾
     var during: f64 = 0;
     while (k < 9) : (k += 1) {
         @memset(&out, 0);
-        renderSegment(engine, params, &out, 1024, 48000, 1.0);
+        renderSegment(engine, params, &out, 1024, 48000, fader_unity_pos);
         for (out) |s| during += @as(f64, s) * s;
     }
     try std.testing.expect(during > 1.0); // 直声期有声
@@ -4464,7 +4560,7 @@ test "audio: 主通道效果链作用在汇总信号上（混响/延迟加入尾
     k = 0;
     while (k < 8) : (k += 1) {
         @memset(&out, 0);
-        renderSegment(engine, params, &out, 1024, 48000, 1.0);
+        renderSegment(engine, params, &out, 1024, 48000, fader_unity_pos);
         for (out) |s| tail += @as(f64, s) * s;
     }
     try std.testing.expect(tail > 1.0); // 尾音（子通道声音绕进主通道 delay）
@@ -4822,6 +4918,63 @@ test "audio: VSTi 事件——MIDI 通道跟乐器 + 块内采样偏移（多通
     // 位图：乐鑫 0 已全停、乐器 1 的 p61 仍在响
     try std.testing.expectEqual(@as(u64, 0), engine.vsti_active_lo[0]);
     try std.testing.expectEqual(@as(u64, 1) << 61, engine.vsti_active_lo[1]);
+}
+
+test "audio: 音量推子锥度 + 位置域自动化（曲线 = 推子位置）" {
+    // ① 锥度：`gain = (p/0.75)²`（unity 在 0.75，顶部 +5 dB）
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), faderGain(fader_unity_pos), 1e-6);
+    try std.testing.expectApproxEqAbs(fader_max_gain, faderGain(1.0), 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), faderDb(1.0), 0.02); // ≈ +5 dB
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), faderDb(fader_unity_pos), 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, -7.04), faderDb(0.5), 0.02);
+    try std.testing.expect(faderDb(0.0) < -100.0); // 0 = −∞（用大负数表示）
+
+    // ② **位置域叠加**：基准 0 + 贡献 = 推子位置（curve 就是位置）
+    try std.testing.expectApproxEqAbs(faderGain(0.2), volumeGain(0.0, 0.2), 1e-6);
+    try std.testing.expectApproxEqAbs(faderGain(0.7), volumeGain(0.5, 0.2), 1e-6);
+    // 曲线最低点 = 位置 0 = **静音**；最高点 = 位置 1 = **+5 dB**
+    try std.testing.expectEqual(@as(f32, 0.0), volumeGain(0.0, 0.0));
+    try std.testing.expectApproxEqAbs(fader_max_gain, volumeGain(0.0, 1.0), 1e-6);
+    // ③ 越界钳制（基准 0.9 + 0.5 → 位置 1）
+    try std.testing.expectApproxEqAbs(fader_max_gain, volumeGain(0.9, 0.5), 1e-6);
+    try std.testing.expectEqual(@as(f32, 0.0), volumeGain(0.1, -0.5));
+}
+
+test "audio: 通道增益跳块平滑——阶跃不瞬跳（防爆音）" {
+    const a = std.testing.allocator;
+    var p = Params{};
+    p.chan_gain_sm = try a.alloc(f32, 2);
+    defer a.free(p.chan_gain_sm);
+    @memset(p.chan_gain_sm, std.math.nan(f32));
+
+    // 首块：NaN → 直写（不从 0 爬）
+    const r0 = smoothChanGain(&p, 0, 0.5, 0.5, 0.01);
+    try std.testing.expectEqual(@as(f32, 0.5), r0[0]);
+    try std.testing.expectEqual(@as(f32, 0.5), r0[1]);
+
+    // 无阶跃：完全透明
+    const r1 = smoothChanGain(&p, 0, 0.5, 0.5, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), r1[0], 1e-6);
+
+    // 阶跃 0.5 → 1.0：块起点只走一部分（8ms τ，10ms 块 ≈ 71%），**不瞬跳**
+    const r2 = smoothChanGain(&p, 0, 1.0, 1.0, 0.01);
+    try std.testing.expect(r2[0] > 0.5 and r2[0] < 1.0);
+    try std.testing.expectApproxEqAbs(r2[1], p.chan_gain_sm[0], 1e-6); // 状态记到本块终点
+
+    // 连续多块 → 单调逼近目标，不越过
+    var prev = r2[1];
+    var n: usize = 0;
+    while (n < 100) : (n += 1) {
+        const r = smoothChanGain(&p, 0, 1.0, 1.0, 0.01);
+        try std.testing.expect(r[0] >= prev - 1e-6);
+        try std.testing.expect(r[0] <= 1.0 + 1e-6);
+        prev = r[1];
+    }
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), prev, 1e-3);
+
+    // 无状态（数组不够长）→ 直写（不崩）
+    const r3 = smoothChanGain(&p, 9, 0.3, 0.3, 0.01);
+    try std.testing.expectEqual(@as(f32, 0.3), r3[0]);
 }
 
 test "audio: 一阶极点（NaN 播种 / τ=0 直通 / 追赶收敛）——自动化平滑的唯一实现" {

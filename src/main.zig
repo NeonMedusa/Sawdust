@@ -302,6 +302,14 @@ pub fn main(init: std.process.Init) !u8 {
                 }
             }
         }
+        // “存档无法打开”提示（只有「确定」；Enter/Esc/点击均可关闭）
+        if (app.modal == .notice) {
+            if (app.modal_choice != null) {
+                app.modal = null;
+                app.modal_choice = null;
+                app.clearNotice();
+            }
+        }
         // 样式/轨道清空确认（非空删除/清空；Enter = 确认、Esc = 取消）
         if (app.modal == .pattern_delete or app.modal == .track_clear or app.modal == .track_delete or app.modal == .delete_auto_curve) {
             if (app.modal_choice) |choice| {
@@ -2434,8 +2442,65 @@ const InputState = struct {
 
 // ── 主界面组装 ──
 
+/// 浮动窗口条目：`zp` 指向窗口自己的 `z` 字段（提升后无需回写副本）
+const WinEntry = struct { zp: *i32, draw: app_mod.WinKind };
+
+/// 浮动窗口的**屏幕矩形**（“点击置顶”的最上层判定 / 层声明 / 裁切记录共用同一张表）
+fn winRectOf(app: *App, kind: app_mod.WinKind) @import("ui.zig").Rect {
+    return switch (kind) {
+        .rack => .{ .x = app.rack.x, .y = app.rack.y, .w = app.rack.w, .h = app.rack.h },
+        .synth => .{ .x = app.synth_win.x, .y = app.synth_win.y, .w = app.synth_win.w, .h = app.synth_win.h },
+        .mixer => .{ .x = app.mixer_win.x, .y = app.mixer_win.y, .w = app.mixer_win.w, .h = app.mixer_win.h },
+        .effect => .{ .x = app.effect_win.x, .y = app.effect_win.y, .w = app.effect_win.w, .h = app.effect_win.h },
+        .drumkit => .{ .x = app.drumkit_win.x, .y = app.drumkit_win.y, .w = app.drumkit_win.w, .h = app.drumkit_win.h },
+        .help => .{ .x = app.help_win.x, .y = app.help_win.y, .w = app.help_win.w, .h = app.help_win.h },
+        .settings => .{ .x = app.settings_win.x, .y = app.settings_win.y, .w = app.settings_win.w, .h = app.settings_win.h },
+        .plugin_mgr => .{ .x = app.plugin_mgr.x, .y = app.plugin_mgr.y, .w = app.plugin_mgr.w, .h = app.plugin_mgr.h },
+        .auto => .{ .x = app.auto_win.x, .y = app.auto_win.y, .w = @import("view_auto_win.zig").W, .h = @import("view_auto_win.zig").H },
+        .vst_auto => .{ .x = app.vst_auto.x, .y = app.vst_auto.y, .w = @import("view_vst_auto.zig").W, .h = @import("view_vst_auto.zig").H },
+    };
+}
+
+/// 按 `z` **升序**原地排序（插入排序；元素 ≤ 10，**稳定** → 同 z 保持列表顺序）
+fn sortWinEntries(items: []WinEntry) void {
+    var i: usize = 1;
+    while (i < items.len) : (i += 1) {
+        const key = items[i];
+        var j: usize = i;
+        while (j > 0 and items[j - 1].zp.* > key.zp.*) : (j -= 1) items[j] = items[j - 1];
+        items[j] = key;
+    }
+}
+
+/// **点击置顶**：一次点击只提升**光标下最上层**的那一个窗口（`items` 需按 z 升序）。
+///
+/// 以前是各窗口在自己的 draw 里判 `inRect(鼠标) && mouse_pressed` 就置顶 →
+/// 一次点击会给“光标下的**所有**窗口”依次发号（按 z 升序），而**不在光标下**的窗口
+/// （包括原先最前面那个）不会提升 → 被提升过的整体压下去。实测表现：
+/// “点一个窗口，它后方的窗口跑到第二层，原来最前面的掉到最底”。
+/// 现在只提升最上层那个 → 其余窗口的相对层次**完全不变**（标准桌面行为）。
+///
+/// 波形窗固定盖在所有浮动窗之上（不进 z 序）→ 光标在它里面时归它。
+/// 模态期间（确认框 / 导出）不动作（返回 null）——同 `bringToFront` 的守卫。
+fn raiseTopmostUnderCursor(app: *App, items: []const WinEntry, mouse_x: i32, mouse_y: i32) ?*i32 {
+    if (app.modal != null or app.export_wav != null or app.export_options_win.open) return null;
+    var hit: ?*i32 = null;
+    for (items) |win| { // 升序遍历 → 最后一个命中 = 最上层
+        const r = winRectOf(app, win.draw);
+        if (util.inRect(mouse_x, mouse_y, r.x, r.y, r.w, r.h)) hit = win.zp;
+    }
+    if (app.wave_win.open and util.inRect(mouse_x, mouse_y, app.wave_win.x, app.wave_win.y, app.wave_win.w, app.wave_win.h)) {
+        hit = &app.wave_win.z;
+    }
+    if (hit) |zp| app.bringToFront(zp);
+    return hit;
+}
+
 fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     app.layout.initIfNeeded(w);
+
+    // **手动接管结束**：鼠标松开 → 拖动结束，自动化重新接管（见 `App.beginAutoDrag`）
+    if (!ui.mouse_down) app.clearAutoDrag();
 
     // ── 层声明（帧首）──
     // 立即式 UI 里“绘制顺序 = 事件处理顺序”；层系统把“谁接收鼠标”
@@ -2473,55 +2538,54 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     const menu_open = app.menuIsOpen();
 
     // 浮动窗口列表（按 z 升序 = 从下到上）；排序用插入排序（元素很少）
-    var wins: [10]struct { z: i32, draw: app_mod.WinKind } = undefined;
+    var wins: [10]WinEntry = undefined;
     var nwin: usize = 0;
     if (rack_open) {
-        wins[nwin] = .{ .z = app.rack.z, .draw = .rack };
+        wins[nwin] = .{ .zp = &app.rack.z, .draw = .rack };
         nwin += 1;
     }
     if (synth_open) {
-        wins[nwin] = .{ .z = app.synth_win.z, .draw = .synth };
+        wins[nwin] = .{ .zp = &app.synth_win.z, .draw = .synth };
         nwin += 1;
     }
     if (app.drumkit_win.open) {
-        wins[nwin] = .{ .z = app.drumkit_win.z, .draw = .drumkit };
+        wins[nwin] = .{ .zp = &app.drumkit_win.z, .draw = .drumkit };
         nwin += 1;
     }
     if (mixer_open) {
-        wins[nwin] = .{ .z = app.mixer_win.z, .draw = .mixer };
+        wins[nwin] = .{ .zp = &app.mixer_win.z, .draw = .mixer };
         nwin += 1;
     }
     if (effect_open) {
-        wins[nwin] = .{ .z = app.effect_win.z, .draw = .effect };
+        wins[nwin] = .{ .zp = &app.effect_win.z, .draw = .effect };
         nwin += 1;
     }
     if (app.help_win.open) {
-        wins[nwin] = .{ .z = app.help_win.z, .draw = .help };
+        wins[nwin] = .{ .zp = &app.help_win.z, .draw = .help };
         nwin += 1;
     }
     if (app.settings_win.open) {
-        wins[nwin] = .{ .z = app.settings_win.z, .draw = .settings };
+        wins[nwin] = .{ .zp = &app.settings_win.z, .draw = .settings };
         nwin += 1;
     }
     if (app.plugin_mgr.open) {
-        wins[nwin] = .{ .z = app.plugin_mgr.z, .draw = .plugin_mgr };
+        wins[nwin] = .{ .zp = &app.plugin_mgr.z, .draw = .plugin_mgr };
         nwin += 1;
     }
     if (app.auto_win.open) {
-        wins[nwin] = .{ .z = app.auto_win.z, .draw = .auto };
+        wins[nwin] = .{ .zp = &app.auto_win.z, .draw = .auto };
         nwin += 1;
     }
     if (app.vst_auto.open) {
-        wins[nwin] = .{ .z = app.vst_auto.z, .draw = .vst_auto };
+        wins[nwin] = .{ .zp = &app.vst_auto.z, .draw = .vst_auto };
         nwin += 1;
     }
-    {
-        var i: usize = 1;
-        while (i < nwin) : (i += 1) {
-            const key = wins[i];
-            var j: usize = i;
-            while (j > 0 and wins[j - 1].z > key.z) : (j -= 1) wins[j] = wins[j - 1];
-            wins[j] = key;
+    sortWinEntries(wins[0..nwin]);
+
+    // ── 点击置顶：一次点击只提升光标下最上层的那个窗口（见 raiseTopmostUnderCursor）──
+    if (ui.mouse_pressed and !menu_open) {
+        if (raiseTopmostUnderCursor(app, wins[0..nwin], ui.mouse_x, ui.mouse_y) != null) {
+            sortWinEntries(wins[0..nwin]); // 提升后立即重排：本帧的层/绘制就用新序（不闪一帧）
         }
     }
 
@@ -2543,19 +2607,7 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     // 注：prio 用 1 + idx（idx = 排序后的位次）而非窗口 z 值——declare 对
     // 同 prio 是覆盖且要求 prio 互不相同；位次天然互异且与排序一致。
     for (wins[0..nwin], 0..) |win, wi| {
-        const r: @import("ui.zig").Rect = switch (win.draw) {
-            .rack => .{ .x = app.rack.x, .y = app.rack.y, .w = app.rack.w, .h = app.rack.h },
-            .synth => .{ .x = app.synth_win.x, .y = app.synth_win.y, .w = app.synth_win.w, .h = app.synth_win.h },
-            .mixer => .{ .x = app.mixer_win.x, .y = app.mixer_win.y, .w = app.mixer_win.w, .h = app.mixer_win.h },
-            .effect => .{ .x = app.effect_win.x, .y = app.effect_win.y, .w = app.effect_win.w, .h = app.effect_win.h },
-            .drumkit => .{ .x = app.drumkit_win.x, .y = app.drumkit_win.y, .w = app.drumkit_win.w, .h = app.drumkit_win.h },
-            .help => .{ .x = app.help_win.x, .y = app.help_win.y, .w = app.help_win.w, .h = app.help_win.h },
-            .settings => .{ .x = app.settings_win.x, .y = app.settings_win.y, .w = app.settings_win.w, .h = app.settings_win.h },
-            .plugin_mgr => .{ .x = app.plugin_mgr.x, .y = app.plugin_mgr.y, .w = app.plugin_mgr.w, .h = app.plugin_mgr.h },
-            .auto => .{ .x = app.auto_win.x, .y = app.auto_win.y, .w = @import("view_auto_win.zig").W, .h = @import("view_auto_win.zig").H },
-            .vst_auto => .{ .x = app.vst_auto.x, .y = app.vst_auto.y, .w = @import("view_vst_auto.zig").W, .h = @import("view_vst_auto.zig").H },
-        };
-        _ = ui.declare(.{ .prio = 1 + @as(i32, @intCast(wi)), .rect = r });
+        _ = ui.declare(.{ .prio = 1 + @as(i32, @intCast(wi)), .rect = winRectOf(app, win.draw) });
     }
     if (menu_open) {
         // 任何菜单展开 = 最上模态层（全屏屏蔽）
@@ -2647,18 +2699,8 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     app.win_draw_n = 0;
     for (wins[0..nwin]) |win| {
         if (app.win_draw_n >= app.win_draw_info.len) break;
-        app.win_draw_info[app.win_draw_n] = switch (win.draw) {
-            .rack => .{ .kind = .rack, .x = app.rack.x, .y = app.rack.y, .w = app.rack.w, .h = app.rack.h },
-            .synth => .{ .kind = .synth, .x = app.synth_win.x, .y = app.synth_win.y, .w = app.synth_win.w, .h = app.synth_win.h },
-            .mixer => .{ .kind = .mixer, .x = app.mixer_win.x, .y = app.mixer_win.y, .w = app.mixer_win.w, .h = app.mixer_win.h },
-            .effect => .{ .kind = .effect, .x = app.effect_win.x, .y = app.effect_win.y, .w = app.effect_win.w, .h = app.effect_win.h },
-            .drumkit => .{ .kind = .drumkit, .x = app.drumkit_win.x, .y = app.drumkit_win.y, .w = app.drumkit_win.w, .h = app.drumkit_win.h },
-            .help => .{ .kind = .help, .x = app.help_win.x, .y = app.help_win.y, .w = app.help_win.w, .h = app.help_win.h },
-            .settings => .{ .kind = .settings, .x = app.settings_win.x, .y = app.settings_win.y, .w = app.settings_win.w, .h = app.settings_win.h },
-            .plugin_mgr => .{ .kind = .plugin_mgr, .x = app.plugin_mgr.x, .y = app.plugin_mgr.y, .w = app.plugin_mgr.w, .h = app.plugin_mgr.h },
-            .auto => .{ .kind = .auto, .x = app.auto_win.x, .y = app.auto_win.y, .w = @import("view_auto_win.zig").W, .h = @import("view_auto_win.zig").H },
-            .vst_auto => .{ .kind = .vst_auto, .x = app.vst_auto.x, .y = app.vst_auto.y, .w = @import("view_vst_auto.zig").W, .h = @import("view_vst_auto.zig").H },
-        };
+        const r = winRectOf(app, win.draw);
+        app.win_draw_info[app.win_draw_n] = .{ .kind = win.draw, .x = r.x, .y = r.y, .w = r.w, .h = r.h };
         app.win_draw_n += 1;
     }
 }
@@ -4457,20 +4499,20 @@ fn uniqueBackupPath(io: std.Io, path: []const u8, buf: []u8) ?[]const u8 {
 
 /// 执行旧档升级（弹窗确认后）：读 → 内存迁移（parseAuto 链）→ import →
 /// 写 `.tmp` → 原件重命名 `.bak.saw`（碰撞加序号）→ `.tmp` 回原路径。
-/// 危险窗口 = 两次相邻重命名之间；任一步失败 → 保留原件、清理 tmp、toast 报错。
+/// 危险窗口 = 两次相邻重命名之间；任一步失败 → 保留原件、清理 tmp、**弹窗**报错。
 fn performUpgrade(app: *App, io: std.Io) void {
     const path = app.pending_upgrade_path orelse return;
     const cwd = std.Io.Dir.cwd();
 
     const data = cwd.readFileAlloc(io, path, app.allocator, .unlimited) catch |e| {
-        app.setToastWith("升级失败：读取失败（{s}）", .{@errorName(e)});
+        app.setNotice("升级失败：读取文件失败（{s}）。\n原文件未改动。", .{@errorName(e)});
         app.clearPendingUpgrade();
         return;
     };
     defer app.allocator.free(data);
 
     var parsed = persist.parseAuto(app.allocator, data) catch |e| {
-        app.setToastWith("升级失败：{s}", .{persist.parseErrorHint(e)});
+        app.setNotice("升级失败：存档无法解析（{s}）。\n原文件未改动。", .{persist.parseErrorHint(e)});
         app.clearPendingUpgrade();
         return;
     };
@@ -4479,13 +4521,13 @@ fn performUpgrade(app: *App, io: std.Io) void {
     app.importProject(parsed.value);
 
     const project = app.exportProject() catch |e| {
-        app.setToastWith("升级失败：导出失败（{s}）", .{@errorName(e)});
+        app.setNotice("升级失败：导出工程失败（{s}）。\n原文件未改动。", .{@errorName(e)});
         app.clearPendingUpgrade();
         return;
     };
     defer app.freeProject(project);
     const bytes = persist.toBinary(app.allocator, project) catch |e| {
-        app.setToastWith("升级失败：序列化失败（{s}）", .{@errorName(e)});
+        app.setNotice("升级失败：序列化失败（{s}）。\n原文件未改动。", .{@errorName(e)});
         app.clearPendingUpgrade();
         return;
     };
@@ -4494,12 +4536,12 @@ fn performUpgrade(app: *App, io: std.Io) void {
     // 1) 写 .tmp（同目录）
     var tmp_buf: [1080]u8 = undefined;
     const tmp_path = std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path}) catch {
-        app.setToast("升级失败：路径过长");
+        app.setNotice("升级失败：路径过长。\n请把工程移到更短的路径下重试。", .{});
         app.clearPendingUpgrade();
         return;
     };
     cwd.writeFile(io, .{ .sub_path = tmp_path, .data = bytes }) catch |e| {
-        app.setToastWith("升级失败：写入临时文件失败（{s}）", .{@errorName(e)});
+        app.setNotice("升级失败：写入临时文件失败（{s}）。\n原文件未改动（可能是目录不可写/磁盘满）。", .{@errorName(e)});
         app.clearPendingUpgrade();
         return;
     };
@@ -4507,13 +4549,13 @@ fn performUpgrade(app: *App, io: std.Io) void {
     var bak_buf: [1100]u8 = undefined;
     const bak = uniqueBackupPath(io, path, &bak_buf) orelse {
         cwd.deleteFile(io, tmp_path) catch {};
-        app.setToast("升级失败：无法确定备份名");
+        app.setNotice("升级失败：无法确定备份文件名。\n原文件未改动。", .{});
         app.clearPendingUpgrade();
         return;
     };
     cwd.rename(path, cwd, bak, io) catch |e| {
         cwd.deleteFile(io, tmp_path) catch {};
-        app.setToastWith("升级失败：备份重命名失败（{s}）", .{@errorName(e)});
+        app.setNotice("升级失败：备份重命名失败（{s}）。\n原文件未改动。", .{@errorName(e)});
         app.clearPendingUpgrade();
         return;
     };
@@ -4521,7 +4563,7 @@ fn performUpgrade(app: *App, io: std.Io) void {
     cwd.rename(tmp_path, cwd, path, io) catch |e| {
         // 尝试回滚（备份改回原名）；回滚失败则原文件仍在备份名下，不丢数据
         cwd.rename(bak, cwd, path, io) catch {};
-        app.setToastWith("升级失败：替换失败（{s}）", .{@errorName(e)});
+        app.setNotice("升级失败：替换失败（{s}）。\n已尝试回滚；若原路径没了，看同目录的 .bak.saw。", .{@errorName(e)});
         app.clearPendingUpgrade();
         return;
     };
@@ -4536,22 +4578,31 @@ fn performUpgrade(app: *App, io: std.Io) void {
 /// 从指定路径加载并替换当前工程（失败时保留当前工程不变）
 fn loadProjectFromPath(app: *App, io: std.Io, path: []const u8) void {
     const data = std.Io.Dir.cwd().readFileAlloc(io, path, app.allocator, .unlimited) catch |e| {
-        app.setToastWith("打开失败：读取失败（{s}）", .{@errorName(e)});
+        app.setNotice("读取文件失败（{s}）。\n文件可能被占用、或路径已失效。", .{@errorName(e)});
         return;
     };
     defer app.allocator.free(data);
 
-    // **只认二进制存档**（JSON 通道已于 v9 删除）：
-    // - 不是 SAWD magic → 直接报错（旧 JSON 工程已无法打开）；
+    // **只认二进制存档**（工程 JSON 通道已于 v9 删除）：
+    // - 不是 SAWD magic → 旧 JSON 工程/随便一个文件 → **弹窗**说清楚怎么办；
     // - 版本 > 当前 → 拒绝（请换新版 Sawdust）；
     // - 版本 < 当前 → “备份并升级”弹窗（能兼容读 + 读入时 ×40，但保存后旧版打不开）。
     if (!std.mem.eql(u8, data[0..@min(data.len, persist.binary_magic.len)], persist.binary_magic)) {
-        app.setToast("打开失败：不是 Sawdust 工程文件（需要二进制 .saw）");
+        // 旧 JSON 工程（v1–v5）：读取通道已删，只能请用户拿旧版程序转一次
+        if (persist.probeLegacyJsonVersion(app.allocator, data)) |jver| {
+            app.setNotice(
+                "存档版本过旧（旧版 JSON v{d}），本版已不支持打开。\n" ++
+                    "请用旧版程序（V16–V18）打开并「另存为」.saw，\n再用本版打开。",
+                .{jver},
+            );
+            return;
+        }
+        app.setNotice("这不是 Sawdust 工程文件。\n需要二进制 .saw 存档（旧版 JSON 工程需用 V16–V18 转换）。", .{});
         return;
     }
     if (persist.probeVersion(app.allocator, data)) |ver| {
         if (ver > persist.binary_version) {
-            app.setToastWith("打开失败：存档版本过新（v{d}），请使用更新的 Sawdust", .{ver});
+            app.setNotice("存档版本过新（v{d}），本版打不开。\n请使用更新的 Sawdust。", .{ver});
             return;
         }
         if (ver < persist.binary_version) {
@@ -4561,12 +4612,12 @@ fn loadProjectFromPath(app: *App, io: std.Io, path: []const u8) void {
             return; // 等弹窗确认（performUpgrade）；取消 = 不打开
         }
     } else {
-        app.setToast("打开失败：存档被截断（只有文件头）");
+        app.setNotice("存档被截断（只有文件头），无法打开。\n文件可能拷贝/下载不完整。", .{});
         return;
     }
 
     const parsed = persist.parseAuto(app.allocator, data) catch |e| {
-        app.setToastWith("打开失败：{s}", .{persist.parseErrorHint(e)});
+        app.setNotice("存档无法解析：{s}", .{persist.parseErrorHint(e)});
         return;
     };
     // 注意：**不再 defer parsed.deinit()** —— `beginProjectLoad` 接管所有权
@@ -4944,7 +4995,49 @@ fn drawModal(ui: *Ui, app: *App) void {
         .delete_auto_curve => drawDeleteConfirm(ui, app, w, h),
         .track_delete => drawDeleteConfirm(ui, app, w, h),
         .save_upgrade => drawUpgradeConfirm(ui, app, w, h),
+        .notice => drawNotice(ui, app, w, h),
     }
+}
+
+/// “存档无法打开/升级失败”提示（只有一个「确定」）。
+/// 打开/升级失败**一律走这里**，不用 Toast（右下角一闪就没了，用户经常看不到）。
+fn drawNotice(ui: *Ui, app: *App, w: i32, h: i32) void {
+    const text = app.notice_text orelse "";
+    const title = "无法打开工程";
+    // 按 '\n' 分行（最多 4 行；超过部分丢弃）
+    var lines: [4][]const u8 = undefined;
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |ln| {
+        if (n == lines.len) break;
+        lines[n] = ln;
+        n += 1;
+    }
+    var text_w: i32 = @intFromFloat(ui.font.measure(title));
+    for (lines[0..n]) |ln| text_w = @max(text_w, @as(i32, @intFromFloat(ui.font.measure(ln))));
+    const btn_w: i32 = 84;
+    const max_w: i32 = w - 32;
+    const dlg_w = @min(@max(text_w + 48, btn_w + 64), max_w); // 再长的文案也不超出屏幕
+    const dlg_h: i32 = 60 + @as(i32, @intCast(@max(n, 1))) * 22;
+    const dx = @divTrunc(w - dlg_w, 2);
+    const dy = @divTrunc(h - dlg_h, 2);
+    ui.noteOverlayRect(dx, dy, dlg_w + 4, dlg_h + 4);
+
+    ui.renderer.fillRect(dx + 4, dy + 4, dlg_w, dlg_h, r_mod.rgb(12, 13, 16));
+    ui.renderer.fillRect(dx, dy, dlg_w, dlg_h, ui.theme.panel);
+    ui.renderer.strokeRect(dx, dy, dlg_w, dlg_h, ui.theme.accent);
+    const tw_title: i32 = @intFromFloat(ui.font.measure(title));
+    ui.label(title, dx + @divTrunc(dlg_w - tw_title, 2), dy + 14, ui.theme.accent);
+    var y: i32 = dy + 38;
+    for (lines[0..n]) |ln| {
+        const tw: i32 = @intFromFloat(ui.font.measure(ln));
+        ui.label(ln, dx + @divTrunc(dlg_w - tw, 2), y, ui.theme.text);
+        y += 22;
+    }
+
+    const labels = [_][]const u8{"确定"};
+    const choices = [_]QuitChoice{.cancel};
+    drawModalButtons(ui, app, dx, dy, dlg_w, dlg_h, &labels, &choices, 0, 0);
 }
 
 /// 旧版存档升级确认框（备份并升级 / 取消）——③ 迁移流程（v1–v3 → v5 二进制）
@@ -5485,6 +5578,113 @@ test "main: 旧版二进制 v5 → performUpgrade 备份并改写为当前版本
     // 4) 升级后是“已保存”状态，且待升级标记已清
     try std.testing.expect(app.pending_upgrade_path == null);
     try std.testing.expect(!app.dirty);
+}
+
+test "main: 打不开的存档 → 弹窗（不是 Toast）：旧 JSON / 非工程 / 版本过新 / 升级失败" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.dir.close(io);
+    const dirp = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(dirp);
+    const json_path = try std.fmt.allocPrint(alloc, "{s}/legacy.saw", .{dirp});
+    defer alloc.free(json_path);
+    const junk_path = try std.fmt.allocPrint(alloc, "{s}/junk.saw", .{dirp});
+    defer alloc.free(junk_path);
+    const new_path = try std.fmt.allocPrint(alloc, "{s}/future.saw", .{dirp});
+    defer alloc.free(new_path);
+    const bad_path = try std.fmt.allocPrint(alloc, "{s}/broken5.saw", .{dirp});
+    defer alloc.free(bad_path);
+
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = json_path, .data = "{\"version\":3,\"bpm\":112,\"clips\":[],\"notes\":[]}" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = junk_path, .data = "hello" });
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = new_path, .data = "SAWD\x63" }); // 版本 99
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = bad_path, .data = "SAWD\x05\xff\xff" }); // v5 但载荷损坏
+
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+
+    // ① 旧版 JSON 工程 → 弹窗 + “用旧版程序转存”指引（不再只靠 Toast）
+    loadProjectFromPath(&app, io, json_path);
+    try std.testing.expectEqual(app_mod.ModalKind.notice, app.modal.?);
+    try std.testing.expect(app.notice_text != null);
+    try std.testing.expect(std.mem.indexOf(u8, app.notice_text.?, "旧版 JSON v3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, app.notice_text.?, "V16") != null);
+    // 再设一次 → 旧正文释放（泄漏由 testing allocator 抳）
+    loadProjectFromPath(&app, io, junk_path);
+    try std.testing.expectEqual(app_mod.ModalKind.notice, app.modal.?);
+    try std.testing.expect(std.mem.indexOf(u8, app.notice_text.?, "不是 Sawdust 工程文件") != null);
+
+    // ② 版本过新 → 弹窗
+    loadProjectFromPath(&app, io, new_path);
+    try std.testing.expectEqual(app_mod.ModalKind.notice, app.modal.?);
+    try std.testing.expect(std.mem.indexOf(u8, app.notice_text.?, "版本过新（v99）") != null);
+
+    // ③ 关掉弹窗 → 正文释放、modal 清空
+    app.modal = null;
+    app.modal_choice = null;
+    app.clearNotice();
+    try std.testing.expect(app.notice_text == null);
+
+    // ④ 升级失败（载荷损坏）→ 弹窗，且原文件未动
+    app.setPendingUpgrade(bad_path, 5);
+    performUpgrade(&app, io);
+    try std.testing.expectEqual(app_mod.ModalKind.notice, app.modal.?);
+    try std.testing.expect(std.mem.indexOf(u8, app.notice_text.?, "升级失败") != null);
+    const still = try std.Io.Dir.cwd().readFileAlloc(io, bad_path, alloc, .unlimited);
+    defer alloc.free(still);
+    try std.testing.expectEqualStrings("SAWD\x05\xff\xff", still); // 原件保留
+}
+
+test "main: 点击窗口只提升最上层——其余窗口层次不变（回归：后方窗口不得被抬到第二层）" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+
+    // 三层窗口（均打开）：A=机架在前、B=合成器居中、C=鼓组在后
+    app.rack = .{ .open = true, .x = 0, .y = 0, .w = 200, .h = 200, .z = 30 };
+    app.synth_win = .{ .open = true, .x = 100, .y = 100, .w = 200, .h = 200, .z = 20 };
+    app.drumkit_win = .{ .open = true, .x = 150, .y = 150, .w = 200, .h = 200, .z = 10 };
+    // 升序列表（与 drawApp 里的列表同序）
+    var items: [3]WinEntry = .{
+        .{ .zp = &app.drumkit_win.z, .draw = .drumkit },
+        .{ .zp = &app.synth_win.z, .draw = .synth },
+        .{ .zp = &app.rack.z, .draw = .rack },
+    };
+    sortWinEntries(items[0..]);
+
+    // ① 点 (250,250)：命中 B 和 C，**不命中 A**（以前的实现会把 B/C 都提升→ A 掉到最底）
+    const raised = raiseTopmostUnderCursor(&app, items[0..], 250, 250);
+    try std.testing.expect(raised == &app.synth_win.z); // 只提升最上层的 B
+    try std.testing.expect(app.synth_win.z > app.rack.z);
+    try std.testing.expect(app.synth_win.z > app.drumkit_win.z);
+    try std.testing.expectEqual(@as(i32, 30), app.rack.z); // A 没动
+    try std.testing.expectEqual(@as(i32, 10), app.drumkit_win.z); // C 没动（关键：不得被抬到第二层）
+
+    // ② 点 (50,50)：只命中 A → A 置顶
+    const r2 = raiseTopmostUnderCursor(&app, items[0..], 50, 50);
+    try std.testing.expect(r2 == &app.rack.z);
+    try std.testing.expect(app.rack.z > app.synth_win.z);
+
+    // ③ 点 A∩B 重叠区 (150,150)：A 在上 → 只有 A 提升，B 不动
+    const z_b = app.synth_win.z;
+    const r3 = raiseTopmostUnderCursor(&app, items[0..], 150, 150);
+    try std.testing.expect(r3 == &app.rack.z);
+    try std.testing.expectEqual(z_b, app.synth_win.z);
+
+    // ④ 空白处（无窗口）→ 不提升
+    try std.testing.expect(raiseTopmostUnderCursor(&app, items[0..], 3000, 3000) == null);
+
+    // ⑤ 模态期间不动作（同 bringToFront 守卫）
+    app.modal = .notice;
+    const z_before = app.drumkit_win.z;
+    try std.testing.expect(raiseTopmostUnderCursor(&app, items[0..], 250, 250) == null);
+    try std.testing.expectEqual(z_before, app.drumkit_win.z);
+    app.modal = null;
 }
 
 test "main: 拖放只有两片——播放列表网格内 vs 网格外" {
