@@ -117,8 +117,15 @@ cd Sawdust
 zig build run             # 构建并运行
 ```
 
-编译结果在 `zig-out\bin\` 目录中（Windows 为 `Sawdust.exe`，Linux 为 `Sawdust`），
-正式编译发布请用：```zig build -Dcpu=baseline -Doptimize=ReleaseFast```
+编译结果在 `zig-out\bin\` 目录中（Windows 为 `Sawdust.exe`，Linux 为 `Sawdust`）。
+
+**正式编译发布请用：**```zig build -Doptimize=ReleaseFast```
+
+想在自己机器上启用 **AVX/AVX2**（更快，但**不能分发**，老 CPU 上会崩）：
+```bash
+zig build -Doptimize=ReleaseFast -Dcpu=native      # 本机全部指令集
+zig build -Doptimize=ReleaseFast -Dcpu=x86_64_v3   # AVX2 那一档（约 2013 年后的 CPU）
+```
 
 **C 绑定（Zig 0.17 起）**：`@cImport` 已被 Zig 移除，本项目改为**预生成绑定**：
 `src/c/miniaudio.zig`、`src/c/stb_truetype.zig` 由 `zig translate-c` 生成并入库（构建期

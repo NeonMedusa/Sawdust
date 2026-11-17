@@ -1,7 +1,20 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // **目标 CPU 默认 baseline**（x86-64 只用最老的 SSE2）。
+    //
+    // 为什么：`zig build` 不指定 CPU 时 Zig 是按**本机**编的（会带上 AVX/AVX2 等
+    // 本机专有指令集），那样的包换到稍老的电脑上会直接 **Illegal instruction** 崩掉。
+    // 本项目的发布包必须**开箱即用**，所以默认就锁到最保守的 baseline——
+    // Debug / ReleaseFast 一视同仁，你日常跑的就是你要发的东西。
+    //
+    // 想在本机嗅性能（启用 AVX/AVX2）就自己显式传参，CLI 优先于这里的默认值：
+    //   zig build -Doptimize=ReleaseFast -Dcpu=native        // 本机全部特性
+    //   zig build -Doptimize=ReleaseFast -Dcpu=x86_64_v3     // 只要 AVX2 那一档（~2013 年后的 CPU）
+    // ⚠ 这样编出来的二进制**不能分发**：老 CPU 上会崩。我们**不发布性能版**。
+    const target = b.standardTargetOptions(.{
+        .default_target = .{ .cpu_model = .baseline },
+    });
     const optimize = b.standardOptimizeOption(.{});
     // 调试构建（默认 `zig build run` = Debug）**不 strip**：否则 SafeAllocator 的泄漏报告
     // 与 panic 栈都只剩“Cannot print stack trace: stack tracing is disabled”，
