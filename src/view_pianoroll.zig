@@ -29,6 +29,10 @@ const KeyMode = @import("app.zig").KeyMode;
 /// 现在 hover / 按下 / 拖动 / 右键擦除 / Ctrl+Shift 切换选中**全部**走这里的像素邻近判据。
 const note_hit_tol_px: f32 = 4.0;
 
+/// 边缘热区在**音符体内**那侧的宽度（像素）。加上外侧 `note_hit_tol_px` 容差，
+/// 常规宽度音符的左右边缘响应区各约 12px。**窄音符不用这个值**，见 `noteHitMode`。
+const note_edge_px: i32 = 8;
+
 /// 鼠标处的音符命中（像素邻近）：取**中心最近**者，等距取数组序更大者（= 顶层，
 /// 与 `topmostNoteAt` 的“叠放取顶层”一致）。命中窗口 = 音符本体（至少 1px）±容差。
 fn noteAtMousePx(
@@ -63,6 +67,34 @@ fn noteAtMousePx(
         }
     }
     return best;
+}
+
+/// 音符命中**分区**（鼠标 x 落在音符的哪个部位 → 拉左端 / 移动 / 拉右端）。
+///
+/// 分两档，**任意宽度**下三者都在（各自至少 1px 宽）：
+///
+/// - **常规宽度**（本体 ≥ `3 × note_edge_px` = 24px）：左右各 8px 边缘热区，中间全是移动
+///   （再加外侧 4px 容差，从音符外面一点就能拉到）；
+/// - **窄音符**（< 24px）：两道 8px 热区会**重叠并互相吃掉**（旧实现在这里只能二选一，
+///   于是“中部移动”永远命中不到）→ 改为把**命中窗口**（本体 ± 容差，最窄也有 9px）
+///   **三等分**：左三分之一 = 拉左端、中三分之一 = 移动、右三分之一 = 拉右端。
+///
+/// 实测场景：1 步音符缩到 **1px** 时，窗口 = 9px → 左侧 3px / 中间 3px / 右侧 3px，
+/// 从左边靠近能拉左端、正中间按住能整条拖走、从右边靠近能拉右端。
+fn noteHitMode(nx: i32, nw: i32, mouse_x: i32) model.NoteHitMode {
+    const w = @max(1, nw);
+    if (w >= 3 * note_edge_px) {
+        if (mouse_x <= nx + note_edge_px) return .left;
+        if (mouse_x >= nx + w - note_edge_px) return .right;
+        return .body;
+    }
+    const tol: i32 = @intFromFloat(note_hit_tol_px);
+    const lo = nx - tol;
+    const span = w + 2 * tol; // 命中窗口宽度（与 `noteAtMousePx` 的判据一致）
+    const edge = @max(1, @divTrunc(span, 3));
+    if (mouse_x < lo + edge) return .left;
+    if (mouse_x >= lo + span - edge) return .right;
+    return .body;
 }
 
 pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
@@ -906,18 +938,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             const n = app.notes.items[ni];
             const nx = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(n.step)) * step_ws - scroll_s));
             const nw = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(n.len)) * step_ws)));
-            const near_left = ui.mouse_x <= nx + 8;
-            const near_right = ui.mouse_x >= nx + nw - 8;
-            const mode: model.NoteHitMode = if (near_left and near_right)
-                // 窄音符两缘都近：按鼠标在音符内的相对位置就近选
-                (if (ui.mouse_x - nx <= nx + nw - ui.mouse_x) .left else .right)
-            else if (near_left)
-                .left
-            else if (near_right)
-                .right
-            else
-                .body;
-            note_hit = .{ .index = ni, .mode = mode };
+            // 命中分区：常规宽度走左右 8px 热区；**窄音符按命中窗口三等分**
+            // （左 = 拉左端 / 中 = 移动 / 右 = 拉右端）——详见 `noteHitMode`。
+            note_hit = .{ .index = ni, .mode = noteHitMode(nx, nw, ui.mouse_x) };
         }
     }
 
@@ -1549,4 +1572,45 @@ test "pianoroll: 键列配色——鼓组模式不用钢琴黑白键（修白底
     // 发声中（两种模式）优先 = 强调色底
     try std.testing.expectEqual(theme.accent, keyRowStyle(&theme, true, false, true, true).bg);
     try std.testing.expectEqual(theme.accent, keyRowStyle(&theme, false, false, true, false).bg);
+}
+
+test "pianoroll: 命中分区——极短音符也有左/中/右三段（拉左端 / 移动 / 拉右端）" {
+    const nx: i32 = 100;
+
+    // **1px 宽**（1 步音符低缩放下的样子）：命中窗口 = 本体 ± 4px = 9px
+    // → 左 3px（96..98）/ 中 3px（99..101）/ 右 3px（102..104）
+    try std.testing.expectEqual(model.NoteHitMode.left, noteHitMode(nx, 1, 96));
+    try std.testing.expectEqual(model.NoteHitMode.left, noteHitMode(nx, 1, 98));
+    try std.testing.expectEqual(model.NoteHitMode.body, noteHitMode(nx, 1, 99));
+    try std.testing.expectEqual(model.NoteHitMode.body, noteHitMode(nx, 1, 100)); // 正压在音符上 = 移动
+    try std.testing.expectEqual(model.NoteHitMode.body, noteHitMode(nx, 1, 101));
+    try std.testing.expectEqual(model.NoteHitMode.right, noteHitMode(nx, 1, 102));
+    try std.testing.expectEqual(model.NoteHitMode.right, noteHitMode(nx, 1, 104));
+
+    // 常规宽度（≥ 24px）：两侧各 8px（＋外侧容差），中间全移动——与原行为一致
+    try std.testing.expectEqual(model.NoteHitMode.left, noteHitMode(nx, 48, 96));
+    try std.testing.expectEqual(model.NoteHitMode.left, noteHitMode(nx, 48, 108));
+    try std.testing.expectEqual(model.NoteHitMode.body, noteHitMode(nx, 48, 109));
+    try std.testing.expectEqual(model.NoteHitMode.body, noteHitMode(nx, 48, 139));
+    try std.testing.expectEqual(model.NoteHitMode.right, noteHitMode(nx, 48, 140));
+    try std.testing.expectEqual(model.NoteHitMode.right, noteHitMode(nx, 48, 152));
+
+    // **穷举 1..64px**：命中窗口内三区都存在，且只能按“左 → 中 → 右”出现（不交叉）
+    var w: i32 = 1;
+    while (w <= 64) : (w += 1) {
+        var seen: u3 = 0;
+        var prev: u3 = 0;
+        var x: i32 = nx - 4; // 命中窗口左端
+        while (x <= nx + w + 4) : (x += 1) {
+            const ord: u3 = switch (noteHitMode(nx, w, x)) {
+                .left => 1,
+                .body => 2,
+                .right => 4,
+            };
+            try std.testing.expect(ord >= prev); // 单调不减：不会中→左、右→中这样穿插
+            seen |= ord;
+            prev = ord;
+        }
+        try std.testing.expectEqual(@as(u3, 7), seen); // 左 / 中 / 右 都存在
+    }
 }

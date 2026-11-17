@@ -16,6 +16,13 @@ fn clipLayerLess(clips: []const model.Clip, a: usize, b: usize) bool {
     return a < b;
 }
 
+/// 片段命中容差（像素）：与钢琴卷帘的 `note_hit_tol_px` 同值、同思路
+/// （1 步的小片段在低缩放下只有 1px，鼠标根本“站”不上去）。
+const clip_hit_tol_px: i32 = 4;
+
+/// 边缘热区在**片段体内**那侧的宽度（像素）；窄片段不用这个值，见 `clipHitMode`。
+const clip_edge_px: i32 = 8;
+
 /// `step_px`：一步的**内容像素宽**（浮点；U=96 下每步很小）。
 pub fn clipXW(c: model.Clip, lane_x: i32, step_px: f32, scroll_x: i32, zoom: f32) struct { x: i32, w: i32 } {
     const x0: f32 = (@as(f32, @floatFromInt(c.start)) * step_px - @as(f32, @floatFromInt(scroll_x))) * zoom;
@@ -23,6 +30,61 @@ pub fn clipXW(c: model.Clip, lane_x: i32, step_px: f32, scroll_x: i32, zoom: f32
     const px0 = lane_x + @as(i32, @intFromFloat(@round(x0)));
     const px1 = lane_x + @as(i32, @intFromFloat(@round(x1)));
     return .{ .x = px0, .w = @max(1, px1 - px0) };
+}
+
+/// 片段命中**分区**（左缘拉伸 / 移动 / 右缘拉伸）——与钢琴卷帘的 `noteHitMode` **同一套规则**：
+///
+/// - **常规宽度**（本体 ≥ `3 × clip_edge_px` = 24px）：左右各 8px 边缘热区，中间全是移动；
+/// - **窄片段**（< 24px）：两道 8px 热区会重叠 → 把**命中窗口**（本体 ± 容差）**三等分**，
+///   左 ⅓ = 拉左缘（改 `offset`/`trim_start`，内容头跟着折开）、中 ⅓ = 移动、右 ⅓ = 拉右缘。
+fn clipHitMode(rx: i32, rw: i32, mouse_x: i32) model.ClipHitMode {
+    const w = @max(1, rw);
+    if (w >= 3 * clip_edge_px) {
+        if (mouse_x <= rx + clip_edge_px) return .left;
+        if (mouse_x >= rx + w - clip_edge_px) return .right;
+        return .body;
+    }
+    const lo = rx - clip_hit_tol_px;
+    const span = w + 2 * clip_hit_tol_px;
+    const edge = @max(1, @divTrunc(span, 3));
+    if (mouse_x < lo + edge) return .left;
+    if (mouse_x >= lo + span - edge) return .right;
+    return .body;
+}
+
+/// 鼠标处的**片段命中**（像素邻近）。返回片段下标（调用方不能再按 `(track,step)` 反查）。
+///
+/// 1. 鼠标**确实**落在某个片段所占的步上 → 走老的 `topmostClipAt`（叠放取顶层），
+///    **既有手感与“连点轮换”零变化**；
+/// 2. 否则退到像素容差：本体矩形（至少 1px）± `clip_hit_tol_px` 内取**中心最近**者，
+///    等距取更上层（`clipLayerLess`）——这样 1px 宽的小片段也能 hover / 按下 / 拉边。
+fn clipAtMousePx(
+    app: *const App,
+    mx: i32,
+    step_i: i32,
+    track: i32,
+    lane_x: i32,
+    step_px: f32,
+    scroll_x: i32,
+    zoom: f32,
+) ?usize {
+    if (model.topmostClipAt(app.clips.items, track, step_i)) |ci| return ci;
+    const mxf: f32 = @floatFromInt(mx);
+    var best: ?usize = null;
+    var best_d: f32 = std.math.floatMax(f32);
+    for (app.clips.items, 0..) |c, i| {
+        if (c.track != track) continue;
+        const rect = clipXW(c, lane_x, step_px, scroll_x, zoom);
+        const lo: f32 = @as(f32, @floatFromInt(rect.x - clip_hit_tol_px));
+        const hi: f32 = @as(f32, @floatFromInt(rect.x + rect.w - 1 + clip_hit_tol_px));
+        if (mxf < lo or mxf > hi) continue;
+        const d: f32 = @abs(mxf - (@as(f32, @floatFromInt(rect.x)) + @as(f32, @floatFromInt(rect.w)) * 0.5));
+        if (d < best_d or (d == best_d and (best == null or clipLayerLess(app.clips.items, best.?, i)))) {
+            best_d = d;
+            best = i;
+        }
+    }
+    return best;
 }
 
 /// 步 → 屏幕像素 x（**绝对**坐标：与 `clipXW` 的取整规则完全一致）
@@ -896,29 +958,19 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         }
     }
 
-    // 命中：鼠标下的片段 + 命中模式（中部 / 左缘 / 右缘，边缘区 8px）
+    // 命中：鼠标下的片段 + 命中模式（左缘 / 中部 / 右缘，见 `clipHitMode`）
     // 注：框选手势期间不命中（框选优先）
     var clip_hit: ?struct { index: usize, mode: model.ClipHitMode } = null;
     // 拖动/拉伸进行中不重新命中（模型位置未变，会让另一个片段"假悬停"）
     const drag_busy = app.playlist.drag_clip != null or app.playlist.resize_clip != null or
         app.playlist.drag_batch or app.playlist.batch_trim;
     if (in_lane and valid_track and !app.playlist.marquee_active and !ui.mods_ctrl and !drag_busy) {
-        // 叠放（用户拍板）：命中取**最顶层**（左端越右越上；同左端取数组序最大）
-        if (model.topmostClipAt(app.clips.items, track_i, step_i)) |ci| {
+        // **像素邻近命中**（见 `clipAtMousePx`）：落在片段所占的步上仍走叠放取顶层（零变化），
+        // 偏出一点（±4px 容差）也算命中——1px 宽的小片段因此也能 hover / 按下 / 拉边。
+        if (clipAtMousePx(app, ui.mouse_x, step_i, track_i, lane_x, step_px, app.playlist.scroll_x, zoom)) |ci| {
             const c = app.clips.items[ci];
             const rect = clipXW(c, lane_x, step_px, app.playlist.scroll_x, zoom);
-            const near_left = ui.mouse_x <= rect.x + 8;
-            const near_right = ui.mouse_x >= rect.x + rect.w - 8;
-            const mode: model.ClipHitMode = if (near_left and near_right)
-                // 窄片段两缘都近：按鼠标在片段内的相对位置就近选
-                (if (ui.mouse_x - rect.x <= rect.x + rect.w - ui.mouse_x) .left else .right)
-            else if (near_left)
-                .left
-            else if (near_right)
-                .right
-            else
-                .body;
-            clip_hit = .{ .index = ci, .mode = mode };
+            clip_hit = .{ .index = ci, .mode = clipHitMode(rect.x, rect.w, ui.mouse_x) };
         }
     }
 
@@ -960,9 +1012,12 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // **起点在空白网格 → 按住拖动 = 擦除划过的一切**（划过即删；与旧行为相同）
     // **点在空白处**（没命中片段）→ 取消选区（与左键点空白的语义一致）
     if (ui.mouse_right_pressed and ui.hitRect(main_x, tracks_y, main_w, tracks_h)) {
-        if (clip_hit != null) {
+        if (clip_hit) |ch| {
             app.playlist.erase_drag = false; // 起点有内容：拖动不再擦
-            if (app.eraseClipsAt(track_i, step_i, .topmost) > 0) {
+            // 用**命中片段自己的 (轨道, 左端步)** 去套叠放擦除——像素命中只负责“指向哪个片段”，
+            // 叠放语义仍由 `eraseClipsAt` 提供（与钢琴卷帘的音符擦除同一套写法）。
+            const hc = app.clips.items[ch.index];
+            if (app.eraseClipsAt(hc.track, hc.start, .topmost) > 0) {
                 app.playlist.drag_clip = null;
                 app.playlist.resize_clip = null;
                 app.history_pending = "擦除片段";
@@ -1738,6 +1793,78 @@ test "playlist: hitAt——落点换算（轨道行/吸附/缩放/滚动；区�
     try std.testing.expect(hitAt(&app, 120, 40) == null); // tracks_y 上方
     try std.testing.expect(hitAt(&app, 120, 50 + 300 + 1) == null); // tracks_h 下方
     try std.testing.expect(hitAt(&app, 100 + 400, 60) == null); // view_w 右侧
+}
+
+test "playlist: 命中容差 + 三区——1px 小片段也能 hover / 分段拉边 / 拖动" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+
+    // 手工几何：1 步 = 1px、zoom 1、无滚动 → rect.x = start、rect.w = len（好算）
+    const lane_x: i32 = 0;
+    const step_px: f32 = 1.0;
+    const scroll_x: i32 = 0;
+    const zoom: f32 = 1.0;
+    app.clips.append(alloc, .{ .track = 0, .start = 100, .len = 1, .pattern = 0 }) catch {};
+    app.clips.append(alloc, .{ .track = 1, .start = 100, .len = 1, .pattern = 0 }) catch {}; // 另一轨（应永不命中）
+
+    // 本身就是 1px：rect = { x = 100, w = 1 }
+    const r = clipXW(app.clips.items[0], lane_x, step_px, scroll_x, zoom);
+    try std.testing.expectEqual(@as(i32, 100), r.x);
+    try std.testing.expectEqual(@as(i32, 1), r.w);
+
+    // **落在片段步上**：走老的 `topmostClipAt`（零行为变化）
+    try std.testing.expectEqual(@as(?usize, 0), clipAtMousePx(&app, 100, 100, 0, lane_x, step_px, scroll_x, zoom));
+    // **偏出 ±4px 也算命中**（旧实现这里是 miss）
+    try std.testing.expectEqual(@as(?usize, 0), clipAtMousePx(&app, 96, 96, 0, lane_x, step_px, scroll_x, zoom));
+    try std.testing.expectEqual(@as(?usize, 0), clipAtMousePx(&app, 104, 104, 0, lane_x, step_px, scroll_x, zoom));
+    // 超过容差 → miss（window = [96, 104]）
+    try std.testing.expect(clipAtMousePx(&app, 95, 95, 0, lane_x, step_px, scroll_x, zoom) == null);
+    try std.testing.expect(clipAtMousePx(&app, 105, 105, 0, lane_x, step_px, scroll_x, zoom) == null);
+    // 别的轨道上的同位置片段不会抢命中
+    try std.testing.expectEqual(@as(?usize, 0), clipAtMousePx(&app, 103, 103, 0, lane_x, step_px, scroll_x, zoom));
+
+    // 叠放：同一位置两个片段 → 容差区内等距 → 取**更上层**（数组序更大）
+    app.clips.append(alloc, .{ .track = 0, .start = 100, .len = 1, .pattern = 0 }) catch {};
+    try std.testing.expectEqual(@as(?usize, 2), clipAtMousePx(&app, 104, 104, 0, lane_x, step_px, scroll_x, zoom));
+    // 落在步上仍取顶层（与旧规则一致）
+    try std.testing.expectEqual(@as(?usize, 2), clipAtMousePx(&app, 100, 100, 0, lane_x, step_px, scroll_x, zoom));
+
+    // 三区（1px 宽）：命中窗口 9px → 左 3 / 中 3 / 右 3
+    try std.testing.expectEqual(model.ClipHitMode.left, clipHitMode(r.x, r.w, 96));
+    try std.testing.expectEqual(model.ClipHitMode.left, clipHitMode(r.x, r.w, 98));
+    try std.testing.expectEqual(model.ClipHitMode.body, clipHitMode(r.x, r.w, 99));
+    try std.testing.expectEqual(model.ClipHitMode.body, clipHitMode(r.x, r.w, 100));
+    try std.testing.expectEqual(model.ClipHitMode.body, clipHitMode(r.x, r.w, 101));
+    try std.testing.expectEqual(model.ClipHitMode.right, clipHitMode(r.x, r.w, 102));
+    try std.testing.expectEqual(model.ClipHitMode.right, clipHitMode(r.x, r.w, 104));
+
+    // 常规宽度（≥ 24px）：左右各 8px，中间移动
+    try std.testing.expectEqual(model.ClipHitMode.left, clipHitMode(100, 48, 108));
+    try std.testing.expectEqual(model.ClipHitMode.body, clipHitMode(100, 48, 109));
+    try std.testing.expectEqual(model.ClipHitMode.body, clipHitMode(100, 48, 139));
+    try std.testing.expectEqual(model.ClipHitMode.right, clipHitMode(100, 48, 140));
+
+    // **穷举 1..64px**：三区都在，且只能按“左 → 中 → 右”出现（不交叉）
+    var w: i32 = 1;
+    while (w <= 64) : (w += 1) {
+        var seen: u3 = 0;
+        var prev: u3 = 0;
+        var x: i32 = 100 - clip_hit_tol_px;
+        while (x <= 100 + w + clip_hit_tol_px) : (x += 1) {
+            const ord: u3 = switch (clipHitMode(100, w, x)) {
+                .left => 1,
+                .body => 2,
+                .right => 4,
+            };
+            try std.testing.expect(ord >= prev);
+            seen |= ord;
+            prev = ord;
+        }
+        try std.testing.expectEqual(@as(u3, 7), seen);
+    }
 }
 
 test "playlist: 片段内音符预览——拖左右边缘时逐像素不抖（绝对步换算）" {
