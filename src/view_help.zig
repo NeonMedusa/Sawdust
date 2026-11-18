@@ -10,8 +10,9 @@ const util = @import("view_util.zig");
 const window_mod = @import("window.zig");
 
 const title_h: i32 = 22;
-const min_w: i32 = 430;
-const min_h: i32 = 260;
+const min_w: i32 = 360;
+// 可滚动 + 可拉伸 → 允许缩得很小（缩放很大时逻辑屏幕也会很小）
+const min_h: i32 = 180;
 const row_h: i32 = 21;
 /// 键位列宽（说明列从 `key_w` 之后开始）
 const key_w: i32 = 170;
@@ -96,8 +97,38 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         }
     }
 
-    // 内容：两列（键位 / 说明），节标题用强调色
-    var yy = y + title_h + 10;
+    // 右下角缩放柄（同设置页/机架窗：三角形区 + 拖动改尺寸）
+    const grip = 14;
+    const grip_hovered = util.hitUI(ui, x + ww - grip, y + hh - grip, grip, grip);
+    if (grip_hovered) ui.cursor = .resize_h;
+    if (grip_hovered and ui.mouse_pressed) {
+        ui.active_id = 9501;
+        hw.resize_w0 = ww;
+        hw.resize_h0 = hh;
+        hw.resize_mx = ui.mouse_x;
+        hw.resize_my = ui.mouse_y;
+    }
+    if (ui.active_id == 9501) {
+        if (!ui.mouse_down) {
+            ui.active_id = 0;
+        } else {
+            hw.w = hw.resize_w0 + (ui.mouse_x - hw.resize_mx);
+            hw.h = hw.resize_h0 + (ui.mouse_y - hw.resize_my);
+        }
+    }
+    ui.renderer.line(x + ww - 10, y + hh - 2, x + ww - 2, y + hh - 10, ui.theme.panel_border);
+
+    // 内容：两列（键位 / 说明），节标题用强调色。
+    // **可滚动**：标题栏固定，内容区裁剪 + 滚轮（以前靠“窗口高刚刚好”，加两行就露尾巴）。
+    const content_top = y + title_h + 1;
+    const content_vis: i32 = hh - title_h - 1;
+    const max_scroll: i32 = @max(0, hw.content_h - content_vis);
+    if (util.hitUI(ui, x + 1, content_top, ww - 2, content_vis)) {
+        hw.scroll = std.math.clamp(hw.scroll - ui.wheel * 28, 0, max_scroll);
+    }
+    hw.scroll = std.math.clamp(hw.scroll, 0, max_scroll);
+    const saved_clip = ui.renderer.pushClip(x + 1, content_top, ww - 2, content_vis);
+    var yy = content_top + 10 - hw.scroll;
     for (&rows) |r| {
         if (r.sec) {
             yy += 6;
@@ -106,7 +137,6 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
             ui.renderer.hline(x + 12, yy - 5, ww - 24, ui.theme.panel_border);
             continue;
         }
-        if (yy + row_h > y + hh - 8) break; // 装不下：后面的行不画（拉大窗口可见）
         ui.label(r.key, x + 20, yy, ui.theme.text);
         if (r.link) {
             // 链接行：悬停高亮 + 下划线（链接外观）+ 单击 → 系统浏览器
@@ -123,6 +153,9 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         }
         yy += row_h;
     }
+    ui.renderer.popClip(saved_clip);
+    // 内容总高：与 scroll 无关（yy 已被 scroll 偏移过，加回来才不变）
+    hw.content_h = (yy - content_top) + hw.scroll + 12;
 
     return util.inRect(ui.mouse_x, ui.mouse_y, x, y, ww, hh);
 }

@@ -25,6 +25,11 @@
 | v8 | 音符/片段静音 `muted`（静音体系那一轮） | `×40` + `muted` 缺失 → `false` |
 | **v9（当前）** | **自动化整套**（`auto_lanes`/`auto_bindings`/`auto_sel`）+ `SavedBinding.smooth_ms·invert·param_id·target_slot` + `SavedInstrument/SavedMixerChannel/SavedEffectSlot/SavedDrumLayer.uid` + **单位 U 96→3840** + **清格式**（删 5 个死字段、`bpm` 改 f32、删 JSON 通道） | 不发迁移（已是新单位） |
 
+> **v9 已随正式版发布 → 格式冻结**。旧档已经在用户手上，所以：
+> - **只加字段**（旧档填默认）→ 仍旧登记 `introducedVersion = 9`，不必抬版；
+> - **其他任何改动**（改语义、调顺序、删字段、改类型）→ **必须抬到 `binary_version = 10`**
+>   并写 `v9→v10` 迁移函数。
+
 > 关键事实（免得再误判“空造版本”）：**v6/v7/v8 都是 main 真实发布过的**（v18 写 v8）。
 > automation 分支只新增了 **v9** 一个版本。读 v5–v8 时的 ×40 与字段默认值全在
 > `fromBinary` 一个入口里（`ver < 9 → migrateUnitsToV5`），**没有逐版本补丁函数**——

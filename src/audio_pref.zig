@@ -1,8 +1,10 @@
-//! 音频输出偏好（`<data_root>/audio.txt`）。
+//! 音频输出偏好（**纯内存**；持久化在 `settings.json` 的 `audio_backend` / `audio_device`）。
 //!
-//! 设置页与主循环都要访问本模块；音频引擎只在启动时读取，因此改后端或设备都在
-//! 下次启动生效。设备以名称保存：设备 ID 是后端私有的二进制联合体，跨重启/驱动
-//! 更新并不稳定；找不到同名设备时引擎会安全回退到系统默认设备。
+//! 设置页与主循环都要访问本模块；音频引擎只在启动时读取，因此改**后端**要重启生效；
+//! 同一后端内改**设备**由引擎立即重开。设备以**名称**保存：设备 ID 是后端私有的二进制
+//! 联合体，跨重启/驱动更新并不稳定；找不到同名设备时引擎会安全回退到系统默认设备。
+//!
+//! 注：早期版本写 `<data_root>/audio.txt`；现在全部设置都在 `settings.json`，旧文件不再读写。
 
 const std = @import("std");
 
@@ -88,12 +90,17 @@ pub fn requestDevice(name: []const u8) void {
     saved = false;
 }
 
-fn prefPath(buf: []u8, data_root: []const u8) ?[]const u8 {
-    return std.fmt.bufPrint(buf, "{s}/audio.txt", .{data_root}) catch null;
+/// 从 `settings.json` 装填（启动时一次；`device` 空 = 系统默认）
+pub fn fromSettings(backend: i32, device: []const u8) void {
+    var s = Selection{ .backend = backendFromInt(backend) };
+    s.setDevice(device);
+    current = s;
+    pending = null;
+    saved = false;
 }
 
-fn parseBackend(s: []const u8) Backend {
-    const n = std.fmt.parseInt(u8, std.mem.trim(u8, s, " \t\r\n"), 10) catch return .auto;
+/// `settings.json` 里的整数 → 后端（未知值 → 自动）
+pub fn backendFromInt(n: i32) Backend {
     return switch (n) {
         1 => .pulse,
         2 => .alsa,
@@ -102,48 +109,26 @@ fn parseBackend(s: []const u8) Backend {
     };
 }
 
-/// 兼容旧版仅存一行数字的文件；新版是 `backend=N` + `device=名称` 两行。
-fn parse(data: []const u8) Selection {
-    var out = Selection{};
-    const trimmed = std.mem.trim(u8, data, " \t\r\n");
-    if (!std.mem.startsWith(u8, trimmed, "backend=")) {
-        out.backend = parseBackend(trimmed);
-        return out;
-    }
-    var lines = std.mem.splitScalar(u8, trimmed, '\n');
-    while (lines.next()) |raw| {
-        const line = std.mem.trimEnd(u8, raw, "\r");
-        if (std.mem.startsWith(u8, line, "backend=")) out.backend = parseBackend(line["backend=".len..]);
-        if (std.mem.startsWith(u8, line, "device=")) out.setDevice(line["device=".len..]);
-    }
-    return out;
+/// 落盘用的整数（与 `backendFromInt` 互逆）
+pub fn backendToInt(b: Backend) i32 {
+    return @backingInt(b);
 }
 
-pub fn load(io: std.Io, data_root: []const u8) void {
-    var pbuf: [1024]u8 = undefined;
-    const p = prefPath(&pbuf, data_root) orelse return;
-    const data = std.Io.Dir.cwd().readFileAlloc(io, p, std.heap.page_allocator, .limited(512)) catch return;
-    defer std.heap.page_allocator.free(data);
-    current = parse(data);
-}
-
-pub fn save(io: std.Io, data_root: []const u8) void {
-    var pbuf: [1024]u8 = undefined;
-    const p = prefPath(&pbuf, data_root) orelse return;
-    var text: [320]u8 = undefined;
-    const data = std.fmt.bufPrint(&text, "backend={d}\ndevice={s}\n", .{ @backingInt(current.backend), current.deviceName() }) catch return;
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = p, .data = data }) catch return;
-}
-
-test "音频偏好：旧格式与设备选择" {
+test "音频偏好：设置值 ↔ 后端、设备名称" {
     const testing = std.testing;
-    const old = parse("3\n");
-    try testing.expectEqual(Backend.jack, old.backend);
-    try testing.expectEqualStrings("", old.deviceName());
+    try testing.expectEqual(Backend.jack, backendFromInt(3));
+    try testing.expectEqual(Backend.auto, backendFromInt(99));
+    try testing.expectEqual(@as(i32, 2), backendToInt(.alsa));
 
-    const now = parse("backend=2\ndevice=USB Audio\n");
-    try testing.expectEqual(Backend.alsa, now.backend);
-    try testing.expectEqualStrings("USB Audio", now.deviceName());
+    fromSettings(2, "USB Audio");
+    try testing.expectEqual(Backend.alsa, current.backend);
+    try testing.expectEqualStrings("USB Audio", current.deviceName());
+    // 很长的设备名被截断，且换行不破坏存储
+    var long_buf: [device_name_cap + 40]u8 = @splat('x');
+    long_buf[10] = '\n';
+    fromSettings(0, &long_buf);
+    try testing.expectEqual(@as(usize, device_name_cap), current.deviceName().len);
+    try testing.expect(std.mem.indexOfScalar(u8, current.deviceName(), '\n') == null);
 
     try testing.expectEqualStrings("JACK", label(.jack));
     try testing.expect(maBackend(.auto) == null);

@@ -14,7 +14,7 @@
 |---|---|
 | 构建工具 | Zig 0.17 |
 | 运行时库 | libX11、libXext、libXcursor、PulseAudio（或 PipeWire-Pulse） |
-| 字体 | 查找顺序：`<exe>/data/font.txt`（自选）→ **fontconfig**（尊重用户配置）→ 系统名单（Windows 微软雅黑 → Segoe UI → …；Linux 文泉驿微米黑 → Noto CJK → 思源黑体 → …）→ `<exe>/data/fonts/` → 任意一种系统字体。全找不到才报错并印安装命令 |
+| 字体 | 查找顺序：`settings.json` 的 `font_path`（设置页“选择字体文件…”）→ **fontconfig**（尊重用户配置）→ 系统名单（Windows 微软雅黑 → Segoe UI → …；Linux 文泉驿微米黑 → Noto CJK → 思源黑体 → …）→ `<exe>/data/fonts/` → 任意一种系统字体。全找不到才报错并印安装命令 |
 
 Debian/Ubuntu 一行装齐：
 ```bash

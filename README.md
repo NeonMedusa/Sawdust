@@ -91,8 +91,8 @@ scoop install sawdust
 - [ ] 性能打磨（长工程滚动、打开/保存耗时、内存峰值）
 - [x] 跨平台：**Linux（X11）已支持**（在 WSLg 上开发并验证，**尚未在真机 Linux 上实测**，见 [`docs/linux.md`](docs/linux.md)）；
   macOS 未开始
-- [x] **DPI 感知的 UI 缩放**（100%~300%；高分屏/系统缩放不再“全部很小”，见 [`docs/ui-scaling.md`](docs/ui-scaling.md)；
-  `SAWDUST_UI_SCALE=1.5` 可手动指定）
+- [x] **DPI 感知的 UI 缩放**（75%~400%，设置页可调、**立即生效**；高分屏/系统缩放不再“全部很小”，
+  Linux 自动检测 XSETTINGS → Xft.dpi → 环境变量，见 [`docs/ui-scaling.md`](docs/ui-scaling.md)）
 
 ## 已知问题（已确认、尚未修复）
 
@@ -105,6 +105,12 @@ scoop install sawdust
 - **自动化编辑器**：不能框选曲线上的点批量移动；“ALT + 鼠标划过画线”未实现；点数与同时生效
   绑定数受音频侧共享点池预算限制（**16384 点 / 64 条绑定**，超出会跳过并弹一次 Toast）。
   见 [`docs/automation.md`](docs/automation.md) §11.45。
+- **音高自动化未做**（**无法做颤音 / 滑音**）：自动化只能绑“有控件的东西”（推子/旋钮/参数行），
+  音高既无推子也无旋钮，右键菜单里无处可点。设计稿见
+  [`docs/automation.md`](docs/automation.md) §11.46（乐器音高偏移 cents + 自动化目标选择器）。
+- **钢琴卷帘 minimap 的音符预览会被截断**：一个样式 + 一个乐器超过 **512 个音符**时，minimap 只画前 512 个
+  （按音符创建顺序取），后写的音符看不见。原因与后续优化方向见
+  [`docs/resources.md`](docs/resources.md) §四第 8 条（块数上限 + 每帧全量重扫 + 按段聚合/增量重建）。
 - **Linux**：只在 WSLg 上开发验证过，**尚未在真机 Linux 上实测**。见 [`docs/linux.md`](docs/linux.md)。
 
 ## 构建与运行
@@ -193,7 +199,8 @@ zig translate-c -I libs/stb       libs/stb/stb_truetype.h    > src/c/stb_truetyp
 VST3 宿主见 `docs/plugin-hosting.md`；**Zig 0.17 迁移实录**见 `docs/zig-017-migration.md`；
 **播放中编辑的调度与释音协议**见 `docs/scheduler-protocol.md`（不变量 / 事件生命期 / 重扫门控 / 诊断字段）；
 **内存 / CPU / 二进制体积账本**见 `docs/resources.md`（池化现状 / 优化 backlog / 发布口径矩阵 / `.rodata` 初值镜像坑）；
-**UI 缩放（DPI）**见 `docs/ui-scaling.md`（逻辑像素单点乘算 / 字体按 DPI 光栅化 / 环境变量覆盖）；
+**UI 缩放（DPI）**见 `docs/ui-scaling.md`（逻辑像素单点乘算 / 字体按 DPI 光栅化 /
+设置页滑块 + 自动检测 / 改完立即生效且有 15 s 后悔窗口）；
 **拖动 / 吸附 / Alt 细调 / Ctrl+Q 绝对量化**见 `docs/drag-snap.md`（八条不变式 / `GridRebase` 量化与重锚 / 橡皮筋与饱和点 / 手势路径对照表 / §9 量化两步法）；
 **网格与时间分辨率（960 PPQN = U 3840）**见 `docs/units-3840.md`（四族网格档位 / 整除上限 / 存档 v9 迁移 / 实机问题录）；
 **命中判定**见 `docs/pianoroll-hit.md`（像素容差 `noteAtMousePx` / 边缘热区 / 手势帧序瞬移 / 播放列表片段命中与叠放轮换）；

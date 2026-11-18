@@ -16,9 +16,11 @@ const synth = @import("synth.zig");
 /// - v6：鼓组 VST3 层 / 音频片段 / 音频样式；
 /// - v7：`Project.instrument_order`（乐器显示顺序）；
 /// - v8：音符·片段静音 `muted`；
-/// - **v9**（当前，**未正式发布**）：自动化整套 + `SavedBinding.smooth_ms/invert/param_id`
+/// - **v9**（**已发布，格式冻结**）：自动化整套 + `SavedBinding.smooth_ms/invert/param_id`
 ///   + `SavedInstrument/SavedMixerChannel.uid` + 时间分辨率 U 96→3840（步域 ×40）
 ///   + **清格式**（删掉 `removed_fields` 那张表里的字段）。
+///   **v9 已随正式版发布在外** → 除非只做“新增字段”（登记 `introducedVersion = 9`，
+///   旧档填默认值），否则**下次改格式必须抬到 v10**（并写 v9→v10 迁移）。
 ///
 /// **不变量**：任何 `Saved*`/`Project` 字段增删/调序**必须**跟上：
 /// 新增 → 登记 `introducedVersion`；删除 → 登记 `removed_fields`。
@@ -437,7 +439,8 @@ pub fn importSynth(s: *const SavedSynth, p: *synth.SynthParams) void {
     }
 }
 
-/// 应用设置（数据目录下 `settings.json`；缺失/损坏 → 默认值）
+/// 应用设置（数据目录下 `settings.json`；缺失/损坏 → 默认值）。
+/// **所有用户可见的设置都在这里**（早期散在 `audio.txt` / `font.txt`，已废弃）。
 pub const Settings = struct {
     /// 启动时打开上次工程（false = 新建空工程）
     open_last: bool = false,
@@ -445,6 +448,16 @@ pub const Settings = struct {
     fps: i32 = 120,
     /// 上次打开/保存的工程路径（仅落盘；运行时真身在 `App.project_path`）
     last_project: []const u8 = "",
+    /// **UI 缩放**：true = 每次启动自动检测（阶梯见 `src/dpi.zig`）；false = 用 `ui_scale`
+    ui_scale_auto: bool = true,
+    /// 固定缩放倍率（自动期间也保留着，取消自动就回到它）
+    ui_scale: f32 = 1.0,
+    /// 音频后端：0 自动 / 1 PulseAudio / 2 ALSA / 3 JACK（见 `audio_pref.Backend`）
+    audio_backend: i32 = 0,
+    /// 音频输出设备名（"" = 系统默认）
+    audio_device: []const u8 = "",
+    /// 自选字体文件路径（"" = 自动探测：fontconfig → 系统名单 → data/fonts/）
+    font_path: []const u8 = "",
 };
 
 /// 设置 → JSON（归调用方释放）
@@ -463,18 +476,36 @@ pub fn settingsFromJson(allocator: std.mem.Allocator, data: []const u8) !std.jso
 
 test "persist: 设置 JSON 往返（含路径转义；未知字段忽略、缺字段补齐）" {
     const allocator = std.testing.allocator;
-    const json = try settingsToJson(allocator, .{ .open_last = true, .fps = 90, .last_project = "C:\\Music\\曲.saw" });
+    const json = try settingsToJson(allocator, .{
+        .open_last = true,
+        .fps = 90,
+        .last_project = "C:\\Music\\曲.saw",
+        .ui_scale_auto = false,
+        .ui_scale = 1.5,
+        .audio_backend = 2,
+        .audio_device = "USB Audio",
+        .font_path = "C:\\Fonts\\mi.ttf",
+    });
     defer allocator.free(json);
     var parsed = try settingsFromJson(allocator, json);
     defer parsed.deinit();
     try std.testing.expect(parsed.value.open_last);
     try std.testing.expectEqual(@as(i32, 90), parsed.value.fps);
     try std.testing.expectEqualStrings("C:\\Music\\曲.saw", parsed.value.last_project);
+    try std.testing.expect(!parsed.value.ui_scale_auto);
+    try std.testing.expectEqual(@as(f32, 1.5), parsed.value.ui_scale);
+    try std.testing.expectEqual(@as(i32, 2), parsed.value.audio_backend);
+    try std.testing.expectEqualStrings("USB Audio", parsed.value.audio_device);
+    try std.testing.expectEqualStrings("C:\\Fonts\\mi.ttf", parsed.value.font_path);
 
-    // 未知字段忽略；缺字段 → 默认值
+    // 未知字段忽略；缺字段 → 默认值（老 settings.json 照旧能读）
     var parsed2 = try settingsFromJson(allocator, "{\"fps\":60,\"future\":123}");
     defer parsed2.deinit();
     try std.testing.expectEqual(@as(i32, 60), parsed2.value.fps);
+    try std.testing.expect(parsed2.value.ui_scale_auto);
+    try std.testing.expectEqual(@as(f32, 1.0), parsed2.value.ui_scale);
+    try std.testing.expectEqual(@as(i32, 0), parsed2.value.audio_backend);
+    try std.testing.expectEqualStrings("", parsed2.value.font_path);
     try std.testing.expect(!parsed2.value.open_last);
     try std.testing.expectEqualStrings("", parsed2.value.last_project);
 }

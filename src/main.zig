@@ -22,6 +22,7 @@ const synth = @import("synth.zig");
 const sequencer = @import("sequencer.zig");
 const model = @import("model.zig");
 const persist = @import("persist.zig");
+const dpi = @import("dpi.zig");
 const midi = @import("midi.zig");
 const filedialog = @import("filedialog.zig");
 const util = @import("view_util.zig");
@@ -85,30 +86,41 @@ pub fn main(init: std.process.Init) !u8 {
     defer if (picker) |*pk| pk.deinit();
 
     var win: window.Window = undefined;
-    // **UI 缩放（DPI）**：环境变量 `SAWDUST_UI_SCALE` 可强制覆盖（无 DPI 的环境 / WSLg /
-    // 系统 DPI 探测不准时想手动指定——包括 `=1` 强制关掉自动缩放）。
-    // 启动时采样一次；改缩放需重开程序。
-    const env_scale: ?f32 = blk: {
-        if (std.c.getenv("SAWDUST_UI_SCALE")) |sv| {
-            if (std.fmt.parseFloat(f32, std.mem.span(sv))) |v| {
-                if (v >= 0.75 and v <= 4.0) break :blk v;
-            } else |_| {}
-        }
-        break :blk null;
-    };
     try win.init(allocator, "Sawdust — Simple Audio Workstation", 1280, 760);
     defer win.deinit();
-    // 未显式指定 → 按后端 DPI 推导（Windows: GetDpiForWindow；X11: Xft.dpi / 屏幕尺寸）
-    const scale: f32 = env_scale orelse std.math.clamp(win.dpiScale(), 1.0, 3.0);
+
+    // **设置必须最早读**：UI 缩放固定值 / 字体路径 / 音频输出都在 `settings.json` 里，
+    // 而它们都得在**加载字体**和**初始化音频引擎**之前就位。数据根只是路径探测
+    // （`<exe>/data`），不需要 App 实例。
+    var edir_buf: [1024]u8 = undefined;
+    const exe_dir = exeDir(allocator, io, &edir_buf);
+    var root_buf: [512]u8 = undefined;
+    const data_root: []const u8 = preset_mod.resolveDataRoot(io, exe_dir, &root_buf) orelse "";
+
+    var settings_parsed: ?std.json.Parsed(persist.Settings) = null;
+    defer if (settings_parsed) |*sp| sp.deinit();
+    settings_parsed = loadSettingsRaw(allocator, io, data_root);
+    const st: persist.Settings = if (settings_parsed) |*sp| sp.value else .{};
+
+    // **UI 缩放**：勾了“自动”就按平台阶梯检测（`src/dpi.zig`），否则用设置里的固定值。
+    // 桌面改缩放时**实时跟随**（仅自动模式）：窗口后端把属性变化置标记，主循环重算。
+    var dpi_raw = dpi.Raw{};
+    dpi.fillEnv(&dpi_raw);
+    win.dpiRaw(&dpi_raw);
+    win.watchDpi();
+    var dpi_res = if (st.ui_scale_auto) dpi.fromRaw(dpi_raw) else dpi.Result{
+        .scale = std.math.clamp(st.ui_scale, dpi.min_scale, dpi.max_scale),
+        .source = .settings,
+    };
     // 字体按缩放后字号加载（字形位图一次到位，避免位图放大发糊）
-    var font = loadFont(allocator, io, scale) catch |e| {
+    var font = loadFont(allocator, io, dpi_res.scale, st.font_path) catch |e| {
         std.debug.print("字体加载失败（{s}）\n", .{@errorName(e)});
         return 1;
     };
     defer font.deinit();
     // 初始窗口按**逻辑尺寸** 1280×760 重新落地（物理尺寸由后端按 scale 换算，并夹到屏幕内）：
     // 建窗前还不知道真实 DPI，所以先开一个“物理 1280×760”，拿到 scale 后再校正。
-    win.setClientSizeLogical(1280, 760, scale);
+    win.setClientSizeLogical(1280, 760, dpi_res.scale);
 
     var app = App{ .allocator = allocator };
     app.attachIo(io); // 0.17：异步导入的 worker 用 futex 等活，需要进程 Io
@@ -121,12 +133,9 @@ pub fn main(init: std.process.Init) !u8 {
     defer app.deinitAll();
     app.resetPatterns(1); // 空工程基线：只有样式 1（不再铺 6 个演示样式）；轨道行跨度自动推导
     app.resetMixerChannels(@import("app.zig").default_mixer_channels); // 默认调音台通道（主通道 + 通道#1）
-    // 数据目录（预设库）+ 首次扫描（IO 统一在帧末 pending 处理）
+    // 数据目录已在启动最前面解析（设置文件在那里）；这里装填 + 首次扫描
     {
-        var edir_buf: [1024]u8 = undefined;
-        const edir = exeDir(allocator, io, &edir_buf);
-        var root_buf: [512]u8 = undefined;
-        if (preset_mod.resolveDataRoot(io, edir, &root_buf)) |root| app.setDataRoot(root);
+        app.setDataRoot(data_root);
         app.pending_preset = .scan;
     }
     // 插件管理数据（配置 + 缓存；**只读加载，从不自动扫描**）
@@ -140,7 +149,10 @@ pub fn main(init: std.process.Init) !u8 {
         app.plugin_mgr.open = true;
         app.pending_scan_start = true;
     }
-    loadSettings(&app, io); // 设置（settings.json；缺失 = 默认）+ 启动打开上次工程
+    loadSettings(&app, st); // fps / 打开上次工程 / UI 缩放状态 / 字体路径
+    // 实际生效值：自动 = 检测值；固定 = settings 里的 ui_scale（字体已按它加载过）
+    app.ui_scale = dpi_res.scale;
+    app.setDetectedScale(dpi_res);
     // 初始片段（空基线）：样式 1 放在 Track 1 的最左边（长度 = 样式有效长度）
     app.addClip(.{
         .track = 0,
@@ -154,7 +166,7 @@ pub fn main(init: std.process.Init) !u8 {
     app.resetHistory("初始状态"); // 空基线 = 历史基线（脏标记由历史派生）
     app.params.events = &app.events;
 
-    audio_pref.load(io, app.dataRoot()); // 音频后端偏好（data/audio.txt）
+    audio_pref.fromSettings(st.audio_backend, st.audio_device); // 音频后端/设备（来自 settings.json）
     app.engine.init(&app.params, allocator) catch |e| {
         std.debug.print("音频初始化失败（{s}）：UI 仍可运行\n", .{@errorName(e)});
     };
@@ -196,6 +208,33 @@ pub fn main(init: std.process.Init) !u8 {
         app.tickToast(app.frame_dt_ns); // 状态栏提示递减（按实际流逝）
         app.tickCursorSmooth(); // 游标平滑（渲染帧推进；音频缓冲量化不显——实测“游标还是抖”的根因）
         schedLogTick(&app, io); // 调度诊断（仅 SAWDUST_SCHED_LOG 时生效；每秒一行汇总）
+
+        // ── UI 缩放：**每帧从 App 取**（改它就是立即生效）——
+        // 从今以后的 `scale` 都是本帧值，旧代码一行不用改。
+        const scale: f32 = app.ui_scale;
+        // 字形图集按新缩放重建（唯一需要重建的东西：位图是按 16×scale 光栅化的）
+        if (app.font_dirty) {
+            app.font_dirty = false;
+            if (loadFont(allocator, io, scale, app.fontPath())) |nf| {
+                font.deinit();
+                font = nf;
+                ui.font = &font;
+            } else |e| {
+                app.setToastWith("重建字体失败（{s}）", .{@errorName(e)});
+            }
+        }
+        // 缩放确认倒计时：超时 → 自动回到改之前的倍率
+        if (app.tickScaleConfirm(app.frame_dt_ns)) app.setToast("已恢复原来的界面缩放");
+        // **桌面改缩放实时跟随**（仅“自动”模式）：X11/Wayland-X 属性变了 → 重新检测
+        if (app.ui_scale_auto and win.takeDpiDirty()) {
+            var raw2 = dpi.Raw{};
+            dpi.fillEnv(&raw2);
+            win.dpiRaw(&raw2);
+            dpi_res = dpi.fromRaw(raw2);
+            app.setDetectedScale(dpi_res);
+            // 外部（桌面）的明确意图 → 直接应用，不弹确认条
+            app.applyUiScale(dpi_res.scale, false);
+        }
 
         // ── 脏确认流程（自绘模态；**不用系统 MessageBox**——
         // 系统弹窗会把鼠标吸到默认按钮上，实测体验差）──
@@ -554,6 +593,16 @@ pub fn main(init: std.process.Init) !u8 {
                     }
                     if (app.export_options_win.open) {
                         if (k.code == 0x1B) app.export_options_win.open = false;
+                        continue;
+                    }
+                    // **缩放确认条**：Enter/空格 = 保持，Esc = 恢复（不依赖鼠标——
+                    // 缩错了按钮可能不在可视区，但键盘永远能操作）。
+                    if (app.scale_confirm != null) {
+                        switch (k.code) {
+                            0x0D, 0x20 => app.keepUiScale(),
+                            0x1B => app.revertUiScale(),
+                            else => {},
+                        }
                         continue;
                     }
                     // 模态确认框优先捕获键盘
@@ -1022,6 +1071,8 @@ pub fn main(init: std.process.Init) !u8 {
         }
         // 导出格式面板（模态；文件选择前先选格式与质量）
         if (app.export_options_win.open) drawExportOptionsDialog(&ui, &app, io);
+        // 缩放确认条（立即生效后的 15 s 后悔窗口；浮在最上层，键盘 Enter/Esc 也能用）
+        if (app.scale_confirm != null) drawScaleConfirm(&ui, &app);
         // 导出进度窗（模态；置于最上层——导出期间其余元素均不可操作）
         if (app.export_wav != null) drawExportDialog(&ui, &app, io);
         // 文本输入框（最顶层——跨窗口/菜单，重命名乐器/通道用）
@@ -1152,7 +1203,7 @@ pub fn main(init: std.process.Init) !u8 {
                 // 换后端 = 重建 ma_context：仍按“重启后生效”
                 audio_pref.pending = null;
                 audio_pref.current = pb;
-                audio_pref.save(io, app.dataRoot());
+                app.settings_dirty = true; // 音频后端/设备现在也存在 settings.json 里
                 audio_pref.saved = true;
             } else if (app.export_wav != null) {
                 // 导出期间设备被独占停用：保留 pending，导出结束后再切
@@ -1160,7 +1211,7 @@ pub fn main(init: std.process.Init) !u8 {
                 audio_pref.pending = null;
                 if (app.engine.switchPlaybackDevice(pb.deviceName())) |_| {
                     audio_pref.current = pb;
-                    audio_pref.save(io, app.dataRoot());
+                    app.settings_dirty = true; // 同上：设置统一落 settings.json
                     audio_pref.saved = false; // 已立即生效，不再显示“重启后生效”
                     app.setToastWith("已切换输出设备：{s}", .{if (pb.deviceName().len == 0) "系统默认" else pb.deviceName()});
                 } else |e| {
@@ -1175,9 +1226,10 @@ pub fn main(init: std.process.Init) !u8 {
         if (font_info.reload_requested) {
             font_info.reload_requested = false;
             // 先加载新的，成功后再换（失败就继续用旧的，不让 UI 变空）
-            if (loadFont(allocator, io, scale)) |nf| {
+            if (loadFont(allocator, io, scale, app.fontPath())) |nf| {
                 font.deinit();
                 font = nf;
+                ui.font = &font;
             } else |_| {}
         }
 
@@ -3927,6 +3979,7 @@ fn dispatchPick(app: *App, io: std.Io, use_: app_mod.PickUse, path: []const u8) 
         .load_sample => |u| applySamplePath(app, u.instrument, u.pitch, u.layer, path),
         .relocate_instrument => |u| app.relocateInstrument(@intCast(u.index), path),
         .relocate_effect => |u| app.relocateEffect(u.ch, u.slot, path),
+        .font_file => app.setFontPath(path), // 换字体：帧首重建字形图集（不用重启）
     }
 }
 
@@ -4449,23 +4502,30 @@ fn finishPluginScan(app: *App, io: std.Io, exit_code: u32) void {
     _ = exit_code;
 }
 
-/// 读取设置（缺失/损坏 → 默认值，静默）。“启动打开上次工程”走既有
-/// `pending_open_path` 机制（首帧末自动执行；启动时 dirty=false 无确认弹窗）。
-fn loadSettings(app: *App, io: std.Io) void {
-    const spath = settingsPath(app) orelse return;
-    defer app.allocator.free(spath);
-    const data = std.Io.Dir.cwd().readFileAlloc(io, spath, app.allocator, .unlimited) catch return;
-    defer app.allocator.free(data);
-    var parsed = persist.settingsFromJson(app.allocator, data) catch return;
-    defer parsed.deinit();
-    app.settings_open_last = parsed.value.open_last;
-    app.fps_limit = std.math.clamp(parsed.value.fps, 30, 240);
-    if (parsed.value.open_last and parsed.value.last_project.len > 0) {
-        app.setPendingOpen(parsed.value.last_project);
-    }
+/// 读设置文件（缺失/损坏 → null = 全默认）。**必须在字体/音频初始化之前调用**。
+fn loadSettingsRaw(allocator: std.mem.Allocator, io: std.Io, data_root: []const u8) ?std.json.Parsed(persist.Settings) {
+    if (data_root.len == 0) return null;
+    var pb: [1024]u8 = undefined;
+    const spath = std.fmt.bufPrint(&pb, "{s}/settings.json", .{data_root}) catch return null;
+    const data = std.Io.Dir.cwd().readFileAlloc(io, spath, allocator, .unlimited) catch return null;
+    defer allocator.free(data);
+    return persist.settingsFromJson(allocator, data) catch null;
 }
 
-/// 写入设置（静默失败；下一步变更会重试）
+/// 把设置装填进 App（启动时一次）。“启动打开上次工程”走既有
+/// `pending_open_path` 机制（首帧末自动执行；启动时 dirty=false 无确认弹窗）。
+fn loadSettings(app: *App, st: persist.Settings) void {
+    app.settings_open_last = st.open_last;
+    app.fps_limit = std.math.clamp(st.fps, 30, 240);
+    app.ui_scale_auto = st.ui_scale_auto;
+    app.ui_scale = std.math.clamp(st.ui_scale, dpi.min_scale, dpi.max_scale);
+    app.setFontPath(st.font_path);
+    app.font_dirty = false; // 启动时字体已按设置加载过，不必重建
+    if (st.open_last and st.last_project.len > 0) app.setPendingOpen(st.last_project);
+}
+
+/// 写入设置（静默失败；下一步变更会重试）。
+/// **所有用户可见设置都在这里**（含音频后端/设备 — 早期在 `audio.txt`）。
 fn saveSettings(app: *App, io: std.Io) void {
     const spath = settingsPath(app) orelse return;
     defer app.allocator.free(spath);
@@ -4473,6 +4533,11 @@ fn saveSettings(app: *App, io: std.Io) void {
         .open_last = app.settings_open_last,
         .fps = app.fps_limit,
         .last_project = app.project_path orelse "",
+        .ui_scale_auto = app.ui_scale_auto,
+        .ui_scale = app.ui_scale,
+        .audio_backend = audio_pref.backendToInt(audio_pref.current.backend),
+        .audio_device = audio_pref.current.deviceName(),
+        .font_path = app.fontPath(),
     }) catch return;
     defer app.allocator.free(json);
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = spath, .data = json }) catch return;
@@ -4978,6 +5043,32 @@ fn drawExportDialog(ui: *Ui, app: *App, io: std.Io) void {
 /// 用户选择写入 `app.modal_choice`，由主循环的退出流程消费。
 /// 不用系统 MessageBox：系统弹窗会把鼠标吸到默认按钮上（实测体验差，
 /// 且受系统设置 `SnapToDefaultButton` 影响）。
+/// **缩放确认条**：改完缩放后浮在窗口顶部，15 s 内不点“保持”就自动恢复。
+/// 只用当前字体/缩放绘制，但宽度取 `min(逻辑宽-20, 520)` 并**顶部居中**，
+/// 所以哪怕缩到 400% 也不会跑到屏幕外（字大了只是条子变高）。
+fn drawScaleConfirm(ui: *Ui, app: *App) void {
+    const c = app.scale_confirm orelse return;
+    const sw = ui.renderer.logicalWidth();
+    const bar_w: i32 = @min(sw - 20, 520);
+    const bar_h: i32 = 56;
+    const bx = @divTrunc(sw - bar_w, 2);
+    const by: i32 = 12;
+    ui.renderer.fillRect(bx + 2, by + 2, bar_w, bar_h, r_mod.rgb(10, 11, 13));
+    ui.renderer.fillRect(bx, by, bar_w, bar_h, ui.theme.panel);
+    ui.renderer.strokeRect(bx, by, bar_w, bar_h, ui.theme.accent);
+    var lb: [128]u8 = undefined;
+    const line = std.fmt.bufPrint(&lb, "界面缩放已改为 {d:.0}%（原 {d:.0}%）——看起来正常吗？", .{
+        app.ui_scale * 100.0, c.prev * 100.0,
+    }) catch "界面缩放已改变";
+    ui.label(line, bx + 10, by + 8, ui.theme.text);
+    const secs = @divTrunc(@max(c.remain_ms, 0) + 999, 1000);
+    var sb: [48]u8 = undefined;
+    ui.label(std.fmt.bufPrint(&sb, "{d} 秒后自动恢复（Esc = 立即恢复）", .{secs}) catch "", bx + 10, by + 30, ui.theme.text_dim);
+    if (ui.button(9560, "保持", bx + bar_w - 172, by + 16, 76, 24)) app.keepUiScale();
+    if (ui.button(9561, "恢复", bx + bar_w - 90, by + 16, 76, 24)) app.revertUiScale();
+}
+
+/// 模态确认框分发（自绘；避开系统 MessageBox 把鼠标吸到默认按钮）
 fn drawModal(ui: *Ui, app: *App) void {
     const kind = app.modal orelse return;
     const w = ui.renderer.logicalWidth();
@@ -5192,18 +5283,6 @@ fn envValue(name: [*:0]const u8) ?[]const u8 {
     return std.mem.span(v);
 }
 
-/// 读 `<exe>/data/font.txt`（一行字体路径；用户在设置里自选的字体，优先于一切自动探测）
-fn readFontChoice(io: std.Io, exe_dir: []const u8, out: []u8) ?[]const u8 {
-    var pbuf: [1024]u8 = undefined;
-    const p = std.fmt.bufPrint(&pbuf, "{s}/data/font.txt", .{exe_dir}) catch return null;
-    const data = std.Io.Dir.cwd().readFileAlloc(io, p, std.heap.page_allocator, 4096) catch return null;
-    defer std.heap.page_allocator.free(data);
-    const t = std.mem.trim(u8, data, " \t\r\n");
-    if (t.len == 0 or t.len >= out.len) return null;
-    @memcpy(out[0..t.len], t);
-    return out[0..t.len];
-}
-
 /// 问 fontconfig：用户配置的 sans-serif 实际落到哪个文件（非 Linux 返回 null）
 /// 用 `std.c.system` 而不是 spawn+管道：只是一次性读一行，同步最省事
 fn probeFontconfig(io: std.Io, exe_dir: []const u8, out: []u8) ?[]const u8 {
@@ -5283,20 +5362,25 @@ inline fn lpx(v: i32, scale: f32) i32 {
 /// 让 `measure/lineHeight` 等度量除回逻辑像素。
 /// **所有字体加载都必须走这里**（包括设置页的热重载）——
 /// 否则字形是物理尺寸、度量却按逻辑算 → 缩放后文字排版全错位。
-fn loadFont(allocator: std.mem.Allocator, io: std.Io, scale: f32) !Font {
-    const s = std.math.clamp(scale, 0.75, 4.0);
+fn loadFont(allocator: std.mem.Allocator, io: std.Io, scale: f32, preferred: []const u8) !Font {
+    const s = std.math.clamp(scale, dpi.min_scale, dpi.max_scale);
     font_px = 16.0 * s;
-    var f = try loadFontRaw(allocator, io);
+    var f = try loadFontRaw(allocator, io, preferred);
     f.px_scale = s;
     return f;
 }
 
 /// 字体解析顺序（见 `docs/linux.md` §1.1）：
-/// 0 `data/font.txt`（用户自选）→ 1 fontconfig（尊重用户配置）→ 2 系统名单
+/// 0 `settings.json` 的 `font_path`（用户在设置页自选）→ 1 fontconfig（尊重用户配置）→ 2 系统名单
 /// → 3 `<exe>/data/fonts/` → 4 任意一种系统字体 → 报错
-fn loadFontRaw(allocator: std.mem.Allocator, io: std.Io) !Font {
+fn loadFontRaw(allocator: std.mem.Allocator, io: std.Io, preferred: []const u8) !Font {
     var ebuf: [1024]u8 = undefined;
     const exe_dir = exeDir(allocator, io, &ebuf);
+
+    // 0) 设置页自选（空 = 不指定）
+    if (preferred.len > 0) {
+        if (useFont(allocator, io, preferred)) |f| return f else |_| {}
+    }
 
     // 1) 系统已装字体：Windows 优先微软雅黑；Linux 优先文泉驿微米黑/Noto CJK
     if (comptime builtin.os.tag == .windows) {

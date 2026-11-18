@@ -17,6 +17,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ui = @import("ui.zig");
 const types = @import("window_types.zig");
+const dpi = @import("dpi.zig");
 const port_io = @import("port_io.zig");
 const Event = types.Event;
 const Modifiers = types.Modifiers;
@@ -123,6 +124,19 @@ const XEvent = extern union {
     motion: XMotionEvent,
     configure: XConfigureEvent,
     client: XClientMessageEvent,
+    property: XPropertyEvent,
+};
+
+/// `PropertyNotify`（root 的 `RESOURCE_MANAGER` / XSETTINGS 的 `_XSETTINGS_SETTINGS` 变了）
+const XPropertyEvent = extern struct {
+    type: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: *Display,
+    window: XWindow,
+    atom: Atom,
+    time: c_ulong,
+    state: c_int,
 };
 
 const XColor = extern struct {
@@ -199,9 +213,29 @@ extern "X11" fn XrmDestroyDatabase(db: *anyopaque) void;
 extern "X11" fn XrmGetResource(db: *anyopaque, name: [*:0]const u8, cls: [*:0]const u8, out_type: *?[*:0]const u8, out_val: *?[*:0]const u8) c_int;
 
 /// 从 X 资源里取 `Xft.dpi`（没有 → null）。X 资源串形如 `Xft.dpi:\t144\n...`
+///
+/// **必须实时读 root 的 `RESOURCE_MANAGER` 属性**：`XResourceManagerString()` 是
+/// **连接级缓存**，桌面在启动后改缩放时它不会更新（SDL3 源码注释里踩过）。
 fn xrmGetDpi(dpy: ?*Display) ?f32 {
-    const res = XResourceManagerString(dpy) orelse return null;
-    const db = XrmGetStringDatabase(res) orelse return null;
+    const root = XRootWindow(dpy, XDefaultScreen(dpy));
+    const prop = XInternAtom(dpy, "RESOURCE_MANAGER", 0);
+    if (prop == 0) return null;
+    var atype: Atom = 0;
+    var aformat: c_int = 0;
+    var nitems: c_ulong = 0;
+    var after: c_ulong = 0;
+    var data: ?[*]u8 = null;
+    if (XGetWindowProperty(dpy, root, prop, 0, 8192, 0, 0, &atype, &aformat, &nitems, &after, &data) != 0) return null;
+    defer {
+        if (data) |d| _ = XFree(d);
+    }
+    const bytes = data orelse return null;
+    // Xlib 给的属性是**非** 0 结尾的：拷到本地缓冲再加 0
+    var buf: [8192]u8 = undefined;
+    const n = @min(@as(usize, nitems), buf.len - 1);
+    @memcpy(buf[0..n], bytes[0..n]);
+    buf[n] = 0;
+    const db = XrmGetStringDatabase(@ptrCast(&buf)) orelse return null;
     defer XrmDestroyDatabase(db);
     var vtype: ?[*:0]const u8 = null;
     var val: ?[*:0]const u8 = null;
@@ -209,6 +243,98 @@ fn xrmGetDpi(dpy: ?*Display) ?f32 {
     const s = val orelse return null;
     return std.fmt.parseFloat(f32, std.mem.span(s)) catch null;
 }
+
+/// 取 XSETTINGS 里某个**整数**键（`_XSETTINGS_SETTINGS` 属性的二进制格式）。
+///
+/// 格式（全部按 header 的字节序）：`u8 order | pad[3] | u32 serial | u32 n`，
+/// 之后每条：`u8 type | pad | u16 name_len | name | pad→4 | value`
+/// （type 0=int→u32、1=string→u32 len+bytes、2=color→4×u16）。
+/// 找不到 / 属性不存在 → null。
+fn xsettingsInt(self: *const X11Window, key: []const u8) ?i32 {
+    const dpy = self.dpy orelse return null;
+    // 选择属主窗口：`_XSETTINGS_S<屏幕号>`（没有守护进程时无属主）
+    var nb: [32]u8 = undefined;
+    const sel_str = std.fmt.bufPrint(&nb, "_XSETTINGS_S{d}", .{XDefaultScreen(dpy)}) catch return null;
+    var nz: [33]u8 = undefined;
+    @memcpy(nz[0..sel_str.len], sel_str);
+    nz[sel_str.len] = 0;
+    const sel = XInternAtom(dpy, nz[0..sel_str.len :0].ptr, 1);
+    if (sel == 0) return null;
+    const owner = XGetSelectionOwner(dpy, sel);
+    if (owner == 0) return null;
+    const prop = XInternAtom(dpy, "_XSETTINGS_SETTINGS", 1);
+    if (prop == 0) return null;
+    var atype: Atom = 0;
+    var aformat: c_int = 0;
+    var nitems: c_ulong = 0;
+    var after: c_ulong = 0;
+    var data: ?[*]u8 = null;
+    if (XGetWindowProperty(dpy, owner, prop, 0, 1 << 20, 0, 0, &atype, &aformat, &nitems, &after, &data) != 0) return null;
+    defer {
+        if (data) |d| _ = XFree(d);
+    }
+    const bytes = data orelse return null;
+    const len: usize = nitems;
+    if (len < 12) return null;
+    const little = bytes[0] == 0;
+    var r = Reader{ .b = bytes, .len = len, .little = little, .i = 8 };
+    const count = r.readU32() orelse return null;
+    var k: u32 = 0;
+    while (k < count) : (k += 1) {
+        const ty = r.readU8() orelse return null;
+        _ = r.readU8() orelse return null; // pad
+        const nlen = r.readU16() orelse return null;
+        const name = r.take(nlen) orelse return null;
+        r.align4();
+        switch (ty) {
+            0 => {
+                const v = r.readU32() orelse return null;
+                if (std.mem.eql(u8, name, key)) return @bitCast(v);
+            },
+            1 => { // string：u32 len + bytes
+                const slen = r.readU32() orelse return null;
+                _ = r.take(slen) orelse return null;
+                r.align4();
+            },
+            2 => { // color：4 × u16
+                _ = r.take(8) orelse return null;
+            },
+            else => return null,
+        }
+    }
+    return null;
+}
+
+/// XSETTINGS 属性的最小字节读取器（字节序由 header 决定）
+const Reader = struct {
+    b: [*]const u8,
+    len: usize,
+    little: bool,
+    i: usize,
+
+    fn readU8(self: *Reader) ?u8 {
+        if (self.i + 1 > self.len) return null;
+        defer self.i += 1;
+        return self.b[self.i];
+    }
+    fn readU16(self: *Reader) ?u16 {
+        const s = self.take(2) orelse return null;
+        return if (self.little) std.mem.readInt(u16, s[0..2], .little) else std.mem.readInt(u16, s[0..2], .big);
+    }
+    fn readU32(self: *Reader) ?u32 {
+        const s = self.take(4) orelse return null;
+        return if (self.little) std.mem.readInt(u32, s[0..4], .little) else std.mem.readInt(u32, s[0..4], .big);
+    }
+    fn take(self: *Reader, n: usize) ?[]const u8 {
+        if (self.i + n > self.len) return null;
+        const s = self.b[self.i .. self.i + n];
+        self.i += n;
+        return s;
+    }
+    fn align4(self: *Reader) void {
+        self.i = (self.i + 3) & ~@as(usize, 3);
+    }
+};
 extern "X11" fn XDefaultVisual(dpy: ?*Display, screen: c_int) ?*Visual;
 extern "X11" fn XDefaultDepth(dpy: ?*Display, screen: c_int) c_int;
 extern "X11" fn XRootWindow(dpy: ?*Display, screen: c_int) XWindow;
@@ -289,6 +415,7 @@ const MotionNotify: c_int = 6;
 const Expose: c_int = 12;
 const DestroyNotify: c_int = 17;
 const ConfigureNotify: c_int = 22;
+const PropertyNotify: c_int = 28;
 const SelectionClear: c_int = 29;
 const SelectionRequest: c_int = 30;
 const SelectionNotify: c_int = 31;
@@ -296,6 +423,7 @@ const ClientMessage: c_int = 33;
 
 // 事件掩码
 const KeyPressMask: c_long = 1 << 0;
+const PropertyChangeMask: c_long = 1 << 22;
 const KeyReleaseMask: c_long = 1 << 1;
 const ButtonPressMask: c_long = 1 << 2;
 const ButtonReleaseMask: c_long = 1 << 3;
@@ -418,6 +546,13 @@ pub const X11Window = struct {
     drag_accept: bool = false,
     /// 本次拖放的落点（客户区；来自 XdndPosition 的根坐标，经 XTranslateCoordinates 转换）
     drop_pt: ?types.DropPoint = null,
+    // ── DPI 变化监听（自动缩放“实时跟随”）：root 的 `RESOURCE_MANAGER` 或
+    //    XSETTINGS 的 `_XSETTINGS_SETTINGS` 一变就置位 ──
+    dpi_dirty: bool = false,
+    dpi_atom_resource: Atom = 0,
+    dpi_atom_xsettings: Atom = 0,
+    /// XSETTINGS 属主窗口（已订阅 PropertyChange 的那个；0 = 未知/无守护进程）
+    dpi_xs_owner: XWindow = 0,
     // ── 剪贴板（Ctrl+V 用）：CLIPBOARD 选区 → 文本
     clip_atom: Atom = 0,
     clip_prop: Atom = 0,
@@ -566,25 +701,47 @@ pub const X11Window = struct {
         return self.drop_pt;
     }
 
-    /// **DPI 缩放**（物理像素 / 96）。X11 没有统一的 DPI API，按优先级：
-    /// 1. `Xft.dpi` 资源（Xsettings 常见做法，整数或浮点都见过）；
-    /// 2. 显示器像素宽 / 物理毫米宽估算；
-    /// 3. 1.0（= 1080p 的旧行为）。
-    pub fn dpiScale(self: *const X11Window) f32 {
-        const dpy = self.dpy orelse return 1.0;
-        // ① Xft.dpi
-        if (xrmGetDpi(dpy)) |dpi| {
-            if (dpi >= 48.0 and dpi <= 960.0) return dpi / 96.0;
-        }
-        // ② 用屏幕物理尺寸估算
+    /// **DPI 原始输入**（X11）：XSETTINGS 两个键 + `Xft.dpi` + 屏幕 mm（阶梯在 `src/dpi.zig`）。
+    /// `windows_dpi` / 环境变量由调用方填。
+    pub fn dpiRaw(self: *const X11Window, raw: *dpi.Raw) void {
+        const dpy = self.dpy orelse return;
+        raw.xs_scaling = xsettingsInt(self, "Gdk/WindowScalingFactor") orelse 0;
+        if (raw.xs_scaling == 0) raw.xs_dpi = xsettingsInt(self, "Xft/DPI") orelse 0;
+        if (xrmGetDpi(dpy)) |d| raw.xft_dpi = d;
         const screen = XDefaultScreen(dpy);
         const px_w: i32 = @intCast(XDisplayWidth(dpy, screen));
         const mm_w: i32 = @intCast(XDisplayWidthMM(dpy, screen));
         if (px_w > 0 and mm_w > 0) {
-            const dpi = @as(f32, @floatFromInt(px_w)) * 25.4 / @as(f32, @floatFromInt(mm_w));
-            if (dpi >= 48.0 and dpi <= 960.0) return dpi / 96.0;
+            raw.screen_px_w = px_w;
+            raw.screen_mm_w = mm_w;
         }
-        return 1.0;
+    }
+
+    /// 开始监听 DPI 相关属性变化（root + XSETTINGS 属主）。只做一次；失败无害。
+    pub fn watchDpi(self: *X11Window) void {
+        const dpy = self.dpy orelse return;
+        const screen = XDefaultScreen(dpy);
+        self.dpi_atom_resource = XInternAtom(dpy, "RESOURCE_MANAGER", 1);
+        self.dpi_atom_xsettings = XInternAtom(dpy, "_XSETTINGS_SETTINGS", 1);
+        _ = XSelectInput(dpy, XRootWindow(dpy, screen), PropertyChangeMask);
+        var nb: [32]u8 = undefined;
+        const sel_str = std.fmt.bufPrint(&nb, "_XSETTINGS_S{d}", .{screen}) catch return;
+        var nz: [33]u8 = undefined;
+        @memcpy(nz[0..sel_str.len], sel_str);
+        nz[sel_str.len] = 0;
+        const sel = XInternAtom(dpy, nz[0..sel_str.len :0].ptr, 1);
+        if (sel != 0) {
+            self.dpi_xs_owner = XGetSelectionOwner(dpy, sel);
+            if (self.dpi_xs_owner != 0) _ = XSelectInput(dpy, self.dpi_xs_owner, PropertyChangeMask);
+        }
+        _ = XFlush(dpy);
+    }
+
+    /// 自上次检查以来 DPI 来源是否变过（取一次即清零）
+    pub fn takeDpiDirty(self: *X11Window) bool {
+        const d = self.dpi_dirty;
+        self.dpi_dirty = false;
+        return d;
     }
 
     pub fn takeDropped(self: *X11Window) ?[]u8 {
@@ -867,6 +1024,15 @@ pub const X11Window = struct {
                 }
             },
             Expose => self.present(),
+            PropertyNotify => {
+                const pe = ev.property;
+                // DPI 相关属性变了 → 只置个标记（真正的重新检测在主循环，自动模式才用）
+                if ((self.dpi_atom_resource != 0 and pe.atom == self.dpi_atom_resource) or
+                    (self.dpi_atom_xsettings != 0 and pe.atom == self.dpi_atom_xsettings))
+                {
+                    self.dpi_dirty = true;
+                }
+            },
             ClientMessage => {
                 const cm = ev.client;
                 if (cm.message_type == self.wm_delete) {

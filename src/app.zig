@@ -26,6 +26,8 @@ const fx = @import("effects.zig");
 const plugin_db = @import("plugin_db.zig");
 const vst_host = @import("vst_host.zig");
 const preset_mod = @import("preset.zig");
+const dpi_mod = @import("dpi.zig");
+const audio_pref = @import("audio_pref.zig");
 const wav = @import("wav.zig"); // 导出音频（24-bit PCM WAV 写出器）
 const audio_export = @import("audio_export.zig");
 const audio_import = @import("audio_import.zig"); // P2：异步导入（单 worker）
@@ -1162,10 +1164,20 @@ pub const PickUse = union(enum) {
     load_sample: struct { instrument: i32, pitch: u8, layer: ?usize },
     relocate_instrument: struct { index: usize },
     relocate_effect: struct { ch: usize, slot: usize },
+    /// 设置页：选一个字体文件（.ttf/.ttc/.otf）
+    font_file,
+};
+
+/// **缩放确认**（改缩放后 15 秒内不确认 → 自动回滚）：
+/// 缩错了可能把设置页推出屏幕，所以给一条“自动后悔”的路。
+pub const ScaleConfirm = struct {
+    /// 改之前的倍率（超时 / 点“恢复” → 回到它）
+    prev: f32,
+    /// 剩余毫秒（主循环按帧 dt 递减；不用墙钟，帧率无关）
+    remain_ms: i32 = 15_000,
 };
 
 pub const PickKind = enum { open, save, folder };
-
 /// 一个待处理的文件对话框请求（字段全是静态字面量，不需要释放）
 pub const PickRequest = struct {
     kind: PickKind,
@@ -1184,6 +1196,7 @@ pub const PickRequest = struct {
             .import_midi => "已取消导入",
             .export_midi, .export_wav => "已取消导出",
             .plugin_folder, .plugin_file, .load_sample => "已取消选择",
+            .font_file => "已取消选择字体",
             .relocate_instrument, .relocate_effect => "已取消重新定位",
         };
     }
@@ -1265,11 +1278,44 @@ pub const HelpWindow = struct {
     x: i32 = 420,
     y: i32 = 110,
     w: i32 = 500,
-    h: i32 = 572, // 刚好等于内容高度（20 行×21px + 4 节标题间距 + 边距；无滚动——冗余会让底部空一截）
+    /// 高度：**刚好装下全部内容（不用滚）** = 内容 596 + 标题栏 22 + 边框 1 + 1 余量。
+    /// 内容 = 顶 10 + 4 节×(6+21+1)=112 + 22 行×21=462 + 底 12。
+    /// 加/删帮助行时跟着算（装不下也不会丢内容：内容区可滚 + 右下角可拉）。
+    h: i32 = 620,
+    /// 内容滚动 + 总高（每帧布局后回写；滚动上限靠它）
+    scroll: i32 = 0,
+    content_h: i32 = 640,
+    /// 右下角缩放柄（同设置页/机架窗）
+    resize_w0: i32 = 0,
+    resize_h0: i32 = 0,
+    resize_mx: i32 = 0,
+    resize_my: i32 = 0,
     /// Z 序（越大越靠上；点窗口即置顶）——见 `RackState.z` 注释
     z: i32 = 26,
     grab_dx: i32 = 0,
     grab_dy: i32 = 0,
+};
+
+/// 设置页的**待应用副本**：滑块/开关只改它，点“应用”才真正生效。
+/// 为什么：UI 缩放如果边拖边生效，缩放变了滑块跟着变，手感糊成一团（用户实测反馈）。
+pub const SettingsDraft = struct {
+    open_last: bool = false,
+    fps: i32 = 120,
+    ui_scale_auto: bool = true,
+    ui_scale: f32 = 1.0,
+    /// 音频输出（**也是草案**：点“应用”才提交，见 view_settings 底栏）
+    audio_backend: audio_pref.Backend = .auto,
+    audio_device: [audio_pref.device_name_cap]u8 = @splat(0),
+    audio_device_len: usize = 0,
+
+    pub fn audioDevice(self: *const SettingsDraft) []const u8 {
+        return self.audio_device[0..self.audio_device_len];
+    }
+
+    pub fn setAudioDevice(self: *SettingsDraft, name: []const u8) void {
+        self.audio_device_len = @min(name.len, self.audio_device.len);
+        @memcpy(self.audio_device[0..self.audio_device_len], name[0..self.audio_device_len]);
+    }
 };
 
 /// 设置窗口（启动行为 / 最高帧率；工具栏“选项”打开）
@@ -1278,12 +1324,25 @@ pub const SettingsWindow = struct {
     x: i32 = 460,
     y: i32 = 130,
     w: i32 = 520,
-    /// 高度要装得下“启动时 / 帧率 / 数据交换 / 字体 / 音频”五段（加段时同步调）
+    /// 高度要装得下“启动时 / 帧率 / 界面缩放 / 字体 / 音频”五段（加段时同步调 `total_h`）
     h: i32 = 590,
+    /// 内容滚动（内容比可视区高时可用滚轮；底部按钮条不随之滚动）
+    scroll: i32 = 0,
+    /// 内容总高（每帧布局后回写；滚动上限靠它，否则最后一行会被底栏盖住）
+    content_h: i32 = 640,
+    /// 输出设备列表的矩形（上一帧）：滚轮落在它里面时**只滚这一栏**，不滚整页
+    device_rect: [4]i32 = .{ 0, 0, 0, 0 },
+    /// 该列表**是否真的能滚**（设备多到超出列表高）：不能滚就让滚轮去滚整页
+    device_scrollable: bool = false,
     /// Z 序（越大越靠上；点窗口即置顶）——见 `RackState.z` 注释
     z: i32 = 27,
     grab_dx: i32 = 0,
     grab_dy: i32 = 0,
+    /// 右下角缩放柄的按下基准（同机架窗：w0/h0 + 按下点）
+    resize_w0: i32 = 0,
+    resize_h0: i32 = 0,
+    resize_mx: i32 = 0,
+    resize_my: i32 = 0,
     /// 输出设备列表滚动（设备很多时仍可逐个选择）。
     audio_device_scroll: i32 = 0,
 };
@@ -1881,6 +1940,8 @@ pub const App = struct {
     /// 波形窗口（音频片段 / 鼓组采样器层）
     wave_win: WaveWindow = .{},
     settings_win: SettingsWindow = .{},
+    /// 设置页的**待应用副本**（ null = 没打开；见 `SettingsDraft`）
+    settings_draft: ?SettingsDraft = null,
     plugin_mgr: PluginMgrWindow = .{},
     /// 本帧浮动窗口的**绘制顺序与最终矩形**（`main.drawApp` 逐帧填写；与绘制严格同序：
     /// 后排 = 在上）——插件子窗口区域裁切（`setEditorClip`）据此收集覆盖矩形
@@ -1897,11 +1958,28 @@ pub const App = struct {
     /// 管理器「开始扫描 / 取消」待帧末执行
     pending_scan_start: bool = false,
     pending_scan_cancel: bool = false,
-    /// 应用设置（settings.json；IO 由 main 帧末执行）
+    /// 应用设置（`settings.json`；IO 由 main 帧末执行）
     /// - `settings_open_last`：启动时打开上次工程（false = 新建空工程）
     /// - `fps_limit`：最高帧率（帧预算 = 1e9 / fps；30..240）
     settings_open_last: bool = false,
     fps_limit: i32 = 120,
+    // ── UI 缩放（DPI）──
+    /// 运行时**真身**：`renderer.scale` 每帧读它（改它 = 立即生效）
+    ui_scale: f32 = 1.0,
+    /// true = 每次启动自动检测，且**桌面改缩放时实时跟随**；false = 用 `ui_scale`
+    ui_scale_auto: bool = true,
+    /// 最近一次检测结果 + 人话依据（设置页显示“检测到 150%（XSETTINGS …）”）
+    ui_scale_detected: f32 = 1.0,
+    ui_scale_src: dpi_mod.Source = .fallback,
+    ui_scale_detail: [72]u8 = @splat(0),
+    ui_scale_detail_len: usize = 0,
+    /// 自选字体路径（"" = 自动探测：fontconfig → 系统名单 → data/fonts/）
+    font_path_buf: [512]u8 = @splat(0),
+    font_path_len: usize = 0,
+    /// 字形图集需要重建（改缩放 / 换字体时置位；帧首由 main 处理）
+    font_dirty: bool = false,
+    /// 正在等待用户确认的缩放切换（15 s 后自动回滚；见 `applyUiScale`）
+    scale_confirm: ?ScaleConfirm = null,
     /// 设置需要落盘（变更 / 工程路径变化时置位）
     settings_dirty: bool = false,
     /// 待处理的文件对话框请求（null = 无；见 `PickRequest`）
@@ -4314,6 +4392,79 @@ pub const App = struct {
         if (self.pending_upgrade_path) |p| self.allocator.free(p);
         self.pending_upgrade_path = null;
         self.pending_upgrade_version = 0;
+    }
+
+    // ── UI 缩放 / 字体（设置页 + 主循环共用）──
+
+    /// 自选字体路径（空 = 自动探测）
+    pub fn fontPath(self: *const App) []const u8 {
+        return self.font_path_buf[0..self.font_path_len];
+    }
+
+    /// 设自选字体（`p` 空 = 恢复自动探测）：立刻重建字形图集 + 标脏落盘
+    pub fn setFontPath(self: *App, p: []const u8) void {
+        self.font_path_len = @min(p.len, self.font_path_buf.len);
+        @memcpy(self.font_path_buf[0..self.font_path_len], p[0..self.font_path_len]);
+        self.font_dirty = true;
+        self.settings_dirty = true;
+    }
+
+    /// 记录最近一次检测结果（设置页显示“检测到 x.x（来源：依据）”）
+    pub fn setDetectedScale(self: *App, r: dpi_mod.Result) void {
+        self.ui_scale_detected = r.scale;
+        self.ui_scale_src = r.source;
+        const d = r.detail();
+        self.ui_scale_detail_len = @min(d.len, self.ui_scale_detail.len);
+        @memcpy(self.ui_scale_detail[0..self.ui_scale_detail_len], d[0..self.ui_scale_detail_len]);
+    }
+
+    /// 检测到的人话依据（空 = 没检测到任何线索）
+    pub fn uiScaleDetail(self: *const App) []const u8 {
+        return self.ui_scale_detail[0..self.ui_scale_detail_len];
+    }
+
+    /// **应用缩放**：立即生效（下一帧重建字形图集）。
+    /// `confirm = true` → 开 15 s 倒计时：不确认就回滚（缩错了可能把设置页推出屏幕）；
+    /// `confirm = false` → 直接确定（用于“桌面改缩放实时跟随”，那是外部的明确意图）。
+    pub fn applyUiScale(self: *App, new_scale: f32, confirm: bool) void {
+        const s = std.math.clamp(new_scale, dpi_mod.min_scale, dpi_mod.max_scale);
+        if (@abs(s - self.ui_scale) < 0.001) return;
+        if (confirm) {
+            // 已有一个未确认的切换 → 保留最早的“退路”，只顺延计时
+            const prev = if (self.scale_confirm) |c| c.prev else self.ui_scale;
+            self.scale_confirm = .{ .prev = prev, .remain_ms = 15_000 };
+        } else {
+            self.scale_confirm = null;
+            self.settings_dirty = true;
+        }
+        self.ui_scale = s;
+        self.font_dirty = true;
+    }
+
+    /// 确认当前缩放（写盘）；没在确认态 → 无操作
+    pub fn keepUiScale(self: *App) void {
+        if (self.scale_confirm == null) return;
+        self.scale_confirm = null;
+        self.settings_dirty = true;
+    }
+
+    /// 回滚到切换前的缩放（超时 / 点“恢复”）：不写盘
+    pub fn revertUiScale(self: *App) void {
+        const c = self.scale_confirm orelse return;
+        self.scale_confirm = null;
+        self.ui_scale = c.prev;
+        self.font_dirty = true;
+    }
+
+    /// 倒计时到期 → 自动回滚；返回 true = 本帧发生了回滚（调用方提示一声）
+    pub fn tickScaleConfirm(self: *App, dt_ns: i64) bool {
+        var c = self.scale_confirm orelse return false;
+        const dt_ms: i32 = @intCast(@divTrunc(dt_ns, 1_000_000));
+        c.remain_ms -= dt_ms;
+        self.scale_confirm = c;
+        if (c.remain_ms > 0) return false;
+        self.revertUiScale();
+        return true;
     }
 
     /// **存档打不开**要给弹窗，不是 Toast（右下角一闪就没了，用户经常根本没看到）。
@@ -17831,6 +17982,59 @@ test "automation: 点池——发布一条 200 点曲线（旧上限 64），UI 
     }
     // 超预算（池只有 `pool_points`）→ 计数 + 一次性提示，不崩、不静默
     try std.testing.expectEqual(@as(u32, 0), app.params.dbg_lane_overflow.load(.monotonic));
+}
+
+test "ui: 缩放确认状态机——应用/保持/回滚/超时/钳位" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.ui_scale = 1.0;
+
+    // 应用（带确认）→ 立即生效 + 需要重建字体 + 进入确认态
+    app.applyUiScale(1.5, true);
+    try std.testing.expectEqual(@as(f32, 1.5), app.ui_scale);
+    try std.testing.expect(app.scale_confirm != null);
+    try std.testing.expect(app.font_dirty);
+    app.font_dirty = false;
+
+    // 保持 → 清确认态 + 标脏落盘（值不变）
+    app.settings_dirty = false;
+    app.keepUiScale();
+    try std.testing.expect(app.scale_confirm == null);
+    try std.testing.expect(app.settings_dirty);
+    try std.testing.expectEqual(@as(f32, 1.5), app.ui_scale);
+
+    // 回滚 → 回到改之前
+    app.applyUiScale(2.0, true);
+    try std.testing.expectEqual(@as(f32, 2.0), app.ui_scale);
+    app.revertUiScale();
+    try std.testing.expectEqual(@as(f32, 1.5), app.ui_scale);
+    try std.testing.expect(app.scale_confirm == null);
+
+    // 超时：1 s 不动；累计 > 15 s 才回滚
+    app.applyUiScale(1.0, true);
+    try std.testing.expect(!app.tickScaleConfirm(1_000_000_000));
+    try std.testing.expectEqual(@as(f32, 1.0), app.ui_scale);
+    try std.testing.expect(app.tickScaleConfirm(20_000_000_000));
+    try std.testing.expectEqual(@as(f32, 1.5), app.ui_scale);
+    try std.testing.expect(app.scale_confirm == null);
+    // 无确认态时 tick 什么也不做
+    try std.testing.expect(!app.tickScaleConfirm(1_000_000_000));
+
+    // confirm = false（外部变化 / 桌面改缩放）→ 不弹确认条，直接落盘
+    app.settings_dirty = false;
+    app.applyUiScale(2.0, false);
+    try std.testing.expect(app.scale_confirm == null);
+    try std.testing.expect(app.settings_dirty);
+    // 越界值被钳住（75%~400%）
+    app.applyUiScale(99.0, false);
+    try std.testing.expectEqual(@as(f32, 4.0), app.ui_scale);
+    // 相同值不重复触发（不重建字体）
+    app.font_dirty = false;
+    app.applyUiScale(4.0, false);
+    try std.testing.expect(!app.font_dirty);
 }
 
 test "automation: 发布节流——内容没变不重建快照；改点/改绑定/接管/超周期才重发" {

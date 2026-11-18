@@ -9,19 +9,71 @@ Windows 后端虽然声明了 **per-monitor DPI aware V2**，但布局不缩放�
 **方案（单点乘算）**：布局代码**一行不改**，全部继续按**逻辑像素（96 DPI 当量）**工作；
 只在一个地方把逻辑像素换成物理像素 —— 渲染器。
 
-## 1. 缩放因子 `ui.scale`
+## 1. 缩放因子：`App.ui_scale`（设置 + 自动检测）
 
-| 平台 | 来源 | 兜底 |
+**唯一的用户入口是设置页**（`设置 → 界面缩放`）；环境变量 `SAWDUST_UI_SCALE` **已删除**——
+“配环境变量”和“改配置文件”学习成本一样，而两条路只会制造“我改了为什么没生效”的困惑。
+
+`settings.json` 两个字段：
+
+| 字段 | 含义 |
+|---|---|
+| `ui_scale_auto` | true = 每次启动**自动检测**（且桌面改缩放时实时跟随）；false = 用 `ui_scale` |
+| `ui_scale` | 固定倍率（自动期间也保留，取消自动就回到它） |
+
+界面：`[✓] 自动` + 下面一行“检测到 150%（XSETTINGS：Gdk/WindowScalingFactor = 2）”
++ **5% 步进的滑块**（75% – 400%，65 格）。手拖滑块 = 自动取消，并进入 15 s 确认窗口。
+
+### 1.1 自动检测的阶梯（`src/dpi.zig`，纯函数好测）
+
+顺序抄 SDL3 的 `X11_GetGlobalContentScale` + ArchWiki HiDPI 的实践，**命中即返回**：
+
+| # | 来源 | 备注 |
 |---|---|---|
-| Windows | `GetDpiForWindow(hwnd) / 96`（per-monitor，随窗口所在显示器） | 1.0 |
-| Linux（X11） | ① `Xft.dpi` 资源（`XResourceManagerString` + `XrmGetStringDatabase`）；② `DisplayWidth(px) / DisplayWidthMM` 估算 | 1.0 |
-| 任意 | 环境变量 **`SAWDUST_UI_SCALE=1.5`** 强制覆盖（WSLg / 无 DPI 环境 / 自查用） | — |
+| 1 | Windows `GetDpiForWindow()/96` | per-monitor |
+| 2 | XSETTINGS `Gdk/WindowScalingFactor` | 整数，1 = 100%（GNOME/Xfce 的协议级值） |
+| 3 | XSETTINGS `Xft/DPI` | 单位 **1/1024 dpi** |
+| 4 | `Xft.dpi`（root `RESOURCE_MANAGER`） | **实时读属性**：`XResourceManagerString()` 是连接级缓存，桌面改缩放不更新 |
+| 5 | `GDK_SCALE` / `QT_SCALE_FACTOR` / `QT_SCREEN_SCALE_FACTORS` | 用户显式设的才认；每屏列表取第一个 |
+| 6 | 屏幕 ppi 估算（`DisplayWidth / DisplayWidthMM`） | **只当建议**：ppi ≥ 130 且上面全没命中才自动用，且 clamp ≤ 200% |
+| 7 | 1.0 | — |
 
-- 取值 **clamp 到 1.0~3.0**（环境变量允许 0.75~4.0，便于"想小一点"的人）。
-- 启动时采样一次（改了要重开程序：缩放变了意味着整个帧缓冲与字形缓存都要重建，
-  首版不值得为此做热切换）。
-- 初始窗口按**逻辑 1280×760** 换算成物理尺寸，且不会开出屏幕
-  （`setClientSizeLogical` 里按屏幕宽高夹取）。
+两条铁律：
+
+- **绝不相乘**：`Xft.dpi` + `GDK_SCALE` 同时存在时相乘会把界面放大成两倍（ArchWiki 明确警告）；
+- **物理 ppi 不是用户意愿**：4K 27" 在 100% 下 ppi≈163，一概自动套 150% 会违背用户设置，
+  所以它排在最后且只在“什么信号都没有”时生效。
+
+XSETTINGS 客户端是自己实现的（`window_x11.zig`：`_XSETTINGS_S0` 属主窗口 →
+`_XSETTINGS_SETTINGS` 属性 → 按 header 字节序解码 INT/STRING/COLOR）。
+Wayland 原生不在本轮（我们只有 X11 后端）；XWayland 下第 4/6 步常常拿不到真值，
+设置页会显示“未检测到缩放设置”，用户手拖滑块即可。
+
+### 1.2 立即生效 + 15 s 后悔窗口
+
+以前“改缩放需重启”。现在改成**立即生效**：
+
+- `ui.renderer.scale` 每帧从 `app.ui_scale` 取；
+- **唯一要重建的是字形图集**（位图按 `16 × scale` 光栅化，见 §3）——`App.font_dirty` 置位，
+  主循环在帧首 `loadFont(scale, font_path)` 后换掉 `ui.font`（几十 ms，一次卡顿）；
+- 布局全部是即时模式、无缓存 → 其余零成本；VST3 子窗口位置每帧按 scale 重算，也不受影响。
+
+缩错了可能把设置页推出屏幕，所以有**确认条**（顶部居中，宽度 clamp 到 `逻辑宽-20`）：
+`[保持] [恢复]`，15 秒内不确认就**自动回到原倍率**（只在点“保持”时写盘）；
+`Enter`/`Space` = 保持，`Esc` = 恢复。
+
+### 1.3 桌面改缩放时实时跟随（仅“自动”模式）
+
+窗口后端监听 root 的 `RESOURCE_MANAGER` 与 XSETTINGS 的 `_XSETTINGS_SETTINGS`
+（`XSelectInput(root, PropertyChangeMask)` + 属主窗口同样订阅），一变化就置 `dpi_dirty`；
+主循环看到标记 → 重跑阶梯 → 值真的变了就 `applyUiScale(new, confirm=false)`
+（外部意图，不弹确认条）。
+
+### 1.4 窗口尺寸
+
+初始窗口按**逻辑 1280×760** 换算成物理尺寸，且不会开出屏幕
+（`setClientSizeLogical` 里按屏幕宽高夹取）。改缩放时**窗口物理尺寸不变**（逻辑区变多/变少，
+布局自然重排），所以不会出现“窗口被推到屏幕外”。
 
 ## 2. 渲染器是唯一的换算点（`src/render.zig`）
 
@@ -66,19 +118,21 @@ Windows 后端虽然声明了 **per-monitor DPI aware V2**，但布局不缩放�
 `syncPluginEditors` 里做双向换算：面板逻辑尺寸 = 插件物理尺寸 / scale，
 同步子窗口时再乘回去；`collectEditorCovers` 把逻辑的窗口/弹层矩形乘 scale 后再求交。
 
-## 6. 明确不做
+## 6. 仍然不做
 
 - **不改** `model.min_track_span`（幽灵行轴上限）：行数是视口逻辑高度 / `track_h`，
   缩放后 1080p 与 4K 看到的行数一致，本来就不该按物理像素算。
-- 不做运行时热切换缩放（重开程序即可）。
-- 不做每显示器动态跟随（窗口拖到另一块不同 DPI 的屏幕后需要重启——
-  首版够用；要做的话在 `WM_DPICHANGED` 里重设 scale + 重建字体）。
+- **不做按物理 ppi 自动缩放**：Windows 与 X11 的程序都只认“系统缩放百分比”
+  （`WM_DPICHANGED` / XSETTINGS 报的是缩放，不是 ppi）。4K@100% 天生很小是系统行为，
+  要变大就在系统里调缩放——我们不越俎代庵去推翻用户的明确设置。
 
 ## 7. 自测清单
 
-1. Windows：系统缩放调到 150% / 200% → 工具栏、状态栏、轨道行高、菜单、字号
-   的**物理尺寸**应与 100% 时一致，文字清晰不糊，鼠标点击位置准确。
-2. `SAWDUST_UI_SCALE=2.0` 在 100% 环境启动 → 等同 200% 的效果（验证无 DPI 环境）。
-3. Linux：`Xft.dpi` 设置正确时自动生效；`xrandr --dpi 192` 后重开程序应放大一倍。
+1. **设置页滑块**：拖到 150% → 点“应用”→ 界面立即变大 + 顶部弹确认条；不点“保持” 15 s 后回滚。
+2. **自动模式**：Windows 系统缩放调到 150% / 200%（程序开着）→ 窗口一帧内跟随（不弹确认条）
+   ——  走的是 `WM_DPICHANGED`；把窗口拖到另一块不同缩放的屏幕同理。
+3. **Linux**：`Xft.dpi = 144` 或 XSETTINGS 里改 `Gdk/WindowScalingFactor`（程序开着）→ 实时跟随；
+   无任何缩放信号的桌面，设置页应显示“未检测到缩放设置”。
 4. 检查点：工具栏按钮可点、文本输入框光标/选区位置正确、拖动数值控件手感一致、
-   插件面板里的子窗口与 chrome 对齐、浮动窗口拖拽不飘。
+   插件面板里的子窗口与 chrome 对齐、浮动窗口拖拽不飘、**字形不发糊**（位图按新缩放重光渡）。
+5. 极端：400% 下设置页 / 帮助页仍能缩进屏幕，底栏按钮与内容可滚动。

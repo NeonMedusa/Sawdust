@@ -52,6 +52,10 @@ const WindowsWindow = struct {
     should_quit: bool = false,
     /// 待消费的拖入文件路径（UTF-8；WM_DROPFILES 收集，App 帧初取走）
     dropped: std.ArrayListUnmanaged([]u8) = .empty,
+    /// **DPI 实时变化**：`WM_DPICHANGED` 置位；`takeDpiDirty()` 取一次就清零
+    dpi_dirty: bool = false,
+    /// `WM_DPICHANGED` 报上来的新 DPI（0 = 未收到，用 `GetDpiForWindow` 现查）
+    dpi_now: f32 = 0,
     /// 本次拖放的落点（`DragQueryPoint`；null = 无）
     drop_pt: ?DropPoint = null,
     /// 当前系统光标（避免重复设置）
@@ -179,14 +183,28 @@ const WindowsWindow = struct {
         return self.drop_pt;
     }
 
-    /// **DPI 缩放**（物理像素 / 96）：我们已声明 per-monitor DPI-aware V2，
-    /// 所以必须自己把 UI 放大，否则 4K/高缩放下控件和字会显得非常小。
-    /// 取不到时返回 1.0（= 100%，即 1080p 的旧行为）。
-    pub fn dpiScale(self: *const WindowsWindow) f32 {
-        const hwnd = self.hwnd orelse return 1.0;
+    /// 把 Windows 系统 DPI 填进检测输入（其余字段由 `dpi.fillEnv` 补）
+    pub fn dpiRaw(self: *const WindowsWindow, raw: *@import("dpi.zig").Raw) void {
+        // `WM_DPICHANGED` 报过就用它（比再查一次准，而且不依赖窗口句柄有效）
+        if (self.dpi_now >= 48.0) {
+            raw.windows_dpi = self.dpi_now;
+            return;
+        }
+        const hwnd = self.hwnd orelse return;
         const d = GetDpiForWindow(hwnd);
-        if (d >= 48 and d <= 960) return @as(f32, @floatFromInt(d)) / 96.0;
-        return 1.0;
+        if (d >= 48 and d <= 960) raw.windows_dpi = @floatFromInt(d);
+    }
+
+    /// Windows：`WM_DPICHANGED` 里置位（换显示器 / 改系统缩放 / 改分辨率都会触发）
+    pub fn takeDpiDirty(self: *WindowsWindow) bool {
+        const d = self.dpi_dirty;
+        self.dpi_dirty = false;
+        return d;
+    }
+
+    /// Windows：无需额外订阅（系统会主动发 `WM_DPICHANGED`）
+    pub fn watchDpi(self: *WindowsWindow) void {
+        _ = self;
     }
 
     /// 按**逻辑尺寸**设客户端大小（物理 = 逻辑 × scale）：开机按 DPI 把初始窗口调成 1280×760 逻辑。
@@ -619,6 +637,23 @@ const WindowsWindow = struct {
                 return 0;
             },
             WM_ERASEBKGND => return 1, // 我们自己画，避免闪烁
+            WM_DPICHANGED => {
+                // wParam 低 16 位 = 新 DPI；lParam = 系统建议的新窗口矩形（物理像素）
+                // 换显示器 / 改系统缩放 / 改分辨率都会到这里 → 置位，主循环（自动模式下）重算缩放
+                if (self) |s| {
+                    const nd: u32 = @intCast(wparam & 0xFFFF);
+                    if (nd >= 48 and nd <= 960) {
+                        s.dpi_now = @floatFromInt(nd);
+                        s.dpi_dirty = true;
+                    }
+                    // 按建议矩形调整（保持**逻辑**尺寸不变；Windows 对 per-monitor aware 窗口的标准做法）
+                    if (lparam != 0) {
+                        const r: *const RECT = @ptrFromInt(@as(usize, @intCast(lparam)));
+                        _ = SetWindowPos(hwnd, null, r.left, r.top, r.right - r.left, r.bottom - r.top, 0x0004 | 0x0010); // SWP_NOZORDER | SWP_NOACTIVATE
+                    }
+                }
+                return 0;
+            },
             else => {},
         }
         return DefWindowProcW(@ptrCast(hwnd), msg, wparam, lparam);
@@ -717,6 +752,7 @@ const WM_CHAR: u32 = 0x0102;
 const WM_SYSKEYDOWN: u32 = 0x0104;
 const WM_SYSKEYUP: u32 = 0x0105;
 const WM_ERASEBKGND: u32 = 0x0014;
+const WM_DPICHANGED: u32 = 0x02E0;
 const WM_SYSCOMMAND: u32 = 0x0112;
 const SC_CLOSE: usize = 0xF060;
 const DIB_RGB_COLORS: u32 = 0;
@@ -802,10 +838,18 @@ pub fn openExternalUrl(url: [:0]const u8) void {
 }
 
 const UnsupportedWindow = struct {
-    /// DPI 占位（非 Windows 后端自行实现；这里返回 1.0）
-    pub fn dpiScale(self: *const UnsupportedWindow) f32 {
+    pub fn dpiRaw(self: *const UnsupportedWindow, raw: *@import("dpi.zig").Raw) void {
         _ = self;
-        return 1.0;
+        _ = raw;
+    }
+
+    pub fn takeDpiDirty(self: *UnsupportedWindow) bool {
+        _ = self;
+        return false;
+    }
+
+    pub fn watchDpi(self: *UnsupportedWindow) void {
+        _ = self;
     }
 
     pub fn init(self: *UnsupportedWindow, allocator: std.mem.Allocator, title: []const u8, width: u32, height: u32) !void {
