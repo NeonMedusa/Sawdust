@@ -439,22 +439,15 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, row: usize, x: i32, y: i32, w: i32, c
     ui.renderer.fillRect(mm_x, mm_y, mm_w, mm_h, ui.theme.bg);
     ui.renderer.strokeRect(mm_x, mm_y, mm_w, mm_h, ui.theme.panel_border);
     const pattern = app.piano.pattern orelse app.sel.pattern;
-    var max_step: i32 = 64; // minimap 总长（步）：至少 4 小节
-    var min_pitch: i32 = 127;
-    var max_pitch: i32 = 0;
-    for (app.notes.items) |n| {
-        if (n.pattern != pattern or n.instrument != @as(i32, @intCast(idx))) continue;
-        max_step = @max(max_step, n.step + n.len);
-        min_pitch = @min(min_pitch, n.pitch);
-        max_pitch = @max(max_pitch, n.pitch);
-    }
+    // 统计走缓存（`notes_ver` 门控）：每行预览不再每帧扫一遍全量 `notes`
+    const pv = app.rackPreviewFor(@intCast(idx), pattern);
+    const max_step = pv.max_step;
     // 纵向：按实际音域映射（与横向 minimap 同一规则：保底 1 个八度、中点居中）
-    const range = model.rangeMap(min_pitch, max_pitch, 12);
-    for (app.notes.items) |n| {
-        if (n.pattern != pattern or n.instrument != @as(i32, @intCast(idx))) continue;
-        const nx = mm_x + @divTrunc(n.step * mm_w, max_step);
-        const nw = @max(1, @divTrunc(n.len * mm_w, max_step));
-        const y_norm = range.yOf(n.pitch);
+    const range = model.rangeMap(pv.min_pitch, pv.max_pitch, 12);
+    for (pv.blocks.items) |b| {
+        const nx = mm_x + @divTrunc(b.step * mm_w, max_step);
+        const nw = @max(1, @divTrunc(b.len * mm_w, max_step));
+        const y_norm = range.yOf(b.pitch);
         const ny = mm_y + mm_h - 1 - @as(i32, @intFromFloat(y_norm * @as(f32, @floatFromInt(mm_h - 2))));
         const nyc = std.math.clamp(ny, mm_y + 1, mm_y + mm_h - 2);
         ui.renderer.fillRect(nx, nyc, nw, 1, ui.theme.waveform);

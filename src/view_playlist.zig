@@ -5,6 +5,7 @@ const r_mod = @import("render.zig");
 const Ui = @import("ui.zig").Ui;
 const App = @import("app.zig").App;
 const model = @import("model.zig");
+const note_preview = @import("note_preview.zig");
 const util = @import("view_util.zig");
 const view_lane = @import("view_lane.zig");
 
@@ -345,7 +346,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         // 注：步进像素不可为 0（最细网格 1 步 = 0.125 px）→ 兜底 4px
         ui.scrollbar_nudge = @max(4, @as(i32, @intFromFloat(@round(@as(f32, @floatFromInt(model.snapSteps(app.playlist.snap))) * util.pianoStepPx()))));
         ui.scrollbar_target = &app.playlist.scroll_x_target; // 步进走补间（拖动仍直接写 scroll_x）
-        _ = ui.scrollbarTimelineEx(8, x + 1, hsb_y, w - 2, ruler_h, &app.playlist.scroll_x, min_content, &app.playlist.zoom, view_w, dyn_zoom_min, 8.0, bars_right < util.overhang_map_limit, mini_buf[0..nmini]);
+        _ = ui.scrollbarTimelineEx(8, x + 1, hsb_y, w - 2, ruler_h, &app.playlist.scroll_x, min_content, &app.playlist.zoom, view_w, dyn_zoom_min, 8.0, bars_right < util.overhang_map_limit, .{ .blocks = mini_buf[0..nmini] });
     }
     ui.renderer.hline(x + 1, ruler_y, w - 2, ui.theme.panel_border);
 
@@ -449,18 +450,23 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     const rows_draw: i32 = @max(map_rows, @divTrunc(app.playlist.scroll + tracks_h + track_h - 1, @max(1, track_h)));
     app.playlist.view_rows = rows_draw;
 
-    // 样式音域统计（每帧一次）：片段预览的纵向映射用（避免片段循环里重复扫全量音符）。
+    // 样式音域统计（**内容不变就不重算**：`notes_ver` 门控）：片段预览的纵向映射用
+    // （避免片段循环里重复扫全量音符）。
     // **按实际样式数**复用 App 缓冲（原为 `[max_patterns]` 栈数组——上限放到十亿级后
     // 不能预分配；成本完全按真实用量）。
     const pat_stat = app.ensurePatStats(app.pattern_items.items.len);
-    for (pat_stat) |*s| s.* = .{};
-    for (app.notes.items) |n| {
-        if (n.pattern < 0) continue;
-        const pi: usize = @intCast(n.pattern);
-        if (pi >= pat_stat.len) continue;
-        pat_stat[pi].has_notes = true;
-        pat_stat[pi].min_pitch = @min(pat_stat[pi].min_pitch, n.pitch);
-        pat_stat[pi].max_pitch = @max(pat_stat[pi].max_pitch, n.pitch);
+    if (app.pat_stats_ver != app.notes_ver or app.pat_stats_len != pat_stat.len) {
+        app.pat_stats_ver = app.notes_ver;
+        app.pat_stats_len = pat_stat.len;
+        for (pat_stat) |*s| s.* = .{};
+        for (app.notes.items) |n| {
+            if (n.pattern < 0) continue;
+            const pi: usize = @intCast(n.pattern);
+            if (pi >= pat_stat.len) continue;
+            pat_stat[pi].has_notes = true;
+            pat_stat[pi].min_pitch = @min(pat_stat[pi].min_pitch, n.pitch);
+            pat_stat[pi].max_pitch = @max(pat_stat[pi].max_pitch, n.pitch);
+        }
     }
 
     // 轨道行（裁剪：滚动时不画出边界）
@@ -662,19 +668,53 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                                 // 实测 bug：旧版有 `drawn >= 64` 截断——多乐器共用一个大样式时，
                                 // 数组顺序靠前的那个乐器往往就占满 64 个名额（实测工程：样式 3578 个
                                 // 音符，前 64 个全属同一个乐器）——预览看起来“只显示单个乐器的音符”。
-                                // 性能：循环本就要扫全量 notes；每个命中音符只是一次 1-8px × 2px 的
-                                // `fillRect`（实测 3578 音符/剪辑每帧几万字节写入，软件光栅无感）。
-                                // 若要优化，应做“同像素列合并”而不是静默丢音符（截断即本 bug 之源）。
-                                for (app.notes.items) |n| {
-                                    if (n.pattern != clip.pattern) continue;
-                                    const rel = n.step - win_lo;
-                                    if (rel >= win_steps or rel + n.len <= 0) continue; // 不在可见窗口
-                                    // x/宽度全部用**时间轴绝对步**换算并与片段矩形求交（见 `previewNoteSpan` 注释）
-                                    // 注：`n.step` 是**样式内**步 → 先换成时间轴步（`clip.start + rel`）
-                                    const span = previewNoteSpan(clip.start + rel, n.len, clip_x, clip_w, lane_x, step_px, app.playlist.scroll_x, zoom) orelse continue;
-                                    const y_norm = range.yOf(n.pitch);
-                                    const ny = inner_y + inner_h - 2 - @as(i32, @intFromFloat(y_norm * @as(f32, @floatFromInt(inner_h - 2))));
-                                    ui.renderer.fillRect(span.x, ny, span.w, 2, inner_col);
+                                // 性能：走**共用桶索引**（`note_preview.forEachInWindow`）——
+                                // 旧实现每个片段都 `for (app.notes.items)` 全量扫（O(片段数 × N)），
+                                // 现在只遍历覆盖“片段可见窗口”的几个时间桶。
+                                {
+                                    const Ctx = struct {
+                                        clip: model.Clip,
+                                        clip_x: i32,
+                                        clip_w: i32,
+                                        lane_x: i32,
+                                        step_px: f32,
+                                        scroll_x: i32,
+                                        zoom: f32,
+                                        win_lo: i32,
+                                        win_steps: i32,
+                                        inner_y: i32,
+                                        inner_h: i32,
+                                        inner_col: r_mod.Color,
+                                        range: model.RangeMap,
+                                        ui: *Ui,
+                                    };
+                                    const ctx = Ctx{
+                                        .clip = clip,
+                                        .clip_x = clip_x,
+                                        .clip_w = clip_w,
+                                        .lane_x = lane_x,
+                                        .step_px = step_px,
+                                        .scroll_x = app.playlist.scroll_x,
+                                        .zoom = zoom,
+                                        .win_lo = win_lo,
+                                        .win_steps = win_steps,
+                                        .inner_y = inner_y,
+                                        .inner_h = inner_h,
+                                        .inner_col = inner_col,
+                                        .range = range,
+                                        .ui = ui,
+                                    };
+                                    note_preview.forEachInWindow(app, clip.pattern, null, win_lo, win_lo + win_steps, ctx, struct {
+                                        fn cb(c: Ctx, a: *const App, ni: usize) void {
+                                            const n = a.notes.items[ni];
+                                            const rel = n.step - c.win_lo;
+                                            if (rel >= c.win_steps or rel + n.len <= 0) return; // 不在可见窗口
+                                            const span = previewNoteSpan(c.clip.start + rel, n.len, c.clip_x, c.clip_w, c.lane_x, c.step_px, c.scroll_x, c.zoom) orelse return;
+                                            const y_norm = c.range.yOf(n.pitch);
+                                            const ny = c.inner_y + c.inner_h - 2 - @as(i32, @intFromFloat(y_norm * @as(f32, @floatFromInt(c.inner_h - 2))));
+                                            c.ui.renderer.fillRect(span.x, ny, span.w, 2, c.inner_col);
+                                        }
+                                    }.cb);
                                 }
                             }
                         }

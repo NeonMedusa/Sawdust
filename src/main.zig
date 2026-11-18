@@ -131,6 +131,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer app.clips.deinit(allocator);
     defer app.notes.deinit(allocator);
     defer app.deinitAll();
+    // 钢琴窗 minimap 的位图缓存是**文件级**的（全项目只有一个钢琴窗）→ 退出时手动释放
+    defer view_pianoroll.deinitCaches(allocator);
     app.resetPatterns(1); // 空工程基线：只有样式 1（不再铺 6 个演示样式）；轨道行跨度自动推导
     app.resetMixerChannels(@import("app.zig").default_mixer_channels); // 默认调音台通道（主通道 + 通道#1）
     // 数据目录已在启动最前面解析（设置文件在那里）；这里装填 + 首次扫描

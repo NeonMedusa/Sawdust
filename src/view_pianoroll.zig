@@ -14,6 +14,7 @@ const Ui = @import("ui.zig").Ui;
 const Theme = @import("ui.zig").Theme;
 const App = @import("app.zig").App;
 const model = @import("model.zig");
+const note_preview = @import("note_preview.zig");
 const synth = @import("synth.zig");
 const util = @import("view_util.zig");
 const view_lane = @import("view_lane.zig");
@@ -36,7 +37,7 @@ const note_edge_px: i32 = 8;
 /// 鼠标处的音符命中（像素邻近）：取**中心最近**者，等距取数组序更大者（= 顶层，
 /// 与 `topmostNoteAt` 的“叠放取顶层”一致）。命中窗口 = 音符本体（至少 1px）±容差。
 fn noteAtMousePx(
-    app: *const App,
+    app: *App,
     mx: i32,
     my: i32,
     lane_x: i32,
@@ -53,17 +54,37 @@ fn noteAtMousePx(
     const mx_f: f32 = @as(f32, @floatFromInt(mx - lane_x));
     var best: ?usize = null;
     var best_d: f32 = std.math.floatMax(f32);
-    for (app.notes.items, 0..) |n, i| {
-        if (n.pattern != pattern or n.instrument != app.sel.instrument or n.pitch != pitch) continue;
-        const x0: f32 = @as(f32, @floatFromInt(n.step)) * step_ws - scroll_s;
-        const x1: f32 = @as(f32, @floatFromInt(n.step + n.len)) * step_ws - scroll_s;
-        const lo: f32 = @min(x0, x1);
-        const hi: f32 = @max(@max(x0, x1), lo + 1.0); // 本体至少 1px（与绘制一致）
-        if (mx_f < lo - note_hit_tol_px or mx_f > hi + note_hit_tol_px) continue;
-        const d: f32 = @abs(mx_f - (lo + hi) * 0.5);
-        if (d <= best_d) {
-            best_d = d;
-            best = i;
+    // **只扫鼠标所在（±1）的时间桶**（以前是每帧全量扫 `notes`，见 `docs/resources.md` §四第 9 条）。
+    // 索引在 `App.ensureNoteIndex` 里维护（随 `notes_ver` 失效），长音跨桶会重复登记 → 不会漏。
+    app.ensureNoteIndex(pattern);
+    const ix = &app.note_index;
+    const nb: usize = ix.starts.items.len - 1;
+    if (nb > 0) {
+        // 像素 → 内容步 → 桶（±1 覆盖像素容差与桶边界）
+        const step_at: i32 = @intFromFloat(@floor((mx_f + scroll_s) / step_ws));
+        const b_at: i32 = @divFloor(step_at, @import("app.zig").bucket_units);
+        var bb: i32 = @max(0, b_at - 1);
+        const b_end: i32 = @min(b_at + 1, @as(i32, @intCast(nb)) - 1);
+        while (bb <= b_end) : (bb += 1) {
+            const b: usize = @intCast(bb);
+            const lo_i: usize = ix.starts.items[b];
+            const hi_i: usize = ix.starts.items[b + 1];
+            for (ix.items.items[lo_i..hi_i]) |ni| {
+                const i: usize = ni;
+                if (i >= app.notes.items.len) continue; // 防御：索引过期也只漏扫，不越界
+                const n = app.notes.items[i];
+                if (n.pattern != pattern or n.instrument != app.sel.instrument or n.pitch != pitch) continue;
+                const x0: f32 = @as(f32, @floatFromInt(n.step)) * step_ws - scroll_s;
+                const x1: f32 = @as(f32, @floatFromInt(n.step + n.len)) * step_ws - scroll_s;
+                const lo: f32 = @min(x0, x1);
+                const hi: f32 = @max(@max(x0, x1), lo + 1.0); // 本体至少 1px（与绘制一致）
+                if (mx_f < lo - note_hit_tol_px or mx_f > hi + note_hit_tol_px) continue;
+                const d: f32 = @abs(mx_f - (lo + hi) * 0.5);
+                if (d <= best_d) {
+                    best_d = d;
+                    best = i;
+                }
+            }
         }
     }
     return best;
@@ -95,6 +116,73 @@ fn noteHitMode(nx: i32, nw: i32, mouse_x: i32) model.NoteHitMode {
     if (mouse_x < lo + edge) return .left;
     if (mouse_x >= lo + span - edge) return .right;
     return .body;
+}
+
+/// minimap 预览**位图缓存**（全项目只有一个钢琴窗 → 单例足够）。
+///
+/// 以前：每帧扫两遍 `notes` + 块列表封顶（512 → 8192 → 堆）—— 块数始终 = 音符数，
+/// 绘制成本随 N 涨。现在：直接光栅化成 **轨道像素网格位图**（`cols × rows` 位），
+/// 绘制成本 = 置位像素数（与音符数无关），且与屏幕上看得到的一致（无外观损失）。
+/// 重建只在 `(notes_ver, pattern, instrument, cols/rows/content_w)` 变化时发生。
+const MiniCache = struct {
+    ver: u64 = std.math.maxInt(u64),
+    pattern: i32 = -1,
+    inst: i32 = -2,
+    cols: i32 = 0,
+    rows: i32 = 0,
+    content_w: i32 = 0,
+    color: u32 = 0,
+    /// 行优先位图（每行重新起字）：`words_per_row = ceil(cols/64)`
+    words: []u64 = &.{},
+    cap: usize = 0,
+};
+var mini_cache: MiniCache = .{};
+
+fn rebuildMiniCache(app: *App, pattern: i32, color: u32, cols: i32, rows: i32, content_w: i32) void {
+    const c = &mini_cache;
+    c.ver = app.notes_ver;
+    c.pattern = pattern;
+    c.inst = app.sel.instrument;
+    c.cols = cols;
+    c.rows = rows;
+    c.content_w = content_w;
+    c.color = color;
+    if (cols <= 0 or rows <= 0 or content_w <= 0) return;
+    const need = note_preview.wordsNeeded(cols, rows);
+    if (need == 0) return;
+    if (need > c.cap or (c.cap > need * 4 and c.cap > 4096)) {
+        // **动态扩容 + 动态缩容**：内容变少（缩窄窗口/缩短样式）时把内存收回来，
+        // 免得一个曾经的大工程把缓冲永久占着。旧缓冲归还分配器。
+        const bigger = app.allocator.alloc(u64, need) catch return;
+        if (c.cap > 0) app.allocator.free(c.words[0..c.cap]);
+        c.words = bigger;
+        c.cap = need;
+    }
+    // 音高范围（全量扫一遍——只在位图重建时发生，不是每帧）：用该乐器的实际音域，
+    // 保底 1 个八度（否则一两个音会像“通高块”，见 `model.rangeMap`）。
+    var min_pitch: i32 = 127;
+    var max_pitch: i32 = 0;
+    var any_note = false;
+    for (app.notes.items) |n| {
+        if (n.pattern != pattern or n.instrument != app.sel.instrument) continue;
+        any_note = true;
+        min_pitch = @min(min_pitch, n.pitch);
+        max_pitch = @max(max_pitch, n.pitch);
+    }
+    if (!any_note) {
+        @memset(c.words[0..need], 0);
+        return;
+    }
+    const range = model.rangeMap(min_pitch, max_pitch, 12);
+    // 内容宽度（px）→ 步域窗口：共用光栅化器按**步**映射（`note_preview.rasterize`）
+    const content_steps: i32 = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(content_w)) / util.pianoStepPx())));
+    note_preview.rasterize(app, pattern, app.sel.instrument, 0, content_steps, range, cols, rows, c.words[0..need]);
+}
+
+/// 释放文件级缓存（进程退出时由 main 调；否则 SafeAllocator 会报泄漏）
+pub fn deinitCaches(alloc: std.mem.Allocator) void {
+    if (mini_cache.cap > 0) alloc.free(mini_cache.words[0..mini_cache.cap]);
+    mini_cache = .{};
 }
 
 pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
@@ -200,41 +288,25 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     {
         // **动态缩放下限**（见函数顶部 dyn_zoom_min）
 
-        // minimap：当前样式 + 当前乐器的音符分布（横向版 VSCode minimap）。
-        // 纵向映射用**实际音域**（最低音→底、最高音→顶），并设**保底范围**
-        // （至少 1 个八度）——否则只有一两个音时会看起来像通高块。
-        var mini_buf: [512]Ui.MiniBlock = undefined;
-        var nmini: usize = 0;
-        var min_pitch: i32 = 127;
-        var max_pitch: i32 = 0;
-        var any_note = false;
-        for (app.notes.items) |n| {
-            if (n.pattern != pattern or n.instrument != app.sel.instrument) continue;
-            any_note = true;
-            min_pitch = @min(min_pitch, n.pitch);
-            max_pitch = @max(max_pitch, n.pitch);
-        }
-        if (any_note) {
-            // 保底 1 个八度（否则一两个音会像“通高块”）；以音域中点扩展
-            const range = model.rangeMap(min_pitch, max_pitch, 12);
-            for (app.notes.items) |n| {
-                if (nmini >= mini_buf.len) break;
-                if (n.pattern != pattern or n.instrument != app.sel.instrument) continue;
-                mini_buf[nmini] = .{
-                    .pos = @intFromFloat(@round(@as(f32, @floatFromInt(n.step)) * util.pianoStepPx())),
-                    .len = @max(1, @as(i32, @intFromFloat(@round(@as(f32, @floatFromInt(n.len)) * util.pianoStepPx())))),
-                    .kind = .note,
-                    .y = 1.0 - range.yOf(n.pitch),
-                    .color = ui.theme.waveform,
-                };
-                nmini += 1;
-            }
+        // minimap：当前样式 + 当前乐器的音符分布（**位图缓存**；见文件顶部 `MiniCache`）
+        const mini_cols = w - 2;
+        const bar_rows: i32 = @max(4, ruler_h - 4);
+        if (mini_cache.ver != app.notes_ver or mini_cache.pattern != pattern or
+            mini_cache.inst != app.sel.instrument or mini_cache.cols != mini_cols or
+            mini_cache.rows != bar_rows or mini_cache.content_w != min_content)
+        {
+            rebuildMiniCache(app, pattern, ui.theme.waveform, mini_cols, bar_rows, min_content);
         }
         // 防误触：滑块外单击 / 滚动条上滚轮 = 移动"一个当前网格"（Ctrl+单击才是直接定位）
         // 注：步进像素不能为 0（最细网格 1 步 = 0.125 px）→ 兜底 4px，否则"点一下没反应"
         ui.scrollbar_nudge = @max(4, @as(i32, @intFromFloat(@round(@as(f32, @floatFromInt(model.snapSteps(app.piano.snap))) * util.pianoStepPx()))));
         ui.scrollbar_target = &app.piano.scroll_x_target; // 步进走补间（拖动仍直接写 scroll_x）
-        _ = ui.scrollbarTimelineEx(10, x + 1, hsb_y, w - 2, ruler_h, &app.piano.scroll_x, min_content, &app.piano.zoom, view_w, dyn_zoom_min, 8.0, bars_right < util.overhang_map_limit, mini_buf[0..nmini]);
+        _ = ui.scrollbarTimelineEx(10, x + 1, hsb_y, w - 2, ruler_h, &app.piano.scroll_x, min_content, &app.piano.zoom, view_w, dyn_zoom_min, 8.0, bars_right < util.overhang_map_limit, .{ .bitmap = .{
+            .bits = mini_cache.words,
+            .cols = mini_cache.cols,
+            .rows = mini_cache.rows,
+            .color = mini_cache.color,
+        } });
     }
     ui.renderer.hline(x + 1, ruler_y, w - 2, ui.theme.panel_border);
 

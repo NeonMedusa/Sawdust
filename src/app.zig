@@ -1318,6 +1318,47 @@ pub const SettingsDraft = struct {
     }
 };
 
+/// **音符桶索引**（CSR）：当前钢琴窗 `(pattern, instrument)` 的音符按**时间桶**归组。
+/// 用途：hover 命中 `noteAtMousePx` 只扫鼠标所在（±1）的桶 → 每帧从 O(N) 降到 O(桶内数)；
+/// minimap 增量重建（后续）共用同一套桶表。
+/// 布局：`starts[b]..starts[b+1]` 是本桶在 `items` 里的区间，`items` 存的是 `notes.items` 的下标；
+/// 一个音符**跨越多个桶时每个桶各登一次**（长音也能在任意包含它的位置被找到）。
+pub const NoteIndex = struct {
+    ver: u64 = std.math.maxInt(u64),
+    /// key 只到 `pattern`（**不按乐器**）：同一张表同时服务钢琴窗 hover、机架每行预览等
+    /// —— 消费方各自按 `instrument` 过滤即可，不用为每个乐器建一份。
+    pattern: i32 = -1,
+    /// 建索引时的音符总数：**兜底失效条件**——任何增删都会变，
+    /// 即使某条删除路径忘调 `touchNotes()` 也不会留下悬空下标（实测崩溃：删除音符后越界）
+    len: usize = 0,
+    starts: std.ArrayListUnmanaged(u32) = .empty,
+    items: std.ArrayListUnmanaged(u32) = .empty,
+
+    pub fn deinit(self: *NoteIndex, alloc: std.mem.Allocator) void {
+        self.starts.deinit(alloc);
+        self.items.deinit(alloc);
+    }
+};
+
+/// 桶宽：**4 个全音符**（4/4 下的 4 小节）。
+/// 取固定单位而不按拍号算：索引只为“缩小搜索范围”，不靠它与音乐结构对齐。
+pub const bucket_units: i32 = 4 * model.units_per_whole;
+
+/// 机架行预览的**统计缓存**（一行一个）：只存“总长 + 音域”，块仍然现场画。
+/// 一条行预览要扫两遗 `notes`（统计 + 画块），这里消掉开销更大的第一遗；
+/// 机架行预览的**块缓存**（一行一个乐器）：一次扫描同时得到统计与块，
+/// 此后每帧只遍历缓存（不再扫 `notes`）。
+pub const RackBlock = struct { step: i32, len: i32, pitch: i32 };
+
+pub const RackPreview = struct {
+    ver: u64 = std.math.maxInt(u64),
+    pattern: i32 = -1,
+    max_step: i32 = 64,
+    min_pitch: i32 = 127,
+    max_pitch: i32 = 0,
+    blocks: std.ArrayListUnmanaged(RackBlock) = .empty,
+};
+
 /// 设置窗口（启动行为 / 最高帧率；工具栏“选项”打开）
 pub const SettingsWindow = struct {
     open: bool = false,
@@ -2022,8 +2063,113 @@ pub const App = struct {
     /// 播放列表片段预览的每样式音域统计（按**实际样式数**分配/复用——见 `ensurePatStats`；
     /// 原为 `[max_patterns]` 栈数组，上限放到十亿级后改为复用缓冲）
     pat_stats: []PatPreviewStat = &.{},
+    /// **音符桶索引**（hover 命中用；见 `NoteIndex` / `ensureNoteIndex`）
+    note_index: NoteIndex = .{},
+    /// 播放列表片段预览的“每样式音域”快照版本（与 `notes_ver`/`pat_stats.len` 比 → 没变就不重扫）
+    pat_stats_ver: u64 = std.math.maxInt(u64),
+    pat_stats_len: usize = std.math.maxInt(usize),
+    /// 机架行预览的每行统计缓存（索引 = 乐器下标；**只缓存“统计”不缓存块**）
+    rack_preview: std.ArrayListUnmanaged(RackPreview) = .empty,
+    /// **音符内容版本号**（UI 缓存用）：增删/移动/拉伸/量化/撤销/读档时 +1。
+    /// 目前只有钢琴窗 minimap 的预览缓存靠它判断“要不要重建”
+    /// （以前每帧全量扫 `notes`，见 `docs/resources.md` §四第 8 条）。
+    notes_ver: u64 = 0,
 
     // ── 方法 ──
+
+    /// 机架行预览的统计（带缓存；`inst` = 乐器下标，`pattern` = 要预览的样式）
+    pub fn rackPreviewFor(self: *App, inst: i32, pattern: i32) RackPreview {
+        const i: usize = @intCast(inst);
+        if (i >= self.rack_preview.items.len) {
+            self.rack_preview.resize(self.allocator, i + 1) catch return .{ .pattern = pattern };
+            // 扩容后的新项保持“未缓存”状态
+            var k = i;
+            while (k < self.rack_preview.items.len) : (k += 1) self.rack_preview.items[k] = .{};
+        }
+        const c = &self.rack_preview.items[i];
+        if (c.ver == self.notes_ver and c.pattern == pattern) return c.*;
+        c.ver = self.notes_ver;
+        c.pattern = pattern;
+        c.max_step = 64; // minimap 总长（步）：至少 4 小节
+        c.min_pitch = 127;
+        c.max_pitch = 0;
+        c.blocks.clearRetainingCapacity();
+        // 两遗并一遗：同一次扫描里既算统计、又把**块**收进缓存
+        // （以前每行每帧都要再扫一遍 `notes` 画块）
+        for (self.notes.items) |n| {
+            if (n.pattern != pattern or n.instrument != inst) continue;
+            c.max_step = @max(c.max_step, n.step + n.len);
+            c.min_pitch = @min(c.min_pitch, n.pitch);
+            c.max_pitch = @max(c.max_pitch, n.pitch);
+            c.blocks.append(self.allocator, .{ .step = n.step, .len = n.len, .pitch = n.pitch }) catch break;
+        }
+        // **动态缩容**：删掉大量音符后把块缓冲的容量收回来
+        if (c.blocks.capacity > c.blocks.items.len * 4 + 64) {
+            c.blocks.shrinkAndFree(self.allocator, c.blocks.items.len);
+        }
+        return c.*;
+    }
+
+    /// 标“音符内容变了”（供 UI 缓存，目前只有 minimap 预览；多标无妨）
+    pub fn touchNotes(self: *App) void {
+        self.notes_ver +%= 1;
+    }
+
+    /// 重建/复用**桶索引**（`pattern` = 样式；桶里含该样式的**所有乐器**音符）。
+    /// 只有 `notes_ver / pattern`（或音符总数）变了才真正重建（稳态下零成本）。
+    pub fn ensureNoteIndex(self: *App, pattern: i32) void {
+        const ix = &self.note_index;
+        if (ix.ver == self.notes_ver and ix.pattern == pattern and ix.len == self.notes.items.len) return;
+        ix.ver = self.notes_ver;
+        ix.pattern = pattern;
+        ix.len = self.notes.items.len;
+        ix.starts.clearRetainingCapacity();
+        ix.items.clearRetainingCapacity();
+
+        var max_end: i32 = 0;
+        for (self.notes.items) |n| {
+            if (n.pattern != pattern) continue;
+            max_end = @max(max_end, n.step + @max(1, n.len));
+        }
+        const nb: usize = if (max_end <= 0) 1 else @intCast(@divTrunc(max_end + bucket_units - 1, bucket_units));
+        ix.starts.resize(self.allocator, nb + 1) catch return;
+        @memset(ix.starts.items, 0);
+
+        // ① 计数：一个音符登到它覆盖的每个桶（starts[b+1] 先存本桶数量）
+        for (self.notes.items) |n| {
+            if (n.pattern != pattern) continue;
+            const b0: usize = @intCast(@divFloor(n.step, bucket_units));
+            const b1: usize = @intCast(@divFloor(n.step + @max(1, n.len) - 1, bucket_units));
+            var b = b0;
+            while (b <= b1 and b < nb) : (b += 1) ix.starts.items[b + 1] += 1;
+        }
+        // ② 前缀和 → CSR
+        var k: usize = 0;
+        while (k < nb) : (k += 1) ix.starts.items[k + 1] += ix.starts.items[k];
+        // ③ 填充（游标 = starts 的副本）
+        const total = ix.starts.items[nb];
+        ix.items.resize(self.allocator, total) catch return;
+        const cursor = self.allocator.alloc(u32, nb) catch return;
+        defer self.allocator.free(cursor);
+        @memcpy(cursor, ix.starts.items[0..nb]);
+        for (self.notes.items, 0..) |n, i| {
+            if (n.pattern != pattern) continue;
+            const b0: usize = @intCast(@divFloor(n.step, bucket_units));
+            const b1: usize = @intCast(@divFloor(n.step + @max(1, n.len) - 1, bucket_units));
+            var b = b0;
+            while (b <= b1 and b < nb) : (b += 1) {
+                ix.items.items[cursor[b]] = @intCast(i);
+                cursor[b] += 1;
+            }
+        }
+        // **动态缩容**：音符大幅减少时把容量收回来（否则删光音符后索引仍占着峰值内存）
+        if (ix.items.capacity > ix.items.items.len * 4 + 64) {
+            ix.items.shrinkAndFree(self.allocator, ix.items.items.len);
+        }
+        if (ix.starts.capacity > ix.starts.items.len * 4 + 64) {
+            ix.starts.shrinkAndFree(self.allocator, ix.starts.items.len);
+        }
+    }
 
     /// 放置一个样式片段（分配失败时静默忽略）
     pub fn addClip(self: *App, c: Clip) void {
@@ -2035,6 +2181,7 @@ pub const App = struct {
     pub fn addNote(self: *App, n: Note) void {
         self.notes.append(self.allocator, n) catch {};
         self.dirty = true;
+        self.touchNotes(); // 桶索引/预览缓存失效（下标集合变了）
     }
 
     // ── 选区 / 批量操作（框选、批量删除/克隆/复制/粘贴）──
@@ -2305,7 +2452,10 @@ pub const App = struct {
             nt.len = q.len;
             n += 1;
         }
-        if (n > 0) self.dirty = true;
+        if (n > 0) {
+            self.dirty = true;
+            self.touchNotes(); // 增删音符 → UI 缓存/桶索引失效
+        }
         return n;
     }
 
@@ -2370,6 +2520,7 @@ pub const App = struct {
             }
         }
         if (removed > 0) self.dirty = true;
+        if (removed > 0) self.touchNotes(); // 桶索引/预览缓存失效（下标集合变了）
         return removed;
     }
 
@@ -2446,7 +2597,10 @@ pub const App = struct {
             }) catch {};
         }
         const n = self.clipboard_notes.items.len;
-        if (n > 0) self.dirty = true;
+        if (n > 0) {
+            self.dirty = true;
+            self.touchNotes(); // 增删音符 → UI 缓存/桶索引失效
+        }
         return n;
     }
 
@@ -2539,7 +2693,10 @@ pub const App = struct {
                 changed = true;
             }
         }
-        if (changed) self.dirty = true;
+        if (changed) {
+            self.dirty = true;
+            self.touchNotes(); // 拖动/键盘微调：minimap 预览跟上
+        }
         return changed;
     }
 
@@ -2663,7 +2820,10 @@ pub const App = struct {
                 }
             }
         }
-        if (changed) self.dirty = true;
+        if (changed) {
+            self.dirty = true;
+            self.touchNotes(); // 批量拉伸（拖动中逐帧）：minimap 预览跟上
+        }
         return applied;
     }
 
@@ -4483,6 +4643,9 @@ pub const App = struct {
     /// 释放全部乐器（名字 + 合成器参数，含退役的）+ 保存相关字段——进程退出时调用
     pub fn deinitAll(self: *App) void {
         self.sched_log_pending.deinit(self.allocator); // 诊断缓冲（--sched-log 用）
+        self.note_index.deinit(self.allocator); // 音符桶索引（hover 命中用）
+        for (self.rack_preview.items) |*rp| rp.blocks.deinit(self.allocator);
+        self.rack_preview.deinit(self.allocator); // 机架行预览统计/块缓存
         for (self.auto_curves.items) |*lc| lc.deinit(self.allocator);
         self.auto_curves.deinit(self.allocator);
         self.auto_bindings.deinit(self.allocator); // 自动化（内存态）
@@ -6215,7 +6378,6 @@ pub const App = struct {
         return true;
     }
 
-    /// **内容签名**（发布节流用）：曲线形状/插值 + 绑定的全部字段 + 车道解析数量 + 手动接管目标。
     /// 只要它不变且没到强制重发周期，就不再重建音频快照（省掉每帧几百 KB 的池拷贝）。
     fn laneSignature(self: *const App) u64 {
         // FNV-1a 64（嵌入式便宜哈希；这里只要求“变了就不同”）
@@ -8439,6 +8601,7 @@ pub const App = struct {
     /// 若当前状态与所在快照等价（忽略选区）→ 不产生新条目（防“点了没动”噪音）。
     pub fn commitHistory(self: *App, label: []const u8) void {
         self.snap_dirty = true; // A2：数据变了 → 下一帧重建快照（影子对拍）
+        self.touchNotes(); // UI 缓存（minimap 预览）：宁可多标，漏标只会让预览慢一拍
         // **先清理悬空绑定**（乐器被删除/换成别的乐器、通道被删、插件参数没了）——
         // 这样新快照里不会留下“指向不存在目标”的绑定；撤销时按旧快照把两者一起恢复。
         _ = self.pruneAutoBindings();
@@ -8533,6 +8696,7 @@ pub const App = struct {
     fn applyHistoryState(self: *App, st: *const HistoryState, prev_idx: usize, target_idx: usize) void {
         // **A4**：撤销/重做/跳历史改了数据 → 必须重建快照，否则播放中听不到变化（实测：undo 后快照没变）
         self.snap_dirty = true;
+        self.touchNotes(); // 快照里含音符 → UI 缓存（minimap）也作废
         // 曲线内容可能被快照整体替换（`version` 取自快照，可能碰巧相同）→ 强制 bump，
         // 让发布节流（`publishAutoLane` 的内容签名）一定看到“变了”。
         // 播放中**不停播**：撤销/重做/跳转走“编辑重扫”（见 `publishHistoryRescan`）——
@@ -9925,7 +10089,10 @@ pub const App = struct {
             n += 1;
             if (mode == .topmost) break;
         }
-        if (n > 0) self.dirty = true;
+        if (n > 0) {
+            self.dirty = true;
+            self.touchNotes(); // 增删音符 → UI 缓存/桶索引失效
+        }
         return n;
     }
 

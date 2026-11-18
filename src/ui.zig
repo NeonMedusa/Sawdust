@@ -1583,10 +1583,25 @@ pub const Ui = struct {
         zoom_min: f32,
         zoom_max: f32,
     ) bool {
-        return self.scrollbarTimelineEx(id, x, y, w, h, scroll, @max(content_w.*, content_min_w), zoom, view_w, zoom_min, zoom_max, true, &.{});
+        return self.scrollbarTimelineEx(id, x, y, w, h, scroll, @max(content_w.*, content_min_w), zoom, view_w, zoom_min, zoom_max, true, .{ .blocks = &.{} });
     }
 
-    /// 同上，但带 **minimap 内容块**（`mini` 画在滑块之下，内容分布可见）。
+    /// **minimap 内容源**：内容块列表（片段/音符）或**像素位图**（钢琴窗 minimap 用）。
+    /// 位图尺寸 = 轨道自身的像素栅格 → 绘制成本与音符数量**完全脱钩**（只与置位像素数有关）。
+    pub const MiniBitmap = struct {
+        /// `cols × rows` 位，行优先；字内位序：bit i = col `i % 64`（每行重新起字）
+        bits: []const u64,
+        cols: i32,
+        rows: i32,
+        color: Color,
+    };
+
+    pub const MiniSource = union(enum) {
+        blocks: []const MiniBlock,
+        bitmap: MiniBitmap,
+    };
+
+    /// 同上，但带 **minimap 内容**（`mini` 画在滑块之下，内容分布可见）。
     pub fn scrollbarTimelineEx(
         self: *Ui,
         id: u64,
@@ -1601,7 +1616,7 @@ pub const Ui = struct {
         zoom_min: f32,
         zoom_max: f32,
         allow_overhang: bool,
-        mini: []const MiniBlock,
+        mini: MiniSource,
     ) bool {
         const edge = 8; // 边缘命中区上限（缩放）
         const cap: i32 = 1 << 30; // 内部防溢出（交互无感）
@@ -1632,24 +1647,47 @@ pub const Ui = struct {
         // 轨道背景（凹槽，常显）
         self.renderer.fillRect(x, y, w, h, self.theme.bg);
 
-        // minimap 内容块（在背景之上、滑块之下）：内容分布按比例映射到轨道
-        if (mini.len > 0) {
-            const inner_y = y + 2;
-            const inner_h = @max(4, h - 4);
-            for (mini) |blk| {
-                const bx = x + @as(i32, @intCast(@divTrunc(@as(i64, blk.pos) * w, cw64)));
-                const bw = @max(1, @as(i32, @intCast(@divTrunc(@as(i64, blk.len) * w, cw64))));
-                if (bx >= x + w or bx + bw <= x) continue; // 不在轨道可视范围内：跳过
-                if (blk.kind == .full) {
-                    // 占满全高（片段类）
-                    self.renderer.fillRect(bx, inner_y, bw, inner_h, blk.color);
-                } else {
-                    // 纵向定位（音符类）：按 y 映射到内部高度内的一小条（钳制越界）
-                    const y_norm = std.math.clamp(blk.y, 0, 1);
-                    const by = inner_y + @as(i32, @intFromFloat(y_norm * @as(f32, @floatFromInt(inner_h - 2))));
-                    self.renderer.fillRect(bx, by, bw, 2, blk.color);
+        // minimap 内容（在背景之上、滑块之下）：块列表按比例映射，或位图逐像素点亮
+        switch (mini) {
+            .blocks => |blocks| if (blocks.len > 0) {
+                const inner_y = y + 2;
+                const inner_h = @max(4, h - 4);
+                for (blocks) |blk| {
+                    const bx = x + @as(i32, @intCast(@divTrunc(@as(i64, blk.pos) * w, cw64)));
+                    const bw = @max(1, @as(i32, @intCast(@divTrunc(@as(i64, blk.len) * w, cw64))));
+                    if (bx >= x + w or bx + bw <= x) continue; // 不在轨道可视范围内：跳过
+                    if (blk.kind == .full) {
+                        // 占满全高（片段类）
+                        self.renderer.fillRect(bx, inner_y, bw, inner_h, blk.color);
+                    } else {
+                        // 纵向定位（音符类）：按 y 映射到内部高度内的一小条（钳制越界）
+                        const y_norm = std.math.clamp(blk.y, 0, 1);
+                        const by = inner_y + @as(i32, @intFromFloat(y_norm * @as(f32, @floatFromInt(inner_h - 2))));
+                        self.renderer.fillRect(bx, by, bw, 2, blk.color);
+                    }
                 }
-            }
+            },
+            .bitmap => |bm| bm: {
+                // 位图：`cols × rows`，直接映射到轨道内区（每置位像素画 1×1）
+                const inner_y = y + 2;
+                const inner_h = @max(4, h - 4);
+                if (bm.cols <= 0 or bm.rows <= 0) break :bm;
+                const words_per_row: usize = (@as(usize, @intCast(bm.cols)) + 63) / 64;
+                if (bm.bits.len < words_per_row * @as(usize, @intCast(bm.rows))) break :bm;
+                var row: i32 = 0;
+                while (row < bm.rows) : (row += 1) {
+                    const py = inner_y + @divTrunc(row * inner_h, bm.rows);
+                    const base = @as(usize, @intCast(row)) * words_per_row;
+                    var col: i32 = 0;
+                    while (col < bm.cols) : (col += 1) {
+                        const ci: usize = @intCast(col);
+                        if ((bm.bits[base + ci / 64] >> @intCast(ci % 64)) & 1 == 0) continue;
+                        const px = x + @divTrunc(col * w, bm.cols);
+                        const pw = @max(1, @divTrunc((col + 1) * w, bm.cols) - @divTrunc(col * w, bm.cols));
+                        self.renderer.fillRect(px, py, pw, 1, bm.color);
+                    }
+                }
+            },
         }
 
         var changed = false;
