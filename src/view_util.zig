@@ -185,11 +185,11 @@ pub const piano_header_w: i32 = 90; // 琴键列宽（与播放列表轨道列�
 // **不画**（那条线归上一层负责）——避免“两套小节线各画各的”。
 // 注：当前值（36）是**调优中**的临时值（原为 4/6/3，用户实测太密）。
 /// 网格层（= 当前量化档位）
-pub const grid_min_px_snap: f32 = 24.0;
+pub const grid_min_px_snap: f32 = 18.0;
 /// 拍线
-pub const grid_min_px_beat: f32 = 24.0;
+pub const grid_min_px_beat: f32 = 18.0;
 /// 小节线（**权威层**）：按 **2 的幂 × 小节** 变稀（1/2/4/8/16…，乐句感）
-pub const grid_min_px_bar: f32 = 24.0;
+pub const grid_min_px_bar: f32 = 18.0;
 /// **小节号（刻度尺数字）的最小间距**。数字 = 线梯子的整数倍（可再抽稀一倍）、
 /// 但**绝不独立分级**——保证每个数字下面正好有一条小节线。
 pub const ruler_label_min_px: f32 = 40.0;

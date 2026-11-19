@@ -43,7 +43,9 @@ pub fn forEachInWindow(
     if (ix.starts.items.len < 2) return;
     const nb: usize = ix.starts.items.len - 1;
     const bu = @import("app.zig").bucket_units;
-    const b0: usize = @intCast(@max(0, @divFloor(step_lo, bu)));
+    // 起点向前多看 `max_len`：起始在窗口之前、但一直延伸进窗口的长音也要被扫到。
+    const look_lo = step_lo - @max(1, ix.max_len);
+    const b0: usize = @intCast(@max(0, @divFloor(look_lo, bu)));
     const b1: usize = @min(nb - 1, @as(usize, @intCast(@max(0, @divFloor(step_hi - 1, bu)))));
     var b = b0;
     while (b <= b1) : (b += 1) {

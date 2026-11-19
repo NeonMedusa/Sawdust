@@ -647,21 +647,53 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             }
         }
 
+        // 可见步域窗口（供幽灵音符/主体音符的候选集定位；±1 步余量吸收取整误差）
+        const win_step_lo: i32 = @as(i32, @intFromFloat(@floor(scroll_s / step_ws))) - 1;
+        const win_step_hi: i32 = @as(i32, @intFromFloat(@ceil((scroll_s + @as(f32, @floatFromInt(view_w))) / step_ws))) + 1;
+
         // 幽灵音符（**同样式、其它乐器**；灰色半透明——只读参考，无交互）：
         // 画在主体音符**之前** → 真实音符压在上层。
         // 交互（命中/框选/行选）的乐器筛选保留——幽灵不参与选择与拖动。
+        // 性能：**只遍历可见步域窗口内的候选**（桶索引），不再每帧扫全量 `notes`。
         {
             const saved_ghost = ui.renderer.pushClip(lane_x, lane_y, view_w, lane_h);
             defer ui.renderer.popClip(saved_ghost);
-            for (app.notes.items) |n| {
-                if (n.pattern != pattern or n.instrument == app.sel.instrument) continue;
-                const gx = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(n.step)) * step_ws - scroll_s));
-                const gy = lane_y + (127 - n.pitch) * kh - app.piano.scroll;
-                const gw = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(n.len)) * step_ws)));
-                if (gx + gw < lane_x or gx > lane_x + view_w) continue;
-                if (gy + kh < lane_y or gy > lane_y + lane_h) continue;
-                ui.renderer.fillRect(gx, gy, gw, kh - 1, ui.theme.ghost_note);
-            }
+            const GhostCtx = struct {
+                ui: *Ui,
+                lane_x: i32,
+                lane_y: i32,
+                view_w: i32,
+                lane_h: i32,
+                step_ws: f32,
+                scroll_s: f32,
+                kh: i32,
+                scroll: i32,
+                sel_inst: i32,
+            };
+            const gctx = GhostCtx{
+                .ui = ui,
+                .lane_x = lane_x,
+                .lane_y = lane_y,
+                .view_w = view_w,
+                .lane_h = lane_h,
+                .step_ws = step_ws,
+                .scroll_s = scroll_s,
+                .kh = kh,
+                .scroll = app.piano.scroll,
+                .sel_inst = app.sel.instrument,
+            };
+            note_preview.forEachInWindow(app, pattern, null, win_step_lo, win_step_hi, gctx, struct {
+                fn cb(c: GhostCtx, a: *const App, ni: usize) void {
+                    const n = a.notes.items[ni];
+                    if (n.instrument == c.sel_inst) return;
+                    const gx = c.lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(n.step)) * c.step_ws - c.scroll_s));
+                    const gy = c.lane_y + (127 - n.pitch) * c.kh - c.scroll;
+                    const gw = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(n.len)) * c.step_ws)));
+                    if (gx + gw < c.lane_x or gx > c.lane_x + c.view_w) return;
+                    if (gy + c.kh < c.lane_y or gy > c.lane_y + c.lane_h) return;
+                    c.ui.renderer.fillRect(gx, gy, gw, c.kh - 1, c.ui.theme.ghost_note);
+                }
+            }.cb);
         }
 
         // 音符（当前样式 + 当前乐器）——**单独裁剪到音符区**：
@@ -672,11 +704,14 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             // 层级（与片段同规则，用户拍板）：按左端点升序绘制（越靠右越上层）；
             // 左端相同 → 数组序。暂存下标表排序（见 `PianoState.draw_order`）。
             app.piano.draw_order.clearRetainingCapacity();
-            for (app.notes.items, 0..) |n0, ni0| {
-                if (n0.pattern == pattern and n0.instrument == app.sel.instrument) {
-                    app.piano.draw_order.append(app.allocator, ni0) catch {};
+            // **只收可见步域窗口内的候选**（桶索引定位）；层级排序仍按 (step, 数组序)
+            const OrderCtx = struct { order: *std.ArrayListUnmanaged(usize), alloc: std.mem.Allocator };
+            const octx = OrderCtx{ .order = &app.piano.draw_order, .alloc = app.allocator };
+            note_preview.forEachInWindow(app, pattern, app.sel.instrument, win_step_lo, win_step_hi, octx, struct {
+                fn cb(c: OrderCtx, _: *const App, ni: usize) void {
+                    c.order.append(c.alloc, ni) catch {};
                 }
-            }
+            }.cb);
             std.mem.sort(usize, app.piano.draw_order.items, app.notes.items, struct {
                 fn less(notes: []const model.Note, a: usize, b: usize) bool {
                     if (notes[a].step != notes[b].step) return notes[a].step < notes[b].step;

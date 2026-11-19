@@ -439,17 +439,26 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, row: usize, x: i32, y: i32, w: i32, c
     ui.renderer.fillRect(mm_x, mm_y, mm_w, mm_h, ui.theme.bg);
     ui.renderer.strokeRect(mm_x, mm_y, mm_w, mm_h, ui.theme.panel_border);
     const pattern = app.piano.pattern orelse app.sel.pattern;
-    // 统计走缓存（`notes_ver` 门控）：每行预览不再每帧扫一遍全量 `notes`
-    const pv = app.rackPreviewFor(@intCast(idx), pattern);
-    const max_step = pv.max_step;
-    // 纵向：按实际音域映射（与横向 minimap 同一规则：保底 1 个八度、中点居中）
-    const range = model.rangeMap(pv.min_pitch, pv.max_pitch, 12);
-    for (pv.blocks.items) |b| {
-        const nx = mm_x + @divTrunc(b.step * mm_w, max_step);
-        const nw = @max(1, @divTrunc(b.len * mm_w, max_step));
-        const y_norm = range.yOf(b.pitch);
-        const ny = mm_y + mm_h - 1 - @as(i32, @intFromFloat(y_norm * @as(f32, @floatFromInt(mm_h - 2))));
-        const nyc = std.math.clamp(ny, mm_y + 1, mm_y + mm_h - 2);
-        ui.renderer.fillRect(nx, nyc, nw, 1, ui.theme.waveform);
+    // 统计 + 位图均走缓存（key 含像素尺寸）：每行预览不再每帧扫 `notes`
+    const pv = app.rackPreviewFor(@intCast(idx), pattern, mm_w, mm_h);
+    // 绘制：按**置位像素**点亮（与横向 minimap 同一套语义；成本与音符数无关）
+    if (pv.cols > 0 and pv.rows > 0) {
+        const wpr: usize = (@as(usize, @intCast(pv.cols)) + 63) / 64;
+        const need = wpr * @as(usize, @intCast(pv.rows));
+        if (pv.words.len >= need) {
+            var r: i32 = 0;
+            while (r < pv.rows) : (r += 1) {
+                const py = mm_y + @divTrunc(r * (mm_h - 2), pv.rows) + 1;
+                const base = @as(usize, @intCast(r)) * wpr;
+                var col: i32 = 0;
+                while (col < pv.cols) : (col += 1) {
+                    const ci: usize = @intCast(col);
+                    if ((pv.words[base + ci / 64] >> @intCast(ci % 64)) & 1 == 0) continue;
+                    const px = mm_x + @divTrunc(col * mm_w, pv.cols);
+                    const pw = @max(1, @divTrunc((col + 1) * mm_w, pv.cols) - @divTrunc(col * mm_w, pv.cols));
+                    ui.renderer.fillRect(px, py, pw, 1, ui.theme.waveform);
+                }
+            }
+        }
     }
 }

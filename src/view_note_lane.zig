@@ -16,6 +16,7 @@
 const std = @import("std");
 const r_mod = @import("render.zig");
 const model = @import("model.zig");
+const note_preview = @import("note_preview.zig");
 const app_mod = @import("app.zig");
 const Ui = @import("ui.zig").Ui;
 const util = @import("view_util.zig");
@@ -236,42 +237,98 @@ pub fn draw(
         // 幽灵柱条（**同样式、其它乐器**；灰——只读参考、无交互；画在真实柱条之前）：
         // 与钢琴卷帘的幽灵音符同一约定（同样式其它乐器、不参与命中/拖动）。
         // 力度/声像两种模式共用值域坐标——幽灵与真实柱同几何，仅颜色区分。
-        for (app.notes.items) |nt| {
-            if (nt.pattern != pattern or nt.instrument == app.sel.instrument) continue;
-            const bx = barX(nt.step, track_x, step_ws, scroll_s);
-            if (bx + bar_w < track_x or bx > track_x + track_w) continue;
-            const v = noteValue(nt, mode);
-            const tip_y: i32 = if (mode == .velocity)
-                top + avail - velBarH(v, avail)
-            else
-                top + @divTrunc(avail, 2) - panBarH(v, avail);
-            const baseline: i32 = if (mode == .velocity)
-                top + avail
-            else
-                top + @divTrunc(avail, 2);
-            const lo = @min(tip_y, baseline);
-            const hi = @max(tip_y, baseline);
-            ui.renderer.fillRect(bx, lo, bar_w, @max(1, hi - lo + 1), ui.theme.ghost_note);
-            // 幽灵音符也给一个末端方块（**与本乐器同尺寸**、颜色偏暗的灰）：
-            // 目的 = 能看出**其它乐器**的力度/声像，而不是一条条叠在一起的白条（用户要求）。
-            const gdot: i32 = @max(bar_w, @divTrunc(bar_w * 3, 2));
-            const gcol = r_mod.rgb(150, 150, 150);
-            ui.renderer.fillRect(bx + @divTrunc(bar_w - gdot, 2), tip_y - @divTrunc(gdot, 2), gdot, gdot, gcol);
+        // 可见步域窗口（柱条绘制/收集都只在这个范围里找候选）
+        const lane_win_lo: i32 = @as(i32, @intFromFloat(@floor(scroll_s / step_ws))) - 1;
+        const lane_win_hi: i32 = @as(i32, @intFromFloat(@ceil((scroll_s + @as(f32, @floatFromInt(track_w))) / step_ws))) + 1;
+        {
+            const GC = struct {
+                ui: *Ui,
+                track_x: i32,
+                track_w: i32,
+                step_ws: f32,
+                scroll_s: f32,
+                bar_w: i32,
+                mode: NoteLaneMode,
+                top: i32,
+                avail: i32,
+                sel_inst: i32,
+            };
+            const gc = GC{
+                .ui = ui,
+                .track_x = track_x,
+                .track_w = track_w,
+                .step_ws = step_ws,
+                .scroll_s = scroll_s,
+                .bar_w = bar_w,
+                .mode = mode,
+                .top = top,
+                .avail = avail,
+                .sel_inst = app.sel.instrument,
+            };
+            note_preview.forEachInWindow(app, pattern, null, lane_win_lo, lane_win_hi, gc, struct {
+                fn cb(c: GC, a: *const App, ni: usize) void {
+                    const nt = a.notes.items[ni];
+                    if (nt.instrument == c.sel_inst) return;
+                    const bx = barX(nt.step, c.track_x, c.step_ws, c.scroll_s);
+                    if (bx + c.bar_w < c.track_x or bx > c.track_x + c.track_w) return;
+                    const v = noteValue(nt, c.mode);
+                    const tip_y: i32 = if (c.mode == .velocity)
+                        c.top + c.avail - velBarH(v, c.avail)
+                    else
+                        c.top + @divTrunc(c.avail, 2) - panBarH(v, c.avail);
+                    const baseline: i32 = if (c.mode == .velocity)
+                        c.top + c.avail
+                    else
+                        c.top + @divTrunc(c.avail, 2);
+                    const lo = @min(tip_y, baseline);
+                    const hi = @max(tip_y, baseline);
+                    c.ui.renderer.fillRect(bx, lo, c.bar_w, @max(1, hi - lo + 1), c.ui.theme.ghost_note);
+                    // 幽灵音符也给一个末端方块（**与本乐器同尺寸**、颜色偏暗的灰）：
+                    // 目的 = 能看出**其它乐器**的力度/声像，而不是一条条叠在一起的白条（用户要求）。
+                    const gdot: i32 = @max(c.bar_w, @divTrunc(c.bar_w * 3, 2));
+                    const gcol = r_mod.rgb(150, 150, 150);
+                    c.ui.renderer.fillRect(bx + @divTrunc(c.bar_w - gdot, 2), tip_y - @divTrunc(gdot, 2), gdot, gdot, gcol);
+                }
+            }.cb);
         }
         // 收集可见柱条（当前样式 + 乐器；x 在视野内），按柱高降序排序
         const LaneBar = struct { idx: usize, len_px: i32, selected: bool };
         var bars: [1024]LaneBar = undefined;
         var n: usize = 0;
-        for (app.notes.items, 0..) |nt, i| {
-            if (nt.pattern != pattern or nt.instrument != app.sel.instrument) continue;
-            const bx = barX(nt.step, track_x, step_ws, scroll_s);
-            if (bx + bar_w < track_x or bx > track_x + track_w) continue;
-            if (n >= bars.len) break;
-            const v = noteValue(nt, mode);
-            const len_px: i32 = if (mode == .velocity) velBarH(v, avail) else @intCast(@abs(panBarH(v, avail)));
-            bars[n] = .{ .idx = i, .len_px = len_px, .selected = nt.selected };
-            n += 1;
-        }
+        const CollCtx = struct {
+            bars: *[1024]LaneBar,
+            n: *usize,
+            track_x: i32,
+            track_w: i32,
+            step_ws: f32,
+            scroll_s: f32,
+            bar_w: i32,
+            mode: NoteLaneMode,
+            avail: i32,
+        };
+        const cctx = CollCtx{
+            .bars = &bars,
+            .n = &n,
+            .track_x = track_x,
+            .track_w = track_w,
+            .step_ws = step_ws,
+            .scroll_s = scroll_s,
+            .bar_w = bar_w,
+            .mode = mode,
+            .avail = avail,
+        };
+        note_preview.forEachInWindow(app, pattern, app.sel.instrument, lane_win_lo, lane_win_hi, cctx, struct {
+            fn cb(c: CollCtx, a: *const App, ni: usize) void {
+                const nt = a.notes.items[ni];
+                const bx = barX(nt.step, c.track_x, c.step_ws, c.scroll_s);
+                if (bx + c.bar_w < c.track_x or bx > c.track_x + c.track_w) return;
+                if (c.n.* >= c.bars.len) return;
+                const v = noteValue(nt, c.mode);
+                const len_px: i32 = if (c.mode == .velocity) velBarH(v, c.avail) else @intCast(@abs(panBarH(v, c.avail)));
+                c.bars[c.n.*] = .{ .idx = ni, .len_px = len_px, .selected = nt.selected };
+                c.n.* += 1;
+            }
+        }.cb);
         std.mem.sort(LaneBar, bars[0..n], {}, struct {
             fn less(_: void, a: LaneBar, b: LaneBar) bool {
                 return a.len_px > b.len_px; // 降序：长的先画、短的叠在上

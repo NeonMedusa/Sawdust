@@ -108,9 +108,6 @@ scoop install sawdust
 - **音高自动化未做**（**无法做颤音 / 滑音**）：自动化只能绑“有控件的东西”（推子/旋钮/参数行），
   音高既无推子也无旋钮，右键菜单里无处可点。设计稿见
   [`docs/automation.md`](docs/automation.md) §11.46（乐器音高偏移 cents + 自动化目标选择器）。
-- **钢琴卷帘 minimap 的音符预览会被截断**：一个样式 + 一个乐器超过 **512 个音符**时，minimap 只画前 512 个
-  （按音符创建顺序取），后写的音符看不见。原因与后续优化方向见
-  [`docs/resources.md`](docs/resources.md) §四第 8 条（块数上限 + 每帧全量重扫 + 按段聚合/增量重建）。
 - **Linux**：只在 WSLg 上开发验证过，**尚未在真机 Linux 上实测**。见 [`docs/linux.md`](docs/linux.md)。
 
 ## 构建与运行

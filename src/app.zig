@@ -1331,6 +1331,9 @@ pub const NoteIndex = struct {
     /// 建索引时的音符总数：**兜底失效条件**——任何增删都会变，
     /// 即使某条删除路径忘调 `touchNotes()` 也不会留下悬空下标（实测崩溃：删除音符后越界）
     len: usize = 0,
+    /// 建索引时的**最长音符长度**（步）：查询窗口向前多看这么多，
+    /// 保证“起始在窗口之前、但一直延伸进窗口”的长音也不漏。
+    max_len: i32 = 1,
     starts: std.ArrayListUnmanaged(u32) = .empty,
     items: std.ArrayListUnmanaged(u32) = .empty,
 
@@ -1344,19 +1347,27 @@ pub const NoteIndex = struct {
 /// 取固定单位而不按拍号算：索引只为“缩小搜索范围”，不靠它与音乐结构对齐。
 pub const bucket_units: i32 = 4 * model.units_per_whole;
 
-/// 机架行预览的**统计缓存**（一行一个）：只存“总长 + 音域”，块仍然现场画。
-/// 一条行预览要扫两遗 `notes`（统计 + 画块），这里消掉开销更大的第一遗；
-/// 机架行预览的**块缓存**（一行一个乐器）：一次扫描同时得到统计与块，
-/// 此后每帧只遍历缓存（不再扫 `notes`）。
-pub const RackBlock = struct { step: i32, len: i32, pitch: i32 };
-
+/// 机架行预览的**位图缓存**（一行一个乐器）：与钢琴窗横向 minimap 同一套（`note_preview.rasterize`），
+/// 所以绘制成本 = 置位像素数（与音符数无关）。
+/// key = `(notes_ver, pattern, inst, cols, rows)`：内容或行尺寸变了才重建。
 pub const RackPreview = struct {
     ver: u64 = std.math.maxInt(u64),
     pattern: i32 = -1,
+    inst: i32 = -1,
+    cols: i32 = 0,
+    rows: i32 = 0,
+    /// 总长（步，驱动横向比例；至少 4 小节）
     max_step: i32 = 64,
     min_pitch: i32 = 127,
     max_pitch: i32 = 0,
-    blocks: std.ArrayListUnmanaged(RackBlock) = .empty,
+    /// `cols × rows` 位图（行优先、每行重新起字）
+    words: []u64 = &.{},
+    cap: usize = 0,
+
+    pub fn deinit(self: *RackPreview, alloc: std.mem.Allocator) void {
+        if (self.cap > 0) alloc.free(self.words[0..self.cap]);
+        self.* = .{};
+    }
 };
 
 /// 设置窗口（启动行为 / 最高帧率；工具栏“选项”打开）
@@ -2068,7 +2079,7 @@ pub const App = struct {
     /// 播放列表片段预览的“每样式音域”快照版本（与 `notes_ver`/`pat_stats.len` 比 → 没变就不重扫）
     pat_stats_ver: u64 = std.math.maxInt(u64),
     pat_stats_len: usize = std.math.maxInt(usize),
-    /// 机架行预览的每行统计缓存（索引 = 乐器下标；**只缓存“统计”不缓存块**）
+    /// 机架行预览的位图缓存（索引 = 乐器下标；与钢琴窗 minimap 同一套 `note_preview.rasterize`）
     rack_preview: std.ArrayListUnmanaged(RackPreview) = .empty,
     /// **音符内容版本号**（UI 缓存用）：增删/移动/拉伸/量化/撤销/读档时 +1。
     /// 目前只有钢琴窗 minimap 的预览缓存靠它判断“要不要重建”
@@ -2077,36 +2088,43 @@ pub const App = struct {
 
     // ── 方法 ──
 
-    /// 机架行预览的统计（带缓存；`inst` = 乐器下标，`pattern` = 要预览的样式）
-    pub fn rackPreviewFor(self: *App, inst: i32, pattern: i32) RackPreview {
+    /// 机架行预览的统计 + **位图**（带缓存；`cols`/`rows` = 行内 minimap 的像素尺寸）
+    pub fn rackPreviewFor(self: *App, inst: i32, pattern: i32, cols: i32, rows: i32) RackPreview {
         const i: usize = @intCast(inst);
         if (i >= self.rack_preview.items.len) {
             self.rack_preview.resize(self.allocator, i + 1) catch return .{ .pattern = pattern };
-            // 扩容后的新项保持“未缓存”状态
             var k = i;
             while (k < self.rack_preview.items.len) : (k += 1) self.rack_preview.items[k] = .{};
         }
         const c = &self.rack_preview.items[i];
-        if (c.ver == self.notes_ver and c.pattern == pattern) return c.*;
+        if (c.ver == self.notes_ver and c.pattern == pattern and c.inst == inst and
+            c.cols == cols and c.rows == rows) return c.*;
         c.ver = self.notes_ver;
         c.pattern = pattern;
+        c.inst = inst;
+        c.cols = cols;
+        c.rows = rows;
         c.max_step = 64; // minimap 总长（步）：至少 4 小节
         c.min_pitch = 127;
         c.max_pitch = 0;
-        c.blocks.clearRetainingCapacity();
-        // 两遗并一遗：同一次扫描里既算统计、又把**块**收进缓存
-        // （以前每行每帧都要再扫一遍 `notes` 画块）
+        // ① 统计：总长 + 音域（只在这一行**内容/尺寸变化**时跑）
         for (self.notes.items) |n| {
             if (n.pattern != pattern or n.instrument != inst) continue;
             c.max_step = @max(c.max_step, n.step + n.len);
             c.min_pitch = @min(c.min_pitch, n.pitch);
             c.max_pitch = @max(c.max_pitch, n.pitch);
-            c.blocks.append(self.allocator, .{ .step = n.step, .len = n.len, .pitch = n.pitch }) catch break;
         }
-        // **动态缩容**：删掉大量音符后把块缓冲的容量收回来
-        if (c.blocks.capacity > c.blocks.items.len * 4 + 64) {
-            c.blocks.shrinkAndFree(self.allocator, c.blocks.items.len);
+        // ② 位图：共用光栅化器（窗口 = 整个样式内容，已按乐器过滤）
+        const need = @import("note_preview.zig").wordsNeeded(cols, rows);
+        if (need == 0) return c.*;
+        if (need > c.cap or (c.cap > need * 4 and c.cap > 4096)) {
+            const bigger = self.allocator.alloc(u64, need) catch return c.*;
+            if (c.cap > 0) self.allocator.free(c.words[0..c.cap]);
+            c.words = bigger;
+            c.cap = need;
         }
+        const range = model.rangeMap(c.min_pitch, c.max_pitch, 12);
+        @import("note_preview.zig").rasterize(self, pattern, inst, 0, c.max_step, range, cols, rows, c.words[0..need]);
         return c.*;
     }
 
@@ -2123,6 +2141,7 @@ pub const App = struct {
         ix.ver = self.notes_ver;
         ix.pattern = pattern;
         ix.len = self.notes.items.len;
+        ix.max_len = 1;
         ix.starts.clearRetainingCapacity();
         ix.items.clearRetainingCapacity();
 
@@ -2130,6 +2149,7 @@ pub const App = struct {
         for (self.notes.items) |n| {
             if (n.pattern != pattern) continue;
             max_end = @max(max_end, n.step + @max(1, n.len));
+            ix.max_len = @max(ix.max_len, @max(1, n.len));
         }
         const nb: usize = if (max_end <= 0) 1 else @intCast(@divTrunc(max_end + bucket_units - 1, bucket_units));
         ix.starts.resize(self.allocator, nb + 1) catch return;
@@ -4644,8 +4664,8 @@ pub const App = struct {
     pub fn deinitAll(self: *App) void {
         self.sched_log_pending.deinit(self.allocator); // 诊断缓冲（--sched-log 用）
         self.note_index.deinit(self.allocator); // 音符桶索引（hover 命中用）
-        for (self.rack_preview.items) |*rp| rp.blocks.deinit(self.allocator);
-        self.rack_preview.deinit(self.allocator); // 机架行预览统计/块缓存
+        for (self.rack_preview.items) |*rp| rp.deinit(self.allocator);
+        self.rack_preview.deinit(self.allocator); // 机架行预览位图缓存
         for (self.auto_curves.items) |*lc| lc.deinit(self.allocator);
         self.auto_curves.deinit(self.allocator);
         self.auto_bindings.deinit(self.allocator); // 自动化（内存态）

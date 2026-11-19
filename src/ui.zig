@@ -1266,7 +1266,28 @@ pub const Ui = struct {
         // 上界 = 内容末尾 − 视口，**再加上缩放前已有的悬空量**：否则悬空状态下锚定值被钳回内容末尾
         // （表现为“以最右边的内容为锚点”，实测 bug）。
         const max_scroll: f32 = @max(0, cw - view_cw_new) + @as(f32, @floatFromInt(@max(0, over)));
-        return @intFromFloat(std.math.clamp(ns, 0, max_scroll));
+        // **必须 round，不能裸 @intFromFloat**：后者向零截断，锚定结果每次都少 ~0.5px，
+        // 而补间是“每帧一小步、每步重新锚定”→ 误差**单调向左累积**
+        // （实测：Ctrl+滚轮来回滚，视角慢慢往左跑）。纵向版本一直用的 @round，
+        // 所以同样是缩放、纵向不飘而横向飘。
+        return @intFromFloat(@round(std.math.clamp(ns, 0, max_scroll)));
+    }
+
+    test "ui: zoomAnchoredScrollX——反复缩放不漂移（锚定往返可逆）" {
+        // 进→回各 50 步（模拟补间多帧）：允许几像素随机误差，但不允许单调单向漂移
+        var scroll: i32 = 10000;
+        var z: f32 = 1.0;
+        var i: usize = 0;
+        while (i < 50) : (i += 1) {
+            scroll = Ui.zoomAnchoredScrollX(scroll, 1200, 600, z, z * 1.1, 100000, 100000, 0);
+            z *= 1.1;
+        }
+        i = 0;
+        while (i < 50) : (i += 1) {
+            scroll = Ui.zoomAnchoredScrollX(scroll, 1200, 600, z, z / 1.1, 100000, 100000, 0);
+            z /= 1.1;
+        }
+        try std.testing.expect(@abs(scroll - 10000) <= 10);
     }
 
     test "ui: zoomAnchoredScrollX——深缩放（zoom<0.01）锚定精确（几百小节跳变回归）" {
