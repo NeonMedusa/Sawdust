@@ -331,8 +331,8 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
                 ui.renderer.fillRect(lx, wave_y, 2, wave_h, ui.theme.accent);
                 ui.renderer.fillRect(rx - 2, wave_y, 2, wave_h, ui.theme.accent);
                 // 抓手：命中带比线宽宽（±8px，好抓）；悬停/拖动时 ↔ 光标 + 加亮
-                const grip_l_hover = util.inRect(ui.mouse_x, ui.mouse_y, lx - 8, wave_y, 20, wave_h);
-                const grip_r_hover = util.inRect(ui.mouse_x, ui.mouse_y, rx - 8, wave_y, 20, wave_h);
+                const grip_l_hover = util.hitUI(ui, lx - 8, wave_y, 20, wave_h);
+                const grip_r_hover = util.hitUI(ui, rx - 8, wave_y, 20, wave_h);
                 const dragging = ww.trim_drag_side != 0;
                 if (grip_l_hover or grip_r_hover or dragging) ui.cursor = .resize_h;
                 const l_hot = grip_l_hover or ww.trim_drag_side == 1;

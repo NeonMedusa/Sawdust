@@ -190,6 +190,8 @@ pub fn main(init: std.process.Init) !u8 {
     // 帧预算睡眠**；旧实现测“绘制前”，亚毫秒被夹成 1ms 下限 → 一切按 dt 的
     // 动画/倒计时慢 ~8 倍：跟随滑动滞后、宽限倒计时超长（实测根因））
     var prev_frame_start_ns: i64 = 0;
+    // 上一帧是否在文本输入（用于检测“刚打开输入框”这个边沿）
+    var prev_text_input_active: bool = false;
 
     while (true) {
         // 帧率上限：取设置值（30..240fps；帧预算 = 1e9 / fps——改设置即时生效）
@@ -790,6 +792,8 @@ pub fn main(init: std.process.Init) !u8 {
             app.params.instrument_gain[i].store(g, .monotonic);
             // 乐器声像（0-1）；空槽位 → 0.5（居中，防旧值残留）
             app.params.instrument_pan[i].store(if (has) app.instruments.items[i].pan else 0.5, .monotonic);
+            // 乐器弯音位置（0..1；0.5 = 不弯）——音高自动化的静态基线
+            app.params.instrument_pitch[i].store(if (has) app.instruments.items[i].pitch else 0.5, .monotonic);
             // 混音通道路由（`mixer` 已是 0 起；**按实际通道数**钳制——
             // 否则通道数减少后旧值会指向不存在的通道，实测 bug）
             const n_ch: u32 = @intCast(app.mixer_channels_state.items.len);
@@ -800,6 +804,16 @@ pub fn main(init: std.process.Init) !u8 {
             app.params.instrument_channel[i].store(ch, .monotonic);
             // MIDI 通道（-1 = 无）：VSTi 事件按它写进 `channel`（多通道插件必需）
             app.params.instrument_midi_channel[i].store(if (inst) |it| it.midi_channel else -1, .monotonic);
+            // **弯音参数解析**（UI 线程；通道变化时重查）：VST3 的 pitch bend = 参数，
+            // `IMidiMapping(kPitchBend)` 给出参数 id；查不到 → 0（不支持，车道保留但不驱动）。
+            if (inst) |it| {
+                if (it.kind == .vst3) {
+                    if (it.plugin) |pl| {
+                        const ch_now: u8 = @intCast(std.math.clamp(@max(it.midi_channel, 0), 0, 15));
+                        if (pl.pitch_ch != ch_now) pl.queryPitchParam(ch_now);
+                    }
+                }
+            }
             // 乐器类型 + 鼓组层槽位（kind 边沿会在音频侧触发全释音）
             app.params.instrument_kind[i].store(if (inst) |it| @backingInt(it.kind) else 0, .monotonic);
             // VST3 乐器实例（kind == 2；帧末 syncInstrumentPlugins 惰性加载/发布）
@@ -1037,7 +1051,20 @@ pub fn main(init: std.process.Init) !u8 {
             ui.wheel = 0;
         }
 
+        // **文本输入开始时，把键盘焦点抢回主窗口**。
+        // 嵌入式插件编辑器（Win：`WS_CHILD` 子窗口）在显示时会 `SetFocus(自己)`，
+        // 之后 WM_KEYDOWN/WM_CHAR 全进了插件窗口 → 我们的输入框打不了字，
+        // 系统还会发“无效按键”的蜂鸣声（实测：换 Vital 后点搜索框/重命名输入不了）。
+        // Linux 同理：插件 UI 是独立顶层窗口，需要 XSetInputFocus 抢回来。
+        if (app.text_input.active and !prev_text_input_active) win.focusMain();
+        prev_text_input_active = app.text_input.active;
+
         // □ 缩放拖动：鼠标冻结（光标隐藏 + 锚定不动，位移经 frozen_dy 传入）
+        // **防御**：捕获必须伴随“按住”。控件清理遗漏（实测：id 撞车导致 `active_id` 被别的
+        // 控件抢清、`mouse_capture` 永远清不掉）会让光标**永久隐藏**。
+        // ⚠ **兑底必须在帧末**（见下面 `ui.endFrame()` 前）：若在帧首就清掉，
+        // 松手那一帧 `frozenDeltaY()` 已返回 0 → 拖拽控件把“总位移=0”再算一遍
+        // → 值被拉回按下时的起点（实测：“拖完松手就回退”，所有拖拽行都中招）。
         if (ui.mouse_capture) {
             win.beginMouseCapture();
             ui.cursor = .hidden;
@@ -1116,6 +1143,9 @@ pub fn main(init: std.process.Init) !u8 {
             }
         }
         ui.endFrame();
+        // **帧末兑底**：没按着却还挂着捕获 → 清掉（下一帧 `endMouseCapture()` 会恢复光标）。
+        // 放在**绘图之后**：松手那一帧控件仍能拿到完整的 `frozen_dy`（见帧首注释）。
+        if (!ui.mouse_down) ui.mouse_capture = false;
 
         // 普通拖动（滚动条/片段/音符/分隔条）捕获鼠标：拖出窗口后仍能收到松开事件
         // （否则拖动状态卡死，鼠标移回时误触发拖动分支 → 回弹/跳变）。
@@ -1351,8 +1381,8 @@ pub fn main(init: std.process.Init) !u8 {
     killScanWorker(&app.plugin_mgr, 3);
     // 扫描队列/累积 JSONL 是堆分配 → 退出前显式释放（否则 Debug 的 SafeAllocator 会报泄漏）
     clearScanQueue(&app);
-    // Linux：直接 `_exit`（不跑 atexit / 全局析构）。理由：插件（Vital）的后台线程在进程
-    // 析构期间会踩到已释放内存 → 退出时 segfault。进程整体消失即可，无需优雅收尾。
+    // Linux：直接 `_exit`（不跑 atexit / 全局析构）。理由：插件模块常驻（我们不 dlclose），
+    // 其后台线程在进程析构期间会踩到已释放内存 → 退出时 segfault。进程整体消失即可。
     if (comptime builtin.os.tag != .windows) std.c.exit(0);
     return 0;
 }
@@ -2500,7 +2530,7 @@ const InputState = struct {
 const WinEntry = struct { zp: *i32, draw: app_mod.WinKind };
 
 /// 浮动窗口的**屏幕矩形**（“点击置顶”的最上层判定 / 层声明 / 裁切记录共用同一张表）
-fn winRectOf(app: *App, kind: app_mod.WinKind) @import("ui.zig").Rect {
+fn winRectOf(app: *App, kind: app_mod.WinKind, scr_w: i32, scr_h: i32) @import("ui.zig").Rect {
     return switch (kind) {
         .rack => .{ .x = app.rack.x, .y = app.rack.y, .w = app.rack.w, .h = app.rack.h },
         .synth => .{ .x = app.synth_win.x, .y = app.synth_win.y, .w = app.synth_win.w, .h = app.synth_win.h },
@@ -2510,8 +2540,19 @@ fn winRectOf(app: *App, kind: app_mod.WinKind) @import("ui.zig").Rect {
         .help => .{ .x = app.help_win.x, .y = app.help_win.y, .w = app.help_win.w, .h = app.help_win.h },
         .settings => .{ .x = app.settings_win.x, .y = app.settings_win.y, .w = app.settings_win.w, .h = app.settings_win.h },
         .plugin_mgr => .{ .x = app.plugin_mgr.x, .y = app.plugin_mgr.y, .w = app.plugin_mgr.w, .h = app.plugin_mgr.h },
-        .auto => .{ .x = app.auto_win.x, .y = app.auto_win.y, .w = @import("view_auto_win.zig").W, .h = @import("view_auto_win.zig").H },
-        .vst_auto => .{ .x = app.vst_auto.x, .y = app.vst_auto.y, .w = @import("view_vst_auto.zig").W, .h = @import("view_vst_auto.zig").H },
+        .auto => blk: {
+            // 常量尺寸 + 同一套锤钳制（与 `view_auto_win.draw` 一致，否则点击/置顶与画面错位）
+            const va = @import("view_auto_win.zig");
+            var r = @import("ui.zig").Rect{ .x = app.auto_win.x, .y = app.auto_win.y, .w = va.W, .h = va.H };
+            util.clampWindow(scr_w, scr_h, &r.x, &r.y, &r.w, &r.h, va.min_w, va.min_h);
+            break :blk r;
+        },
+        .vst_auto => blk: {
+            const vv = @import("view_vst_auto.zig");
+            var r = @import("ui.zig").Rect{ .x = app.vst_auto.x, .y = app.vst_auto.y, .w = vv.W, .h = vv.heightFor(app) };
+            util.clampWindow(scr_w, scr_h, &r.x, &r.y, &r.w, &r.h, vv.min_w, vv.min_h);
+            break :blk r;
+        },
     };
 }
 
@@ -2536,11 +2577,11 @@ fn sortWinEntries(items: []WinEntry) void {
 ///
 /// 波形窗固定盖在所有浮动窗之上（不进 z 序）→ 光标在它里面时归它。
 /// 模态期间（确认框 / 导出）不动作（返回 null）——同 `bringToFront` 的守卫。
-fn raiseTopmostUnderCursor(app: *App, items: []const WinEntry, mouse_x: i32, mouse_y: i32) ?*i32 {
+fn raiseTopmostUnderCursor(app: *App, items: []const WinEntry, mouse_x: i32, mouse_y: i32, scr_w: i32, scr_h: i32) ?*i32 {
     if (app.modal != null or app.export_wav != null or app.export_options_win.open) return null;
     var hit: ?*i32 = null;
     for (items) |win| { // 升序遍历 → 最后一个命中 = 最上层
-        const r = winRectOf(app, win.draw);
+        const r = winRectOf(app, win.draw, scr_w, scr_h);
         if (util.inRect(mouse_x, mouse_y, r.x, r.y, r.w, r.h)) hit = win.zp;
     }
     if (app.wave_win.open and util.inRect(mouse_x, mouse_y, app.wave_win.x, app.wave_win.y, app.wave_win.w, app.wave_win.h)) {
@@ -2638,7 +2679,7 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
 
     // ── 点击置顶：一次点击只提升光标下最上层的那个窗口（见 raiseTopmostUnderCursor）──
     if (ui.mouse_pressed and !menu_open) {
-        if (raiseTopmostUnderCursor(app, wins[0..nwin], ui.mouse_x, ui.mouse_y) != null) {
+        if (raiseTopmostUnderCursor(app, wins[0..nwin], ui.mouse_x, ui.mouse_y, w, h) != null) {
             sortWinEntries(wins[0..nwin]); // 提升后立即重排：本帧的层/绘制就用新序（不闪一帧）
         }
     }
@@ -2661,7 +2702,7 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     // 注：prio 用 1 + idx（idx = 排序后的位次）而非窗口 z 值——declare 对
     // 同 prio 是覆盖且要求 prio 互不相同；位次天然互异且与排序一致。
     for (wins[0..nwin], 0..) |win, wi| {
-        _ = ui.declare(.{ .prio = 1 + @as(i32, @intCast(wi)), .rect = winRectOf(app, win.draw) });
+        _ = ui.declare(.{ .prio = 1 + @as(i32, @intCast(wi)), .rect = winRectOf(app, win.draw, w, h) });
     }
     if (menu_open) {
         // 任何菜单展开 = 最上模态层（全屏屏蔽）
@@ -2753,8 +2794,8 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     app.win_draw_n = 0;
     for (wins[0..nwin]) |win| {
         if (app.win_draw_n >= app.win_draw_info.len) break;
-        const r = winRectOf(app, win.draw);
-        app.win_draw_info[app.win_draw_n] = .{ .kind = win.draw, .x = r.x, .y = r.y, .w = r.w, .h = r.h };
+        const r2 = winRectOf(app, win.draw, w, h);
+        app.win_draw_info[app.win_draw_n] = .{ .kind = win.draw, .x = r2.x, .y = r2.y, .w = r2.w, .h = r2.h };
         app.win_draw_n += 1;
     }
 }
@@ -3625,6 +3666,13 @@ fn syncEmbeddedEditor(
     pl.setEditorEnabled(app.modal == null and ui.overlay_n == 0);
 }
 
+/// 拆除某插件的编辑器（**面板关闭 / 切目标 / 清残留** 的唯一入口）。
+/// 顺手清掉 `vst_editor_owner`（它持裸指针，插件实例随时可能退役）。
+fn destroyEditorOf(app: *App, pl: *vst_host.Plugin) void {
+    if (app.vst_editor_owner == pl) app.vst_editor_owner = null;
+    pl.destroyEditor();
+}
+
 fn syncPluginEditors(app: *App, ui: *Ui, fw: i32, fh: i32) void {
     // 用户用窗口自己的关闭按钮关掉了插件 UI → 清掉 owner（否则按钮状态会滞后）
     if (vst_host.Plugin.takeUserClosedEditor()) |h| {
@@ -3664,23 +3712,18 @@ fn syncPluginEditors(app: *App, ui: *Ui, fw: i32, fh: i32) void {
         }
     }
 
-    // 面板都关着：清掉"编辑器目标"（下次打开任意面板算目标变化 → 会重新显示窗口）
-    if (instr_pl == null and fx_pl == null) app.vst_editor_target = null;
-
-    // 1) 归属对不上的编辑器：关闭（面板关闭/切目标/插件被换的残留）
+    // 1) 归属对不上的编辑器：**真拆除**（面板关闭/切目标/插件被换的残留）——
+    //    与 Windows 一致：不养“隐藏的编辑器”（它占内存 + 插件 GUI 线程常驻烧 CPU）。
     for (app.instruments.items) |*inst| {
         if (inst.plugin) |pl| {
-            if (pl.view != null and pl != instr_pl and pl != fx_pl) pl.closeEditor();
+            if (pl.view != null and pl != instr_pl and pl != fx_pl) destroyEditorOf(app, pl);
         }
         if (inst.kit) |kit| {
             for (kit.pads.items) |*pad| {
                 for (pad.layers.items) |*ly| {
                     if (ly.kind != .vst3) continue;
                     if (ly.plugin) |pl| {
-                        if (pl.view != null and pl != instr_pl and pl != fx_pl) {
-                            if (app.vst_editor_owner == pl) app.vst_editor_owner = null;
-                            pl.closeEditor();
-                        }
+                        if (pl.view != null and pl != instr_pl and pl != fx_pl) destroyEditorOf(app, pl);
                     }
                 }
             }
@@ -3690,32 +3733,18 @@ fn syncPluginEditors(app: *App, ui: *Ui, fw: i32, fh: i32) void {
         for (mc.effects.items) |*es| {
             if (es.kind == .plugin) {
                 if (es.plugin) |pl| {
-                    if (pl.view != null and pl != instr_pl and pl != fx_pl) pl.closeEditor();
+                    if (pl.view != null and pl != instr_pl and pl != fx_pl) destroyEditorOf(app, pl);
                 }
             }
         }
     }
 
-    // 2) 乐器面板：尺寸固定=插件尺寸；坐标同步；遮挡则隐藏
+    // 2) 乐器面板：Linux「独立窗口」模式**不自动弹窗**（窗口只能由面板顶部的
+    //    「打开插件 UI（独立窗口）」按钮开，位置/大小沿用上次，见 `Plugin.win_x/win_y`）；
+    //    这里只提前建好编辑器（按钮需要 `view != null` 才显示）并与模态抢输入。
     if (instr_pl) |pl| {
         ensureEditor(app, pl);
         if (comptime builtin.os.tag == .linux) {
-            // Linux 独立窗口：面板保持原尺寸（画参数表 + "打开插件 UI" 按钮）。
-            // **切目标时关旧开新**：记住当前窗口属于谁，换了就把旧的隐藏、把新的摆出来。
-            if (pl.view != null) {
-                // 只有**目标变化**（切到别的乐器）才"关旧开新"；
-                // 用户手动关掉窗口（owner=null，目标不变）时**保持关闭**，否则会立刻弹回来。
-                if (app.vst_editor_target != pl) {
-                    if (app.vst_editor_owner) |old_pl| {
-                        if (old_pl != pl) old_pl.setEditorVisible(false);
-                    }
-                    app.vst_editor_target = pl;
-                    if (app.vst_editor_owner != pl) {
-                        pl.showEditorAt(160, 120);
-                        app.vst_editor_owner = pl;
-                    }
-                }
-            }
             pl.setEditorEnabled(app.modal == null and ui.overlay_n == 0);
         } else if (pl.view != null) {
             syncEmbeddedEditor(app, ui, pl, &app.synth_win, vst_panel_title_h, .synth, fw, fh);
@@ -3726,21 +3755,6 @@ fn syncPluginEditors(app: *App, ui: *Ui, fw: i32, fh: i32) void {
     if (fx_pl) |pl| {
         ensureEditor(app, pl);
         if (comptime builtin.os.tag == .linux) {
-            // Linux 独立窗口：效果面板同样不嵌入（切效果器也是关旧开新）
-            if (pl.view != null) {
-                // 只有**目标变化**（切到别的乐器）才"关旧开新"；
-                // 用户手动关掉窗口（owner=null，目标不变）时**保持关闭**，否则会立刻弹回来。
-                if (app.vst_editor_target != pl) {
-                    if (app.vst_editor_owner) |old_pl| {
-                        if (old_pl != pl) old_pl.setEditorVisible(false);
-                    }
-                    app.vst_editor_target = pl;
-                    if (app.vst_editor_owner != pl) {
-                        pl.showEditorAt(240, 200);
-                        app.vst_editor_owner = pl;
-                    }
-                }
-            }
             pl.setEditorEnabled(app.modal == null and ui.overlay_n == 0);
         } else if (pl.view != null) {
             syncEmbeddedEditor(app, ui, pl, &app.effect_win, vst_fx_chrome_h, .effect, fw, fh);
@@ -5137,7 +5151,9 @@ fn drawNotice(ui: *Ui, app: *App, w: i32, h: i32) void {
     const btn_w: i32 = 84;
     const max_w: i32 = w - 32;
     const dlg_w = @min(@max(text_w + 48, btn_w + 64), max_w); // 再长的文案也不超出屏幕
-    const dlg_h: i32 = 60 + @as(i32, @intCast(@max(n, 1))) * 22;
+    // **高度预算**：上边距 38（标题）+ 每行 22 + 间隔 16 + 按钮 26 + 下边距 16
+    // （旧写法 `60 + n*22` 太小 → 按钮压在正文上，实测：无法打开工程时「确定」盖住提示）
+    const dlg_h: i32 = 96 + @as(i32, @intCast(@max(n, 1))) * 22;
     const dx = @divTrunc(w - dlg_w, 2);
     const dy = @divTrunc(h - dlg_h, 2);
     dialogChrome(ui, dx, dy, dlg_w, dlg_h);
@@ -5147,7 +5163,11 @@ fn drawNotice(ui: *Ui, app: *App, w: i32, h: i32) void {
     var y: i32 = dy + 38;
     for (lines[0..n]) |ln| {
         const tw: i32 = @intFromFloat(ui.font.measure(ln));
-        ui.label(ln, dx + @divTrunc(dlg_w - tw, 2), y, ui.theme.text);
+        if (tw + 32 <= dlg_w) {
+            ui.label(ln, dx + @divTrunc(dlg_w - tw, 2), y, ui.theme.text);
+        } else {
+            ui.labelClipped(ln, dx + 16, y, dlg_w - 32, ui.theme.text); // 超长行：左对齐裁切
+        }
         y += 22;
     }
 
@@ -5669,7 +5689,7 @@ test "main: 点击窗口只提升最上层——其余窗口层次不变（回�
     sortWinEntries(items[0..]);
 
     // ① 点 (250,250)：命中 B 和 C，**不命中 A**（以前的实现会把 B/C 都提升→ A 掉到最底）
-    const raised = raiseTopmostUnderCursor(&app, items[0..], 250, 250);
+    const raised = raiseTopmostUnderCursor(&app, items[0..], 250, 250, 2000, 1200);
     try std.testing.expect(raised == &app.synth_win.z); // 只提升最上层的 B
     try std.testing.expect(app.synth_win.z > app.rack.z);
     try std.testing.expect(app.synth_win.z > app.drumkit_win.z);
@@ -5677,23 +5697,23 @@ test "main: 点击窗口只提升最上层——其余窗口层次不变（回�
     try std.testing.expectEqual(@as(i32, 10), app.drumkit_win.z); // C 没动（关键：不得被抬到第二层）
 
     // ② 点 (50,50)：只命中 A → A 置顶
-    const r2 = raiseTopmostUnderCursor(&app, items[0..], 50, 50);
+    const r2 = raiseTopmostUnderCursor(&app, items[0..], 50, 50, 2000, 1200);
     try std.testing.expect(r2 == &app.rack.z);
     try std.testing.expect(app.rack.z > app.synth_win.z);
 
     // ③ 点 A∩B 重叠区 (150,150)：A 在上 → 只有 A 提升，B 不动
     const z_b = app.synth_win.z;
-    const r3 = raiseTopmostUnderCursor(&app, items[0..], 150, 150);
+    const r3 = raiseTopmostUnderCursor(&app, items[0..], 150, 150, 2000, 1200);
     try std.testing.expect(r3 == &app.rack.z);
     try std.testing.expectEqual(z_b, app.synth_win.z);
 
     // ④ 空白处（无窗口）→ 不提升
-    try std.testing.expect(raiseTopmostUnderCursor(&app, items[0..], 3000, 3000) == null);
+    try std.testing.expect(raiseTopmostUnderCursor(&app, items[0..], 3000, 3000, 2000, 1200) == null);
 
     // ⑤ 模态期间不动作（同 bringToFront 守卫）
     app.modal = .notice;
     const z_before = app.drumkit_win.z;
-    try std.testing.expect(raiseTopmostUnderCursor(&app, items[0..], 250, 250) == null);
+    try std.testing.expect(raiseTopmostUnderCursor(&app, items[0..], 250, 250, 2000, 1200) == null);
     try std.testing.expectEqual(z_before, app.drumkit_win.z);
     app.modal = null;
 }

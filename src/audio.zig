@@ -482,6 +482,59 @@ pub const LaneSet = struct {
         return self.collectPluginParams(2, inst_idx, 0, st0, st1, dt_s, state, keys, out);
     }
 
+    /// 快照里是否存在指定 `kind` 的车道（`renderBlock` 用它判断要不要限段长）
+    pub fn hasKind(self: *const LaneSet, kind: u8) bool {
+        var i: usize = 0;
+        while (i < self.n and i < self.lanes.len) : (i += 1) {
+            const l = &self.lanes[i];
+            if (l.active and l.n > 0 and l.kind == kind) return true;
+        }
+        return false;
+    }
+
+    /// **音高 lane（kind == 5）的段推进**：乐器 `inst_idx` 的弯音位置（0..1，0.5 = 不弯），
+    /// 段首/段末两个端点（含逐绑定极点 + 基准 + 深度/极性/反向，已 clamp）。
+    /// 返回 null = 该乐器没有音高车道（调用方退回静态弯音值）。
+    pub const PitchStep = struct { v0: f32, v1: f32 };
+
+    pub fn collectPitch(
+        self: *const LaneSet,
+        inst_idx: usize,
+        st0: f32,
+        st1: f32,
+        dt_s: f32,
+        state: []f32,
+        keys: []u32,
+    ) ?PitchStep {
+        var v0: f32 = 0;
+        var v1: f32 = 0;
+        var found = false;
+        var base: f32 = 0.5; // 基准取**第一条**音高绑定的 base（与音量/声像的 `baseOf` 同语义）
+        var i: usize = 0;
+        while (i < self.n and i < self.lanes.len) : (i += 1) {
+            const l = &self.lanes[i];
+            if (!l.active or l.n == 0 or l.kind != 5 or !l.inst or l.ch != inst_idx) continue;
+            const c1v = l.evalAt(self.points, st1);
+            if (c1v < 0) continue;
+            if (i >= state.len or i >= keys.len) continue;
+            const c0v = l.evalAt(self.points, st0);
+            if (keys[i] != l.key or std.math.isNan(state[i])) {
+                keys[i] = l.key;
+                state[i] = if (c0v < 0) c1v else c0v;
+            }
+            const prev = state[i];
+            const next = poleStep(prev, c1v, l.smooth_ms, dt_s);
+            state[i] = next;
+            const sign: f32 = if (l.invert) -1.0 else 1.0;
+            v0 += (if (l.bipolar) (prev - 0.5) * 2.0 else prev) * l.depth * sign;
+            v1 += (if (l.bipolar) (next - 0.5) * 2.0 else next) * l.depth * sign;
+            if (!found) base = l.base;
+            found = true;
+        }
+        if (!found) return null;
+        return .{ .v0 = std.math.clamp(base + v0, 0.0, 1.0), .v1 = std.math.clamp(base + v1, 0.0, 1.0) };
+    }
+
     /// 该座位该分组的**基线值**（有绑定 → 曲线自己定值；无 → null = 用静态推子/旋钮）
     /// 该座位的**基线值**（绑定设为 `null` 时由 `publishAutoLane` 填上类型默认，永不为“空”）。
     /// 返回 `null` = 该座位没有音量/声像车道（音频侧退回静态推子/旋钮值）。
@@ -610,6 +663,9 @@ pub const Params = struct {
     /// 每乐器声像（0-1；0.5 居中；UI 每帧同步）——音符级声像的**基准**：
     /// 播放时合成有效声像（基准 + 音符偏移），见 `effectivePan`
     instrument_pan: []std.atomic.Value(f32) = &.{},
+    /// 每乐器**弯音位置**（0..1；0.5 = 不弯；UI 每帧同步）——音高自动化的静态基线。
+    /// VSTi → `IMidiMapping` 解析出的弯音参数；内置合成器 → 频率倍率（±2 半音）。
+    instrument_pitch: []std.atomic.Value(f32) = &.{},
     /// VSTi **panic 旗标**（UI 线程置位）：下一段对全 128 音高无条件 note-off。
     /// 用途：state 恢复（撤销/读档/载预设）可能**唤醒快照里仍在发声的声部**——
     /// 它们不在宿主活跃位图里，按位图补 off 会漏 → 永挂（实测 bug：播放中调
@@ -761,6 +817,7 @@ pub const Params = struct {
         self.synth_ptrs = try allocAtomicArr(?*synth.SynthParams, a, ic, null);
         self.instrument_gain = try allocAtomicArr(f32, a, ic, 0.8);
         self.instrument_pan = try allocAtomicArr(f32, a, ic, 0.5);
+        self.instrument_pitch = try allocAtomicArr(f32, a, ic, 0.5);
         self.instrument_panic = try allocAtomicArr(bool, a, ic, false);
         self.instrument_channel = try allocAtomicArr(u32, a, ic, 0);
         self.instrument_midi_channel = try allocAtomicArr(i32, a, ic, -1);
@@ -805,6 +862,7 @@ pub const Params = struct {
         freeAtomicArr(?*synth.SynthParams, a, &self.synth_ptrs);
         freeAtomicArr(f32, a, &self.instrument_gain);
         freeAtomicArr(f32, a, &self.instrument_pan);
+        freeAtomicArr(f32, a, &self.instrument_pitch);
         freeAtomicArr(bool, a, &self.instrument_panic);
         freeAtomicArr(u32, a, &self.instrument_channel);
         freeAtomicArr(i32, a, &self.instrument_midi_channel);
@@ -859,6 +917,7 @@ pub const Params = struct {
             try growAtomicArr(?*synth.SynthParams, a, &self.synth_ptrs, ic, null);
             try growAtomicArr(f32, a, &self.instrument_gain, ic, 0.8);
             try growAtomicArr(f32, a, &self.instrument_pan, ic, 0.5);
+            try growAtomicArr(f32, a, &self.instrument_pitch, ic, 0.5);
             try growAtomicArr(bool, a, &self.instrument_panic, ic, false);
             try growAtomicArr(u32, a, &self.instrument_channel, ic, 0);
             try growAtomicArr(i32, a, &self.instrument_midi_channel, ic, -1);
@@ -2246,6 +2305,12 @@ fn midiChan(params: *const Params, i: usize) u8 {
     return @intCast(@min(c, 15));
 }
 
+/// 弯音位置（0..1；0.5 = 不弯）→ 频率倍率（`2^(semi/12)`），`range` = 行程（半音）
+fn bendMul(pos: f32, range: f32) f32 {
+    const semi = (std.math.clamp(pos, 0.0, 1.0) - 0.5) * 2.0 * @max(0.0, range);
+    return std.math.pow(f32, 2.0, semi / 12.0);
+}
+
 // ── 鼓组 VST3 层（每层一份事件批 + 位图；同乐器级 VSTi 惯例）──
 
 /// 鼓组 VST3 层：置位/清除发声位图
@@ -2924,6 +2989,14 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
                 const nvps = lane_set.collectVstParams(i, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key, &vps);
                 var vi: usize = 0;
                 while (vi < nvps) : (vi += 1) pl.queueAuto(vps[vi].param_id, vps[vi].v0, vps[vi].v1);
+                // **音高自动化（v4）**：弯音在 VST3 里就是一个参数（`IMidiMapping` 解析），
+                // 与其他参数同一条通道（`queueAuto` → inputParameterChanges）。
+                // 插件不支持 → 车道照常存在，只是不驱动它（UI 显示“不支持”）。
+                if (pl.pitchParamId()) |pp| {
+                    if (lane_set.collectPitch(i, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key)) |pv| {
+                        pl.queueAuto(pp, pv.v0, pv.v1);
+                    }
+                }
             }
             // 本段事件（段边界 = 事件时刻 → offset 全 0）；消费后清零
             pl.processInstrument(sc, frames, engine.vsti_events[i][0..engine.vsti_event_n[i]], host_time);
@@ -3025,11 +3098,22 @@ pub fn renderSegment(engine: *Engine, params: *Params, out: [*]f32, frames: u32,
                 const lp = params.kit_layer_params[i][l].load(.monotonic) orelse continue;
                 const ks = engine.kitSynth(i, l) orelse continue;
                 // 乐器级声像平衡也作用于鼓组层；合成器内部自有声像/音量平滑
-                synth.renderBalanced(lp, ks, cbuf, frames, sr, g_a * lg, true, bg_a[0], bg_a[1], bg_b[0], bg_b[1]);
+                synth.renderBalanced(lp, ks, cbuf, frames, sr, g_a * lg, true, bg_a[0], bg_a[1], bg_b[0], bg_b[1], 1.0, 1.0); // 鼓组层不弯音
             }
         } else {
             // 内置合成器：音量有内部平滑，**声像平衡按段首→段尾在块内插值**（与其他路径同口径）
-            synth.renderBalanced(sp, &engine.synths[i], cbuf, frames, sr, g_a, true, bg_a[0], bg_a[1], bg_b[0], bg_b[1]);
+            // **弯音（v4）**：位置 0..1 → ±2 半音的频率倍率（块内线性插值，与声像同口径）。
+            // 有音高车道 → 车道值（含基准）；无 → 静态 `inst.pitch`。
+            const pv = if (lane_on)
+                lane_set.collectPitch(i, lane_st0, lane_st1, dt_blk, &engine.bind_sm_val, &engine.bind_sm_key)
+            else
+                null;
+            const stat_pitch: f32 = if (i < params.instrument_pitch.len) params.instrument_pitch[i].load(.monotonic) else 0.5;
+            const pa: f32 = if (pv) |p| p.v0 else stat_pitch;
+            const pb: f32 = if (pv) |p| p.v1 else stat_pitch;
+            // 行程取本乐器设定（合成器面板可调；0..24）
+            const range: f32 = @floatFromInt(sp.bend_range.load(.monotonic));
+            synth.renderBalanced(sp, &engine.synths[i], cbuf, frames, sr, g_a, true, bg_a[0], bg_a[1], bg_b[0], bg_b[1], bendMul(pa, range), bendMul(pb, range));
             if (i == 0) _ = params.dbg_seg_render.fetchAdd(1, .monotonic);
         }
     }
@@ -3702,7 +3786,16 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
         // 远程事件（试听等）也走内部合成器 → 保守起见有排队就切
         break :blk false;
     };
-    if (!split_needed) {
+    // ── **音高自动化在跑 → 限段长**（v4）──
+    // 弯音参数每段只有“段首/段末”两个点，4096 帧一段（≈85ms）会听到台阶；
+    // 压到 ≈5ms 后听不出来。代价 = process() 次数变多，**只在真的有音高车道时才开**
+    // （纯 VSTi 工程的“整块一段”快路径也因此退回切段路径）。
+    const pitch_seg_cap: u32 = blk: {
+        const set = &params.lane_bufs[params.lane_pub.load(.acquire)];
+        break :blk if (set.hasKind(5)) 256 else 0;
+    };
+    const seg_must_split = split_needed or pitch_seg_cap > 0;
+    if (!seg_must_split) {
         const blk_end: i64 = @as(i64, @intCast(abs0)) + @as(i64, @intCast(frames));
         while (si < engine.stash_n) {
             const ev = engine.stash[si];
@@ -3718,7 +3811,7 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
         renderSegment(engine, params, out, frames, sr, master);
         done = frames;
     }
-    while (split_needed and done < frames and si < engine.stash_n) {
+    while (seg_must_split and done < frames and si < engine.stash_n) {
         const ev = engine.stash[si];
         // 事件应在的绝对帧位置
         const ev_frame: i64 = ref_frame +
@@ -3730,17 +3823,22 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
             si += 1;
             continue;
         }
-        // 未到时：渲染到事件边界为止
+        // 未到时：渲染到事件边界为止（音高在跑 → 再按段长上限切细）
         const off: u64 = @intCast(ev_frame - cur);
-        const seg: u32 = @intCast(@min(@as(u64, frames - done), off));
+        const seg: u32 = @intCast(@min(@as(u64, frames - done), if (pitch_seg_cap > 0) @min(off, pitch_seg_cap) else off));
         if (seg == 0) break;
         engine.seg_abs0 = abs0 + done;
         renderSegment(engine, params, out + done * 2, seg, sr, master);
         done += seg;
     }
-    if (split_needed and done < frames) {
-        engine.seg_abs0 = abs0 + done;
-        renderSegment(engine, params, out + done * 2, frames - done, sr, master);
+    if (seg_must_split and done < frames) {
+        // 音高在跑 → 尾段也不能超上限（否则每块最后 ~85ms 又变回台阶）
+        while (done < frames) {
+            const seg: u32 = @intCast(@min(@as(u64, frames - done), if (pitch_seg_cap > 0) pitch_seg_cap else @as(u64, frames - done)));
+            engine.seg_abs0 = abs0 + done;
+            renderSegment(engine, params, out + done * 2, seg, sr, master);
+            done += seg;
+        }
     }
 
     // 5) stash 压缩（保留未处理的事件）

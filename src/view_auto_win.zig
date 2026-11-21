@@ -18,6 +18,9 @@ const view_lane = @import("view_lane.zig");
 
 pub const W: i32 = 448;
 pub const H: i32 = 300;
+/// 窗口最小尺寸（`main.winRectOf` 与 `draw` 的钳制下限**必须一致**）
+pub const min_w: i32 = 300;
+pub const min_h: i32 = 200;
 
 const row_h: i32 = 34;
 /// 表头行高（列标题：曲线 / 极性 / 反向 / 基础 / 深度 / 平滑）
@@ -60,8 +63,10 @@ const Col = struct {
 pub fn draw(ui: *Ui, app: *App) void {
     const win = &app.auto_win;
     if (!win.open) return;
-    const w = W;
-    const h = H;
+    // **钳制**：主窗口缩小时自动收进屏幕（与机架/混音台/帮助/自动化参数表同一套）
+    var w = W;
+    var h = H;
+    util.clampWindow(ui.renderer.logicalWidth(), ui.renderer.logicalHeight(), &win.x, &win.y, &w, &h, min_w, min_h);
     const x = win.x;
     const y = win.y;
 
@@ -122,6 +127,7 @@ pub fn draw(ui: *Ui, app: *App) void {
                 .vst_param => "插件参数",
                 .fx_param => "效果器参数",
                 .kit_param => "鼓组层参数",
+                .pitch_bend => "音高（Pitch Bend）",
                 .none => "未绑定",
             };
             const pol_txt: []const u8 = if (bipolar) "双向" else "单向";
@@ -178,7 +184,7 @@ pub fn draw(ui: *Ui, app: *App) void {
     const view_rows: i32 = @max(1, @divTrunc(list_h, row_h));
     const content_rows: i32 = @intCast(binds.len);
     const max_scroll: i32 = @max(0, content_rows - view_rows);
-    if (util.inRect(ui.mouse_x, ui.mouse_y, x + 4, list_top, w - 14, list_h) and ui.wheel != 0 and max_scroll > 0) {
+    if (util.hitUI(ui, x + 4, list_top, w - 14, list_h) and ui.wheel != 0 and max_scroll > 0) {
         win.rows_scroll = std.math.clamp(win.rows_scroll - ui.wheel, 0, max_scroll);
         ui.wheel = 0;
     }
@@ -226,7 +232,7 @@ pub fn draw(ui: *Ui, app: *App) void {
         ui.renderer.hline(x + 4, by - 4, w - 8, ui.theme.panel_border);
         {
             const bw1: i32 = 116;
-            const hovered1 = util.inRect(ui.mouse_x, ui.mouse_y, x + 8, by, bw1, 22);
+            const hovered1 = util.hitUI(ui, x + 8, by, bw1, 22);
             ui.renderer.fillRect(x + 8, by, bw1, 22, if (hovered1) ui.theme.item_hover else ui.theme.slider_track);
             ui.renderer.strokeRect(x + 8, by, bw1, 22, ui.theme.panel_border);
             ui.labelClipped("+ 新曲线并链接", x + 12, by + 5, bw1 - 8, ui.theme.text);
@@ -240,7 +246,7 @@ pub fn draw(ui: *Ui, app: *App) void {
 
             const bx2 = x + 8 + bw1 + 8;
             const bw2: i32 = 116;
-            const hovered2 = util.inRect(ui.mouse_x, ui.mouse_y, bx2, by, bw2, 22);
+            const hovered2 = util.hitUI(ui, bx2, by, bw2, 22);
             ui.renderer.fillRect(bx2, by, bw2, 22, if (hovered2 or win.pick_open) ui.theme.item_hover else ui.theme.slider_track);
             ui.renderer.strokeRect(bx2, by, bw2, 22, ui.theme.panel_border);
             ui.labelClipped("链接到曲线", bx2 + 8, by + 5, bw2 - 26, ui.theme.text);
@@ -257,7 +263,7 @@ pub fn draw(ui: *Ui, app: *App) void {
     // 拖标题栏移动（按下记“鼠标 − 窗口左上”的偏移；按住期间反算）
     {
         const id = Ui.idOf("auto_win_title", 0);
-        if (util.inRect(ui.mouse_x, ui.mouse_y, x, y, w - 24, util.title_h) and ui.mouse_pressed) {
+        if (util.hitUI(ui, x, y, w - 24, util.title_h) and ui.mouse_pressed) {
             ui.active_id = id;
             win.drag_dx = ui.mouse_x - win.x;
             win.drag_dy = ui.mouse_y - win.y;
@@ -290,7 +296,7 @@ fn drawRow(ui: *Ui, app: *App, bi: usize, label: []const u8, x: i32, y: i32, w: 
     // 启用开关（方形；开 = 蓝，关 = 灰）
     {
         const bx = x + Col.on;
-        const hovered = util.inRect(ui.mouse_x, ui.mouse_y, bx, cy, ctrl_h, ctrl_h);
+        const hovered = util.hitUI(ui, bx, cy, ctrl_h, ctrl_h);
         ui.renderer.fillRect(bx, cy, ctrl_h, ctrl_h, if (b.enabled) ui.theme.accent else ui.theme.slider_track);
         ui.renderer.strokeRect(bx, cy, ctrl_h, ctrl_h, ui.theme.panel_border);
         if (hovered and ui.mouse_pressed) {
@@ -301,7 +307,7 @@ fn drawRow(ui: *Ui, app: *App, bi: usize, label: []const u8, x: i32, y: i32, w: 
 
     // 曲线名（点击 → 切到播放列表编辑这条曲线；垂直居中同其他控件）
     {
-        const hovered = util.inRect(ui.mouse_x, ui.mouse_y, x + Col.name, cy, Col.name_w, ctrl_h);
+        const hovered = util.hitUI(ui, x + Col.name, cy, Col.name_w, ctrl_h);
         if (hovered) ui.renderer.fillRect(x + Col.name, cy, Col.name_w, ctrl_h, ui.theme.item_hover);
         // 名字可能超宽 → **中段省略**（头…尾），垂直居中由 `textTop` 算
         ui.labelMiddle(label, x + Col.name, textTop(ui, cy), Col.name_w, if (hovered) ui.theme.accent else if (b.enabled) ui.theme.text else ui.theme.text_dim);
@@ -312,7 +318,7 @@ fn drawRow(ui: *Ui, app: *App, bi: usize, label: []const u8, x: i32, y: i32, w: 
     // **极性**（单向 / 双向）——左键切换；右键菜单
     {
         const px = x + Col.pol;
-        const hovered = util.inRect(ui.mouse_x, ui.mouse_y, px, cy, Col.btn_w, ctrl_h);
+        const hovered = util.hitUI(ui, px, cy, Col.btn_w, ctrl_h);
         ui.renderer.fillRect(px, cy, Col.btn_w, ctrl_h, if (hovered) ui.theme.item_hover else ui.theme.slider_track);
         ui.renderer.strokeRect(px, cy, Col.btn_w, ctrl_h, ui.theme.panel_border);
         const txt: []const u8 = if (b.bipolar) "双向" else "单向";
@@ -328,7 +334,7 @@ fn drawRow(ui: *Ui, app: *App, bi: usize, label: []const u8, x: i32, y: i32, w: 
     // **反向**（与极性独立）：单向+反向 = ducking（曲线越高，参数压得越低）
     {
         const ix = x + Col.inv;
-        const hovered = util.inRect(ui.mouse_x, ui.mouse_y, ix, cy, Col.btn_w, ctrl_h);
+        const hovered = util.hitUI(ui, ix, cy, Col.btn_w, ctrl_h);
         ui.renderer.fillRect(ix, cy, Col.btn_w, ctrl_h, if (hovered) ui.theme.item_hover else ui.theme.slider_track);
         ui.renderer.strokeRect(ix, cy, Col.btn_w, ctrl_h, ui.theme.panel_border);
         const txt: []const u8 = if (b.invert) "反向" else "正常";
@@ -350,7 +356,7 @@ fn drawRow(ui: *Ui, app: *App, bi: usize, label: []const u8, x: i32, y: i32, w: 
             b.base = val;
             app.history_pending = "调整自动化基础值";
         }
-        if (util.inRect(ui.mouse_x, ui.mouse_y, bx0, cy, Col.base_w, ctrl_h) and ui.mouse_right_pressed) {
+        if (util.hitUI(ui, bx0, cy, Col.base_w, ctrl_h) and ui.mouse_right_pressed) {
             openCtx(app, ui, bi, .base);
         }
     }
@@ -363,7 +369,7 @@ fn drawRow(ui: *Ui, app: *App, bi: usize, label: []const u8, x: i32, y: i32, w: 
             b.depth = @as(f32, @floatFromInt(pct)) / 100.0;
             app.history_pending = "调整自动化深度";
         }
-        if (util.inRect(ui.mouse_x, ui.mouse_y, sx, cy, Col.depth_w, ctrl_h) and ui.mouse_right_pressed) {
+        if (util.hitUI(ui, sx, cy, Col.depth_w, ctrl_h) and ui.mouse_right_pressed) {
             openCtx(app, ui, bi, .depth);
         }
     }
@@ -378,7 +384,7 @@ fn drawRow(ui: *Ui, app: *App, bi: usize, label: []const u8, x: i32, y: i32, w: 
             b.smooth_ms = @floatFromInt(ms);
             app.history_pending = "调整自动化平滑";
         }
-        if (util.inRect(ui.mouse_x, ui.mouse_y, sx, cy, Col.smooth_w, ctrl_h) and ui.mouse_right_pressed) {
+        if (util.hitUI(ui, sx, cy, Col.smooth_w, ctrl_h) and ui.mouse_right_pressed) {
             openCtx(app, ui, bi, .smooth);
         }
     }
@@ -386,7 +392,7 @@ fn drawRow(ui: *Ui, app: *App, bi: usize, label: []const u8, x: i32, y: i32, w: 
     // 移除（右侧贴边；与其它控件同高同 y）
     {
         const rx = x + Col.del;
-        const hovered = util.inRect(ui.mouse_x, ui.mouse_y, rx, cy, ctrl_h, ctrl_h);
+        const hovered = util.hitUI(ui, rx, cy, ctrl_h, ctrl_h);
         if (hovered) ui.renderer.fillRect(rx, cy, ctrl_h, ctrl_h, ui.theme.item_hover);
         const tw: i32 = @intFromFloat(ui.font.measure("×"));
         ui.labelCentered("×", rx + @divTrunc(ctrl_h - tw, 2), cy, ctrl_h, if (hovered) ui.theme.danger else ui.theme.text_dim);
@@ -614,6 +620,10 @@ fn targetName(app: *const App, t: view_lane.Target, buf: []u8) []const u8 {
         .vst_param => return app.vstParamLabel(t, buf),
         .fx_param => return app.fxParamLabel(t, buf),
         .kit_param => return app.kitParamLabel(t, buf),
+        .pitch_bend => {
+            const idx = app.instrumentIndexByUid(t.uid) orelse return "乐器? · 音高";
+            return std.fmt.bufPrint(buf, "{s} · 音高", .{app.instruments.items[idx].name}) catch "乐器 · 音高";
+        },
     }
 }
 
@@ -632,6 +642,11 @@ fn baseValueOf(app: *const App, t: view_lane.Target) f32 {
             return if (t.kind == .inst_vol) inst.volume else inst.pan;
         },
         .tempo => return view_lane.Target.normFromBpm(app.bpm),
+        .pitch_bend => {
+            // 静态基准 = 乐器的弯音位置（0.5 = 不弯；新乐器默认就是它）
+            const idx = app.instrumentIndexByUid(t.uid) orelse return 0.5;
+            return app.instruments.items[idx].pitch;
+        },
         .vst_param => {
             const r = app.vstParamResolve(t) orelse return 0.0;
             return @floatCast(r.pl.paramNorm(r.param_idx));

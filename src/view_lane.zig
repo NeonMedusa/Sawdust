@@ -84,7 +84,23 @@ pub const Target = struct {
     /// **`vst_param`**：`uid` = 乐器 uid、`param_id` = 插件参数 ID（v1/v2 只支持乐器 VSTi）。
     /// **`fx_param`**：效果器链上的 VST3 参数——`uid` = 通道、`slot` = 效果槽（v3）。
     /// **`kit_param`**：鼓组层 VST3 参数——`uid` = 乐器、`slot` = 层（v3）。
-    pub const Kind = enum { none, master_vol, mixer_vol, mixer_pan, inst_vol, inst_pan, tempo, vst_param, fx_param, kit_param };
+    pub const Kind = enum {
+        none,
+        master_vol,
+        mixer_vol,
+        mixer_pan,
+        inst_vol,
+        inst_pan,
+        tempo,
+        vst_param,
+        fx_param,
+        kit_param,
+        /// **乐器音高（MIDI 标准 pitch bend 语义）**：`uid` = 乐器 uid。
+        /// **必须永远追加在末尾**——存档 `SavedBinding.target_kind` 存的是枚举序号。
+        /// 本轮只做“可建链 / 可存盘 / UI 正确”，音频侧（cents 偏移 / pitch-bend 事件）下一轮接；
+        /// 未接时发声上等同 `none`，不得崩。
+        pitch_bend,
+    };
     /// **BPM 的归一化映射区间**（线性）：0 → 20，1 → 999
     pub const tempo_min: f32 = @import("model.zig").bpm_min;
     pub const tempo_span: f32 = @import("model.zig").bpm_max - tempo_min;
@@ -121,6 +137,7 @@ pub const Target = struct {
         return switch (kind) {
             .master_vol, .mixer_vol, .inst_vol => 0.0,
             .mixer_pan, .inst_pan => 0.5,
+            .pitch_bend => 0.5, // 中点 = 不弯（向两边弯 = 0..1 的偏移）
             .tempo => 0.0,
             .vst_param, .fx_param, .kit_param => 0.0, // 实际基值取插件自己报的默认值（`App.defaultBaseFor`）
             .none => 0.0,
@@ -128,9 +145,10 @@ pub const Target = struct {
     }
 
     /// **默认极性**（对齐 VST3 的 `kIsBipolar` 标志：声像类参数有中心位置）。
+    /// 弯音同声像：0.5 = 中心（不弯）→ 双向。
     pub fn defaultBipolar(kind: Kind) bool {
         return switch (kind) {
-            .mixer_pan, .inst_pan => true,
+            .mixer_pan, .inst_pan, .pitch_bend => true,
             else => false,
         };
     }
@@ -939,6 +957,9 @@ pub const Unit = enum {
     db, // **音量推子锥度**：40·log10(v)（= `audio.faderDb`），−60dB 及以下 = 静音
     bpm, // 20–999
     pan, // 0..1（0.50 = 居中）
+    /// **弯音**（半音，带符号；0 = 不弯）。换算 = (v−0.5)·2·`bend_range`（默认 ±2）。
+    /// **必须永远追加在末尾**——lane 的显示单位存的是枚举序号。
+    semitone,
 
     pub fn label(u: Unit) []const u8 {
         return switch (u) {
@@ -947,9 +968,28 @@ pub const Unit = enum {
             .db => "dB",
             .bpm => "BPM",
             .pan => "PAN",
+            .semitone => "半音",
         };
     }
 };
+
+/// **带符号半音显示**（0 = 不弯）：`range` = 行程（半音，默认 2 / 内置合成器可调）
+pub fn formatSemitone(v: f32, range: f32, buf: []u8) []const u8 {
+    const vc = std.math.clamp(v, 0.0, 1.0);
+    const semi = (vc - 0.5) * 2.0 * @max(0.0, range);
+    const sign: []const u8 = if (semi >= 0) "+" else "";
+    return std.fmt.bufPrint(buf, "{s}{d:.2}", .{ sign, semi }) catch "";
+}
+
+/// 半音文本 → 归一化位置（0.5 = 不弯）
+pub fn parseSemitone(text_in: []const u8, range: f32) ?f32 {
+    const text = std.mem.trim(u8, text_in, " ");
+    if (text.len == 0) return null;
+    const x = std.fmt.parseFloat(f32, text) catch return null;
+    const r = @max(0.0, range);
+    if (r <= 0.0) return 0.5; // 行程 0：怎么写都不弯
+    return std.math.clamp(0.5 + x / (2.0 * r), 0.0, 1.0);
+}
 
 /// 归一化值 → 显示字符串（`buf` 由调用方给）
 pub fn formatValue(u: Unit, v: f32, buf: []u8) []const u8 {
@@ -971,6 +1011,11 @@ pub fn formatValue(u: Unit, v: f32, buf: []u8) []const u8 {
         .pan => blk: {
             // **0..1，两位小数**（0.50 = 居中）——全项目一个声像域，不再用 L/R 百分比
             break :blk std.fmt.bufPrint(buf, "{d:.2}", .{vc}) catch "";
+        },
+        .semitone => blk: {
+            // **带符号半音**（无上下文时按默认行程 ±2 换算；
+            // 参数表的音高行走 `formatSemitone(v, 乐器行程)`，内置合成器可向 24 半音）
+            break :blk formatSemitone(vc, @floatFromInt(@import("synth.zig").bend_range_default), buf);
         },
     };
 }
@@ -1003,6 +1048,10 @@ pub fn parseValue(u: Unit, text_in: []const u8) ?f32 {
             const x = std.fmt.parseFloat(f32, text) catch return null;
             return std.math.clamp(x, 0.0, 1.0);
         },
+        .semitone => {
+            // 带符号半音（如 -1.5 / +2）；无上下文时按默认行程 ±2
+            return parseSemitone(text, @floatFromInt(@import("synth.zig").bend_range_default));
+        },
     }
 }
 
@@ -1023,6 +1072,11 @@ pub fn unitCycle(lane: *const Lane, out: *[4]Unit) []const Unit {
             out[n] = .midi;
             n += 1;
             out[n] = .db;
+            n += 1;
+        },
+        .pitch_bend => {
+            // 弯音类：**默认就是半音**（PAN/dB 对它没意义）
+            out[n] = .semitone;
             n += 1;
         },
     }

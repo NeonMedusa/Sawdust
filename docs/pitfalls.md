@@ -250,13 +250,133 @@ power: 5402 + oi * 3
 ```
 
 **教训**：`active_id` 是**全应用唯一**的——加控件时先数“每行几个”，
-再定步长；本项目已三次撞 id（调音台 7160 与钢琴卷帘 7100；合成器 5402
-与下一行合奏；调音台声像 7200 与钢琴卷帘 PAT 标尺 7200——点声像旋钮
-会**跳播放游标**、点标尺会**改声像**）。
+再定步长；**必须查 `ui.zig` 的号段分配表**（不要随手写字面量）。本项目已**四次**撞 id：
+调音台 7160 与钢琴卷帘 7100；合成器 5402 与下一行合奏；调音台声像 7200 与钢琴卷帘 PAT 标尺 7200
+（点声像旋钮会**跳播放游标**）；**v4 弯音行程控件 5300 与振荡器音量旋钮 5300+oi**。
 
-**防发**：分配表维护在 `ui.zig` 的 `active_id` 注释（新增控件先查表取号）；
-每个窗口的控件尽量用**常量基段**（如调音台 `id_pan_base = 8100`）而不是
-散落的字面量，并配一条“段不重叠”的单测（见 `view_mixer.zig`）。
+最后一次的后果最隐蔽：按下时 `dragNumberEx` 设了 `active_id=5300` + `mouse_capture=true`，
+而**旋钮的释放路径只清 `active_id`、不清 `mouse_capture`**（旋钮本来不走接收制）→ 下一帧旋钮
+先把 `active_id` 抢清，弯音控件自己的清理分支再也进不去 → **`mouse_capture` 永久为真**
+→ 主循环每帧隐藏光标 → **鼠标光标长期不可见**。
+
+**防发**：
+1. 分配表维护在 `ui.zig` 的 `active_id` 注释；每个窗口尽量用**常量基段** + “段不重叠”单测
+   （`view_mixer.zig` 已有）；
+2. 新控件用**具名常量** + 编译期断言避开已用区间（`view_synth.id_bend_range` 的 `comptime assert`）；
+3. 主循环兜底（**必须在帧末**）：`if (!ui.mouse_down) ui.mouse_capture = false;`——
+   捕获必须伴随按住，任何控件的清理遗漏都不会再让光标卡死；
+   放帧首会让松手帧 `frozen_dy` 变 0 → 所有拖拽控件“松手回退”（见下一节事故）。
+
+### 浮动窗口里的控件必须用 `util.hitUI`（裸 `inRect` = 菜单点击穿透）
+
+**症状**：在 VST 参数行右键 → `恢复默认值`，**每点一次就新建并链接一条曲线**。
+
+**根因**：自动化链接窗口的「+ 新曲线并链接」按钮用的是裸 `util.inRect(ui.mouse_x, …)`
+——它**不尊重 `ui.input_blocked`**。菜单展开时 main 确实声明了全屏模态层、
+`menuIsOpen()` 也把 `vst_auto.menu_open` 计入，但那个按钮压根不看这个标志，
+于是“菜单项 + 下方按钮”**同帧都收到这一下点击**。
+
+**规则**：
+- 窗口/视图内部的**普通控件**（按钮/行/拖条/标题拖拽/滑块）→ `util.hitUI`（含屏蔽判断）；
+- **菜单自己**的项与“点外面关闭”仍用裸 `util.inRect`——它们就是最上层，
+  用 `hitUI` 反而会让菜单在自身模态层下失效；
+- 新增菜单记得加进 `App.menuIsOpen()`（漏一项 = 整类穿透，
+  已有回归测试 `app: menuIsOpen——每种菜单都必须计入`）；下拉菜单也算（`auto_win.pick_open`）。
+
+### 参数表控件 id：每行 stride ≥ 2 + 分段/宿主百万级间距
+
+旧写法“每行隔 1 个号、行内偏移 `+5000`/`+5500`”在**参数超过 ~500** 时必然跨行撞
+（插件参数上千甚至上万很常见）；同理，浮窗 / 乐器面板 / 效果器面板三个宿主的基段
+若只相差几千，参数上万时也会撞。
+
+**现行（`view_vst_auto.zig`）**：
+
+```zig
+const row_stride = 2;                 // 拖动 = row_id，按钮 = row_id + 1
+const sec_stride = 1_000_000;         // MIDI / 已链接 / 最近 / 全部 四段
+id_base_float / id_base_synth_panel / id_base_fx_panel = 1e9 / 2e9 / 3e9
+```
+
+“最近改动”的 id 用**行序号**而不是参数下标（参数下标可能上万，会把 id 挤出本段）。
+
+### 插件窗口抢键盘焦点 → 我们的输入框打不了字（系统“嘟”一声）
+
+**症状**：把乐器换成 VSTi（如 Vital）后，点自动化参数表的搜索框 / 重命名输入框，
+**敲键盘没反应**，Windows 发出“无效按键”提示音；必须先点一下主窗口外面再点回来才能输入。
+
+**根因**：键盘只在**主窗口的消息循环**里处理（`WM_KEYDOWN`/`WM_CHAR`）。
+- Windows：插件编辑器是**嵌进面板的 `WS_CHILD` 子窗口**，它首次显示时 `SetFocus(自己)`
+  （`vst_host.syncEditorRect`）→ 之后的按键全进了插件窗口；
+- Linux：插件 UI 是**独立顶层窗口**，点过它之后 X 焦点在那边（同理）。
+
+**修法**：**文本输入框刚打开的那一刻**把焦点抢回主窗口（边沿触发，不是每帧）：
+
+```zig
+// main 主循环
+if (app.text_input.active and !prev_text_input_active) win.focusMain();
+prev_text_input_active = app.text_input.active;
+// win.focusMain(): Windows = SetFocus(main_hwnd)；X11 = XSetInputFocus(dpy, win, RevertToParent)
+```
+
+副作用：插件编辑器里的输入框在自己被点击时会重新拿到焦点（Windows 点子窗口即聚焦），不受影响。
+
+### 拖拽控件“松手就回退”（真因：捕获在帧首被清 → `frozen_dy` 变 0）
+
+**症状**：参数表里拖任意行（VST 参数 / 乐器音量·声像·音高都算）、以及 BPM/拍号等拖拽数字控件，
+**拖的时候值对、插件 UI 也跟着变，一松手就回退到按下时的起始值**。
+
+**真因**：`window.frozenDeltaY()` 的语义是“**未冻结时恒为 0**”。当时为了防“捕获泄漏 → 光标卡死”，
+在 main 的**帧首**加了兜底：
+
+```zig
+// ✗ 帧首：松手那一帧 mouse_down 已经是 false → 捕获被清 → frozen_dy = 0
+if (!ui.mouse_down) ui.mouse_capture = false;
+if (ui.mouse_capture) { win.beginMouseCapture(); … } else win.endMouseCapture();
+```
+
+拖拽内核（`dragNormV` / `dragNumberEx` / `zoomSquareState` / `dragNumberBpm`）在
+`active_id == id` 时会算“总位移 = `frozen_dy - 基点`” → 松手帧拿到 0 → **算出起点值并写回**。
+
+**修法**：兜底挪到**帧末**（`ui.endFrame()` 之后）：
+
+```zig
+ui.endFrame();
+if (!ui.mouse_down) ui.mouse_capture = false;   // 帧末兜底：既防光标卡死，又保住松手帧的 frozen_dy
+```
+
+回归锁：`ui: 拖拽松手帧不得把值拉回起点（dragNormV/zoom 系列共同契约）`。
+
+> 排查过程中顺带修的两个真问题（保留）：
+> 1. `render()` 里**同一参数一段内多条消息要合并成一个队列**（很多插件只认第一个），
+>    `pend` 环满时**覆盖最后一条**而不是丢新值；
+> 2. 参数表读数用 `paramTextValue(我们缓存的值)` 格式化，别只依赖插件当前值。
+> 另：曾以为“音高别名身份不匹配”是元凶——它不是，但确实是个隐患，已用
+> `migratePitchAliasBindings` 归一（`.vst_param{弯音参数}` → `.pitch_bend`）。
+
+### 快照发布：存“值” = 地址复用 → 音频线程撕裂读（**直接崩进程**）
+
+**症状**：编辑/撤销自动化曲线时偶尔崩在音频回调里——
+`snapshot.zig: gatherRaw` → `index out of bounds: index 3366, len 0`，
+而 `start_idx` 本不该为空（刚建过的快照）。
+
+**根因**：`snap_slots` 当时存的是 **`Snapshot` 值**，发布给音频的指针是
+`&snap_slots[slot]`。连续两次重建（UI 两帧 = 16ms）时，第二次会把**新结构体写回同一地址**；
+而音频一个 block 最长 ~85ms，正好能隔在一半——读到“新 `by_start` + 旧 `start_idx`”
+的**撕裂状态**（撕裂读不是 UAF，退役 30 帧的保护根本盖不住它）。
+
+**修法**：快照**堆分配**，发布的指针因此永不复用；退役 30 帧后 `deinit + destroy`：
+
+```zig
+snap_slots: [2]?*snapshot.Snapshot,
+const box = try allocator.create(snapshot.Snapshot);
+box.* = built;              // 新地址；旧的那份还在 retired 里活着
+```
+
+**双重保险**：`gatherRaw` 开头校验桶/索引池尺寸，不一致就 `return null`
+（丢这一段的事件、下次换代重发）——**音频线程永远不能 panic**。
+
+回归锁：`app: 快照连续重建——发布地址不复用`（连建两次 → 旧指针内容不变、新旧都能求值、
+30 帧后 retired 清空）。
 
 ### `Ui` 上下文必须**跨帧复用**（否则控件"没反应"）
 ```zig
@@ -1573,19 +1693,19 @@ const names = if (total == 1) first.? else
 - **修法**：
   1. 创建容器窗口时 `XSetWMProtocols(WM_DELETE_WINDOW)` + `XSelectInput(StructureNotifyMask)`；
   2. `pump()` 收到 `WM_DELETE_WINDOW` → **只 `XUnmapWindow`（隐藏）**，绝不让 WM 销毁窗口
-     （插件对象与窗口都留着，和 `closeEditor` 的"只隐藏"策略一致）；
+     （这是 `hideEditor` 的“软关闭”：用户只是暂时不看，不卸载实例）；
   3. 真收到 `DestroyNotify` → 把该窗口从容器表里摘掉并标 retired，之后不再触碰；
-  4. 用 **MapNotify/UnmapNotify 跟踪真实 map 状态**，`Plugin.editorIsShown()` 以它为准
-     （否则用户关掉后按钮状态不对，还会被"自动重新显示"逻辑立刻弹回来）。
-### 关掉插件 UI 窗口后"又冒出一个新窗口"（已修）
+  4. 用 **MapNotify/UnmapNotify 跟踪真实 map 状态**（否则用户关掉后按钮状态不对，
+     还会被“自动重新显示”逻辑立刻弹回来）。
+### 关掉插件 UI 窗口后"又冒出一个新窗口"（已修，现已连"自动弹窗"一起删掉）
 
 - **症状**：点面板按钮的"关闭"或点窗口自己的 × 之后，插件 UI 窗口消失一瞬又出现一个新的。
 - **根因**：Linux 分支的"关旧开新"用的是 `owner != 目标` 判断：用户一关，`owner = null` →
   下一帧这句又把当前插件当成"新目标"，立刻 `showEditorAt()` 把它打开了。
-- **修法**：把"**目标**"和"**当前开着的**"分开记：
-  - `vst_editor_target`：面板当前指向的插件（只有**它变化**才触发关旧开新）；
-  - `vst_editor_owner`：真正显示中的插件（用户关掉 → 置 null，但 target 不变 → 不会自动重开）；
-  - 两个面板都关着时清空 target（下次打开面板 = 目标变化 → 会重新显示，符合直觉）。
+- **当时的修法**：把"**目标**"和"**当前开着的**"分开记（`vst_editor_target` / `vst_editor_owner`）。
+- **现行做法（2026-11，用户反馈后）**：**根本不再自动弹窗** —— `vst_editor_target` 已整个删除，
+  独立窗口只能由面板顶部「打开插件 UI（独立窗口）」按钮打开（`util.pluginUiToggle`）。
+  没有"自动打开"就再没有"自动弹回来"，`owner` 一个字段就够表达开关状态。
 ### 大数组字段写 `@splat(.{})` → `.rodata` 里白存一份整块镜像（已修，−475 KB）
 
 - **症状**：某提交只加约 1k 行代码，`.text` 仅 +126 KB，`.rodata` 却 +485 KB（398 → 883 KB）。
@@ -1611,7 +1731,8 @@ const names = if (total == 1) first.? else
 
 **保留**（都还在用）：容器窗口 `create/show/move/hide/destroy`、**XEmbed 握手**、
 非致命 X 错误处理、`WM_DELETE_WINDOW→隐藏` 与 `DestroyNotify` 安全处理、事件抽干 `pump()`、
-`takeUserClosed()`（按钮状态同步）、`editorIsShown`/`setEditorVisible`/`showEditorAt`。
+`takeUserClosed()`（按钮状态同步）、`editorIsShown`/`setEditorVisible`/`showEditorAt`、
+`lastPos`/`rememberPos`（关闭/拆除前记**全局单一**窗口位置，重建时回到同一处）。
 
 规模变化：`vst_editor_x11.zig` **510 → 约 345 行**；`vst_host.zig` 减约 90 行。
 验证：Linux **352 pass / 22 skip（374）**、Windows **370 pass / 3 skip（373）**，两端构建通过。

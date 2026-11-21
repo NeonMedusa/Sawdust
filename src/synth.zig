@@ -124,7 +124,19 @@ pub const SynthParams = struct {
 
     hpf: FilterParams = .{},
     lpf: FilterParams = .{},
+
+    /// **弯音行程**（半音；0..48）。默认 **2** = MIDI/GM 惯例。
+    /// 上限 48 是为了能制作**长行程滑音**（五度/八度级 whammy）；MIDI 1.0 `RPN 0` / GM2
+    /// 只规定到 24，内置合成器放宽到 48（VST 的行程仍由插件自己决定）。
+    /// 内置合成器用它算频率倍率（`audio.bendMul`）；**VST 乐器的行程由插件自己的
+    /// Bend Range 参数决定**（VST3 没有行程的映射标准，见 `docs/automation.md` §11.46）。
+    bend_range: Atomic(u8) = Atomic(u8).init(bend_range_default),
 };
+
+/// 弯音行程默认值（±2 半音；MIDI 惯例 / GM 出厂值）
+pub const bend_range_default: u8 = 2;
+/// 弯音行程上限（±48 半音——够做长行程滑音；GM2/RPN 0 只规定到 24）
+pub const bend_range_max: u8 = 48;
 
 // ── 事件 ──
 
@@ -485,13 +497,14 @@ pub fn render(
     gain: f32,
     add: bool,
 ) void {
-    renderBalanced(params, state, out, frames, sample_rate, gain, add, 1.0, 1.0, 1.0, 1.0);
+    renderBalanced(params, state, out, frames, sample_rate, gain, add, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0);
 }
 
 /// 同 `render`，额外带**乐器级声像平衡**（等功率左/右增益）：
 /// 声部声像（`note.pan`）之后再乘一次总线平衡，两者互不干扰。
 /// `a` = 段首、`b` = 段尾：块内**逐采样线性插值**（与 VSTi / 调音台同一口径），
 /// 所以垂直断崖不会变成单采样硬跳。
+/// `bend_a/bend_b` = 弯音**频率倍率**（1.0 = 不弯；音高自动化用，块内同样插值）。
 pub fn renderBalanced(
     params: *const SynthParams,
     state: anytype,
@@ -504,6 +517,8 @@ pub fn renderBalanced(
     bal_r_a: f32,
     bal_l_b: f32,
     bal_r_b: f32,
+    bend_a: f32,
+    bend_b: f32,
 ) void {
     // ── 活跃声部快照（空闲时快速返回）──
     var active: [max_voices]u16 = undefined;
@@ -583,6 +598,10 @@ pub fn renderBalanced(
     if (state.smoothed_master <= 0.0001) state.smoothed_master = gain;
     var i: u32 = 0;
     while (i < frames) : (i += 1) {
+        // **弯音倍率**（音高自动化）：段首 → 段尾块内线性插值（与声像平衡同口径）；
+        // 无自动化时 bend_a == bend_b == 1.0 → 与老行为逐位一致
+        const bend_t = @as(f32, @floatFromInt(i)) / @max(1.0, @as(f32, @floatFromInt(frames)));
+        const bend = bend_a + (bend_b - bend_a) * bend_t;
         // 逐声部 L/R 两路累加（声像需要各声部自己的左右增益；
         // 居中时 pan_l == pan_r == 1.0，与旧版单声道混音**逐位相同**）
         var mix_l: f32 = 0;
@@ -623,7 +642,7 @@ pub fn renderBalanced(
             // ── 振荡器混音（含合奏副本；L/R 两路——副本立体声展开）──
             var vmix_l: f32 = 0;
             var vmix_r: f32 = 0;
-            const fstep = v.freq * dt; // 基础相位步长（副乘失谐系数）
+            const fstep = v.freq * dt * bend; // 基础相位步长（副乘失谐系数；弯音倍率另乘）
             for (0..osc_count) |o| {
                 if (!osc_on[o]) continue;
                 const w = osc_wave[o];

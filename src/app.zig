@@ -298,6 +298,33 @@ pub const WinKind = enum { rack, synth, mixer, effect, drumkit, help, settings, 
 /// 自动化窗口的**视角**：按参数看（这个参数绑了哪些曲线）/ 按曲线看（这条曲线驱动哪些参数）
 pub const AutoWinView = enum { by_target, by_curve };
 
+/// **参数表宿主**：同一份 `view_vst_auto.drawBody` 有三类调用者——
+/// `.float` = 浮动参数表窗口；`.synth_panel` / `.fx_panel` = 面板正文嵌入（Linux 的 VST
+/// 乐器 / 效果器面板）。它同时决定**视图状态**（每宿主一份）与**控件 id 基段**。
+pub const AutoTableHost = enum { float, synth_panel, fx_panel };
+
+/// 宿主 → 控件 id 基段（三处可能同时开着；百万级间距，见 `view_vst_auto.rowId`）
+pub fn hostIdBase(host: AutoTableHost) u64 {
+    return switch (host) {
+        .float => 1_000_000_000,
+        .synth_panel => 2_000_000_000,
+        .fx_panel => 3_000_000_000,
+    };
+}
+
+/// 参数表**每个宿主各存一份**的视图状态。
+/// 以前这些是全局一份（`vst_auto.scroll/filter/fold`）→ 面板正文与浮动窗口会互相拉扯：
+/// 滚一个另一个跟着滚、面板里没搜索框却被浮窗的搜索词静默过滤（实测 bug）。
+pub const AutoTableState = struct {
+    /// 上次画的目标（`App.slotRefKey`）：换目标 → 滚动/搜索复位
+    last_key: u64 = 0,
+    scroll: i32 = 0,
+    midi_fold: bool = false,
+    vst_fold: bool = false,
+    filter_len: usize = 0,
+    filter_buf: [32]u8 = @splat(0),
+};
+
 /// 浮动窗口“绘制顺序 + 最终矩形”（`main.drawApp` 逐帧填写）
 pub const WinDraw = struct { kind: WinKind, x: i32, y: i32, w: i32, h: i32 };
 
@@ -789,7 +816,7 @@ pub const Playback = struct {
 /// 交互：字符追加；退格删末尾一个 code point；回车 = 提交；ESC = 取消；
 /// 点击输入框外 = 提交（吞掉该次点击）。
 pub const TextInput = struct {
-    pub const Target = enum { instrument, mixer_channel, pattern, track, preset_name, kit_pad_name, preset_rename, preset_search, audio_style, automation_value, automation_curve_name, automation_base, automation_depth, automation_smooth, channel_vol, channel_pan, inst_vol, inst_pan, bpm, vst_param_search, vst_param_value };
+    pub const Target = enum { instrument, mixer_channel, pattern, track, preset_name, kit_pad_name, preset_rename, preset_search, audio_style, automation_value, automation_curve_name, automation_base, automation_depth, automation_smooth, channel_vol, channel_pan, inst_vol, inst_pan, inst_pitch, bpm, vst_param_search, vst_param_value };
 
     active: bool = false,
     target: Target = .instrument,
@@ -900,8 +927,6 @@ pub const SynthWindow = struct {
     resize_my: i32 = 0,
     /// 当前编辑的**目标**（乐器合成器 / 鼓组层）；点击机架/鼓组编辑器设定
     target: PresetTarget = .{ .instrument = 0 },
-    /// VST3 无界面插件（兜底参数列表）的滚动位置；切目标时需要重置
-    param_scroll: i32 = 0,
 };
 
 /// 鼓组 VST3 层插件重试节流（帧）——`App.syncKitLayerPlugins` 用
@@ -1514,8 +1539,8 @@ const StatePool = struct {
 const vst_auto_eps: f64 = 1e-4;
 
 pub const App = struct {
-    /// 已退役但音频线程可能仍在读的快照（帧倒计时后释放）
-    pub const RetiredSnap = struct { snap: snapshot.Snapshot, frames: u16 };
+    /// 已退役但音频线程可能仍在读的快照（帧倒计时后 `deinit + destroy`）
+    pub const RetiredSnap = struct { snap: *snapshot.Snapshot, frames: u16 };
 
     /// **A2**：每帧调用——回收退役快照；若数据脏则重建并发布新快照（影子对拍用，未接主路）。
     pub fn pollSnapshotRebuild(self: *App) void {
@@ -1524,6 +1549,7 @@ pub const App = struct {
             if (self.snap_retired.items[i].frames == 0) {
                 var r = self.snap_retired.swapRemove(i);
                 r.snap.deinit();
+                self.allocator.destroy(r.snap);
                 continue;
             }
             self.snap_retired.items[i].frames -= 1;
@@ -1535,18 +1561,19 @@ pub const App = struct {
         if (!self.snap_dirty and !stale_scope) return;
         self.snap_dirty = false;
 
-        // 先退役“当前活动”的旧快照（音频可能还在读它 → 30 帧后释放）
+        // 先退役“当前活动”的旧快照（音频可能还在读它 → 30 帧后 deinit + destroy）
         if (self.snap_slots[self.snap_active]) |old| {
             self.snap_retired.append(self.allocator, .{ .snap = old, .frames = 30 }) catch {
-                // OOM：宁可泄漏也不释放（UAF 比泄漏严重）
+                // OOM：宁可泄漏也不释放（UAF 比泄漏严重）；发布指针继续指向它
                 self.snap_slots[self.snap_active] = null;
                 return;
             };
             self.snap_slots[self.snap_active] = null;
         }
         const slot: usize = 1 - @as(usize, self.snap_active);
-        if (self.snap_slots[slot]) |*old| {
+        if (self.snap_slots[slot]) |old| {
             old.deinit();
+            self.allocator.destroy(old);
             self.snap_slots[slot] = null;
         }
         const built = snapshot.build(
@@ -1560,12 +1587,24 @@ pub const App = struct {
             self.params.snapshot_ptr.store(0, .release);
             return;
         };
-        self.snap_slots[slot] = built;
+        // **快照必须堆分配**：旧实现把 `Snapshot` **值**存在 `snap_slots` 里，发布的是
+        // `&snap_slots[slot]`——连续两次重建会把新结构体**写回同一地址**，音频线程若正在
+        // 读那块（一 block 最长 ~85ms，UI 两帧才 16ms）就会读到“新 by_start + 旧 start_idx”
+        // 的**撕裂状态** → 实测 panic：`index out of bounds: index 3366, len 0`。
+        // 堆分配后地址永不复用（退役 30 帧才 destroy）。
+        const box = self.allocator.create(snapshot.Snapshot) catch {
+            var tmp = built;
+            tmp.deinit();
+            self.params.snapshot_ptr.store(0, .release);
+            return;
+        };
+        box.* = built;
+        self.snap_slots[slot] = box;
         self.snap_active = @intCast(slot);
         self.snap_mode = self.sel.song_mode; // 记下这份快照烘的是哪个域/样式
         self.snap_pattern = self.sel.pattern; // （构建失败则不记 → 下一帧因不一致自然重试）
-        self.snap_insts = if (self.snap_slots[slot]) |*s| s.instCount() else 0;
-        const sp = if (self.snap_slots[slot]) |*s| @intFromPtr(s) else 0;
+        self.snap_insts = box.instCount();
+        const sp = @intFromPtr(box);
         // **A3a**：代递增必须在发布之后——音频看到新代就知道 stash 里的事件是旧数据的，
         // 一律丢弃并按新快照重发本块（否则编辑掉的事件还会先响一下：实测 1 次/整场）。
         self.params.snapshot_ptr.store(sp, .release);
@@ -1622,11 +1661,8 @@ pub const App = struct {
     state_pool: StatePool = .{},
     /// 主窗口句柄（VST3 编辑器窗口的 owner；main 初始化时写入；无窗口环境为 null）
     main_hwnd: ?*anyopaque = null,
-    /// Linux 独立窗口模式：当前显示中的插件编辑器属于哪个插件（切目标时据此关旧开新）
+    /// Linux 独立窗口模式：当前显示中的插件编辑器属于哪个插件（切目标/关面板时据此拆旧）
     vst_editor_owner: ?*@import("vst_host.zig").Plugin = null,
-    /// 上一次看到的"编辑器目标"（面板指向的插件）。**和 owner 分开记**：
-    /// 用户手动关掉窗口后 owner 会变 null，但目标没变 → 不该自动重新打开。
-    vst_editor_target: ?*@import("vst_host.zig").Plugin = null,
 
     // ── 文档数据（所有视图共享）──
     /// 已放置的样式片段
@@ -1730,21 +1766,35 @@ pub const App = struct {
         z: i32 = 0,
         /// 目标插件实例（**运行时寻址**；窗口开着时每帧重新解析插件指针）
         ref: PluginSlotRef = .{ .kind = .instrument },
-        /// 统一的滚动偏移（三段共用一个滚动区）
-        scroll: i32 = 0,
-        /// 搜索过滤（与文本输入实时同步，同名同预设搜索的做法）
-        filter_buf: [32]u8 = @splat(0),
-        filter_len: usize = 0,
+        /// **乐器级身份**（§11.47 方案 A）：非 0 时以“乐器”为窗口主体——
+        /// 内置合成器/鼓组也能打开（看得到「乐器参数」三行）；0 = 沿用 `ref` 的插件槽。
+        inst_uid: u32 = 0,
+        /// 视图状态：**按宿主分开**（浮动窗口 / 面板正文各一份，见 `AutoTableState`）
+        /// 视图状态：**每宿主一份**（浮窗 / 乐器面板 / 效果器面板可同时开着）
+        t: [3]AutoTableState = .{ .{}, .{}, .{} },
+        /// **哪个宿主正在编辑参数搜索框**（两个宿主都有搜索框；不记这个，
+        /// 一边打字会把文字同时写进另一边的过滤词 → 看不见的过滤）
+        search_host: AutoTableHost = .float,
+        /// MIDI 参数行的右键菜单（与 VST 行同款手段：恢复默认值 / 输入值… / 自动化…）
+        /// `uid` = 发起行所属乐器（面板与浮窗共用同一个菜单状态，所以得随菜单带着走）
+        midi_menu: ?struct { kind: view_lane.Target.Kind = .none, uid: u32 = 0, x: i32 = 0, y: i32 = 0 } = null,
         /// 行内菜单（参数行右侧 “自动化” 按钮）
         menu_open: bool = false,
         /// 菜单刚打开的那一帧标记（**否则打开它的那次左键会在同帧把它关掉**）
         menu_just_opened: bool = false,
+        /// 发起菜单的插件槽（面板/浮窗都可能发起；不能复用 `ref`——那是浮窗目标）
+        menu_ref: PluginSlotRef = .{ .kind = .instrument },
         menu_x: i32 = 0,
         menu_y: i32 = 0,
         menu_param: u32 = 0,
         /// 标题拖动抓取偏移
         drag_dx: i32 = 0,
         drag_dy: i32 = 0,
+
+        /// 宿主 → 视图状态（调用点统一走这里，别直接碰 `t`）
+        pub fn table(self: *@This(), host: AutoTableHost) *AutoTableState {
+            return &self.t[@backingInt(host)];
+        }
     } = .{},
     /// “最近改动”的插件参数（最新在前；只存 (乐器 uid, 参数 id)）
     vst_recent: [10]struct { slot_key: u64, param_id: u32 } = @splat(.{ .slot_key = 0, .param_id = 0 }),
@@ -1760,7 +1810,7 @@ pub const App = struct {
     auto_panel_h: i32 = 220,
 
     /// **A2 影子对拍**：快照双缓冲 + 延迟退休（音频线程可能还在读旧快照）
-    snap_slots: [2]?snapshot.Snapshot = .{ null, null },
+    snap_slots: [2]?*snapshot.Snapshot = .{ null, null },
     snap_active: u8 = 0,
     snap_dirty: bool = true,
     /// 当前快照是**用哪个播放域/哪个样式**构建的（`sel.song_mode` / `sel.pattern`）。
@@ -2228,6 +2278,20 @@ pub const App = struct {
         if (self.sel.instrument == idx) return;
         self.sel.instrument = idx;
         self.clearNoteSelection();
+    }
+
+    /// **打开乐器编辑器**（机架双击 / 右键菜单「打开」共用——一个动作一个实现）：
+    /// 鼓组 → 鼓组编辑器（`openDrumKit` 含同步选择/置顶）；其它（内置合成器 / VST3）→ 乐器面板。
+    pub fn openInstrumentEditor(self: *App, idx: usize) void {
+        if (idx >= self.instruments.items.len) return;
+        self.setInstrument(@intCast(idx));
+        if (self.instruments.items[idx].kind == .drumkit) {
+            self.openDrumKit(@intCast(idx));
+            return;
+        }
+        self.synth_win.target = .{ .instrument = @intCast(idx) };
+        self.synth_win.open = true;
+        self.bringToFront(&self.synth_win.z); // 即时反馈：打开即置顶
     }
 
     /// 全选**当前样式 + 当前乐器**的全部音符（Ctrl+A；钢琴卷帘上下文）。
@@ -2884,6 +2948,7 @@ pub const App = struct {
             .name = try self.allocator.dupe(u8, inst.name),
             .volume = inst.volume,
             .pan = inst.pan,
+            .pitch = inst.pitch,
             .muted = inst.muted,
             .mixer = inst.mixer,
             .midi_channel = inst.midi_channel,
@@ -3292,6 +3357,7 @@ pub const App = struct {
     fn applySavedInstrument(self: *App, si: *const persist.SavedInstrument, target: *model.Instrument, plan: ApplyPlan, prev_idx: usize, target_idx: usize) void {
         target.volume = si.volume;
         target.pan = si.pan;
+        target.pitch = si.pitch;
         target.muted = si.muted;
         target.mixer = si.mixer;
         target.midi_channel = si.midi_channel;
@@ -4672,10 +4738,16 @@ pub const App = struct {
 
         self.params.snapshot_ptr.store(0, .release); // A2：先断开音频侧对快照的引用
         for (&self.snap_slots) |*s| {
-            if (s.*) |*sp| sp.deinit();
+            if (s.*) |sp| {
+                sp.deinit();
+                self.allocator.destroy(sp);
+            }
             s.* = null;
         }
-        for (self.snap_retired.items) |*r| r.snap.deinit();
+        for (self.snap_retired.items) |*r| {
+            r.snap.deinit();
+            self.allocator.destroy(r.snap);
+        }
         self.snap_retired.deinit(self.allocator);
         self.order.deinit(self.allocator); // 显示顺序表（无其它持有者）
         // 异步导入：先停 worker（join）——之后才能安全释放缓冲/资产
@@ -5609,15 +5681,15 @@ pub const App = struct {
     }
 
     /// 打开 **VST 自动化窗口的参数搜索框**（复用文本输入基建；文字每帧实时同步到
-    /// `vst_auto.filter_*` —— 与 `beginPresetSearch` 同款做法）。
-    pub fn beginVstParamSearch(self: *App, x: i32, y: i32, w: i32) void {
+    /// `t.filter_*`（**宿主状态**：「与 `beginPresetSearch` 同款做法）。
+    pub fn beginVstParamSearch(self: *App, host: AutoTableHost, t: *AutoTableState, x: i32, y: i32, w: i32) void {
         const ti = &self.text_input;
-        const st = &self.vst_auto;
+        self.vst_auto.search_host = host; // 实时同步只回写到这个宿主
         ti.active = true;
         ti.target = .vst_param_search;
         ti.index = 0;
-        ti.len = st.filter_len;
-        @memcpy(ti.buf[0..st.filter_len], st.filter_buf[0..st.filter_len]);
+        ti.len = t.filter_len;
+        @memcpy(ti.buf[0..t.filter_len], t.filter_buf[0..t.filter_len]);
         ti.cursor = ti.len;
         ti.sel_anchor = null;
         ti.drag_active = false;
@@ -6130,6 +6202,10 @@ pub const App = struct {
                 .none => break :blk "未绑定",
                 .master_vol => break :blk "主通道 · 音量",
                 .tempo => break :blk "速度（BPM）",
+                .pitch_bend => {
+                    const idx = self.instrumentIndexByUid(target.uid) orelse break :blk "乐器? · 音高";
+                    break :blk std.fmt.bufPrint(&tb, "{s} · 音高", .{self.instruments.items[idx].name}) catch "乐器 · 音高";
+                },
                 .mixer_vol, .mixer_pan => {
                     const suffix: []const u8 = if (target.kind == .mixer_vol) "音量" else "声像";
                     const idx = self.channelIndexByUid(target.uid) orelse
@@ -6240,6 +6316,10 @@ pub const App = struct {
     }
     pub fn beginEditInstPan(self: *App, idx: usize, prefill: []const u8, x: i32, y: i32, w: i32) void {
         self.beginEditIndexedNum(.inst_pan, idx, prefill, x, y, w);
+    }
+    /// 乐器弯音（半音输入；0 = 不弯）：`idx` = 乐器下标
+    pub fn beginEditInstPitch(self: *App, idx: usize, prefill: []const u8, x: i32, y: i32, w: i32) void {
+        self.beginEditIndexedNum(.inst_pitch, idx, prefill, x, y, w);
     }
 
     /// 混音台通道音量（0..1 小数）：`ch` = 通道下标（0 = 主通道）
@@ -6439,6 +6519,50 @@ pub const App = struct {
         return h;
     }
 
+    /// **音高别名归一**（v4；`publishAutoLane` 每帧调，幂等）：
+    /// v4 把“插件的弯音参数”在 UI 上归一到 `pitch_bend` 目标（`targetForSlotParam` 重定向）。
+    /// 但**旧绑定**（或者从参数行建链留下的）目标仍是 `.vst_param{param_id = 弯音参数}`——
+    /// 两套身份指向同一个参数会导致：UI 行按 `.pitch_bend` 查“是否被驱动”→ 查不到 → 以为可拖；
+    /// 音频却把 `.vst_param` 绑定当普通参数车道**每段刷**→ 拖完松手后被曲线值“回退”（实测 bug）。
+    /// 返回迁移（含去重删除）的条数。
+    pub fn migratePitchAliasBindings(self: *App) usize {
+        var changed: usize = 0;
+        var i: usize = 0;
+        while (i < self.auto_bindings.items.len) {
+            const b = self.auto_bindings.items[i];
+            if (b.target.kind != .vst_param) {
+                i += 1;
+                continue;
+            }
+            const ii = self.instrumentIndexByUid(b.target.uid) orelse {
+                i += 1;
+                continue;
+            };
+            const pl = self.instruments.items[ii].plugin orelse {
+                i += 1;
+                continue;
+            };
+            const pitch_pid = pl.pitchParamId() orelse {
+                i += 1;
+                continue;
+            };
+            if (b.target.param_id != pitch_pid) {
+                i += 1;
+                continue;
+            }
+            const pitch_t = view_lane.Target{ .kind = .pitch_bend, .uid = b.target.uid };
+            if (self.bindingIndex(b.curve_id, pitch_t) != null) {
+                // 同一曲线已经有一份音高绑定 → 这条是重复的（否则两条车道双驱动）
+                _ = self.auto_bindings.orderedRemove(i);
+            } else {
+                self.auto_bindings.items[i].target = pitch_t;
+                i += 1;
+            }
+            changed += 1;
+        }
+        return changed;
+    }
+
     /// **工程自动化（A）**：把绑定**展开成每通道一组 lane** 发布给音频线程。
     ///
     /// 无锁发布：写在 `lane_pub` 之外的缓冲（3 缓冲轮转），写完后 `release` 发布下标；
@@ -6451,6 +6575,10 @@ pub const App = struct {
         if (self.instruments.items.len > 0 and self.instruments.items[0].uid == 0) self.ensureInstrumentUids();
         // 效果槽 / 鼓组层 uid 惰性补齐（v3：参数自动化按 uid 引用）
         self.ensureSlotUids();
+        // **音高别名归一**（v4）：`.vst_param{pid == 插件弯音参数}` 的旧绑定 → `.pitch_bend`。
+        // 不归一会出现两套身份指向同一个参数：UI 把行当成 `.pitch_bend` 看（→ “没被驱动” 可拖），
+        // 音频却把 `.vst_param` 绑定当普通参数车道每段刷（→ 松手后按曲线值“回退”）。
+        _ = self.migratePitchAliasBindings();
 
         // **发布节流**：内容没变就不重建快照（稳态下每帧几百 KB 的池拷贝是白费的）。
         // 判定 = 内容签名（曲线 version/点数/插值 + 绑定字段 + 数量 + 手动接管）；
@@ -6490,11 +6618,15 @@ pub const App = struct {
                 .vst_param => self.instrumentIndexByUid(b.target.uid) orelse continue, // v2：音频线程求值
                 .fx_param => self.channelIndexByUid(b.target.uid) orelse continue, // v3：效果器链
                 .kit_param => self.instrumentIndexByUid(b.target.uid) orelse continue, // v3：鼓组层
+                // **音高（v4）**：乐器作用域的 MIDI 弯音——车道 kind=5，音频侧按插件是否有
+                // 弯音参数决定驱动方式（VSTi → queueAuto(pid)；内置合成器 → 频率倍率）。
+                .pitch_bend => self.instrumentIndexByUid(b.target.uid) orelse continue,
                 .none => continue,
             };
             const is_vst = b.target.kind == .vst_param;
             const is_fx = b.target.kind == .fx_param;
             const is_kit = b.target.kind == .kit_param;
+            const is_pitch = b.target.kind == .pitch_bend;
             const is_plugin = is_vst or is_fx or is_kit;
             // 插件参数类：把**子对象 uid** 换成当前槽位（槽位会被插入/删除/重排改变）
             var slot_now: usize = 0;
@@ -6504,7 +6636,7 @@ pub const App = struct {
                 const loc = self.kitLayerByUid(ch, b.target.slot) orelse continue;
                 slot_now = self.kitLayerSlot(ch, self.instruments.items[ch].kit.?.pads.items[loc.pad].pitch, loc.layer) orelse continue;
             }
-            const is_inst = is_vst or is_kit or b.target.kind == .inst_vol or b.target.kind == .inst_pan;
+            const is_inst = is_vst or is_kit or is_pitch or b.target.kind == .inst_vol or b.target.kind == .inst_pan;
             const is_pan = b.target.kind == .mixer_pan or b.target.kind == .inst_pan;
             const lc = self.curveById(b.curve_id) orelse continue;
             const n_pts = lc.points.items.len;
@@ -6528,7 +6660,7 @@ pub const App = struct {
             snap.ch = @intCast(@min(ch, 255));
             snap.inst = is_inst;
             snap.slot = @intCast(@min(slot_now, std.math.maxInt(u16)));
-            snap.kind = if (is_kit) 4 else if (is_fx) 3 else if (is_vst) 2 else if (is_pan) 1 else 0;
+            snap.kind = if (is_pitch) 5 else if (is_kit) 4 else if (is_fx) 3 else if (is_vst) 2 else if (is_pan) 1 else 0;
             snap.param_id = if (is_plugin) b.target.param_id else 0;
             // **槽位指纹**：音频侧据此判断“这个槽是不是换绑定了” → 重新播种平滑状态。
             // 插件参数的同一容器上可能挂多个参数/多个子对象 → 必须把 param_id 与 slot 混进指纹。
@@ -6584,22 +6716,30 @@ pub const App = struct {
         self.bringToFront(&self.auto_win.z);
     }
 
+    /// **乐器级自动化参数表**（§11.47 A）：内置合成器/鼓组也能打开，只看得到 MIDI 段。
+    /// 有插件的乐器走这个入口也是对的（窗口里会同时出现 MIDI 段与 VST 段）；
+    /// 但现有调用点（乐器面板右上角按钮 / Linux 正文）仍用 `openVstAutoWin`——
+    /// 两者指向同一个窗口，差别只在 `inst_uid` 是否被设。
+    pub fn openAutoWinForInstrument(self: *App, inst_uid: u32) void {
+        const inst_idx = self.instrumentIndexByUid(inst_uid) orelse return;
+        const st = &self.vst_auto;
+        // 乐器有插件 → 直接把插件槽也接上（参数表才完整）
+        const ref: PluginSlotRef = .{ .kind = .instrument, .a = @intCast(inst_idx) };
+        // **只改目标字段**：视图状态（`t`）不能被重置——那会让面板正文
+        // 的滚动/搜索跟着归零（它们是按宿主分开存的，见 `AutoTableState`）。
+        st.ref = ref;
+        st.inst_uid = inst_uid;
+        st.open = true;
+        self.bringToFront(&st.z);
+    }
+
     /// **打开 VST 参数自动化窗口**（乐器下标；v1 只支持乐器 VSTi）
     /// **保留上次的位置**（同机架/混音台：关掉再开还在原处）
     pub fn openVstAutoWin(self: *App, ref: PluginSlotRef) void {
-        const key = slotRefKey(ref);
         const st = &self.vst_auto;
-        const keep = st.open and slotRefKey(st.ref) == key;
-        if (!keep) {
-            st.* = .{
-                .open = true,
-                .x = st.x,
-                .y = st.y,
-                .ref = ref,
-                .scroll = 0,
-                .filter_len = 0,
-            };
-        }
+        // **只改目标字段**（同 `openAutoWinForInstrument`：视图状态不重置）
+        st.inst_uid = 0; // 插件槽入口：不强制乐器级身份
+        st.ref = ref;
         st.open = true;
         self.bringToFront(&st.z);
     }
@@ -6619,6 +6759,7 @@ pub const App = struct {
                 .none, .master_vol, .tempo => true,
                 .mixer_vol, .mixer_pan => self.channelIndexByUid(t.uid) != null,
                 .inst_vol, .inst_pan => self.instrumentIndexByUid(t.uid) != null,
+                .pitch_bend => self.instrumentIndexByUid(t.uid) != null,
                 .vst_param => blk: {
                     const ii = self.instrumentIndexByUid(t.uid) orelse break :blk false;
                     const inst = &self.instruments.items[ii];
@@ -6656,6 +6797,10 @@ pub const App = struct {
                 _ = self.auto_bindings.orderedRemove(i);
                 removed += 1;
             }
+        }
+        // 真清掉了东西 → 必须让用户知道（否则用户只看得到“我的自动化没了”）
+        if (removed > 0) {
+            self.setToastWith("{d} 条插件参数自动化因插件变化已移除（乐器参数的链接不受影响）", .{removed});
         }
         return removed;
     }
@@ -7068,6 +7213,24 @@ pub const App = struct {
         return view_lane.Target.defaultBase(t.kind);
     }
 
+    /// **弯音行程**（半音）——只对**内置合成器**有意义（`SynthParams.bend_range`，0..48）。
+    /// VST 乐器的行程由插件自己的参数决定（VST3 没有行程映射标准），这里返回默认 ±2：
+    /// 仅用于半音**读数**换算。
+    const bend_default: f32 = @floatFromInt(synth.bend_range_default);
+
+    pub fn bendRangeOf(self: *const App, inst_idx: usize) f32 {
+        if (inst_idx >= self.instruments.items.len) return bend_default;
+        const inst = &self.instruments.items[inst_idx];
+        if (inst.kind != .synth) return bend_default;
+        return @floatFromInt(inst.synth.bend_range.load(.monotonic));
+    }
+
+    /// 目标 → 弯音行程（乐器目标用乐器设定；取不到 → 默认 ±2）
+    pub fn bendRangeForTarget(self: *const App, t: view_lane.Target) f32 {
+        const ii = self.instrumentIndexByUid(t.uid) orelse return bend_default;
+        return self.bendRangeOf(ii);
+    }
+
     /// 插件参数类目标（`vst_param` / `fx_param` / `kit_param`）→ 插件实例 + 参数下标。
     /// **每帧重新解析**（不跨帧持有 `*Plugin`：插件可能被换/卸载）。
     /// 解析不出来 = 目标暂时不可达（插件未加载/参数缓存未就绪）→ null。
@@ -7160,7 +7323,15 @@ pub const App = struct {
         switch (ref.kind) {
             .instrument => {
                 if (ref.a >= self.instruments.items.len) return null;
-                return .{ .kind = .vst_param, .uid = self.instruments.items[ref.a].uid, .param_id = param_id };
+                const inst = &self.instruments.items[ref.a];
+                // **音高别名归一**：插件把这个参数映射到 `kPitchBend` → 目标用「音高」
+                // （乐器作用域、跨插件稳定；参数表那行 = 音高的另一个入口，两个入口同一个链接窗）。
+                if (inst.plugin) |pl| {
+                    if (pl.pitchParamId()) |pp| {
+                        if (pp == param_id) return .{ .kind = .pitch_bend, .uid = inst.uid };
+                    }
+                }
+                return .{ .kind = .vst_param, .uid = inst.uid, .param_id = param_id };
             },
             .fx => {
                 if (ref.a >= self.mixer_channels_state.items.len) return null;
@@ -7266,40 +7437,15 @@ pub const App = struct {
 
     /// 把一个插件实例送入退役列表（延迟销毁；可安全地对音频线程正在引用的实例）
     pub fn retirePlugin(self: *App, pl: *vst_host.Plugin) void {
-        // **先摘掉 owner/target**：它们持有裸指针，实例退役后再解引用 = use-after-free
-        // （实测：自愈替换失败插件后，syncPluginEditors 里 `old_pl.setEditorVisible(false)` 崩）
+        // **先摘掉 owner**：它持裸指针，实例退役后再解引用 = use-after-free
+        // （实测：自愈替换失败插件后，syncPluginEditors 里旧实例的编辑器同步崩）
         if (self.vst_editor_owner == pl) self.vst_editor_owner = null;
-        if (self.vst_editor_target == pl) self.vst_editor_target = null;
-        // 嵌入面板的编辑器子窗口必须先关（实例退役后没人再同步它）
-        if (pl.view != null) pl.closeEditor();
+        // **编辑器先真拆除**（两平台一致）：窗口 + `IPlugView` + 插件侧 GUI 线程都要走掉，
+        // 然后才能在 `unloadPlugin` 里 terminate/release 插件组件（否则插件线程踩已释放对象）。
+        pl.destroyEditor();
         self.retired_plugins.append(self.allocator, .{ .pl = pl, .countdown = 30 }) catch {
             vst_host.unloadPlugin(self.allocator, pl); // 分配失败：立即释放（极罕见）
         };
-    }
-
-    /// 该插件实例是否仍然存活（owner/target 是裸指针，用前必须校验——退役后即悬垂）
-    pub fn isLivePluginPtr(self: *const App, p: *const vst_host.Plugin) bool {
-        for (self.instruments.items) |*inst| {
-            if (inst.plugin) |pl| {
-                if (pl == p) return true;
-            }
-            const kit = if (inst.kit) |*k| k else continue;
-            for (kit.pads.items) |*pad| {
-                for (pad.layers.items) |*ly| {
-                    if (ly.plugin) |pl| {
-                        if (pl == p) return true;
-                    }
-                }
-            }
-        }
-        for (self.mixer_channels_state.items) |*mc| {
-            for (mc.effects.items) |*es| {
-                if (es.plugin) |pl| {
-                    if (pl == p) return true;
-                }
-            }
-        }
-        return false;
     }
 
     /// 插件请求暴露界面（`requestOpenEditor`）→ 打开其所属面板（嵌入路径由帧末同步接手）。'
@@ -9594,6 +9740,9 @@ pub const App = struct {
             self.vst_auto.menu_open or self.curve_menu.open or
             // 自动化链接窗口的**行内右键菜单**（参数行本身是拖动条，同推子）
             self.auto_win.ctx_row != null or
+            // 链接窗口的「链接到曲线…」下拉（不遮就会“点下拉 = 同时点到下面的按钮”：
+            // 实测事故——“恢复默认值”点到了下方「+ 新曲线并链接」，每点一次新增一条曲线）
+            self.auto_win.pick_open or
             self.mixer_win.ctx_effect != null or self.mixer_win.ctx_channel != null or
             self.mixer_win.ctx_pan != null or self.mixer_win.ctx_vol != null;
     }
@@ -11690,6 +11839,18 @@ pub const App = struct {
                     }
                 }
             },
+            .inst_pitch => {
+                // 弯音：**半音输入**（如 -1.5 / +2；0 = 不弯）——行程取本乐器设定
+                if (ti.index < self.instruments.items.len) {
+                    const range = self.bendRangeOf(ti.index);
+                    const v = view_lane.parseSemitone(val, range) orelse return;
+                    const inst = &self.instruments.items[ti.index];
+                    if (@abs(v - inst.pitch) > 0.0005) {
+                        inst.pitch = v;
+                        self.commitHistory("设置乐器音高");
+                    }
+                }
+            },
             .automation_curve_name => {
                 if (ti.index < self.auto_curves.items.len and val.len > 0) {
                     var nb: [32]u8 = undefined;
@@ -11839,15 +12000,22 @@ pub const App = struct {
                 // ——提交仅收起输入框，过滤保留
             },
             .vst_param_search => {
-                // VST 参数搜索：文字已实时同步到 `vst_auto.filter_*`（见 `beginVstParamSearch`）
+                // VST 参数搜索：文字已实时同步到宿主状态（`vst_auto.t[宿主]`，见 `beginVstParamSearch`）
             },
             .vst_param_value => {
-                // VST 参数输入值…（**百分比**：50 = 参数区间的 50%）
+                // VST 参数输入值…（**百分比**：50 = 参数区间的 50%；
+                // 弯音别名参数例外 → **半音**，行程按乐器设定换算（VST 默认 ±2））
                 const ref = self.vst_value_ref;
                 if (self.slotPlugin(ref)) |pl| {
                     const id: u32 = @truncate(ti.index);
                     if (pl.findParamIndex(id)) |pi| {
-                        if (view_lane.parseValue(.percent, val)) |v| {
+                        const tgt = self.targetForSlotParam(ref, id) orelse view_lane.Target{};
+                        const is_pitch = tgt.kind == .pitch_bend;
+                        const parsed: ?f32 = if (is_pitch)
+                            view_lane.parseSemitone(val, self.bendRangeForTarget(tgt))
+                        else
+                            view_lane.parseValue(.percent, val);
+                        if (parsed) |v| {
                             self.setPluginParamHost(ref, pl, pi, v);
                         }
                     }
@@ -13482,7 +13650,7 @@ test "app: 播放中编辑 → 快照重建即可发声；撤销不停播（替�
     app.pollSnapshotRebuild();
     var evs: [16]synth.SchedEvent = undefined;
     {
-        const snap = if (app.snap_slots[app.snap_active]) |*s| s else return error.TestUnexpectedResult;
+        const snap = app.snap_slots[app.snap_active] orelse return error.TestUnexpectedResult;
         const n = snap.gatherRaw(&evs, 0, 9, 1) orelse return error.TestUnexpectedResult;
         try std.testing.expect(n >= 1);
         try std.testing.expectEqual(@as(u8, 60), evs[0].pitch);
@@ -13493,11 +13661,57 @@ test "app: 播放中编辑 → 快照重建即可发声；撤销不停播（替�
     try std.testing.expect(app.playing);
     app.pollSnapshotRebuild();
     {
-        const snap = if (app.snap_slots[app.snap_active]) |*s| s else return error.TestUnexpectedResult;
+        const snap = app.snap_slots[app.snap_active] orelse return error.TestUnexpectedResult;
         const n = snap.gatherRaw(&evs, 0, 9, 1) orelse return error.TestUnexpectedResult;
         try std.testing.expectEqual(@as(usize, 0), n); // 撤销后音符没了 → 快照里也没有
     }
 }
+test "app: 快照连续重建——发布地址不复用（防“新 by_start + 旧 start_idx”撕裂读）" {
+    // 实测崩溃：`snapshot.zig gatherRaw` → `index out of bounds: index 3366, len 0`，
+    // 发生在撤销自动化曲线后（连续两次重建）。旧实现把 `Snapshot` **值**存在 `snap_slots`，
+    // 第二次重建写回同一地址 → 音频线程（一 block 最长 ~85ms）读到撕裂状态。
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.addClip(.{ .track = 0, .start = 0, .len = 96, .pattern = 0 });
+    try app.notes.append(app.allocator, .{ .step = 0, .len = 8, .pitch = 60, .pattern = 0, .instrument = 0 });
+    try app.notes.append(app.allocator, .{ .step = 16, .len = 8, .pitch = 64, .pattern = 0, .instrument = 0 });
+
+    app.snap_dirty = true;
+    app.pollSnapshotRebuild();
+    const p1 = app.snap_slots[app.snap_active].?;
+    const n1_start_idx = p1.start_idx.len;
+    const n1_by_start = p1.by_start.len;
+    const n1_insts = p1.insts.len;
+    try std.testing.expect(n1_start_idx > 0 and n1_by_start > 0);
+
+    // 连续重建两次（模拟 UI 两帧内两次脏）
+    app.snap_dirty = true;
+    app.pollSnapshotRebuild();
+    app.snap_dirty = true;
+    app.pollSnapshotRebuild();
+
+    const p2 = app.snap_slots[app.snap_active].?;
+    try std.testing.expect(p1 != p2); // **地址不得复用**
+    // 读方手里的 p1（已退役、还没 destroy）内容必须仍是完整的旧快照
+    try std.testing.expectEqual(n1_start_idx, p1.start_idx.len);
+    try std.testing.expectEqual(n1_by_start, p1.by_start.len);
+    try std.testing.expectEqual(n1_insts, p1.insts.len);
+    // 新旧两份都能正常求值（没有撕裂）
+    var evs: [32]synth.SchedEvent = undefined;
+    try std.testing.expect((p1.gatherRaw(&evs, 0, 96, 1) orelse 99) >= 2);
+    try std.testing.expect((p2.gatherRaw(&evs, 0, 96, 1) orelse 99) >= 2);
+
+    // 30 帧后退役快照被回收（不外溢）
+    var i: usize = 0;
+    while (i < 32) : (i += 1) app.pollSnapshotRebuild();
+    try std.testing.expectEqual(@as(usize, 0), app.snap_retired.items.len);
+}
+
 test "app: 切 SONG/PAT 与换样式 → 快照必须重建（否则听到的还是旧内容）" {
     var app = App{ .allocator = std.testing.allocator };
     defer app.clips.deinit(app.allocator);
@@ -16943,6 +17157,46 @@ test "VST3 乐器：applyVst3Instrument 清 pending/退役旧实例，保留名�
     try std.testing.expectEqual(@as(i32, 1), inst2.mixer); // 路由保留
     try std.testing.expectApproxEqAbs(@as(f32, 0.33), inst2.volume, 1e-6);
     try std.testing.expect(inst2.kind == .vst3);
+}
+
+test "自动化：音高别名归一（`.vst_param{弯音参数}` → `.pitch_bend`，含去重）" {
+    try skipIfNoVst(); // VST3 宿主未移植（非 Windows 跳过）
+    const dll_z = std.testing.allocator.dupeSentinel(u8, "zig-out/bin/zig_vst3_gain.dll", 0) catch return;
+    defer std.testing.allocator.free(dll_z);
+
+    var app = App{ .allocator = std.testing.allocator };
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    defer app.deinitAll();
+    defer app.deinitPluginDb();
+    defer app.clips.deinit(std.testing.allocator);
+    defer app.notes.deinit(std.testing.allocator);
+    app.resetHistory("初始");
+
+    const pl = vst_host.loadPlugin(std.testing.allocator, dll_z, 48000, 4096, .instrument) catch return;
+    try std.testing.expect(app.addInstrumentVst3("zig-out/bin/zig_vst3_gain.dll") == 0);
+    app.instruments.items[0].plugin = pl;
+    const uid = app.instruments.items[0].uid;
+    // 模拟“`IMidiMapping` 解析出一个弯音参数”
+    const pitch_pid: u32 = 4242;
+    pl.pitch_pid.store(pitch_pid, .release);
+
+    const c1 = app.addAutoCurve("c1");
+    const c2 = app.addAutoCurve("c2");
+    const old_t = view_lane.Target{ .kind = .vst_param, .uid = uid, .param_id = pitch_pid };
+    const new_t = view_lane.Target{ .kind = .pitch_bend, .uid = uid };
+    try std.testing.expect(app.bindCurveTarget(c1, old_t));
+    try std.testing.expect(app.bindCurveTarget(c2, old_t));
+    // c2 已有一份音高绑定 → 迁移时旧的 vst_param 那条应被**删除**（否则双驱动）
+    try std.testing.expect(app.bindCurveTarget(c2, new_t));
+
+    try std.testing.expectEqual(@as(usize, 2), app.migratePitchAliasBindings());
+    try std.testing.expect(app.bindingIndex(c1, new_t) != null); // 改了目标
+    try std.testing.expect(app.bindingIndex(c1, old_t) == null);
+    try std.testing.expect(app.bindingIndex(c2, new_t) != null); // 保留了已有那条
+    try std.testing.expectEqual(@as(usize, 2), app.auto_bindings.items.len); // 重复项已删
+    // 幂等：再跑一次什么都不动
+    try std.testing.expectEqual(@as(usize, 0), app.migratePitchAliasBindings());
 }
 
 test "VST3 预设：CID 捕获 + 状态捕获/解码往返（sine-synth 真实插件）" {

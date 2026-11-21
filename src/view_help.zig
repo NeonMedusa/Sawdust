@@ -58,10 +58,7 @@ const rows = [_]Row{
 pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     const hw = &app.help_win;
     if (!hw.open) return false;
-    hw.w = std.math.clamp(hw.w, min_w, @max(min_w, w - 20));
-    hw.h = std.math.clamp(hw.h, min_h, @max(min_h, h - 20));
-    hw.x = std.math.clamp(hw.x, 0, @max(0, w - hw.w));
-    hw.y = std.math.clamp(hw.y, 0, @max(0, h - hw.h));
+    util.clampWindow(w, h, &hw.x, &hw.y, &hw.w, &hw.h, min_w, min_h); // 与机架/混音台共用
     const x = hw.x;
     const y = hw.y;
     const ww = hw.w;
@@ -142,7 +139,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
             // 链接行：悬停高亮 + 下划线（链接外观）+ 单击 → 系统浏览器
             const tw: i32 = @intFromFloat(ui.font.measure(r.desc));
             const lx = x + 20 + key_w;
-            const hovered = util.inRect(ui.mouse_x, ui.mouse_y, lx, yy, tw, row_h);
+            const hovered = util.hitUI(ui, lx, yy, tw, row_h);
             const color = if (hovered) ui.theme.accent else ui.theme.text_dim;
             ui.label(r.desc, lx, yy, color);
             const baseline = yy + @as(i32, @intFromFloat(ui.font.ascentL()));

@@ -20,11 +20,8 @@ const view_lane = @import("view_lane.zig");
 pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
     if (!app.rack.open) return false;
     const rk = &app.rack;
-    // 约束在屏幕内
-    rk.w = std.math.clamp(rk.w, util.rack_min_w, @max(util.rack_min_w, w - 20));
-    rk.h = std.math.clamp(rk.h, util.rack_min_h, @max(util.rack_min_h, h - 20));
-    rk.x = std.math.clamp(rk.x, 0, @max(0, w - rk.w));
-    rk.y = std.math.clamp(rk.y, 0, @max(0, h - rk.h));
+    // 约束在屏幕内（与机架/混音台/帮助页共用 `util.clampWindow`）
+    util.clampWindow(w, h, &rk.x, &rk.y, &rk.w, &rk.h, util.rack_min_w, util.rack_min_h);
 
     const x = rk.x;
     const y = rk.y;
@@ -145,15 +142,33 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
     // 注：VST3 乐器的「浏览文件」入口已移入**插件管理**（单文件条目）——
     // 预设面板中的 VST3 分类来自扫描缓存（用户拍板，2026-10）
 
-    // 右键菜单（重命名 / 更换乐器… / 删除乐器 / 音量·声像的恢复默认值）——同理：仅在展开时取消屏蔽
+    // 右键菜单（打开 / 自动化 / 重命名 / 更换乐器… / 删除乐器 …）——同理：仅在展开时取消屏蔽
     if (app.rack.ctx_instrument != null or app.rack.ctx_pan != null or app.rack.ctx_vol != null) ui.input_blocked = false;
     if (app.rack.ctx_instrument) |ci| {
         if (ci < app.instruments.items.len) {
             const is_vst3 = app.instruments.items[ci].kind == .vst3;
-            const items: []const []const u8 = if (is_vst3)
-                &.{ "重新定位插件…", "重命名", "更换乐器…", "删除乐器", "上移", "下移" }
-            else
-                &.{ "重命名", "更换乐器…", "删除乐器", "上移", "下移" };
+            // **顺序**（两平台一致）：打开 → 自动化 →（VST3 多一项：重新定位插件…）→ …
+            // 用枚举分发而不是下标位移（以前靠 `items.len - 2`/`- 1` 算，加项容易误触）
+            const Act = enum { open, auto, relocate, rename, change, remove, up, down };
+            const Entry = struct { label: []const u8, act: Act };
+            const items: []const Entry = if (is_vst3) &.{
+                .{ .label = "打开", .act = .open },
+                .{ .label = "自动化", .act = .auto },
+                .{ .label = "重新定位插件…", .act = .relocate },
+                .{ .label = "重命名", .act = .rename },
+                .{ .label = "更换乐器…", .act = .change },
+                .{ .label = "删除乐器", .act = .remove },
+                .{ .label = "上移", .act = .up },
+                .{ .label = "下移", .act = .down },
+            } else &.{
+                .{ .label = "打开", .act = .open },
+                .{ .label = "自动化", .act = .auto },
+                .{ .label = "重命名", .act = .rename },
+                .{ .label = "更换乐器…", .act = .change },
+                .{ .label = "删除乐器", .act = .remove },
+                .{ .label = "上移", .act = .up },
+                .{ .label = "下移", .act = .down },
+            };
             const mw: i32 = 160;
             const mh: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
             const mx = app.rack.ctx_x; // 固定位置（打开时记录，不跟鼠标跑）
@@ -161,45 +176,40 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
             ui.renderer.fillRect(mx, my, mw, mh, ui.theme.panel);
             ui.renderer.strokeRect(mx, my, mw, mh, ui.theme.accent);
             ui.noteOverlayRect(mx, my, mw, mh); // 遮挡插件子窗口
-            var clicked: ?usize = null;
+            var clicked: ?Act = null;
             var inside = false;
-            for (items, 0..) |item, i| {
+            for (items, 0..) |e, i| {
                 const iy = my + 2 + @as(i32, @intCast(i)) * util.menu_item_h;
                 const ih = util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, mw - 2, util.menu_item_h);
                 if (ih) {
                     inside = true;
                     ui.renderer.fillRect(mx + 1, iy, mw - 2, util.menu_item_h, ui.theme.item_hover);
                 }
-                ui.label(item, mx + 8, iy + 2, ui.theme.text);
-                if (ih and ui.mouse_pressed) clicked = i;
+                ui.label(e.label, mx + 8, iy + 2, ui.theme.text);
+                if (ih and ui.mouse_pressed) clicked = e.act;
             }
-            if (clicked) |ic| {
-                if (ic == items.len - 2) {
-                    // 上移：只交换显示顺序（物理槽位/音符引用不变）——已在首位则无效
-                    if (app.moveInstrument(ci, true)) app.commitHistory("移动乐器");
-                } else if (ic == items.len - 1) {
-                    // 下移——已在末尾则无效
-                    if (app.moveInstrument(ci, false)) app.commitHistory("移动乐器");
-                } else if (is_vst3 and ic == 0) {
-                    // 重新定位插件…（文件对话框 → 换路径；pending 保留）
-                    app.pending_relocate_instrument = ci;
-                } else {
-                    const act: usize = if (is_vst3) ic - 1 else ic;
-                    switch (act) {
-                        0 => {
-                            // 重命名：输入框弹在乐器名位置（行内就地）
-                            app.beginRenameInstrument(ci, mx + 4, my + 4);
-                        },
-                        1 => {
-                            // 更换乐器 → 打开预设面板（任意插件；选中即换，保留属性）
-                            app.openPresetBrowser(.{ .change_instrument = @intCast(ci) });
-                        },
-                        2 => {
-                            app.removeInstrument(ci);
-                            app.commitHistory("删除乐器"); // 原子操作：立即提交
-                        },
-                        else => {},
-                    }
+            if (clicked) |act| {
+                switch (act) {
+                    // 「打开」= 双击打开（同一个 `openInstrumentEditor`）
+                    .open => app.openInstrumentEditor(ci),
+                    // 「自动化」= 自动化**参数表**（内置乐器只有 MIDI 段；空曲时也能建链）
+                    .auto => app.openAutoWinForInstrument(app.instruments.items[ci].uid),
+                    .relocate => app.pending_relocate_instrument = ci,
+                    // 重命名：输入框弹在乐器名位置（行内就地）
+                    .rename => app.beginRenameInstrument(ci, mx + 4, my + 4),
+                    // 更换乐器 → 打开预设面板（任意插件；选中即换，保留属性）
+                    .change => app.openPresetBrowser(.{ .change_instrument = @intCast(ci) }),
+                    .remove => {
+                        app.removeInstrument(ci);
+                        app.commitHistory("删除乐器"); // 原子操作：立即提交
+                    },
+                    // 上移/下移：只交换显示顺序（物理槽位/音符引用不变）——已到边界则无效
+                    .up => {
+                        if (app.moveInstrument(ci, true)) app.commitHistory("移动乐器");
+                    },
+                    .down => {
+                        if (app.moveInstrument(ci, false)) app.commitHistory("移动乐器");
+                    },
                 }
                 app.rack.ctx_instrument = null;
             } else if (ui.mouse_pressed and !inside) {
@@ -403,8 +413,7 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, row: usize, x: i32, y: i32, w: i32, c
     }
     cx += util.rack_mix_w + 8;
 
-    // 名称（点击选中；双击打开编辑器；右键删除）
-    const is_kit = inst.kind == .drumkit;
+    // 名称（点击选中；双击打开编辑器；右键乐器菜单）
     const name_w = @min(util.rack_name_w, w - (cx - x) - 10);
     const name_hovered = util.hitUI(ui, cx, y + 2, name_w, util.rack_row_h - 4);
     const name_col = if (inst.load_failed) ui.theme.danger else if (selected) ui.theme.text else ui.theme.text_dim;
@@ -414,19 +423,12 @@ fn drawRow(ui: *Ui, app: *App, idx: usize, row: usize, x: i32, y: i32, w: i32, c
         app.rack.ctx_instrument = null;
     }
     // 双击名称 → 打开编辑器（合成器 → 合成器窗口；鼓组 → 鼓组编辑器）
-    if (ui.mouse_double and name_hovered) {
-        app.setInstrument(@intCast(idx));
-        if (is_kit) {
-            app.openDrumKit(@intCast(idx)); // 含同步选择/置顶
-        } else {
-            app.synth_win.target = .{ .instrument = @intCast(idx) };
-            app.synth_win.open = true;
-            app.bringToFront(&app.synth_win.z); // 即时反馈：打开即置顶
-        }
-    }
-    if (name_hovered and ui.mouse_right_pressed) {
+    if (ui.mouse_double and name_hovered) app.openInstrumentEditor(idx);
+    // 右键（名称 + 音符 minimap）：乐器菜单（打开 / 自动化 / 重命名 …）
+    if (util.hitUI(ui, cx, y + 2, (x + w) - cx, util.rack_row_h - 4) and ui.mouse_right_pressed) {
         app.rack.ctx_instrument = idx;
-        app.rack.ctx_pan = null; // 互斥（声像旋钮菜单）
+        app.rack.ctx_pan = null; // 互斥（声像/音量旋钮菜单）
+        app.rack.ctx_vol = null;
         app.rack.ctx_x = ui.mouse_x; // 固定菜单位置
         app.rack.ctx_y = ui.mouse_y;
     }

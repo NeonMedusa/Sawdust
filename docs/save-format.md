@@ -8,7 +8,7 @@
 
 | 格式 | 当前版本常量 | 含义 | 已发布？ |
 |---|---|---|---|
-| **`.saw`（唯一工程格式）** | `persist.binary_version = 9` | v9 = 时间分辨率 `U` 96 → **3840**（960 PPQN）+ 自动化整套 + 清格式（见「v9 清格式」节） | ✅ v17/v18 写的是 v8 → **v8 及以前必须迁移** |
+| **`.saw`（唯一工程格式）** | `persist.binary_version = 10` | v10 = **纯新增字段**（`SavedInstrument.pitch`、`SavedSynth.bend_range`）；v9 = U 96→3840 + 自动化整套 + 清格式 | v9 ✅ 已发布（v19 及以前写的是 v9）→ **读 v9 靠字段门控，无需值迁移** |
 
 > **工程存档只有二进制一种**。JSON 工程通道（`toJson`/`fromJson`、"导入 JSON"“导出 JSON”）
 > 已在 v9 这一轮**整条删掉**——理由与经过见「v9 清格式」节。预设、`settings.json` 仍是 JSON，
@@ -23,7 +23,8 @@
 | v6 | 鼓组 VST3 层 / 音频片段（`audio_style`/`trim_*`）/ `audio_styles`（`85f9bad`、`767c11e`） | 同上 |
 | v7 | `Project.instrument_order`（乐器上下移，`c47a6c3`） | `×40` + `instrument_order` 缺失 → 空（按槽位顺序） |
 | v8 | 音符/片段静音 `muted`（静音体系那一轮） | `×40` + `muted` 缺失 → `false` |
-| **v9（当前）** | **自动化整套**（`auto_lanes`/`auto_bindings`/`auto_sel`）+ `SavedBinding.smooth_ms·invert·param_id·target_slot` + `SavedInstrument/SavedMixerChannel/SavedEffectSlot/SavedDrumLayer.uid` + **单位 U 96→3840** + **清格式**（删 5 个死字段、`bpm` 改 f32、删 JSON 通道） | 不发迁移（已是新单位） |
+| **v9** | **自动化整套**（`auto_lanes`/`auto_bindings`/`auto_sel`）+ `SavedBinding.smooth_ms·invert·param_id·target_slot` + `SavedInstrument/SavedMixerChannel/SavedEffectSlot/SavedDrumLayer.uid` + **单位 U 96→3840** + **清格式**（删 5 个死字段、`bpm` 改 f32、删 JSON 通道） | 不发迁移（已是新单位） |
+| **v10（当前）** | 纯新增：`SavedInstrument.pitch`（弯音位置）、`SavedSynth.bend_range`（弯音行程） | v9 档：这两个字段不读（取声明默认）——**漏登就整档错位**（实测：v9 工程打不开） |
 
 > **v9 已随正式版发布 → 格式冻结**。旧档已经在用户手上，所以：
 > - **只加字段**（旧档填默认）→ 仍旧登记 `introducedVersion = 9`，不必抬版；

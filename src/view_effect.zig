@@ -80,8 +80,9 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         const bx0 = bx1 - gap - auto_w;
         const bh2: i32 = win_title_h - 6;
         const by2 = y + 3;
-        // `自动化`：与乐器窗一致——**只有 VST3 插件槽**才画（内置效果器没有插件参数）
-        const show_auto_btn = es.kind == .plugin;
+        // `自动化`：与乐器窗一致——**只有 VST3 插件槽**才画（内置效果器没有插件参数）；
+        // Linux 面板正文已经嵌了参数表 → 不再画标题按钮（否则同一个表两个入口）。
+        const show_auto_btn = es.kind == .plugin and builtin.os.tag != .linux;
         if ((if (show_auto_btn) bx0 else bx1) > x + 200 and es.kind != .empty) { // 标题放不下就不画（窄窗）
             if (show_auto_btn) {
                 const h0 = util.hitUI(ui, bx0, by2, auto_w, bh2);
@@ -226,8 +227,8 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
 /// 注：干湿（mix）不在此列——它在**调音台效果链行**的旋钮里（同一数据，避免两个入口）
 fn drawParamPanel(ui: *Ui, app: *App, es: *app_mod.EffectSlot, px: i32, py: i32, pw: i32, ph: i32) void {
     if (es.kind == .plugin) {
-        // Windows：编辑器嵌在内容区（原生子窗口覆盖）→ 不画软层，直接让子窗口占满
-        // Linux：编辑器是**独立顶层窗口** → 正文照常画（UI 开关 + 自动化正文），与乐器面板对齐
+        // Windows：编辑器嵌在内容区（原生子窗口覆盖）→ 不画软层；
+        // Linux：编辑器是独立顶层窗口 → 正文画 UI 开关 + 参数表（两平台共用同一个表）
         if (comptime builtin.os.tag != .linux) {
             if (es.plugin) |p| {
                 if (p.view != null) return;
@@ -235,25 +236,8 @@ fn drawParamPanel(ui: *Ui, app: *App, es: *app_mod.EffectSlot, px: i32, py: i32,
         }
         const pl = es.plugin;
         var yy = py + 4;
-        // ── Linux：「打开 / 关闭插件 UI（独立窗口）」——没有它，用户关掉插件窗口后就回不来 ──
-        if (comptime builtin.os.tag == .linux) {
-            if (pl) |p| {
-                if (!p.editor_no_ui) {
-                    const is_open = app.vst_editor_owner == p;
-                    const label: []const u8 = if (is_open) "关闭插件 UI（独立窗口）" else "打开插件 UI（独立窗口）";
-                    if (ui.button(7901, label, px, yy, pw, 24)) {
-                        if (is_open) {
-                            p.setEditorVisible(false);
-                            app.vst_editor_owner = null;
-                        } else {
-                            p.showEditorAt(240, 200);
-                            app.vst_editor_owner = p;
-                        }
-                    }
-                    yy += 30;
-                }
-            }
-        }
+        // 插件 UI 开关（Linux「独立顶层窗口」/ Windows「嵌入面板」；无界面插件 / 未加载 → 不占高度）
+        if (pl) |p| yy += util.pluginUiToggle(ui, app, p, 7901, px, yy, pw);
         // ── 头部：名称；路径 · 延迟 ──
         {
             const name_t = if (pl) |p| p.name() else "（未加载）";
@@ -273,15 +257,8 @@ fn drawParamPanel(ui: *Ui, app: *App, es: *app_mod.EffectSlot, px: i32, py: i32,
             .{ .kind = .fx, .a = @intCast(pref.ch), .b = @intCast(pref.slot) }
         else
             .{ .kind = .fx };
-        // Linux：正文直接放**自动化三段式**（与乐器面板同一份）——参数表/已链接/自动化全在一起
-        if (comptime builtin.os.tag == .linux) {
-            view_vst_auto.drawBody(ui, app, ref, 7902, px, yy, pw, py + ph - yy);
-            return;
-        }
-        // 滚动状态挂在窗口面板引用上（切换效果槽时自动归零）
-        var dummy_scroll: i32 = 0;
-        const scroll_p: *i32 = if (app.mixer_win.panel) |*pref| &pref.scroll else &dummy_scroll;
-        util.drawPluginParamList(ui, app, pl, es.load_failed, scroll_p, ref, 7900, px, py, pw, ph, yy);
+        // 参数表：**与乐器面板 / 浮动窗口同一份**（`drawBody`），不再有第二套列表实现
+        view_vst_auto.drawBody(ui, app, ref, px, yy, pw, py + ph - yy, .fx_panel);
         return;
     }
     const infos = fx.paramInfos(@backingInt(es.kind));

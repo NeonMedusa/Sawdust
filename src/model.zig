@@ -92,6 +92,10 @@ pub const Instrument = struct {
     name: []const u8, // 显示名（堆分配；由 App 管理生命周期）
     volume: f32 = 0.75, // 推子位置（0..1；0 dB 在 0.75，见 audio.faderGain）
     pan: f32 = 0.5, // 0-1（0.5 = 居中）
+    /// **弯音位置**（0..1；0.5 = 不弯）——MIDI 标准 pitch bend 语义（±2 半音默认行程）。
+    /// 作用域是**乐器**（不是插件）：换成内置合成器照样生效；VST3 经 `IMidiMapping`
+    /// 解析到插件的弯音参数（见 `vst_host.Plugin.queryPitchParam`）。
+    pitch: f32 = 0.5,
     muted: bool = false,
     /// 混音通道（**0 起**，对应调音台通道序号 0..n-1）
     mixer: i32 = 0,

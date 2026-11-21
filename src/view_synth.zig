@@ -25,6 +25,14 @@ const PluginSlotRef = @import("app.zig").PluginSlotRef;
 const win_title_h: i32 = 22;
 // 振荡器行高（一行一个：容纳旋钮 34 + 上下余量）
 const osc_row_h: i32 = 40;
+/// **弯音行程控件的 id**（合成器窗口号段 5000-5499 内；**避开**：
+/// 5100-5103 ADSR、5200/5201 滤波器、5300-5303 振荡器音量、5400-5411 合奏三件套）。
+const id_bend_range: u64 = 5420;
+comptime {
+    // 撞 id 会“串场”且 `mouse_capture` 清不掉（实测：光标卡隐藏）→ 编译期就拦住
+    std.debug.assert(id_bend_range != 5300 and id_bend_range > 5303);
+    std.debug.assert(id_bend_range < 5400 or id_bend_range > 5411);
+}
 const knob_size: i32 = 34;
 // 最小宽度需容纳振荡器一行：开关 + 序号 + 波形 + 旋钮 + 合奏/散布/功率
 // （估算：开关 22 + 序号 ≈ 40 + 波形 64 + 旋钮 34 + 三组“标签+数值”≈ 250 + 边距）
@@ -68,11 +76,8 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     // 乐器目标：**跟随当前选择**（旧行为）；鼓组层目标：固定绑定（不跟随）。
     // 目标失效（乐器被删/变成鼓组/层被删）→ 自动关闭。
     switch (sw.target) {
-        .instrument => |cur| {
-            const ni = app.sel.instrument;
-            if (cur != ni) sw.param_scroll = 0; // 换目标：兜底列表滚动归零
-            sw.target = .{ .instrument = ni };
-        },
+        // 乐器目标跟随当前选择；滚动/搜索状态由参数表自己按宿主维护
+        .instrument => sw.target = .{ .instrument = app.sel.instrument },
         else => {},
     }
     const p = app.resolvePresetTarget(sw.target) orelse {
@@ -142,10 +147,15 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         const bh2: i32 = win_title_h - 6;
         const by2 = y + 3;
         title_btn_used = false;
-        // `自动化` 按钮：**所有 VST3 插件容器**（乐器 / 鼓组层）——与效果器窗对齐（v3）
-        // Windows 才画：Linux 的面板正文**就是**自动化窗口，再开一个浮动窗就重复了
-        const show_auto_btn = target_is_vst3 and builtin.os.tag != .linux and switch (sw.target) {
-            .instrument, .kit_layer_replace => true,
+        // `自动化` 按钮：**乐器（含内置合成器/鼓组）+ 鼓组层**（§11.47 A）。
+        // 以前要求 `target_is_vst3`——内置乐器因此没入口；现在乐器级入口不需要插件
+        // （无插件时窗口里只画 MIDI 段）。鼓组层依旧只在它是 VST3 层时出现（参数表靠插件）。
+        // **唯一的隐藏条件 = 面板正文已经嵌了参数表**（Linux 的 VST 乐器/鼓组层）；
+        // 内置乐器的正文是合成器 GUI → 必须给标题按钮，否则 Linux 上没有自动化入口。
+        const body_embedded = builtin.os.tag == .linux and target_is_vst3;
+        const show_auto_btn = !body_embedded and switch (sw.target) {
+            .instrument => true,
+            .kit_layer_replace => target_is_vst3,
         };
         if ((if (show_auto_btn) bx0 else bx1) > x + 180) { // 标题放不下就不画（窄窗）
             // [预设 ▾]
@@ -193,7 +203,15 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
                 ui.label("自动化", bx0 + 5, by2 + 2, ui.theme.text);
                 if (h0 and ui.mouse_pressed) {
                     switch (sw.target) {
-                        .instrument => |ii| app.openVstAutoWin(.{ .kind = .instrument, .a = @intCast(@max(0, ii)) }),
+                        .instrument => |ii| {
+                            // §11.47 A：乐器级入口（内置合成器也能开，窗口里只有 MIDI 段）
+                            const iidx: usize = @intCast(@max(0, ii));
+                            if (iidx < app.instruments.items.len) {
+                                app.openAutoWinForInstrument(app.instruments.items[iidx].uid);
+                            } else {
+                                app.openVstAutoWin(.{ .kind = .instrument, .a = @intCast(iidx) });
+                            }
+                        },
                         .kit_layer_replace => |kr| {
                             if (app.kitLayerSlot(@intCast(@max(0, kr.instrument)), kr.pitch, kr.layer)) |slot| {
                                 app.openVstAutoWin(.{
@@ -267,14 +285,14 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
             .instrument => |ii| {
                 if (ii >= 0 and ii < @as(i32, @intCast(app.instruments.items.len))) {
                     const inst = &app.instruments.items[@intCast(ii)];
-                    drawVst3Body(ui, app, inst.plugin, inst.name, inst.pluginPath(), inst.load_failed, .{ .kind = .instrument, .a = @intCast(@min(ii, std.math.maxInt(u16))) }, 9600, &sw.param_scroll, x, y, ww, hh);
+                    drawVst3Body(ui, app, inst.plugin, inst.name, inst.pluginPath(), inst.load_failed, .{ .kind = .instrument, .a = @intCast(@min(ii, std.math.maxInt(u16))) }, 9600, x, y, ww, hh);
                 }
             },
             .kit_layer_replace => |ref| {
                 if (app.kitLayerPtr(ref.instrument, ref.pitch, ref.layer)) |ly| {
                     const disp: []const u8 = if (ly.source_preset.len > 0) ly.source_preset else "VST3 乐器层";
                     const slot: u16 = if (app.kitLayerSlot(@intCast(@max(0, ref.instrument)), ref.pitch, ref.layer)) |s| @intCast(@min(s, std.math.maxInt(u16))) else 0;
-                    drawVst3Body(ui, app, ly.plugin, disp, ly.pluginPath(), ly.load_failed, .{ .kind = .kit_layer, .a = @intCast(@max(0, ref.instrument)), .b = slot }, 9800 + @as(u64, slot), &sw.param_scroll, x, y, ww, hh);
+                    drawVst3Body(ui, app, ly.plugin, disp, ly.pluginPath(), ly.load_failed, .{ .kind = .kit_layer, .a = @intCast(@max(0, ref.instrument)), .b = slot }, 9800 + @as(u64, slot), x, y, ww, hh);
                 }
             },
         }
@@ -366,6 +384,36 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         }
     }
 
+    // ── 弯音行程区 ──
+    // 分段风格与上面三段（振荡器 / ADSR / 滤波器）一致：让开上一行 → 分隔线 → 段标题 → 控件。
+    // 滤波器的内容最高到 `ry + knob_size - 6`（旋钮下缘），所以先推 `knob_size + 2`。
+    // 这一段只影响**音高自动化/推弦**的满行程，不是音色参数；MIDI 导出时烘成 RPN 0。
+    ry += knob_size + 2;
+    ui.renderer.hline(x + 8, ry, ww - 16, ui.theme.panel_border);
+    ry += 6;
+    ui.label("弯音行程", x + 10, ry, ui.theme.text_dim);
+    ry += 18;
+    {
+        const row_h: i32 = 20;
+        var br: i32 = @intCast(p.bend_range.load(.monotonic));
+        const fmt_bend = struct {
+            fn f(v: i32, buf: []u8) []const u8 {
+                if (v == 0) return std.fmt.bufPrint(buf, "关闭", .{}) catch "0";
+                return std.fmt.bufPrint(buf, "±{d} 半音", .{v}) catch "";
+            }
+        }.f;
+        // **id 绝不能撞**（实测事故：曾用 5300 = 振荡器 1 音量旋钮的 id →
+        // 拖行程时旋钮先一步接管 `active_id` → `mouse_capture` 清不掉，
+        // 光标长期隐藏。合成器窗口的号段 = 5000-5499，见 ui.zig 的 id 分配表）
+        const ctrl_w: i32 = 86;
+        if (ui.dragNumberEx(id_bend_range, x + 10, ry + 1, ctrl_w, row_h - 2, &br, 0, @as(i32, synth.bend_range_max), 4, 0, fmt_bend)) {
+            p.bend_range.store(@intCast(std.math.clamp(br, 0, @as(i32, synth.bend_range_max))), .monotonic);
+            app.history_pending = "调整弯音行程"; // 松手 coalesce
+        }
+        ui.labelCentered("满行程 · 推弦/摇把", x + 10 + ctrl_w + 10, ry, row_h, ui.theme.text_dim);
+    }
+    ry += 24;
+
     return util.inRect(ui.mouse_x, ui.mouse_y, x, y, ww, hh);
 }
 
@@ -385,8 +433,12 @@ fn fmtPercent(v: i32, buf: []u8) []const u8 {
 /// 振荡器行（一行一个）：开关 / 序号 / 波形按钮 / 音量旋钮 /
 /// 合奏数量（0-16）/ 合奏散布（0-100%）——两个数值控件与 BPM 同款
 /// （上下拖动、光标冻结隐藏）
-/// VST3 乐器/鼓组层的插件体：嵌入中（子窗口覆盖内容区）不画；否则信息行 + 参数列表兜底
-/// （无界面插件走列表）。`ref`/`id_base` 决定参数编辑记账归属与控件 id 段。
+/// VST3 乐器/鼓组层的插件体（**两平台同一套**）：
+/// - Windows：编辑器嵌在正文（原生子窗口覆盖）→ 不画软层；
+/// - Linux：编辑器是独立顶层窗口 → `[打开/关闭插件 UI]` 开关 + 参数表嵌正文；
+/// - 无界面插件（两平台）：只有参数表。
+/// 参数表 = `view_vst_auto.drawBody(.synth_panel)`（搜索 / 已链接 / 最近改动 / 全部参数，
+/// 乐器级还会自动带出 MIDI 段）——**不再有第二份“简易参数表”实现**。
 fn drawVst3Body(
     ui: *Ui,
     app: *App,
@@ -396,60 +448,38 @@ fn drawVst3Body(
     load_failed: bool,
     ref: PluginSlotRef,
     id_base: u64,
-    scroll_p: *i32,
     x: i32,
     y: i32,
     ww: i32,
     hh: i32,
 ) void {
-    if (pl_opt) |p| {
-        if (p.view != null) {
-            // Windows：编辑器嵌在面板里（原生子窗口覆盖内容区）→ 这里不用画
-            // （参数表/自动化走标题栏 `自动化`：那个窗口就是完整参数表 + 搜索）
-            if (comptime builtin.os.tag != .linux) return;
-            // Linux：编辑器是**独立顶层窗口**。按钮是开关——开关状态就是 `app.vst_editor_owner`
-            // （用户用窗口自己的关闭按钮关掉时，main 每帧会把这个 owner 清空 → 状态自然同步）。
-            const is_open = app.vst_editor_owner == p;
-            const label: []const u8 = if (is_open) "关闭插件 UI（独立窗口）" else "打开插件 UI（独立窗口）";
-            if (ui.button(id_base + 9001, label, x + 10, y + win_title_h + 8, ww - 20, 26)) {
-                if (is_open) {
-                    p.setEditorVisible(false);
-                    app.vst_editor_owner = null;
-                } else {
-                    p.showEditorAt(160, 120);
-                    app.vst_editor_owner = p;
-                }
-            }
-            // Linux：正文直接是 **VST 参数自动化窗口**（编辑器在独立窗口，正文空着浪费）
-            if (comptime builtin.os.tag == .linux) {
-                // v3：乐器 / 鼓组层两种容器都直接嵌自动化正文
-                view_vst_auto.drawBody(ui, app, ref, id_base + 2000, x, y + win_title_h + 40, ww, hh - win_title_h - 40);
-                return;
-            }
-        }
-    }
-    const body_y = y + win_title_h;
-    var yy = body_y + 10;
-    ui.label(display_name, x + 10, yy, ui.theme.text);
-    yy += 22;
-    ui.labelClipped(path, x + 10, yy, ww - 20, ui.theme.text_dim);
-    yy += 22;
-    const pl = pl_opt;
-    if (pl) |p| {
-        var b: [64]u8 = undefined;
-        ui.label(std.fmt.bufPrint(&b, "{s} · 延迟 {d} 样本", .{ p.name(), p.latency }) catch "", x + 10, yy, ui.theme.text_dim);
-    } else {
+    const pl = pl_opt orelse {
+        ui.labelClipped(display_name, x + 10, y + win_title_h + 10, ww - 20, ui.theme.text);
+        ui.labelClipped(path, x + 10, y + win_title_h + 34, ww - 20, ui.theme.text_dim);
         if (load_failed) {
-            ui.label("（插件加载失败——将自动重试；文件恢复后自动加载）", x + 10, yy, ui.theme.danger);
+            ui.label("（插件加载失败——将自动重试；文件恢复后自动加载）", x + 10, y + win_title_h + 58, ui.theme.danger);
         } else {
-            ui.label("（插件未加载）", x + 10, yy, ui.theme.text_dim);
+            ui.label("（插件未加载）", x + 10, y + win_title_h + 58, ui.theme.text_dim);
         }
         return;
+    };
+    // Windows：编辑器嵌在正文里 → 软层什么都不画（参数表走标题栏 `自动化` 浮窗）
+    if (comptime builtin.os.tag != .linux) {
+        if (pl.view != null) return;
     }
-    yy += 24;
-    ui.renderer.hline(x + 8, yy, ww - 16, ui.theme.panel_border);
-    yy += 8;
-    util.drawPluginParamList(ui, app, pl, load_failed, scroll_p, ref, id_base, x + 10, body_y, ww - 20, hh - win_title_h, yy);
+    var yy = y + win_title_h + 8;
+    // Linux：独立窗口的 UI 开关（无界面插件返回 0）——两平台同一个控件实现
+    yy += util.pluginUiToggle(ui, app, pl, id_base + 9001, x + 10, yy, ww - 20);
+    {
+        var b: [96]u8 = undefined;
+        ui.labelClipped(display_name, x + 10, yy, ww - 20, ui.theme.text);
+        const sub = std.fmt.bufPrint(&b, "{s} · 延迟 {d} 样本", .{ std.fs.path.basename(path), pl.latency }) catch path;
+        ui.labelClipped(sub, x + 10, yy + 18, ww - 20, ui.theme.text_dim);
+        yy += 40;
+        ui.renderer.hline(x + 8, yy, ww - 16, ui.theme.panel_border);
+        yy += 6;
+    }
+    view_vst_auto.drawBody(ui, app, ref, x + 4, yy, ww - 8, y + hh - yy, .synth_panel);
 }
 
 fn drawOscRow(ui: *Ui, app: *App, p: *synth.SynthParams, oi: usize, x: i32, y: i32, w: i32) void {

@@ -108,6 +108,9 @@ pub const Snapshot = struct {
             var s = f;
             while (s < t) : (s += 1) {
                 const r = self.by_start[@intCast(s - lo)];
+                // **不变式兑底**（音频线程不能崩）：桶下标越界 = 快照被撕裂/已释放。
+                // 宁可丢这一段的事件（下次换代重发），也不让音频线程 panic。
+                if (@as(usize, r.start) + r.len > self.start_idx.len) return null;
                 for (self.start_idx[r.start .. r.start + r.len]) |ii| {
                     const it = self.insts[ii];
                     if (n >= out.len) return null;
@@ -128,6 +131,7 @@ pub const Snapshot = struct {
             s = f;
             while (s < t) : (s += 1) {
                 const r = self.by_end[@intCast(s - lo)];
+                if (@as(usize, r.start) + r.len > self.end_idx.len) return null;
                 for (self.end_idx[r.start .. r.start + r.len]) |ii| {
                     const it = self.insts[ii];
                     if (n >= out.len) return null;

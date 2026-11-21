@@ -323,7 +323,7 @@ fn runTest(alloc: std.mem.Allocator, path: []const u8, role: host.Role) void {
     }
 }
 
-/// 编辑器接口冒烟：加载 → openEditor → 泵消息 N 秒 → closeEditor。
+/// 编辑器接口冒烟：加载 → openEditor → 泵消息 N 秒 → destroyEditor。
 /// （窗口会真实弹出；期间可交互测试；无 GUI 会话也能验证协议调用不崩）
 fn editorSmoke(alloc: std.mem.Allocator, path: []const u8, secs: u32) void {
     const pz = alloc.dupeSentinel(u8, path, 0) catch return;
@@ -427,6 +427,6 @@ fn editorSmoke(alloc: std.mem.Allocator, path: []const u8, secs: u32) void {
         var bs = base_state;
         bs.deinit(alloc);
     }
-    pl.closeEditor();
+    pl.destroyEditor();
     std.debug.print("编辑器已关闭（removed → 销毁窗口）— OK\n", .{});
 }

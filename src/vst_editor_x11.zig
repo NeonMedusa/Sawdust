@@ -98,6 +98,7 @@ const StructureNotifyMask: c_long = 1 << 17;
 const RevertToParent: c_int = 2;
 const Atom = c_ulong;
 extern "X11" fn XQueryPointer(*Display, Window, root_ret: *Window, child_ret: *Window, root_x: *c_int, root_y: *c_int, win_x: *c_int, win_y: *c_int, mask: *c_uint) c_int;
+extern "X11" fn XTranslateCoordinates(*Display, Window, Window, c_int, c_int, *c_int, *c_int, *Window) c_int;
 
 /// 已 unmap/销毁的容器（不再参与同步）
 var retired: [16]Window = @splat(0);
@@ -184,33 +185,67 @@ pub fn move(handle: *anyopaque, x: i32, y: i32, w: i32, h: i32) void {
     _ = XFlush(dpy);
 }
 
+/// 查询窗口**当前**的位置（root 绝对坐标）。未创建/已退役/查询失败 → null。
+/// 尺寸故意不查：插件窗口的尺寸由插件自己（`getSize`/`resizeView`）定，宿主不记。
+fn queryPos(handle: *anyopaque) ?Pos {
+    const dpy = display() orelse return null;
+    const w = winOf(handle);
+    if (isRetired(w)) return null;
+    var rx: c_int = 0;
+    var ry: c_int = 0;
+    var child: Window = 0;
+    if (XTranslateCoordinates(dpy, w, XDefaultRootWindow(dpy), 0, 0, &rx, &ry, &child) == 0) return null;
+    return .{ .x = @intCast(rx), .y = @intCast(ry) };
+}
+
+/// 窗口位置（屏幕坐标）
+pub const Pos = struct { x: i32, y: i32 };
+
+/// **所有插件窗口共用的"上次摆过的位置"**（会话内有效，不跨重启）。
+/// 为何统一而不是每插件一个：同时最多 1~2 个插件窗口，用户心里只有"我的屏幕布局"，
+/// 统一记忆反而更可预测（"插件窗口就出现在上次挪到的地方"），也少一套状态机。
+var last_pos: struct { x: i32 = 0, y: i32 = 0, valid: bool = false } = .{};
+
+/// 上次摆过的位置；从未摆过 → null（调用方用自己的默认落点）
+pub fn lastPos() ?Pos {
+    if (!last_pos.valid) return null;
+    return .{ .x = last_pos.x, .y = last_pos.y };
+}
+
+/// 记下窗口**当前**位置（隐藏/拆除前调；查询失败就保留旧值）
+fn rememberPos(handle: *anyopaque) void {
+    if (queryPos(handle)) |p| last_pos = .{ .x = p.x, .y = p.y, .valid = true };
+}
+
 /// **区域裁切**：把"绘制在插件之上的矩形"从插件窗口里减掉（等价于 Windows 的 `SetWindowRgn`）。
 /// 为什么要：插件窗口是**原生子窗口**，永远盖在我们的软渲染之上；菜单/模态框如果只是画在
 /// framebuffer 里，就会被插件窗口挡住。X11 的做法是给**容器窗口**设 bounding shape：
 /// 先设整窗，再 `ShapeSubtract` 掉每个遮挡矩形（X 会把子窗口一并裁掉）。
 /// `rects` 用**容器本地坐标**；传空 = 恢复默认（不裁切）并请求重绘。
-/// 隐藏编辑器：unmap + 取消输入选择，**窗口与插件对象都留着**。
-/// （实测：Vital 一旦 `removed()+release()` 就有 GL 线程崩，所以 Linux 侧一律"藏起来不销毁"）
+/// 隐藏编辑器：unmap + 取消输入选择，**窗口与 view 都留着**（软关闭，重开秒显）。
+/// 真正卸载/关面板走 `destroyEditor` → `destroy()`（真销毁 X 窗口）。
 pub fn hide(handle: *anyopaque) void {
     const dpy = display() orelse return;
+    if (isRetired(winOf(handle))) return;
+    rememberPos(handle); // 关之前记位置：下次开（含重建的新窗口）就回这里
     _ = XSelectInput(dpy, winOf(handle), 0);
     _ = XUnmapWindow(dpy, winOf(handle));
     _ = XFlush(dpy);
 }
 
-/// 重新显示（配合 hide：不重建窗口/视图）
-pub fn reshide(handle: *anyopaque) void {
-    show(handle);
-}
-
+/// 销毁窗口（**与 Windows 的 `DestroyWindow` 对齐**；`destroyEditor` 的唯一调用点）。
+/// 调用前插件侧 `IPlugView` 已 `removed()`+`release()`，不会有人再往这窗口投递；
+/// `markRetired` 保证残留请求不变成日志噪音，`unmarkEmbed` 回收握手表。
 pub fn destroy(handle: *anyopaque) void {
     const dpy = display() orelse return;
-    // **不立刻销毁**：插件的 GL/音频线程可能还在往这个窗口投递，销毁会让它们崩。
-    // 只 unmap（视觉上消失）+ 取消输入选择，窗口本身留到进程退出。
     const w = winOf(handle);
+    if (isRetired(w)) return; // 幂等
+    rememberPos(handle);
     markRetired(w);
+    unmarkEmbed(w);
     _ = XSelectInput(dpy, w, 0);
     _ = XUnmapWindow(dpy, w);
+    _ = XDestroyWindow(dpy, w);
     _ = XFlush(dpy);
 }
 
@@ -271,17 +306,27 @@ pub fn takeUserClosed() ?*anyopaque {
     return handleOf(w);
 }
 
-var embed_done: [32]Window = @splat(0);
-fn embedDone(w: Window) bool {
-    for (embed_done) |x| if (x == w) return true;
+/// **已握手表**（容器 → 插件子窗口）：只对同一对（容器, 子窗口）生效。
+/// 以前只存子窗口 id 且永不回收 → 插件重建窗口/实例卸载后表被死 id 占满，
+/// 后续 `ensureXEmbed` 全部误判“已握手”而跳过（UI 焦点/输入偶发失灵）。
+var embed_done: [32]struct { container: Window = 0, child: Window = 0 } = @splat(.{});
+fn embedDone(container: Window, child: Window) bool {
+    for (embed_done) |x| if (x.container == container and x.child == child) return true;
     return false;
 }
-fn markEmbedDone(w: Window) void {
+fn markEmbedDone(container: Window, child: Window) void {
     for (&embed_done) |*x| {
-        if (x.* == 0) {
-            x.* = w;
+        if (x.container == 0) {
+            x.* = .{ .container = container, .child = child };
             return;
         }
+    }
+}
+
+/// 容器窗口销毁时把它的所有记录删掉（否则表被死 id 占满）
+fn unmarkEmbed(container: Window) void {
+    for (&embed_done) |*x| {
+        if (x.container == container) x.* = .{};
     }
 }
 
@@ -291,9 +336,10 @@ pub fn ensureXEmbed(container: *anyopaque) void {
     const dpy = display() orelse return;
     if (isRetired(winOf(container))) return;
     const child = deepestChild(dpy, winOf(container)) orelse return;
+    if (isRetired(child)) return; // 插件重建窗口后的陈旧 id：别发
     // 每秒最多重发一次（JUCE 可能重建窗口/重映射后才真正就绪）
-    if (embedDone(child)) return;
-    markEmbedDone(child);
+    if (embedDone(winOf(container), child)) return;
+    markEmbedDone(winOf(container), child);
     sendXEmbed(dpy, child, XEMBED_EMBEDDED_NOTIFY, 0, @intCast(winOf(container)), 0);
     sendXEmbed(dpy, child, XEMBED_WINDOW_ACTIVATE, 0, 0, 0);
     sendXEmbed(dpy, child, XEMBED_FOCUS_IN, XEMBED_FOCUS_CURRENT, 0, 0);

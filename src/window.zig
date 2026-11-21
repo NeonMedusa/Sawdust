@@ -357,6 +357,13 @@ const WindowsWindow = struct {
         _ = SetCapture(@ptrCast(self.hwnd));
     }
 
+    /// **把键盘焦点抢回主窗口**（文本输入框刚打开时调用）。
+    /// 嵌入式插件编辑器是 `WS_CHILD` 子窗口，它显示时会 `SetFocus(自己)` →
+    /// 之后按键全被它吃掉，我们的输入框收不到字符（系统还会“嘟”一声）。
+    pub fn focusMain(self: *WindowsWindow) void {
+        if (self.hwnd) |h| _ = SetFocus(h);
+    }
+
     /// 结束鼠标冻结（未冻结时无操作）
     pub fn endMouseCapture(self: *WindowsWindow) void {
         if (!self.mouse_captured) return;
@@ -800,6 +807,7 @@ extern "user32" fn CreateCursor(?*anyopaque, i32, i32, i32, i32, *const anyopaqu
 extern "user32" fn DestroyCursor(*anyopaque) callconv(.winapi) i32;
 extern "user32" fn SetCapture(*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "user32" fn ReleaseCapture() callconv(.winapi) i32;
+extern "user32" fn SetFocus(hwnd: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "user32" fn SetProcessDpiAwarenessContext(?*anyopaque) callconv(.winapi) i32;
 /// DPI 查询：`GetDpiForWindow`（Win10 1607+）—— Win32 把"系统 DLL 里存在"的导出全部声明为 extern，
 /// 老系统上调用会失败，但**运行时只会在有窗口的 Win10+ 上被调用**；取到 0 → 退回 1.0。
@@ -880,6 +888,9 @@ const UnsupportedWindow = struct {
         _ = kind;
     }
     pub fn beginMouseCapture(self: *UnsupportedWindow) void {
+        _ = self;
+    }
+    pub fn focusMain(self: *UnsupportedWindow) void {
         _ = self;
     }
     pub fn endMouseCapture(self: *UnsupportedWindow) void {

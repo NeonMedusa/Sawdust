@@ -346,6 +346,7 @@ extern "X11" fn XSetWMProtocols(dpy: ?*Display, w: XWindow, protos: [*]Atom, cou
 extern "X11" fn XChangeProperty(dpy: ?*Display, w: XWindow, prop: Atom, typ: Atom, format: c_int, mode: c_int, data: [*]const u8, n: c_int) c_int;
 extern "X11" fn XMapWindow(dpy: ?*Display, w: XWindow) c_int;
 extern "X11" fn XFlush(dpy: ?*Display) c_int;
+extern "X11" fn XSetInputFocus(dpy: ?*Display, w: XWindow, revert_to: c_int, time: c_ulong) c_int;
 extern "X11" fn XSync(dpy: ?*Display, discard: c_int) c_int;
 extern "X11" fn XPending(dpy: ?*Display) c_int;
 extern "X11" fn XNextEvent(dpy: ?*Display, ev: *XEvent) c_int;
@@ -929,8 +930,16 @@ pub const X11Window = struct {
         };
     }
 
-    /// 开始鼠标冻结（缩放/推子拖动）：记下当前指针位置，之后位移**相对累积**进 frozen_dx/dy。
-    ///
+    /// **把键盘焦点抢回主窗口**（文本输入框刚打开时调用）。
+    /// 插件编辑器在本平台是**独立顶层窗口**，用户点过它之后 X 焦点在那边 →
+    /// 我们的输入框收不到按键（与 Win 侧嵌入式子窗口抢焦点是同一问题）。
+    pub fn focusMain(self: *X11Window) void {
+        const dpy = self.dpy orelse return;
+        _ = XSetInputFocus(dpy, self.win, 2, 0); // RevertToParent, CurrentTime
+        _ = XFlush(dpy);
+    }
+
+    /// 开始鼠标冻结（缩放/推子拖动）：记下当前指针位置，之后位移**相对累积**进 frozen_dx/dy。    ///
     /// ⚠️ **故意不用 `XWarpPointer`**（Windows 那边靠 `SetCursorPos` 把指针钉在锚点）。
     /// 实测（WSLg/Xwayland）warp 会导致推子“时快时慢 + 偶尔反向”：
     /// warp 的回声事件与真实事件交错，靠 `warping` 标志去重会丢真实位移；

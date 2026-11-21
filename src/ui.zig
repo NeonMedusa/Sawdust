@@ -154,7 +154,7 @@ pub const Ui = struct {
     /// - `100-160` / `300-352`：工具栏（菜单按钮 / 音量 / BPM / 拍号）
     /// - `1000-3001`：主面板列表（操作历史 / 样式 / 机架列表）
     /// - `3000-4130`：通道机架（窗口 3000/3001、旋钮 4000、通道推子 4100+）
-    /// - `5000-5499`：合成器窗口（窗口 5000/5001、旋钮 5100-5402）
+    /// - `5000-5499`：合成器窗口（窗口 5000/5001、旋钮 5100-5402、**弯音行程 5420**）
     /// - `6000`：钢琴卷帘琴键试听
     /// - `7000-7001`：播放列表标尺 / 音符轨画笔
     /// - `7100-7501`：钢琴卷帘与播放列表（标尺 7100/7200/7000、框选
@@ -1074,7 +1074,10 @@ pub const Ui = struct {
         var changed = false;
         if (self.active_id == id) {
             const total_dy = self.frozen_dy - self.drag_dy0;
-            const nv = std.math.clamp(self.drag_f0 + @as(f64, @floatFromInt(total_dy)) * 0.004, 0, 1);
+            // **向上拖 = 增大**（与 BPM 推子/推子类控件的直觉一致）；
+            // 旧写法是 `+ total_dy`（屏幕坐标 y 向下增大）→ 向上拖反而变小，
+            // 用户实测反馈：“像 BPM 推子那样往上推该变大”。
+            const nv = std.math.clamp(self.drag_f0 - @as(f64, @floatFromInt(total_dy)) * 0.004, 0, 1);
             if (nv != value.*) {
                 value.* = nv;
                 changed = true;

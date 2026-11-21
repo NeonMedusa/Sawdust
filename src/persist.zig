@@ -21,11 +21,14 @@ const synth = @import("synth.zig");
 ///   + **清格式**（删掉 `removed_fields` 那张表里的字段）。
 ///   **v9 已随正式版发布在外** → 除非只做“新增字段”（登记 `introducedVersion = 9`，
 ///   旧档填默认值），否则**下次改格式必须抬到 v10**（并写 v9→v10 迁移）。
+/// - **v10**（新增字段，无值迁移）：`SavedInstrument.pitch`（乐器弯音位置）
+///   + `SavedSynth.bend_range`（弯音行程）。两者都是**纯新增**，旧档读默认值。
+///   ⚠ 漏登这两个字段 → 读 v9 档时多读字节 → 整档错位报 `CorruptProject`（实测：v9 工程打不开）。
 ///
 /// **不变量**：任何 `Saved*`/`Project` 字段增删/调序**必须**跟上：
 /// 新增 → 登记 `introducedVersion`；删除 → 登记 `removed_fields`。
 /// v5 事故：改布局没登记 → 旧工程加载错位 → `integer does not fit…` 崩溃。
-pub const binary_version: u8 = 9;
+pub const binary_version: u8 = 10;
 /// v5（首版二进制，f4a7960）——兼容读取用
 const binary_version_legacy: u8 = 5;
 /// v6（鼓组 VST3 层 / 音频片段 / 音频样式字段）——引入版本**钉死为 6**，
@@ -38,6 +41,8 @@ const binary_version_v6: u8 = 6;
 const binary_version_v8: u8 = 8;
 /// **v9 引入的字段**（含自动化：曲线/绑定整个家族——v8 发布版根本没有这两个数组）。
 const binary_version_v9: u8 = 9;
+/// **v10 引入的字段**（纯新增：弯音位置 / 弯音行程）。
+const binary_version_v10: u8 = 10;
 
 /// **同名但类型变过**的字段：旧档按 `old_T` 读，再转成当前类型。
 ///
@@ -226,6 +231,8 @@ pub const SavedSynth = struct {
     release: f32 = 0.30,
     hpf: SavedFilter = .{},
     lpf: SavedFilter = .{},
+    /// 弯音行程（半音；0..24；旧存档缺失 → 2 = GM 惯例）
+    bend_range: u8 = synth.bend_range_default,
 };
 
 /// 存档中的鼓组层（每垫一份内嵌合成器参数；见 `docs/drumkit.md` §8）
@@ -292,6 +299,8 @@ pub const SavedInstrument = struct {
     /// 推子位置（0..1；**0 dB 在 0.75**，顶部 = +5 dB——见 audio.faderGain）
     volume: f32 = 0.75,
     pan: f32 = 0.5,
+    /// 弯音位置（0..1；0.5 = 不弯；旧存档缺失 → 0.5）
+    pitch: f32 = 0.5,
     muted: bool = false,
     /// 混音通道（**0 起**；v3 起。v1/v2 存档是 1 起——加载时减 1）
     mixer: i32 = 0,
@@ -405,6 +414,7 @@ pub fn exportSynth(p: *const synth.SynthParams) SavedSynth {
         .release = p.release.load(.monotonic),
         .hpf = .{ .enabled = p.hpf.enabled.load(.monotonic), .cutoff = p.hpf.cutoff.load(.monotonic) },
         .lpf = .{ .enabled = p.lpf.enabled.load(.monotonic), .cutoff = p.lpf.cutoff.load(.monotonic) },
+        .bend_range = p.bend_range.load(.monotonic),
     };
     for (0..synth.osc_count) |i| {
         s.osc[i] = .{
@@ -429,6 +439,7 @@ pub fn importSynth(s: *const SavedSynth, p: *synth.SynthParams) void {
     p.hpf.cutoff.store(s.hpf.cutoff, .monotonic);
     p.lpf.enabled.store(s.lpf.enabled, .monotonic);
     p.lpf.cutoff.store(s.lpf.cutoff, .monotonic);
+    p.bend_range.store(@min(s.bend_range, synth.bend_range_max), .monotonic);
     for (0..synth.osc_count) |i| {
         p.osc[i].enabled.store(s.osc[i].enabled, .monotonic);
         p.osc[i].volume.store(s.osc[i].volume, .monotonic);
@@ -512,7 +523,7 @@ test "persist: 设置 JSON 往返（含路径转义；未知字段忽略、缺�
 
 // ── 二进制格式（**唯一存档格式**）──
 //
-// 布局：magic "SAWD" + u8 版本（当前 9）+ 载荷。载荷 = **comptime 反射编码**（全量字段，
+// 布局：magic "SAWD" + u8 版本（当前 10）+ 载荷。载荷 = **comptime 反射编码**（全量字段，
 // 零逐结构维护；不做任何省略——省默认只在 JSON 时代有意义，现在磁盘体积已不是瓶颈）。
 // 编码规则：
 // - 整数：varint（有符号走 zigzag）；bool：1 字节；枚举：底层整数 varint；
@@ -577,6 +588,13 @@ fn introducedVersion(comptime T: type, comptime name: []const u8) ?u8 {
         // **稳定 uid**（v9）：自动化绑定按 uid 引用目标。不落盘的话读档/撤销后
         // uid 会重新编号 → 绑定“表面在、实际失效”（实测：读档后绑定指向不存在的通道）。
         if (comptime std.mem.eql(u8, name, "uid")) return binary_version_v9;
+        // 乐器弯音位置（v10；仅 SavedInstrument 有）
+        if (comptime std.mem.eql(u8, name, "pitch")) return binary_version_v10;
+        return null;
+    }
+    if (comptime std.mem.endsWith(u8, tn, "SavedSynth")) {
+        // 弯音行程（v10）
+        if (comptime std.mem.eql(u8, name, "bend_range")) return binary_version_v10;
         return null;
     }
     if (comptime std.mem.endsWith(u8, tn, "Project")) {
@@ -1763,6 +1781,39 @@ test "persist: 版本门控——v9 新字段在 v8 档里必须全部跳过（�
     try std.testing.expect(!legacySkip(5, SavedOsc, "volume"));
     try std.testing.expect(!legacySkip(5, SavedDrumLayer, "kind"));
     try std.testing.expect(!legacySkip(5, SavedDrumLayer, "synth"));
+    // **v10 新字段**（弯音位置 / 弯音行程）：v9 档必须跳过（漏登 → v9 工程整档错位打不开）
+    try std.testing.expect(legacySkip(9, SavedInstrument, "pitch"));
+    try std.testing.expect(legacySkip(9, SavedSynth, "bend_range"));
+    try std.testing.expect(!legacySkip(10, SavedInstrument, "pitch"));
+    try std.testing.expect(!legacySkip(10, SavedSynth, "bend_range"));
+}
+
+test "persist: v9 档（v10 前）——弯音字段不得入档，读后取默认值" {
+    // 实测事故：新增 `SavedInstrument.pitch` / `SavedSynth.bend_range` 却没登记
+    // `introducedVersion` → 读 v9 档时多读两个字段 → 整档错位报 CorruptProject
+    // （用户反馈：“v9 存档打不开了”）。
+    const a = std.testing.allocator;
+    var insts = [_]SavedInstrument{.{ .uid = 3, .name = "Lead", .kind = 0, .pitch = 0.9 }};
+    insts[0].synth.bend_range = 12;
+    const proj = Project{ .bpm = 112, .instruments = &insts };
+
+    const bytes = try toBinaryAtVersion(a, proj, binary_version_v9);
+    defer a.free(bytes);
+    try std.testing.expectEqual(@as(u8, binary_version_v9), bytes[4]);
+    var parsed = try fromBinary(a, bytes);
+    defer parsed.deinit();
+    const inst = parsed.value.instruments[0];
+    try std.testing.expectEqualStrings("Lead", inst.name);
+    try std.testing.expectEqual(@as(u32, 3), inst.uid); // v9 字段照读
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), inst.pitch, 1e-6); // v10 字段 → 默认
+    try std.testing.expectEqual(synth.bend_range_default, inst.synth.bend_range);
+    // 当前版本能往返
+    const cur = try toBinary(a, proj);
+    defer a.free(cur);
+    var p2 = try fromBinary(a, cur);
+    defer p2.deinit();
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9), p2.value.instruments[0].pitch, 1e-6);
+    try std.testing.expectEqual(@as(u8, 12), p2.value.instruments[0].synth.bend_range);
 }
 
 test "persist: v8 档带鼓组层——读写对称（v9 的 uid 不得进 v8）" {

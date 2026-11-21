@@ -376,6 +376,40 @@ test "ui: 垂直推子——向上拖应增大" {
     ui.endFrame();
 }
 
+test "ui: 拖拽松手帧不得把值拉回起点（dragNormV/zoom 系列共同契约）" {
+    // 历史 bug：main 曾在**帧首**“没按着就清 mouse_capture” → 松手帧 `frozenDeltaY()`
+    // 已返回 0 → 控件把“总位移=0”再算一遍 → 值回退到按下时的起点
+    // （实测：自动化参数表里所有拖拽行拖完就回退）。
+    // 契约：松手帧仍带去完整 `frozen_dy`（捕获到帧末才清），控件只负责“算值 + 清状态”。
+    var buf: [60 * 200]u32 = undefined;
+    var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 60, .height = 200 };
+    var ui = makeUi(&fb);
+
+    var v: f64 = 0.2;
+    ui.mouse_x = 20;
+    ui.mouse_y = 50;
+    ui.mouse_down = true;
+    ui.mouse_pressed = true;
+    ui.frozen_dy = 0;
+    _ = ui.dragNormV(9, 0, 0, 60, 100, &v);
+    ui.endFrame();
+    try std.testing.expectEqual(@as(u64, 9), ui.active_id);
+
+    // 捕获中：向上拖 40px
+    ui.mouse_pressed = false;
+    ui.frozen_dy = -40;
+    _ = ui.dragNormV(9, 0, 0, 60, 100, &v);
+    const dragged = v;
+    try std.testing.expect(dragged > 0.3); // 0.2 + 40×0.004
+
+    // **松手帧**（捕获未结束，frozen_dy 仍是总量）→ 值不变、状态清掉
+    ui.mouse_down = false;
+    _ = ui.dragNormV(9, 0, 0, 60, 100, &v);
+    try std.testing.expectApproxEqAbs(dragged, v, 1e-9);
+    try std.testing.expectEqual(@as(u64, 0), ui.active_id);
+    try std.testing.expect(!ui.mouse_capture);
+}
+
 test "ui: 垂直滚动条——内容收缩后回收 scroll（滑块不被顶出行程）" {
     var buf: [60 * 200]u32 = undefined;
     var fb = r_mod.Framebuffer{ .pixels = &buf, .width = 60, .height = 200 };

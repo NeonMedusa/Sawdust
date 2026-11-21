@@ -90,11 +90,8 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     const mw = &app.mixer_win;
     if (!mw.open) return false;
 
-    // 约束在屏幕内
-    mw.w = std.math.clamp(mw.w, win_min_w, @max(win_min_w, w - 20));
-    mw.h = std.math.clamp(mw.h, win_min_h, @max(win_min_h, h - 20));
-    mw.x = std.math.clamp(mw.x, 0, @max(0, w - mw.w));
-    mw.y = std.math.clamp(mw.y, 0, @max(0, h - mw.h));
+    // 约束在屏幕内（与机架/帮助页共用 `util.clampWindow`）
+    util.clampWindow(w, h, &mw.x, &mw.y, &mw.w, &mw.h, win_min_w, win_min_h);
 
     const x = mw.x;
     const y = mw.y;

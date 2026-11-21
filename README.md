@@ -72,7 +72,7 @@ scoop install sawdust
   —— **未做**：多端口（多条事件总线，目前只有 1 条 × 16 通道）、辅助音频输入（侧链）
 - [x] 音频文件（WAV/MP3）加载与波形缓存（音频样式 / 音频片段 / 波形窗 / 采样器层，
   见 `docs/audio-files.md`）
-- [x] 自动化曲线，已实现：**音量·声像·插件参数·BPM** 四类目标（`automation` 分支已并入 main）
+- [x] 自动化曲线，已实现：**音量·声像·插件参数·BPM·音高** 五类目标（`automation` 分支已并入 main）
   **仍是雏形**：
   - [ ] **框选曲线上的点、批量移动**（目前只能一个点一个点拖）；
   - [ ] **ALT + 鼠标划过直接画线**（划时按细采样落点、松手再量化简化，设计见 [`docs/automation.md`](docs/automation.md) §11.45）；
@@ -105,9 +105,10 @@ scoop install sawdust
 - **自动化编辑器**：不能框选曲线上的点批量移动；“ALT + 鼠标划过画线”未实现；点数与同时生效
   绑定数受音频侧共享点池预算限制（**16384 点 / 64 条绑定**，超出会跳过并弹一次 Toast）。
   见 [`docs/automation.md`](docs/automation.md) §11.45。
-- **音高自动化未做**（**无法做颤音 / 滑音**）：自动化只能绑“有控件的东西”（推子/旋钮/参数行），
-  音高既无推子也无旋钮，右键菜单里无处可点。设计稿见
-  [`docs/automation.md`](docs/automation.md) §11.46（乐器音高偏移 cents + 自动化目标选择器）。
+- ~~音高自动化未做~~ **已实现（v4）**：乐器作用域的 pitch bend（0.5 = 不弯，±2 半音）。
+  VST3 走 `IMidiMapping`（弯音就是插件的一个参数，JUCE 系叫 `MIDI CC <ch>|129`）；
+  内置合成器直接改频率。换插件**绑定保留**（不支持时只是不驱动）。
+  设计稿与实现笔记见 [`docs/automation.md`](docs/automation.md) §11.46。
 - **Linux**：只在 WSLg 上开发验证过，**尚未在真机 Linux 上实测**。见 [`docs/linux.md`](docs/linux.md)。
 
 ## 构建与运行

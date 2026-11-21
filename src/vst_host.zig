@@ -11,7 +11,7 @@
 //! - 暂无延迟补偿（`latency` 已读出，供后续使用）；
 //! - 参数编辑/状态存档已接（阶段 4）：参数面板拖动 + `inputParameterChanges`、
 //!   工程存档携带 `getState`（base64）；参数自动化（曲线）与干湿混合未做；
-//! - 已验证插件：GuitarD（单组件）、TDR Nova（JUCE 分离式）、SFLT、Vital
+//! - 已验证插件：GuitarD（单组件）、TDR Nova（JUCE 分离式）、SFLT、Vital（Windows）
 //!   （**合成器/VSTi**——已验证控制器层：连接后参数正常；音频接入见阶段 5）。
 //!
 //! 互操作要点（实测踩坑，勿删）：
@@ -46,6 +46,8 @@ const ibstream = vst3.pluginterfaces.base.ibstream;
 const ivstparameterchanges = vst3.pluginterfaces.vst.ivstparameterchanges;
 const ivstevents = vst3.pluginterfaces.vst.ivstevents;
 const ivstprocesscontext = vst3.pluginterfaces.vst.ivstprocesscontext;
+/// MIDI 控制器号（`kAfterTouch = 128`、`kPitchBend = 129`；CC = 0..127）
+const ivstmc = vst3.pluginterfaces.vst.ivstmidicontrollers;
 
 fn uidEq(a: *const tuid.TUID, b: *const tuid.TUID) bool {
     return std.mem.eql(u8, a.*[0..], b.*[0..]);
@@ -1037,6 +1039,9 @@ pub const Plugin = struct {
     /// 子窗口位置（`syncEditorRect` 记账，防每帧重复 SetWindowPos）
     editor_x: i32 = 0,
     editor_y: i32 = 0,
+    /// Linux 独立窗口：**这个窗口对象还没摆过位**（新建时为 `true`；首次 `showEditorAt` 后清）。
+    /// 位置本身**不存这里**：所有插件窗口共用一个"上次摆过的位置"（`vst_editor_x11.lastPos`）。
+    win_need_place: bool = true,
     /// 区域裁切哈希（覆盖矩形+位置尺寸；变化才重建 RGN；见 `setEditorClip`）
     clip_hash: u64 = 0,
     clip_valid: bool = false,
@@ -1072,6 +1077,12 @@ pub const Plugin = struct {
     /// **用户接管闸门**（v2 touch 语义）：UI 手动拧了参数 → 置正数（= 跳过自动化的**块数**），
     /// 音频线程每段递减；> 0 时本段不写自动化（手动值先赢）。
     auto_skip_blocks: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// **弯音参数 id**（0 = 无/不支持）：`IMidiMapping::getMidiControllerAssignment(kPitchBend)`
+    /// 解析出来的插件参数（VST3 的 pitch bend 就是参数，没有弯音事件）。
+    /// **UI 线程写**（`queryPitchParam`；乐器 MIDI 通道变化时重查）、**音频线程读**（queueAuto）。
+    pitch_pid: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// 当前 `pitch_pid` 是按哪个 MIDI 通道查的（仅 UI 线程用；-1 = 未查过）
+    pitch_ch: i16 = -1,
     /// VSTi：本段输入事件（processInstrument 填充；段边界 = 事件时刻）
     in_events: EventList = .{},
     /// 每块填充的进程上下文（tempo/拍号/播放位置/ppq；复用同一实例）
@@ -1220,7 +1231,18 @@ pub const Plugin = struct {
         const c = self.controller orelse return "";
         const rc = self.raw_controller orelse return "";
         const id = self.params[idx].id;
-        const v = c.vtable.getParamNormalized(rc, id);
+        return self.paramTextValue(idx, c.vtable.getParamNormalized(rc, id), buf);
+    }
+
+    /// **用指定值取显示文本**（不读插件当前值）。
+    /// 参数表的行用它：显示的是**宿主写入的值**（缓存），而不是插件的当前值——
+    /// 分离式控制器 / DSP 同步慢的插件会“读数回退”，但它只是没跟上，不是值真变了。
+    pub fn paramTextValue(self: *const Plugin, idx: usize, value: f64, buf: []u8) []const u8 {
+        if (idx >= self.params.len) return "";
+        const c = self.controller orelse return "";
+        const rc = self.raw_controller orelse return "";
+        const id = self.params[idx].id;
+        const v = std.math.clamp(value, 0, 1);
         var wbuf: [128]u16 = @splat(0);
         if (c.vtable.getParamStringByValue(rc, id, v, &wbuf) == btypes.kResultOk) {
             var len: u8 = 0;
@@ -1382,7 +1404,12 @@ pub const Plugin = struct {
     fn pushParamMsg(self: *Plugin, id: u32, value: f64) void {
         const head = self.pend_head.load(.monotonic);
         const tail = self.pend_tail.load(.acquire);
-        if (head -% tail >= self.pend.len) return; // 满：丢弃（拖动中间态可丢，末端值随后必到）
+        if (head -% tail >= self.pend.len) {
+            // **满：覆盖最后一条**（旧实现丢新值 → 拖动的末端值丢失，松手后插件只能看到旧值）
+            if (head == tail) return;
+            self.pend[(head -% 1) % self.pend.len] = .{ .id = id, .value = value };
+            return;
+        }
         self.pend[head % self.pend.len] = .{ .id = id, .value = value };
         self.pend_head.store(head +% 1, .release);
     }
@@ -1526,15 +1553,18 @@ pub const Plugin = struct {
             break :blk editor_x11.create(parent, "Sawdust - VST3 编辑器", cw, ch) orelse return .failed;
         };
 
-        // Linux 上这个 frame 是**故意不释放**的（编辑器只隐藏不销毁），
-        // 所以用 page_allocator，别让调试用的泄漏检测把它当 bug 报出来。
-        const frame = if (comptime builtin.os.tag == .windows)
-            (self.alloc.create(EditorFrame) catch {
+        // **两平台同一分配器**（`Plugin.alloc`）：`destroyEditor` 用同一个 allocator 释放。
+        // 历史坑：Linux 曾用 `page_allocator` 分配（因为当年“只隐藏不销毁”会漏掉它），
+        // 但释放路径（`destroyEditor` / `attached` 失败回滚）走的是 `self.alloc` →
+        // 分配器不匹配 → `SafeAllocator` 直接 `free of invalid memory` panic（实测）。
+        const frame = self.alloc.create(EditorFrame) catch {
+            if (comptime builtin.os.tag == .windows) {
                 _ = DestroyWindow(hwnd);
-                return .failed;
-            })
-        else
-            (std.heap.page_allocator.create(EditorFrame) catch return .failed);
+            } else {
+                editor_x11.destroy(hwnd);
+            }
+            return .failed;
+        };
 
         frame.* = .{ .hwnd = hwnd, .owner = self };
         self.frame = frame;
@@ -1557,6 +1587,7 @@ pub const Plugin = struct {
         self.editor_h = ch;
         self.editor_x = 0;
         self.editor_y = 0;
+        self.win_need_place = true; // 新窗口对象：还没摆过位（照全局记忆 `vst_editor_x11.lastPos`）
         self.clip_valid = false;
         self.editor_shown = false;
         self.editor_enabled = true;
@@ -1565,20 +1596,17 @@ pub const Plugin = struct {
         return .opened;
     }
 
-    /// 面板侧每帧同步：移动子窗口到面板内容区（变化才 SetWindowPos）。
-    /// 大小以 `editor_w/h`（插件请求）为准；**首次定位后才显示**（创建时隐藏，
-    /// 防在主窗左上角闪现小黑框）；显示时才抢焦点。
-    /// Linux「独立窗口」模式：显示/隐藏编辑器窗口（**不销毁**，见 `closeEditor` 注释）
-    pub fn setEditorVisible(self: *Plugin, visible: bool) void {
-        if (comptime builtin.os.tag == .windows) return;
+    /// **软关闭**（两平台同语义）：隐藏编辑器窗口 + 放弃输入，**view 与窗口都保留**（重开秒显）。
+    /// 调用点：面板内的 `[关闭插件 UI]` / 用户点插件窗口自己的关闭按钮。
+    /// **不销毁**——这是“临时不看”，不是卸载。
+    pub fn hideEditor(self: *Plugin) void {
         const h = self.editor_hwnd orelse return;
-        if (visible) {
-            editor_x11.show(h);
-            self.editor_shown = true;
+        if (comptime builtin.os.tag == .windows) {
+            _ = ShowWindow(h, SW_HIDE);
         } else {
-            editor_x11.hide(h);
-            self.editor_shown = false;
+            editor_x11.hide(h); // 内部会把当前位置记进全局记忆（`lastPos`）
         }
+        self.editor_shown = false;
     }
 
     /// 每帧调用：若用户用窗口自己的关闭按钮关掉了某个编辑器，返回它的句柄（否则 null）
@@ -1587,9 +1615,31 @@ pub const Plugin = struct {
         return editor_x11.takeUserClosed();
     }
 
-    /// 该插件编辑器的原生窗口句柄（用于和 `takeUserClosedEditor()` 比对）
-    pub fn editorHandle(self: *const Plugin) ?*anyopaque {
-        return self.editor_hwnd;
+    /// **解析弯音参数**（**UI 线程**；幂等，通道变化时重调）：
+    /// VST3 没有 pitch-bend 事件，规范路径是 `IMidiMapping` 把 `kPitchBend(129)` 映射到
+    /// 某个插件参数（JUCE 系 = `MIDI CC <ch>|129`）。查不到 → 0（该插件不支持弯音，
+    /// 音高自动化照常保留、只是不驱动它）。
+    pub fn queryPitchParam(self: *Plugin, ch: u8) void {
+        self.pitch_ch = ch;
+        self.pitch_pid.store(0, .release);
+        const rc = self.raw_controller orelse return;
+        const c = self.controller orelse return;
+        var mm_raw: ?*anyopaque = null;
+        if (c.vtable.queryInterface(rc, &iedit.imidi_mapping_iid, &mm_raw) != btypes.kResultOk or mm_raw == null) return;
+        const mm: *iedit.IMidiMapping = @ptrCast(@alignCast(mm_raw.?));
+        var pid: vsttypes.ParamID = 0;
+        const ok = mm.vtable.getMidiControllerAssignment(mm_raw.?, 0, @intCast(ch), ivstmc.kPitchBend, &pid);
+        _ = mm.vtable.release(mm_raw.?);
+        if (ok != btypes.kResultOk) return;
+        // 0 = `kNoParamId`（映射表存在但这条没映射）→ 同样视为不支持
+        if (pid == 0 or pid == vsttypes.kNoParamId) return;
+        self.pitch_pid.store(pid, .release);
+    }
+
+    /// 弯音参数 id（null = 该插件不支持；音频线程每段读）
+    pub fn pitchParamId(self: *const Plugin) ?u32 {
+        const p = self.pitch_pid.load(.monotonic);
+        return if (p != 0) p else null;
     }
 
     /// 标记编辑器已隐藏（用户关掉时由上层调用；只改标志，不碰 X）
@@ -1597,21 +1647,27 @@ pub const Plugin = struct {
         self.editor_shown = false;
     }
 
-    /// Linux 独立窗口：摆到屏幕坐标 (x,y) 并显示（**幂等**：已开着就是置顶）。
-    /// 切乐器时用它把"新目标"的窗口打开，配合 `setEditorVisible(false)` 关掉旧的——
-    /// 这样"双击 A 关掉 B、打开 A"的行为不需要跟踪 map 状态。
+    /// Linux 独立窗口：显示编辑器窗口（**幂等**）。
+    /// **只在本窗口第一次显示时定位**，位置的唯一来源是**全局记忆**
+    /// （`vst_editor_x11.lastPos()`：所有插件窗口共用“上次摆过的位置”），
+    /// 从没摆过才用调用方给的默认落点。之后的重开只 `map` 不动几何——
+    /// 位置由 WM 保留，尺寸永远由插件自己定（宿主不记尺寸）。
     pub fn showEditorAt(self: *Plugin, x: i32, y: i32) void {
         if (comptime builtin.os.tag == .windows) return;
         const h = self.editor_hwnd orelse return;
-        editor_x11.move(h, x, y, self.editor_w, self.editor_h);
+        if (self.win_need_place) {
+            self.win_need_place = false;
+            const p = editor_x11.lastPos();
+            // 顺序写死：**先定几何再 map**（先 map 再 move 会先在 (0,0) 闪一下再跳走）
+            editor_x11.move(h, if (p) |q| q.x else x, if (p) |q| q.y else y, self.editor_w, self.editor_h);
+        }
         editor_x11.show(h);
         self.editor_shown = true;
     }
 
-    /// 编辑器窗口是否显示（Linux 独立窗口模式下**只用于显示提示**：
-    /// 用户可能用窗口管理器关掉它，我们不再跟踪这个状态——按钮只管"打开/置顶"）
-    pub fn editorIsShown(self: *const Plugin) bool {
-        return self.editor_shown;
+    /// 编辑器窗口的原生句柄（与 `takeUserClosedEditor()` 的返回值比对用）
+    pub fn editorHandle(self: *const Plugin) ?*anyopaque {
+        return self.editor_hwnd;
     }
 
     pub fn syncEditorRect(self: *Plugin, x: i32, y: i32) void {
@@ -1638,14 +1694,6 @@ pub const Plugin = struct {
                 editor_x11.show(hwnd);
             }
         }
-    }
-
-    /// 子窗口的 client 矩形（主窗坐标；`present` 回写裁切用）。
-    /// 未显示 → null（隐藏期间该区域仍是我们的面板像素，必须照常回写）。
-    pub fn editorClientRect(self: *const Plugin) ?[4]i32 {
-        if (comptime builtin.os.tag != .windows) return null; // X11：present 无需跳过矩形
-        if (self.editor_hwnd == null or !self.editor_shown) return null;
-        return .{ self.editor_x, self.editor_y, self.editor_w, self.editor_h };
     }
 
     /// `present` 裁切用信息：窗口句柄 + 主窗 client 坐标下的位置/尺寸；未显示 → null。
@@ -1697,17 +1745,27 @@ pub const Plugin = struct {
         }
     }
 
-    /// 关闭插件编辑器（UI 线程；幂等）
-    pub fn closeEditor(self: *Plugin) void {
-        // **Linux：只隐藏，不销毁**。实测 Vital：`removed()+release()` 会让它的 GL/后台线程
-        // 崩在已释放的对象上；窗口销毁同理。所以插件对象与窗口都留着，
-        // 下次打开面板直接重新 map（也更快）。进程退出时由系统回收。
-        if (comptime builtin.os.tag != .windows) {
-            if (self.editor_hwnd) |h| editor_x11.hide(h);
-            self.editor_shown = false;
-            return;
+    /// **硬拆除编辑器**（UI 线程；幂等）——**两平台同一实现、同一语义**，唯一“销毁”入口。
+    ///
+    /// 顺序（与 Windows 老路径一致、符合 VST3 规范）：
+    ///   hide/unmap → `setFrame(null)` → `removed()` → `release()` → 销毁 frame 对象 → 销毁窗口。
+    ///
+    /// **必须在 `terminate()`/`release()` 插件组件之前调用**：否则插件自己的 GUI 线程
+    /// （JUCE 的定时器/消息线程等）会继续跑在已释放的 processor/controller 上 →
+    /// 插件内部 segfault（Linux 实测：切乐器后约 0.5s 崩在上一个插件）。
+    /// 背景：以前 Linux 为了规避某个插件的退出期崩溃而“只隐藏不销毁”，代价是
+    /// 编辑器 + 其线程**常驻**（内存 + CPU）且实例卸载后无法回收 → 已废弃。
+    pub fn destroyEditor(self: *Plugin) void {
+        // 先取消显示与输入选择（不管平台）：编辑器不该在拆拆时还在收事件。
+        if (self.editor_hwnd) |h| {
+            if (comptime builtin.os.tag == .windows) {
+                _ = ShowWindow(h, SW_HIDE);
+            } else {
+                editor_x11.hide(h); // 内部会记位置（拆除前就记，重建后回到同一处）
+            }
         }
         if (self.view) |v| {
+            // 顺序与历史 Windows 路径一致（实测可用）：removed → setFrame(null) → release
             _ = v.vtable.removed(v);
             _ = v.vtable.setFrame(v, null);
             _ = v.vtable.release(v);
@@ -1727,8 +1785,10 @@ pub const Plugin = struct {
         }
         self.clip_valid = false;
         self.editor_shown = false;
+        self.editor_enabled = true;
         self.editor_x = 0;
         self.editor_y = 0;
+        self.win_need_place = true; // 下一个窗口对象同样要重新定位（照全局记忆）
     }
 
     /// 处理一块**交错立体声**（就地；`frames` ≤ `max_block`）。
@@ -1791,10 +1851,21 @@ pub const Plugin = struct {
         // 同 offset 时**后写的赢**，但用户接管期间（`auto_skip_blocks > 0`）自动化不写，
         // 所以“人拧了旋钮”一定赢；接管结束后自动化从极点状态平滑接回。
         var n_q: usize = 0;
-        while (n_q < self.in_queues.len) : (n_q += 1) {
+        while (true) {
             const m = self.popParamMsg() orelse break;
-            self.in_queues[n_q].reset(m.id);
-            self.in_queues[n_q].add(0, m.value);
+            // **同一参数在本段多条 → 合并成一条（取最新值）**。
+            // 不合并会给插件塞多个同 id 队列 → 很多插件只认第一个，拖动松手后
+            // 参数“回退”到本段中段的旧值（实测 bug）。
+            var qi: usize = 0;
+            while (qi < n_q) : (qi += 1) {
+                if (self.in_queues[qi].id == m.id) break;
+            }
+            if (qi == n_q) {
+                if (n_q >= self.in_queues.len) continue; // 队列满：丢（极少见；自动化随后会补）
+                n_q += 1;
+            }
+            self.in_queues[qi].reset(m.id);
+            self.in_queues[qi].add(0, m.value);
         }
         // 自动化：本段暂存（`queueAuto` 在 `processInstrument` 之前由音频线程填）
         // **接管闸门每段都递减**（即使本段没有自动化入队）——否则“暂停时拧了旋钮”
@@ -2269,7 +2340,7 @@ pub fn unloadPlugin(allocator: std.mem.Allocator, pl: *Plugin) void {
     if (p.param_cache.len > 0) p.alloc.free(p.param_cache);
     p.param_cache = &.{};
     p.param_cache_valid = false;
-    p.closeEditor(); // 先关编辑器（插件还活着时发起 removed）
+    p.destroyEditor(); // 先拆编辑器（插件还活着时发起 removed → release）
     // 终止前先摘掉组件处理器与连接（规范流程；编辑器已关，handler 无用）
     if (p.raw_controller) |rc| {
         if (p.controller) |c| {
@@ -2294,8 +2365,8 @@ pub fn unloadPlugin(allocator: std.mem.Allocator, pl: *Plugin) void {
     _ = p.processor.vtable.release(p.raw_processor);
     _ = p.component.vtable.release(p.raw_component);
     // 注：**不卸载模块**（原 `p.mod.deinit()` 已移除，与 loadPlugin 同理）——
-    // SFLT 类插件的后台线程/回调在 FreeLibrary 后会执行已卸载代码而崩；
-    // 插件 DLL 常驻进程（行业惯例）。文件占用随进程退出释放。
+    // 插件的后台线程/回调在 `dlclose`/`FreeLibrary` 后会执行已卸载代码而崩（多个插件实测）；
+    // 插件 DLL/.so 常驻进程（行业惯例）。文件占用随进程退出释放。
 
     if (p.in_l.len > 0) allocator.free(p.in_l);
     if (p.in_r.len > 0) allocator.free(p.in_r);
@@ -2375,7 +2446,7 @@ extern "user32" fn ShowWindow(?*anyopaque, i32) callconv(.winapi) i32;
 const SW_SHOW: i32 = 5;
 
 /// 宿主侧 IPlugFrame：插件 `resizeView` 请求 → 记录尺寸 + 调整子窗口 + `onSize`。
-/// 简化：ref 计数只记账（生命周期由 Plugin.closeEditor 掌控）。
+/// 简化：ref 计数只记账（生命周期由 Plugin.destroyEditor 掌控）。
 const EditorFrame = extern struct {
     iface: iplugview.IPlugFrame = .{ .vtable = &vtable },
     ref_count: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
@@ -2451,8 +2522,8 @@ fn editorWndProc(hwnd: ?*anyopaque, msg: u32, wparam: usize, lparam: isize) call
     const pl: ?*Plugin = if (raw != 0) @ptrFromInt(@as(usize, @bitCast(raw))) else null;
     switch (msg) {
         WM_CLOSE => {
-            // 用户点 X：走宿主统一关闭流程（removed → 销毁窗口）
-            if (pl) |p| p.closeEditor() else _ = DestroyWindow(@ptrCast(hwnd));
+            // 用户点 X：**软关闭**（隐藏、保留 view）——卸载/关面板才走 destroyEditor
+            if (pl) |p| p.hideEditor() else _ = DestroyWindow(@ptrCast(hwnd));
             return 0;
         },
         WM_SETFOCUS => {
