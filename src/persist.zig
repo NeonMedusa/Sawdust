@@ -455,8 +455,10 @@ pub fn importSynth(s: *const SavedSynth, p: *synth.SynthParams) void {
 pub const Settings = struct {
     /// 启动时打开上次工程（false = 新建空工程）
     open_last: bool = false,
-    /// 最高帧率（30..240）
+    /// 最高帧率（忙时：播放/拖拽/动画；30..360）
     fps: i32 = 120,
+    /// **闲置帧率**（完全无事 + 最小化时；30..fps——闲置随最高**削峰**，高于最高的值装载时被钳回）
+    fps_idle: i32 = 30,
     /// 上次打开/保存的工程路径（仅落盘；运行时真身在 `App.project_path`）
     last_project: []const u8 = "",
     /// **UI 缩放**：true = 每次启动自动检测（阶梯见 `src/dpi.zig`）；false = 用 `ui_scale`
@@ -490,6 +492,7 @@ test "persist: 设置 JSON 往返（含路径转义；未知字段忽略、缺�
     const json = try settingsToJson(allocator, .{
         .open_last = true,
         .fps = 90,
+        .fps_idle = 15,
         .last_project = "C:\\Music\\曲.saw",
         .ui_scale_auto = false,
         .ui_scale = 1.5,
@@ -502,6 +505,7 @@ test "persist: 设置 JSON 往返（含路径转义；未知字段忽略、缺�
     defer parsed.deinit();
     try std.testing.expect(parsed.value.open_last);
     try std.testing.expectEqual(@as(i32, 90), parsed.value.fps);
+    try std.testing.expectEqual(@as(i32, 15), parsed.value.fps_idle);
     try std.testing.expectEqualStrings("C:\\Music\\曲.saw", parsed.value.last_project);
     try std.testing.expect(!parsed.value.ui_scale_auto);
     try std.testing.expectEqual(@as(f32, 1.5), parsed.value.ui_scale);

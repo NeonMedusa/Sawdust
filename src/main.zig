@@ -178,7 +178,9 @@ pub fn main(init: std.process.Init) !u8 {
     var ui_input = InputState{};
     var ui = Ui.init(r_mod.Renderer.init(&win.fb), &font);
 
-    // 帧率上限：默认 120fps（帧预算 8.33ms；现由设置窗口可调，见 `App.fps_limit`）。
+    // 帧率两档（均设置页可调，见 `App.fps_limit` / `App.fps_idle`）：
+    //   · 忙时上限：默认 120fps（帧预算 = 1e9 / fps），播放/拖拽/动画期间生效；
+    //   · 闲置档：默认 30fps，完全无事或**最小化**时生效（并跳过整个绘制/呈现）。
     // 历史：原为固定 `sleep(16ms)`（名义 60fps），但 Windows 默认计时器
     // 粒度 ≈ 15.6ms → 实测 sleep(16ms) 睡成 ~26ms，加上渲染耗时实际仅
     // ~30 多帧，表现为“UI 不流畅/操作滞后”。修法：
@@ -190,13 +192,39 @@ pub fn main(init: std.process.Init) !u8 {
     // 帧预算睡眠**；旧实现测“绘制前”，亚毫秒被夹成 1ms 下限 → 一切按 dt 的
     // 动画/倒计时慢 ~8 倍：跟随滑动滞后、宽限倒计时超长（实测根因））
     var prev_frame_start_ns: i64 = 0;
+    // 最近一次收到系统输入事件的时间戳（自适应空转帧率用）
+    var last_input_ns: i64 = 0;
     // 上一帧是否在文本输入（用于检测“刚打开输入框”这个边沿）
     var prev_text_input_active: bool = false;
 
     while (true) {
-        // 帧率上限：取设置值（30..240fps；帧预算 = 1e9 / fps——改设置即时生效）
-        const frame_budget_ns: i64 = @divTrunc(1_000_000_000, @as(i64, std.math.clamp(app.fps_limit, 30, 240)));
+        // ── 自适应空转帧率 ──
+        // 完全无事时把上限降到**闲置帧率**（可设；忙时主成本是全量重绘 + 全屏回写，
+        // 降速 ≈ 按比例省电）；任何输入/动画帧立即回满速（输入到达的那一帧照常渲染，
+        // 下一帧起恢复；唤醒滞后 = 1/闲置帧率，30fps 时 ≈33ms 无感）。
+        // **这是“降速”不是“停画”**：即使下面漏判了某个动画，它仍以闲置帧率在走——
+        // 最坏观感是动画变糙，绝无“画面停住”的冻结态，所以判定宁可多算“忙”。
+        // 新增动画/进度类状态时往 `animating` 里加。
+        // （横向滚动补间落地时记得把 `scroll_x_target` 也加进来。）
+        // **最小化**：按闲置档转 + 整个绘制/呈现跳过（见下面 `if (!minimized)`），
+        // 播放/导出/帧末逻辑照常；恢复时下一帧全量重画。
+        const minimized = win.isMinimized();
         const frame_start_ns: i64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
+        const input_recent = (frame_start_ns - last_input_ns) < 300_000_000; // 交互余量
+        const animating = input_recent or app.playing or app.preview.playing or
+            ui.mouse_down or ui.mouse_right_down or ui.mouse_middle_down or
+            ui.active_id != 0 or ui.mouse_capture or
+            app.text_input.active or app.toast != null or app.scale_confirm != null or
+            app.export_wav != null or app.import_mgr.busy() or app.plugin_mgr.scanning or
+            app.playlist.zoom != app.playlist.zoom_target or
+            app.playlist.scroll != app.playlist.scroll_target or
+            app.piano.zoom != app.piano.zoom_target or
+            app.piano.scroll != app.piano.scroll_target;
+        // 帧率上限：忙时取设置值（30..360），无事/最小化取闲置档。
+        // 闲置 ≤ 忙时上限（削峰：UI 已联动，这里兜底运行期任何来源）
+        const user_fps: i64 = std.math.clamp(app.fps_limit, 30, 360);
+        const idle_fps: i64 = std.math.clamp(app.fps_idle, 30, user_fps);
+        const frame_budget_ns: i64 = @divTrunc(1_000_000_000, if (animating and !minimized) user_fps else idle_fps);
         defer {
             // 5) 帧预算：睡完本帧剩余时间（渲染耗时已扣掉）
             const now_ns: i64 = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
@@ -428,6 +456,9 @@ pub fn main(init: std.process.Init) !u8 {
         }
 
         const events = try win.pollEvents();
+        // 有系统事件 = 刚发生过交互（鼠标/键盘/滚轮/缩放）→ 记时间戳，
+        // 下一帧起恢复满速（`animating` 的 `input_recent` 余量内保持）。
+        if (events.len > 0) last_input_ns = frame_start_ns;
         // 修饰键（每帧读“当前”状态——框选手势需要实时状态，
         // 而键盘事件里只有按下瞬间的状态）
         {
@@ -1074,74 +1105,79 @@ pub fn main(init: std.process.Init) !u8 {
         ui.frozen_dy = i2l(win.frozenDeltaY(), scale);
 
         ui.beginFrame();
-        drawApp(&ui, &app, ui.renderer.logicalWidth(), ui.renderer.logicalHeight());
-        // 文件菜单：在 UI 之后、endFrame **之前**（endFrame 会清 mouse_pressed——
-        // 放在之后则菜单永远收不到点击，实测“点菜单没反应”）
-        if (app.file_menu_open) drawFileMenu(&ui, &app);
-        // 样式右键菜单：同上（浮动窗口之后，否则会被盖住）
-        if (app.panels.ctx_pattern != null) view_panels.drawPatternCtxMenu(&ui, &app);
-        if (app.panels.ctx_audio_style != null) view_panels.drawAudioStyleCtxMenu(&ui, &app);
-        // 轨道右键菜单（最外层同上——在浮动窗口之后）
-        if (app.panels.ctx_track != null) view_playlist.drawTrackCtxMenu(&ui, &app);
-        // BPM 右键菜单（同上：必须在工具栏/视图/窗口之后才不会被盖住）
-        if (app.panels.ctx_bpm) drawBpmCtxMenu(&ui, &app);
-        // VST 参数行内 `自动化` 菜单（同上：超过窗口层的话会被窗口层自己的屏蔽卡住）
-        if (app.vst_auto.menu_open) view_vst_auto.drawMenu(&ui, &app);
-        // 播放列表曲线行右键菜单（同上：面板内的值轨是后画的，画在面板里会被曲线盖住）
-        if (app.curve_menu.open) view_playlist.drawCurveMenu(&ui, &app);
-        // 预设浏览器（模态；同上——浮动窗口之后）
-        if (app.preset_browser.open) view_presets.draw(&ui, &app, ui.renderer.logicalWidth(), ui.renderer.logicalHeight());
-        // 模态确认框（最上层；自绘——避开系统 MessageBox 把鼠标吸到默认按钮）
-        if (app.modal != null) {
-            // 注：裁切覆盖矩形由各对话框**按自身矩形**登记（不是全屏）——全屏裁掉会让
-            // 插件 UI 在弹窗期间“消失”（用户实测反馈）；只按对话框裁，插件保持可见，
-            // 输入由 `setEditorEnabled` 闸门拦截（禁用窗点击归父窗口）。
-            drawModal(&ui, &app);
-        }
-        // 导出格式面板（模态；文件选择前先选格式与质量）
-        if (app.export_options_win.open) drawExportOptionsDialog(&ui, &app, io);
-        // 缩放确认条（立即生效后的 15 s 后悔窗口；浮在最上层，键盘 Enter/Esc 也能用）
-        if (app.scale_confirm != null) drawScaleConfirm(&ui, &app);
-        // 导出进度窗（模态；置于最上层——导出期间其余元素均不可操作）
-        if (app.export_wav != null) drawExportDialog(&ui, &app, io);
-        // 文本输入框（最顶层——跨窗口/菜单，重命名乐器/通道用）
-        if (app.text_input.active) {
-            const ti = &app.text_input;
-            if (ti.caret_epoch == 0) ti.caret_epoch = text_edit.nowMs(); // 刚激活 → 从"亮"开始
-            ui.noteOverlayRect(ti.x, ti.y, ti.w, text_input_h); // 遮挡插件子窗口
-            ui.renderer.fillRect(ti.x + 2, ti.y + 2, ti.w, text_input_h, r_mod.rgb(12, 13, 16)); // 阴影
-            ui.textFieldInput(ti.text(), ti.cursor, ti.selection(), ti.drag_active, &ti.view_off, ti.caret_epoch, ti.x, ti.y, ti.w, text_input_h);
-        }
-        // 内置文件选择器（模态，绘于最上层）——先画它，再统一 present
-        if (picker) |*pk| {
-            // 恢复本帧输入给选择器（背景在 drawApp 期间看到的是“空输入”）
-            ui.mouse_x = modal_input.mouse_x;
-            ui.mouse_y = modal_input.mouse_y;
-            ui.mouse_down = modal_input.mouse_down;
-            ui.mouse_pressed = modal_input.mouse_pressed;
-            ui.mouse_released = modal_input.mouse_released;
-            ui.mouse_right_pressed = modal_input.mouse_right_pressed;
-            ui.mouse_right_down = modal_input.mouse_right_down;
-            ui.mouse_middle_pressed = modal_input.mouse_middle_pressed;
-            ui.mouse_middle_down = modal_input.mouse_middle_down;
-            ui.mouse_double = modal_input.mouse_double;
-            ui.wheel = modal_input.wheel;
-            switch (file_picker.draw(&ui, pk, ui.renderer.logicalWidth(), ui.renderer.logicalHeight())) {
-                .pending => {},
-                .cancelled => {
-                    if (filedialog.supported()) app.setToast(pk.cancel_text);
-                    pk.deinit();
-                    picker = null;
-                },
-                .chosen => |path| {
-                    const use_ = pk.use_;
-                    pk.deinit();
-                    picker = null;
-                    dispatchPick(&app, io, use_, path);
-                    app.allocator.free(path);
-                },
+        // **最小化：跳过整个绘制**（帧缓冲保持最后一帧内容；恢复时首帧全量重画，
+        // X11 另有 Expose→present 兜底）。`endFrame` 照常跑——输入边沿每帧被清理，
+        // 不会把最小化期间收不到的点击攒到恢复后重放。
+        if (!minimized) {
+            drawApp(&ui, &app, ui.renderer.logicalWidth(), ui.renderer.logicalHeight());
+            // 文件菜单：在 UI 之后、endFrame **之前**（endFrame 会清 mouse_pressed——
+            // 放在之后则菜单永远收不到点击，实测“点菜单没反应”）
+            if (app.file_menu_open) drawFileMenu(&ui, &app);
+            // 样式右键菜单：同上（浮动窗口之后，否则会被盖住）
+            if (app.panels.ctx_pattern != null) view_panels.drawPatternCtxMenu(&ui, &app);
+            if (app.panels.ctx_audio_style != null) view_panels.drawAudioStyleCtxMenu(&ui, &app);
+            // 轨道右键菜单（最外层同上——在浮动窗口之后）
+            if (app.panels.ctx_track != null) view_playlist.drawTrackCtxMenu(&ui, &app);
+            // BPM 右键菜单（同上：必须在工具栏/视图/窗口之后才不会被盖住）
+            if (app.panels.ctx_bpm) drawBpmCtxMenu(&ui, &app);
+            // VST 参数行内 `自动化` 菜单（同上：超过窗口层的话会被窗口层自己的屏蔽卡住）
+            if (app.vst_auto.menu_open) view_vst_auto.drawMenu(&ui, &app);
+            // 播放列表曲线行右键菜单（同上：面板内的值轨是后画的，画在面板里会被曲线盖住）
+            if (app.curve_menu.open) view_playlist.drawCurveMenu(&ui, &app);
+            // 预设浏览器（模态；同上——浮动窗口之后）
+            if (app.preset_browser.open) view_presets.draw(&ui, &app, ui.renderer.logicalWidth(), ui.renderer.logicalHeight());
+            // 模态确认框（最上层；自绘——避开系统 MessageBox 把鼠标吸到默认按钮）
+            if (app.modal != null) {
+                // 注：裁切覆盖矩形由各对话框**按自身矩形**登记（不是全屏）——全屏裁掉会让
+                // 插件 UI 在弹窗期间“消失”（用户实测反馈）；只按对话框裁，插件保持可见，
+                // 输入由 `setEditorEnabled` 闸门拦截（禁用窗点击归父窗口）。
+                drawModal(&ui, &app);
             }
-        }
+            // 导出格式面板（模态；文件选择前先选格式与质量）
+            if (app.export_options_win.open) drawExportOptionsDialog(&ui, &app, io);
+            // 缩放确认条（立即生效后的 15 s 后悔窗口；浮在最上层，键盘 Enter/Esc 也能用）
+            if (app.scale_confirm != null) drawScaleConfirm(&ui, &app);
+            // 导出进度窗（模态；置于最上层——导出期间其余元素均不可操作）
+            if (app.export_wav != null) drawExportDialog(&ui, &app, io);
+            // 文本输入框（最顶层——跨窗口/菜单，重命名乐器/通道用）
+            if (app.text_input.active) {
+                const ti = &app.text_input;
+                if (ti.caret_epoch == 0) ti.caret_epoch = text_edit.nowMs(); // 刚激活 → 从"亮"开始
+                ui.noteOverlayRect(ti.x, ti.y, ti.w, text_input_h); // 遮挡插件子窗口
+                ui.renderer.fillRect(ti.x + 2, ti.y + 2, ti.w, text_input_h, r_mod.rgb(12, 13, 16)); // 阴影
+                ui.textFieldInput(ti.text(), ti.cursor, ti.selection(), ti.drag_active, &ti.view_off, ti.caret_epoch, ti.x, ti.y, ti.w, text_input_h);
+            }
+            // 内置文件选择器（模态，绘于最上层）——先画它，再统一 present
+            if (picker) |*pk| {
+                // 恢复本帧输入给选择器（背景在 drawApp 期间看到的是“空输入”）
+                ui.mouse_x = modal_input.mouse_x;
+                ui.mouse_y = modal_input.mouse_y;
+                ui.mouse_down = modal_input.mouse_down;
+                ui.mouse_pressed = modal_input.mouse_pressed;
+                ui.mouse_released = modal_input.mouse_released;
+                ui.mouse_right_pressed = modal_input.mouse_right_pressed;
+                ui.mouse_right_down = modal_input.mouse_right_down;
+                ui.mouse_middle_pressed = modal_input.mouse_middle_pressed;
+                ui.mouse_middle_down = modal_input.mouse_middle_down;
+                ui.mouse_double = modal_input.mouse_double;
+                ui.wheel = modal_input.wheel;
+                switch (file_picker.draw(&ui, pk, ui.renderer.logicalWidth(), ui.renderer.logicalHeight())) {
+                    .pending => {},
+                    .cancelled => {
+                        if (filedialog.supported()) app.setToast(pk.cancel_text);
+                        pk.deinit();
+                        picker = null;
+                    },
+                    .chosen => |path| {
+                        const use_ = pk.use_;
+                        pk.deinit();
+                        picker = null;
+                        dispatchPick(&app, io, use_, path);
+                        app.allocator.free(path);
+                    },
+                }
+            }
+        } // if (!minimized)：绘制块结束
         ui.endFrame();
         // **帧末兑底**：没按着却还挂着捕获 → 清掉（下一帧 `endMouseCapture()` 会恢复光标）。
         // 放在**绘图之后**：松手那一帧控件仍能拿到完整的 `frozen_dy`（见帧首注释）。
@@ -1161,10 +1197,12 @@ pub fn main(init: std.process.Init) !u8 {
 
         // 4) 呈现（原生子窗口＝插件编辑器：按**其当前可见区域**裁掉回写——
         //    未遮挡=整矩形跳过（防闪烁）；被弹窗/窗口遮挡的（已 SetWindowRgn 裁掉）
-        //    部分照常回写（保证盖在插件上的窗口/弹窗正常覆盖，不破洞）
-        collectEditorPresents(&app, &win);
-
-        win.present();
+        //    部分照常回写（保证盖在插件上的窗口/弹窗正常覆盖，不破洞）。
+        // **最小化时跳过**：窗口不可见，BitBlt 纯属白烧（恢复时 Expose / 首帧重画兜底）。
+        if (!minimized) {
+            collectEditorPresents(&app, &win);
+            win.present();
+        }
         // 4.1) 历史提交（拖动类操作 **coalesce**：鼠标松开才提交一次——
         // 一次拖动 = 一条历史，而不是每帧一条；左右键都算）
         // 注：滚轮/插件侧改动走“起手提交 + 静置钉值”手势（`touchGesture`）。
@@ -4491,12 +4529,28 @@ fn loadSettingsRaw(allocator: std.mem.Allocator, io: std.Io, data_root: []const 
 /// `pending_open_path` 机制（首帧末自动执行；启动时 dirty=false 无确认弹窗）。
 fn loadSettings(app: *App, st: persist.Settings) void {
     app.settings_open_last = st.open_last;
-    app.fps_limit = std.math.clamp(st.fps, 30, 240);
+    app.fps_limit = std.math.clamp(st.fps, 30, 360);
+    // 闲置随最高削峰（正常来源走设置页联动；这里兜底手改 settings.json 的情况）
+    app.fps_idle = std.math.clamp(st.fps_idle, 30, app.fps_limit);
     app.ui_scale_auto = st.ui_scale_auto;
     app.ui_scale = std.math.clamp(st.ui_scale, dpi.min_scale, dpi.max_scale);
     app.setFontPath(st.font_path);
     app.font_dirty = false; // 启动时字体已按设置加载过，不必重建
     if (st.open_last and st.last_project.len > 0) app.setPendingOpen(st.last_project);
+}
+
+test "main: 设置装载——闲置帧率随最高削峰（高于即钳回；上调不跟随）" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.deinitAll();
+    // 手改 settings.json 出现 闲置(90) > 最高(60)：装载时钳回 60
+    loadSettings(&app, .{ .fps = 60, .fps_idle = 90 });
+    try std.testing.expectEqual(@as(i32, 60), app.fps_limit);
+    try std.testing.expectEqual(@as(i32, 60), app.fps_idle);
+    // 最高往上调不带动闲置（30 保持 30）
+    loadSettings(&app, .{ .fps = 240, .fps_idle = 30 });
+    try std.testing.expectEqual(@as(i32, 240), app.fps_limit);
+    try std.testing.expectEqual(@as(i32, 30), app.fps_idle);
 }
 
 /// 写入设置（静默失败；下一步变更会重试）。
@@ -4507,6 +4561,7 @@ fn saveSettings(app: *App, io: std.Io) void {
     const json = persist.settingsToJson(app.allocator, .{
         .open_last = app.settings_open_last,
         .fps = app.fps_limit,
+        .fps_idle = app.fps_idle,
         .last_project = app.project_path orelse "",
         .ui_scale_auto = app.ui_scale_auto,
         .ui_scale = app.ui_scale,

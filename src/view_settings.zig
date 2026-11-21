@@ -43,6 +43,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         app.settings_draft = .{
             .open_last = app.settings_open_last,
             .fps = app.fps_limit,
+            .fps_idle = app.fps_idle,
             .ui_scale_auto = app.ui_scale_auto,
             .ui_scale = if (app.ui_scale_auto) app.ui_scale_detected else app.ui_scale,
             .audio_backend = audio_pref.current.backend,
@@ -53,6 +54,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     // “应用”是否可点：草案与当前生效值有差异才有意义（未改动 → 置灰）
     const dirty = d.open_last != app.settings_open_last or
         d.fps != app.fps_limit or
+        d.fps_idle != app.fps_idle or
         d.ui_scale_auto != app.ui_scale_auto or
         (!d.ui_scale_auto and @abs(d.ui_scale - app.ui_scale) > 0.001) or
         d.audio_backend != audio_pref.current.backend or
@@ -94,15 +96,26 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     }
     yy += 56;
 
-    // ── 最高帧率 ──
-    ui.label("最高帧率（30 – 240 fps）", x + 14, yy, ui.theme.text_dim);
+    // ── 帧率（忙时上限 / 闲置）──
+    // 两个推子并排：左 = 忙时（播放/拖拽/动画期间的上限），右 = 完全无事+最小化时的档位。
+    // 数字本身在推子里显示（“推子 120”），右侧只补一个单位词“fps”——
+    // 再重复一遍数字（旧版“推子120 120fps”）是冗余。
+    // **闲置 ≤ 最高**：闲置推子的上限就是最高推子的当前值；最高往下拖时闲置跟着
+    // 削峰（不削会出现“闲置比忙时还快”的怪状态），最高往上调时闲置不跟着动。
+    ui.label("最高帧率", x + 14, yy, ui.theme.text_dim);
     var fps = d.fps;
-    if (ui.dragNumber(9522, x + 14, yy + 16, 64, 22, &fps, 30, 240, 2)) {
+    if (ui.dragNumber(9522, x + 14, yy + 16, 64, 22, &fps, 30, 360, 2)) {
         d.fps = fps;
+        if (d.fps_idle > d.fps) d.fps_idle = d.fps; // 闲置随最高削峰（上调不跟随）
     }
-    var fb: [16]u8 = undefined;
-    ui.label(std.fmt.bufPrint(&fb, "{d} fps", .{d.fps}) catch "", x + 88, yy + 20, ui.theme.text);
-    ui.label("（拖动调整；实现为帧预算 = 1 秒 ÷ 帧率）", x + 14, yy + 44, ui.theme.text_dim);
+    ui.label("fps", x + 82, yy + 20, ui.theme.text);
+    ui.label("闲置帧率", x + 160, yy, ui.theme.text_dim);
+    var fps_idle = d.fps_idle;
+    if (ui.dragNumber(9523, x + 160, yy + 16, 64, 22, &fps_idle, 30, d.fps, 2)) {
+        d.fps_idle = fps_idle;
+    }
+    ui.label("fps", x + 228, yy + 20, ui.theme.text);
+    ui.label("（闲置 ≤ 最高；完全无事或最小化时降到闲置档，任何操作立即回满速）", x + 14, yy + 44, ui.theme.text_dim);
     yy += 68;
 
     // ── 数据交换：JSON 通道已于 v9 删除（存档只剩二进制 `.saw`）──
@@ -239,7 +252,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
             if (hovered and ui.mouse_pressed) d.setAudioDevice(if (row == 0) "" else device_name);
         }
     }
-    if (has_scroll) _ = ui.scrollbarV(9526, list_x + list_w - sb_w, list_y, sb_w, list_h, &sw.audio_device_scroll, content_h, list_h);
+    if (has_scroll) _ = ui.scrollbarV(9529, list_x + list_w - sb_w, list_y, sb_w, list_h, &sw.audio_device_scroll, content_h, list_h);
     // 记住列表矩形 + 能不能滚（供下一帧的滚轮分流）
     sw.device_rect = .{ list_x, list_y, list_w, list_h };
     sw.device_scrollable = device_scrollable;
@@ -271,8 +284,10 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     ui.label("改动需点“应用”才生效", x + 14, foot_y + 5, ui.theme.text_dim);
     if (dirty and ui.button(9538, "应用", x + ww - 172, foot_y, 76, 24)) {
         // 提交草案：缩放走 applyUiScale（立即生效 + 15 s 后不确认就回滚），其余直接写
+        // 闲置随最高削峰（UI 已联动；这里兜底手改 settings.json 之类的来源）
         const open_last = d.open_last;
-        const fps_want = std.math.clamp(d.fps, 30, 240);
+        const fps_want = std.math.clamp(d.fps, 30, 360);
+        const fps_idle_want = std.math.clamp(d.fps_idle, 30, fps_want);
         const auto_want = d.ui_scale_auto;
         const scale_want = if (auto_want) app.ui_scale_detected else d.ui_scale;
         const be_want = d.audio_backend;
@@ -287,6 +302,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         }
         app.settings_open_last = open_last;
         app.fps_limit = fps_want;
+        app.fps_idle = fps_idle_want;
         app.ui_scale_auto = auto_want;
         app.settings_dirty = true;
         app.settings_draft = null; // 下一帧按生效值重建 → “应用”自动变灰

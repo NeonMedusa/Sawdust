@@ -1330,6 +1330,7 @@ pub const HelpWindow = struct {
 pub const SettingsDraft = struct {
     open_last: bool = false,
     fps: i32 = 120,
+    fps_idle: i32 = 30,
     ui_scale_auto: bool = true,
     ui_scale: f32 = 1.0,
     /// 音频输出（**也是草案**：点“应用”才提交，见 view_settings 底栏）
@@ -2139,9 +2140,12 @@ pub const App = struct {
     pending_scan_cancel: bool = false,
     /// 应用设置（`settings.json`；IO 由 main 帧末执行）
     /// - `settings_open_last`：启动时打开上次工程（false = 新建空工程）
-    /// - `fps_limit`：最高帧率（帧预算 = 1e9 / fps；30..240）
+    /// - `fps_limit`：最高帧率（忙时：播放/拖拽/动画/进度；帧预算 = 1e9 / fps；30..360）
+    /// - `fps_idle`：**闲置帧率**（完全无事 + 最小化时；30..**fps_limit**——闲置随最高
+    ///   **削峰**：最高往下调时跟着压下来，往上调时不跟随；设置页已联动，主循环兜底钳位）
     settings_open_last: bool = false,
     fps_limit: i32 = 120,
+    fps_idle: i32 = 30,
     // ── UI 缩放（DPI）──
     /// 运行时**真身**：`renderer.scale` 每帧读它（改它 = 立即生效）
     ui_scale: f32 = 1.0,

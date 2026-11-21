@@ -393,6 +393,14 @@ const WindowsWindow = struct {
     /// 从回写中裁掉——子窗口像素由系统维护，软渲染回写会盖掉它（GDI 插件高频闪烁，实测）；
     /// 而被 `SetWindowRgn` 裁掉（被弹窗/菜单遮挡）的部分必须照常回写，否则
     /// 盖在插件上的弹窗会在该区域“破洞”（实测“对话框盖不住 VST UI”）。
+    /// 窗口是否处于**最小化**状态（`IsIconic`，一次廉价 API 调用）。
+    /// 最小化期间主循环跳过整个绘制/呈现并按闲置帧率运转（见 `main.zig` 的
+    /// `animating`/跳绘门控）——音频与帧末逻辑照常。
+    pub fn isMinimized(self: *const WindowsWindow) bool {
+        if (self.hwnd) |h| return IsIconic(h) != 0;
+        return false;
+    }
+
     /// 窗口 DC 是长生命周期 OWNDC，裁剪区不随子窗口变动自动刷新——
     /// 故显式 `SelectClipRgn` 每帧构造的区域（无排除时走全屏快路径）。
     pub fn present(self: *WindowsWindow) void {
@@ -828,6 +836,7 @@ extern "gdi32" fn CombineRgn(?*anyopaque, ?*anyopaque, ?*anyopaque, i32) callcon
 extern "gdi32" fn SelectClipRgn(?*anyopaque, ?*anyopaque) callconv(.winapi) i32;
 extern "gdi32" fn OffsetRgn(?*anyopaque, i32, i32) callconv(.winapi) i32;
 extern "user32" fn GetWindowRgn(?*anyopaque, ?*anyopaque) callconv(.winapi) i32;
+extern "user32" fn IsIconic(hwnd: ?*anyopaque) callconv(.winapi) i32;
 
 /// `CombineRgn` 模式：第一个区域减去第二个
 const RGN_DIFF: i32 = 4;
@@ -846,6 +855,11 @@ pub fn openExternalUrl(url: [:0]const u8) void {
 }
 
 const UnsupportedWindow = struct {
+    pub fn isMinimized(self: *const UnsupportedWindow) bool {
+        _ = self;
+        return false;
+    }
+
     pub fn dpiRaw(self: *const UnsupportedWindow, raw: *@import("dpi.zig").Raw) void {
         _ = self;
         _ = raw;

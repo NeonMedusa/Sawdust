@@ -125,6 +125,17 @@ const XEvent = extern union {
     configure: XConfigureEvent,
     client: XClientMessageEvent,
     property: XPropertyEvent,
+    /// 事件头（所有 X 事件前 5 个字段同构）。Unmap/MapNotify 的“事件窗口”字段
+    /// 与其它事件的 `window` 同偏移——读它即可，不必为两种事件单独立结构。
+    head: XAnyEventHead,
+};
+
+const XAnyEventHead = extern struct {
+    type: c_int,
+    serial: c_ulong,
+    send_event: c_int,
+    display: *Display,
+    window: XWindow,
 };
 
 /// `PropertyNotify`（root 的 `RESOURCE_MANAGER` / XSETTINGS 的 `_XSETTINGS_SETTINGS` 变了）
@@ -415,6 +426,8 @@ const ButtonRelease: c_int = 5;
 const MotionNotify: c_int = 6;
 const Expose: c_int = 12;
 const DestroyNotify: c_int = 17;
+const UnmapNotify: c_int = 18;
+const MapNotify: c_int = 19;
 const ConfigureNotify: c_int = 22;
 const PropertyNotify: c_int = 28;
 const SelectionClear: c_int = 29;
@@ -496,6 +509,10 @@ pub const X11Window = struct {
     utf8_string: Atom = 0,
     fb: Framebuffer = .{ .pixels = &.{}, .width = 0, .height = 0 },
     should_quit: bool = false,
+    /// **最小化**（ICCCM 图标化：WM 发合成 UnmapNotify（event=本窗口），
+    /// 恢复 → MapNotify。启动期 WM reparent 也会来一串 unmap/map——
+    /// MapNotify 总会跟到，状态自愈）。主循环用它跳过绘制/呈现 + 闲置帧率。
+    minimized: bool = false,
 
     // ── 与 Windows 后端保持一致的**兼容字段** ──
     // Linux 下没有 HWND，但**填的是 X11 窗口 id**：上层（插件编辑器嵌入 / 父子窗口关系）
@@ -1009,6 +1026,12 @@ pub const X11Window = struct {
         return self.should_quit;
     }
 
+    /// 窗口是否处于**最小化**状态（由 Unmap/MapNotify 跟踪，见字段注释）。
+    /// 最小化期间主循环跳过整个绘制/呈现并按闲置帧率运转——音频与帧末逻辑照常。
+    pub fn isMinimized(self: *const X11Window) bool {
+        return self.minimized;
+    }
+
     fn push(self: *X11Window, e: Event) void {
         self.events.append(self.allocator, e) catch {};
     }
@@ -1033,6 +1056,13 @@ pub const X11Window = struct {
                 }
             },
             Expose => self.present(),
+            UnmapNotify => {
+                // 图标化（event = 本窗口才认——别的窗口的 unmap 不算）
+                if (ev.head.window == self.win) self.minimized = true;
+            },
+            MapNotify => {
+                if (ev.head.window == self.win) self.minimized = false;
+            },
             PropertyNotify => {
                 const pe = ev.property;
                 // DPI 相关属性变了 → 只置个标记（真正的重新检测在主循环，自动模式才用）
