@@ -1476,7 +1476,13 @@ pub const Engine = struct {
         const a = self.allocator;
         if (ic != self.instruments_cap) {
             const ns = try a.alloc(synth.Synth, ic);
-            for (ns) |*s| s.* = .{};
+            for (ns) |*s| {
+                s.* = .{};
+                // `voices` 字段是 `undefined`（防 .rodata 全池初值镜像，见
+                // `synth.SynthN` 注释）——**构造点必须清零**（noteOn 不写
+                // env_level/phase[o][0]，垃圾值会被渲染出来）
+                s.clearVoices();
+            }
             for (ns[0..@min(ic, self.synths.len)], 0..) |*s, i| s.* = self.synths[i];
             if (self.synths.len > 0) a.free(self.synths);
             self.synths = ns;
@@ -2214,7 +2220,10 @@ test "audio: A3b 鼓组对账——同 pad 两个实例只停被删的那个" {
 
     // 层池是**惰性分配**的（真实运行时由 App 建）——测试里自己建一个
     const kp = try alloc.create(KitPool);
-    for (kp) |*s| s.* = .{};
+    for (kp) |*s| {
+        s.* = .{};
+        s.clearVoices(); // voices 字段是 undefined——构造点必须清零
+    }
     defer alloc.destroy(kp);
     engine.kit_chunks[0].store(kp, .monotonic);
     defer engine.kit_chunks[0].store(null, .monotonic);
@@ -4407,7 +4416,10 @@ const KitTestEnv = struct {
         try self.engine.setCapacity(self.params.instruments_cap, self.params.channels_cap, self.params.slots_cap);
         // 夹具：默认分配乐器 0 的鼓组层池（用例用 `kitSynth(0, l)` 直取）
         const kp = try alloc.create(KitPool);
-        for (kp) |*s| s.* = .{};
+        for (kp) |*s| {
+            s.* = .{};
+            s.clearVoices(); // voices 字段是 undefined——构造点必须清零
+        }
         self.engine.kit_chunks[0].store(kp, .monotonic);
     }
 

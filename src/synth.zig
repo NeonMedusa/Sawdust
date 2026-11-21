@@ -297,14 +297,34 @@ pub const Voice = struct {
 /// 每池，16 层鼓组按整池算 1.36MB；小池 → 9.6KB/层。
 pub fn SynthN(comptime voice_count: usize) type {
     return struct {
-        voices: [voice_count]Voice = @splat(.{}),
+        const Self = @This();
+        /// **故意 `undefined`**（`docs/resources.md` §6.2 的初值镜像坑）：
+        /// 写成 `@splat(.{})` 会把整个“全默认声部池”（≈85KB/池）材料化进 `.rodata`
+        /// 当 memcpy 源，发布体积白涨。**代价是每个构造点必须显式清零**——
+        /// `noteOn` 不写 `env_level`/`phase[o][0]`（相位连续/包络衔接语义），
+        /// 不清零的声部会带着垃圾值渲染。
+        voices: [voice_count]Voice = undefined,
         /// 主音量平滑（防 zipper 噪声）
         smoothed_master: f32 = 0,
         /// 声部分配的轮转起点（避免每次从头扫描）
         next_voice: usize = 0,
         /// 音符序号（声部偷取时的年龄依据）
         note_counter: u64 = 0,
+
+        /// 声部池清零（`voices` 字段是 `undefined`——见其注释）。
+        /// 生产路径：`audio.setCapacity` 构造每个池后调用。
+        pub fn clearVoices(self: *Self) void {
+            @memset(self.voices[0..], .{});
+        }
     };
+}
+
+/// 全默认 + 声部池清零的便捷构造（**测试用它**；生产路径走 `setCapacity`+`clearVoices`）。
+/// 不能直接写 `Synth{}`——`voices` 是 `undefined`，不清零读到的声部是垃圾。
+pub fn synthInit() Synth {
+    var s = Synth{};
+    s.clearVoices();
+    return s;
 }
 
 /// 普通乐器声部池（复音数见 `max_voices`）
@@ -734,7 +754,7 @@ fn voiceLevelFor(state: *const Synth, pitch: u8) f32 {
 
 test "synth: 正弦振荡器输出有限且非零" {
     var p = SynthParams{};
-    var st = Synth{};
+    var st = synthInit();
     var q = EventQueue{};
     var buf: [256 * 2]f32 = undefined;
 
@@ -758,7 +778,7 @@ test "synth: 合奏——立体声展开与响度量级（增益补偿）" {
     const F = 2048;
 
     // ① 单副本（unison = 0）：居中声像 → L == R（与旧单声道实现一致）
-    var st0 = Synth{};
+    var st0 = synthInit();
     _ = noteOn(&st0, 60, 127, 0.5, -1, -1);
     var buf0: [F * 2]f32 = undefined;
     render(&p, &st0, &buf0, F, 48000, 1.0, false);
@@ -773,7 +793,7 @@ test "synth: 合奏——立体声展开与响度量级（增益补偿）" {
 
     // ② 合奏 8 副本：副本失谐 + 立体声展开 → L/R 不同；1/√copies 补偿保量级
     p.osc[0].unison.store(8, .monotonic);
-    var st1 = Synth{};
+    var st1 = synthInit();
     _ = noteOn(&st1, 60, 127, 0.5, -1, -1);
     var buf1: [F * 2]f32 = undefined;
     render(&p, &st1, &buf1, F, 48000, 1.0, false);
@@ -814,7 +834,7 @@ test "synth: 合奏散布——0% 无拍频（每窗电平恒定）、50% 明显
     var rel_spread: [2]f64 = undefined;
     for ([_]f32{ 0.0, 0.5 }, 0..) |det, di| {
         p.osc[0].unison_detune.store(det, .monotonic);
-        var st = Synth{};
+        var st = synthInit();
         _ = noteOn(&st, 45, 127, 0.5, -1, -1); // A2（110Hz）：±25c 的最外对拍频 ≈3Hz——窗内可见
         var buf: [W * 2]f32 = undefined;
         var mn: f64 = std.math.inf(f64);
@@ -867,7 +887,7 @@ test "synth: 散布功率——参数参与渲染（输出与线性不同）" {
     var bufs: [2][F * 2]f32 = undefined;
     for (powers, 0..) |pwr, bi| {
         p.osc[0].detune_power.store(pwr, .monotonic);
-        var st = Synth{};
+        var st = synthInit();
         _ = noteOn(&st, 45, 127, 0.5, -1, -1);
         render(&p, &st, &bufs[bi], F, 48000, 1.0, false);
     }
@@ -886,7 +906,7 @@ test "synth: 包络——起音到峰值、释音归零" {
     p.sustain.store(1.0, .monotonic);
     p.release.store(0.0, .monotonic); // → 1ms
 
-    var st = Synth{};
+    var st = synthInit();
     var q = EventQueue{};
     var buf: [4800 * 2]f32 = undefined; // 0.1s @ 48k
 
@@ -905,7 +925,7 @@ test "synth: 复音（和弦 = 多声部同时发声）" {
     p.attack.store(0.0, .monotonic);
     p.sustain.store(1.0, .monotonic);
 
-    var st = Synth{};
+    var st = synthInit();
     var q = EventQueue{};
     var buf: [4800 * 2]f32 = undefined;
 
@@ -927,7 +947,7 @@ test "synth: 同音高重叠——note-off FIFO（只释放最早分配的声部
     p.sustain.store(1.0, .monotonic);
     p.release.store(0.0, .monotonic); // 1ms 释音：很快归零，便于断言
 
-    var st = Synth{};
+    var st = synthInit();
     var q = EventQueue{};
     var buf: [4800 * 2]f32 = undefined;
 
@@ -955,7 +975,7 @@ test "synth: note-off 按起点步精确匹配（不误切同音高的别的实�
     p.sustain.store(1.0, .monotonic);
     p.release.store(0.0, .monotonic);
 
-    var st = Synth{};
+    var st = synthInit();
     var q = EventQueue{};
     var buf: [4800 * 2]f32 = undefined;
 
@@ -996,7 +1016,7 @@ test "synth: note-off 按起点步精确匹配（不误切同音高的别的实�
 test "synth: 快速连点 = 新声部重触发（不吞音）" {
     var p = SynthParams{};
     p.attack.store(0.5, .monotonic); // 慢起音（可观察每下从低位重起）
-    var st = Synth{};
+    var st = synthInit();
     var q = EventQueue{};
     var buf: [512 * 2]f32 = undefined;
 
@@ -1016,7 +1036,7 @@ test "synth: 声部上限与偷取（最多 max_voices）" {
     p.attack.store(0.0, .monotonic);
     p.sustain.store(1.0, .monotonic);
 
-    var st = Synth{};
+    var st = synthInit();
     var q = EventQueue{};
     var buf: [8 * 2]f32 = undefined;
 
@@ -1039,7 +1059,7 @@ test "synth: all_off 释放全部声部" {
     p.release.store(0.0, .monotonic); // 1ms 释音
     p.sustain.store(1.0, .monotonic);
 
-    var st = Synth{};
+    var st = synthInit();
     var q = EventQueue{};
     var buf: [4800 * 2]f32 = undefined;
 
@@ -1059,7 +1079,7 @@ test "synth: 噪声振荡器输出非恒定" {
     p.osc[0].volume.store(1.0, .monotonic);
     p.osc[0].waveform.store(@backingInt(Waveform.noise), .monotonic);
 
-    var st = Synth{};
+    var st = synthInit();
     var q = EventQueue{};
     var buf: [128 * 2]f32 = undefined;
     q.push(.{ .kind = .on, .pitch = 60 });
@@ -1083,7 +1103,7 @@ test "synth: 低通滤波衰减高频能量" {
 
     var buf: [4096 * 2]f32 = undefined;
 
-    var st1 = Synth{};
+    var st1 = synthInit();
     var q1 = EventQueue{};
     q1.push(.{ .kind = .on, .pitch = 69 });
     pump(&p, &st1, &q1, &buf, 4096, test_sr, 1.0);
@@ -1092,7 +1112,7 @@ test "synth: 低通滤波衰减高频能量" {
 
     p.lpf.enabled.store(true, .monotonic);
     p.lpf.cutoff.store(0.0, .monotonic); // 20Hz
-    var st2 = Synth{};
+    var st2 = synthInit();
     var q2 = EventQueue{};
     q2.push(.{ .kind = .on, .pitch = 69 });
     pump(&p, &st2, &q2, &buf, 4096, test_sr, 1.0);
@@ -1107,7 +1127,7 @@ test "synth: render(add=true) 叠加而不覆盖" {
     p.attack.store(0.0, .monotonic);
     p.sustain.store(1.0, .monotonic);
 
-    var st1 = Synth{};
+    var st1 = synthInit();
     var q1 = EventQueue{};
     var buf: [64 * 2]f32 = undefined;
 
@@ -1117,7 +1137,7 @@ test "synth: render(add=true) 叠加而不覆盖" {
     for (buf) |s| e1 += @abs(s);
 
     // 第二个声部池（同相位）叠加渲染 → 能量应约翻倍（验证 add 而非覆盖）
-    var st2 = Synth{};
+    var st2 = synthInit();
     _ = noteOn(&st2, 60, default_velocity, default_pan, -1, -1);
     render(&p, &st2, &buf, 64, test_sr, 1.0, true);
     var e2: f32 = 0;

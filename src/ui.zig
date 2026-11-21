@@ -1152,6 +1152,9 @@ pub const Ui = struct {
         min_v: f32,
         max_v: f32,
         pixels_per_unit: i32,
+        // 数值文字颜色（null = 默认）。BPM 推子用它做**“被自动化驱动 = 绿”**
+        // 的标记（与其它控件的 auto_active 绿同语义）。
+        value_color: ?Color,
     ) bool {
         const min_i: i32 = @intFromFloat(@round(min_v));
         const max_i: i32 = @intFromFloat(@round(max_v));
@@ -1196,7 +1199,7 @@ pub const Ui = struct {
         const t = std.fmt.bufPrint(&buf, "{d}.{d:0>3}", .{ iv, @abs(f3) }) catch "---";
         const tw: i32 = @intFromFloat(self.font.measure(t));
         const tx = x + @divTrunc(w - tw, 2);
-        self.font.draw(self.renderer, t, @floatFromInt(tx), @floatFromInt(self.centeredBaselineY(y, h)), self.theme.text);
+        self.font.draw(self.renderer, t, @floatFromInt(tx), @floatFromInt(self.centeredBaselineY(y, h)), value_color orelse self.theme.text);
         if (hovered or active) self.cursor = .resize_v;
         return changed;
     }

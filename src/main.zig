@@ -3023,16 +3023,20 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
     x += @as(i32, @intFromFloat(ui.font.measure("BPM"))) + 8;
     {
         const tempo_auto = app.isTargetDriven(.{ .kind = .tempo });
-        // **显示有效 BPM**（有 tempo 自动化时数字跟随曲线——用户拍板的反馈感），
-        // 但**拖/键入改的是文档值**（`bpm_doc`）：自动化挂住时数字会弹回曲线值，
-        // 那是“被曲线接管”的正常表现（见 `docs/automation.md` §11.42 已知限制）。
-        var shown: f32 = if (tempo_auto) app.bpm else app.bpm_doc;
+        // **拖动期间以文档值为基准**（它逐帧被 `setDocBpmManual` 写回 → 控件的
+        // 单帧增量能跨帧累积）。曾以曲线值为基准：`shown` 每帧从 `app.bpm` 重取，
+        // 增量式拖动每帧都被拉回“曲线值 + 单帧增量”——**推子完全推不动**（实测）。
+        // 松手后显示回到曲线值（touch 语义：曲线拥有显示），toast 讲明写去了哪里。
+        const bpm_dragging = ui.active_id == 350;
+        var shown: f32 = if (tempo_auto and !bpm_dragging) app.bpm else app.bpm_doc;
         const shown_before = shown;
         // **与以前同样的手感**：拖 8px = 1 BPM，且**只改整数位**
         // （小数由右键「输入值…」键入，如 `120.555`；推到边界时小数清零）
-        const edited = ui.dragNumberBpm(350, x, by, 56, bh, &shown, model.bpm_min, model.bpm_max, 8);
+        // 数字在被曲线驱动时**变绿**（与其它控件的 auto_active 绿同语义）。
+        const num_color: ?r_mod.Color = if (tempo_auto) ui.theme.auto_active else null;
+        const edited = ui.dragNumberBpm(350, x, by, 56, bh, &shown, model.bpm_min, model.bpm_max, 8, num_color);
         if (edited and shown != shown_before) {
-            app.setDocBpm(shown);
+            app.setDocBpmManual(shown); // 驱动中 toast 说明“改的是取消自动化后恢复的值”
             app.history_pending = "调整 BPM"; // 松手时 coalesce 提交
         }
         // **右键 → 菜单（输入值… / 自动化…）**——不再直接开自动化窗口。

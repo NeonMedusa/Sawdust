@@ -115,7 +115,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         d.fps_idle = fps_idle;
     }
     ui.label("fps", x + 228, yy + 20, ui.theme.text);
-    ui.label("（闲置 ≤ 最高；完全无事或最小化时降到闲置档，任何操作立即回满速）", x + 14, yy + 44, ui.theme.text_dim);
+    ui.label("（完全无事或最小化时降到闲置档，任何操作立即回满速）", x + 14, yy + 44, ui.theme.text_dim);
     yy += 68;
 
     // ── 数据交换：JSON 通道已于 v9 删除（存档只剩二进制 `.saw`）──

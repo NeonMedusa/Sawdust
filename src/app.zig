@@ -200,6 +200,13 @@ pub const HistoryState = struct {
     track_names: [][]u8,
     /// 静音轨道快照（排序行号列表；静态释放）——静音切换也要能撤销
     track_muted: []i32,
+    /// `notes`/`clips` 的**共享计数**（null = 独占）。
+    /// 连续提交之间这两个大数组通常不变（改的是 EQ/曲线/参数……），逐条全量拷贝
+    /// 会让 128 步历史在万音符工程上放大到数十 MB——内容与上一条**逐字节相同**时
+    /// 直接共享（计数 +1），释放走计数。**捕获后无原地改写**（`param_edits` 才会被
+    /// 原地 pin，它不共享）→ 共享安全。
+    notes_refs: ?*u32 = null,
+    clips_refs: ?*u32 = null,
     /// 乐器**显示顺序**快照（行 → 物理槽位）——上移/下移乐器也要能撤销/标脏
     instrument_order: []u32 = &.{},
     bpm: f32 = 120,
@@ -7042,7 +7049,10 @@ pub const App = struct {
         if (i >= self.instruments.items.len) return;
         if (self.instruments.items[i].kit == null) return;
         const kp = self.allocator.create(audio.KitPool) catch return;
-        for (kp) |*s| s.* = .{};
+        for (kp) |*s| {
+            s.* = .{};
+            s.clearVoices(); // voices 字段是 undefined（防 .rodata 初值镜像）——构造点必须清零
+        }
         self.engine.kit_chunks[i].store(kp, .release);
     }
 
@@ -8119,10 +8129,46 @@ pub const App = struct {
         return self.history.items[self.history_current].label;
     }
 
+    /// 共享段释放：计数非空 → 减到 0 才真正释放（见 `HistoryState.notes_refs` 注释）。
+    /// 不加 `len > 0` 守卫——`alloc(T, 0)` 也要配对 `free`（测试分配器纪律）。
+    fn releaseSeg(self: *App, comptime T: type, data: []T, refs: ?*u32) void {
+        if (refs) |r| {
+            r.* -= 1;
+            if (r.* != 0) return;
+            self.allocator.destroy(r);
+        }
+        self.allocator.free(data);
+    }
+
+    /// 捕获时与上一条**逐字节相同**的大段 → 直接共享（丢掉刚拷的这份；上一条
+    /// 原先是独占的 → 就地物化计数）。**返回 error 只在 OOM**——此时 `fresh`
+    /// 仍归调用方（由 errdefer 释放），本函数不会半途吞掉它。
+    fn shareSeg(
+        self: *App,
+        comptime T: type,
+        fresh: []T,
+        prev_data: []T,
+        prev_refs: *?*u32,
+    ) !struct { data: []T, refs: ?*u32 } {
+        if (prev_data.len == fresh.len and std.mem.eql(u8, std.mem.sliceAsBytes(prev_data), std.mem.sliceAsBytes(fresh))) {
+            if (prev_refs.*) |r| {
+                r.* += 1;
+                self.allocator.free(fresh);
+                return .{ .data = prev_data, .refs = r };
+            }
+            const r = try self.allocator.create(u32);
+            r.* = 2;
+            prev_refs.* = r;
+            self.allocator.free(fresh);
+            return .{ .data = prev_data, .refs = r };
+        }
+        return .{ .data = fresh, .refs = null };
+    }
+
     fn freeHistoryState(self: *App, st: *const HistoryState) void {
         self.allocator.free(st.label);
-        self.allocator.free(st.notes);
-        self.allocator.free(st.clips);
+        self.releaseSeg(model.Note, st.notes, st.notes_refs);
+        self.releaseSeg(model.Clip, st.clips, st.clips_refs);
         self.allocator.free(st.instrument_order);
         // 注：**不要**加 `if (len > 0)`——`alloc(T, 0)` 也必须配对 `free`
         // （测试分配器会把 0 长度分配记为泄漏）
@@ -8593,10 +8639,29 @@ pub const App = struct {
     fn captureHistory(self: *App, label: []const u8) !HistoryState {
         const label_copy = try self.allocator.dupe(u8, label);
         errdefer self.allocator.free(label_copy);
-        const notes = try self.allocator.dupe(model.Note, self.notes.items);
-        errdefer self.allocator.free(notes);
-        const clips = try self.allocator.dupe(model.Clip, self.clips.items);
-        errdefer self.allocator.free(clips);
+        // notes/clips：先全量拷出，再尝试与上一条**逐字节共享**（连续提交间大多不变，
+        // 见 `HistoryState.notes_refs`）。errdefer 统一走 releaseSeg：
+        // 独占 = 释放；已共享 = 减计数（err 路径下共享段由上一条继续持有，安全）。
+        const notes_fresh = try self.allocator.dupe(model.Note, self.notes.items);
+        var notes: []model.Note = notes_fresh;
+        var notes_refs: ?*u32 = null;
+        errdefer self.releaseSeg(model.Note, notes, notes_refs);
+        if (self.history.items.len > 0 and self.history_current < self.history.items.len) {
+            const prev = &self.history.items[self.history_current];
+            const seg = try self.shareSeg(model.Note, notes_fresh, prev.notes, &prev.notes_refs);
+            notes = seg.data;
+            notes_refs = seg.refs;
+        }
+        const clips_fresh = try self.allocator.dupe(model.Clip, self.clips.items);
+        var clips: []model.Clip = clips_fresh;
+        var clips_refs: ?*u32 = null;
+        errdefer self.releaseSeg(model.Clip, clips, clips_refs);
+        if (self.history.items.len > 0 and self.history_current < self.history.items.len) {
+            const prev = &self.history.items[self.history_current];
+            const seg = try self.shareSeg(model.Clip, clips_fresh, prev.clips, &prev.clips_refs);
+            clips = seg.data;
+            clips_refs = seg.refs;
+        }
         const insts = try self.allocator.alloc(persist.SavedInstrument, self.instruments.items.len);
         var n: usize = 0;
         errdefer {
@@ -8664,6 +8729,8 @@ pub const App = struct {
             .label = label_copy,
             .notes = notes,
             .clips = clips,
+            .notes_refs = notes_refs,
+            .clips_refs = clips_refs,
             .instruments = insts,
             .mixer = mixer,
             .audio_styles = astyles,
@@ -8693,12 +8760,18 @@ pub const App = struct {
             // 力度/声像也要比较——否则改力度被判为“无变化”，静默丢弃历史条目
             // （与 ADSR 同一个坑：调了值但不产生历史）
             if (a.velocity != b.velocity or a.pan != b.pan) return false;
+            // **静音也要比较**——否则纯切换音符静音（Ctrl+M）被判“无变化”：
+            // 不但不产生历史条目（无法撤销），连**脏标记都不置**——静音后退出
+            // 不弹保存确认，重开即丢
+            if (a.muted != b.muted) return false;
         }
         for (st.clips, self.clips.items) |a, b| {
             if (a.track != b.track or a.start != b.start or a.len != b.len or
                 a.pattern != b.pattern or a.offset != b.offset) return false;
             // 音频片段字段（样式引用/trim）也要比较——否则粗剪/换源被判“无变化”
             if (a.audio_style != b.audio_style or a.trim_start != b.trim_start or a.trim_len != b.trim_len) return false;
+            // 同上：**片段静音**（Ctrl+M）不能被判“无变化”
+            if (a.muted != b.muted) return false;
         }
         // **乐器显示顺序**——否则"上移/下移乐器"会被判成"无变化"而不进历史、不标脏
         if (st.instrument_order.len != self.order.items.len) return false;
@@ -11159,6 +11232,18 @@ pub const App = struct {
         if (!self.isTargetDriven(.{ .kind = .tempo })) self.bpm = self.bpm_doc;
     }
 
+    /// 手动改 BPM 的**用户入口**（工具栏拖动 / 右键键入；历史恢复走 `setDocBpm` 不提示）。
+    /// 驱动中曲线拥有有效值与显示——这次写改变的是“**取消自动化后恢复到的值**”，
+    /// toast 把这个暗写讲明白（否则拖完数字弹回曲线值，用户以为操作完全没生效，
+    /// 实测反馈就是“BPM 推子是坏的”）。拖动中每帧刷新同一条 toast（值跟手），
+    /// 松手后正常计时消失。
+    pub fn setDocBpmManual(self: *App, v: f32) void {
+        self.setDocBpm(v);
+        if (self.isTargetDriven(.{ .kind = .tempo })) {
+            self.setToastWith("BPM 文档值 → {d}（当前由自动化曲线驱动，取消链接后生效）", .{self.bpm_doc});
+        }
+    }
+
     /// 播放中的**小数步位置**（子步精度；未播放或域不匹配时 = 整数步）。
     /// 游标绘制与视角跟随用——整数步在屏幕上是 5px×zoom 的阶梯：播放中每步
     /// “跳一下再被平滑滚动回拉”形成锯齿抖动（实测“游标很抖”，放大时尤其明显）。
@@ -11999,7 +12084,7 @@ pub const App = struct {
                 const v = std.fmt.parseFloat(f32, val) catch return;
                 const nv = std.math.clamp(v, model.bpm_min, model.bpm_max);
                 if (@abs(nv - self.bpm_doc) > 0.0005) {
-                    self.setDocBpm(nv);
+                    self.setDocBpmManual(nv); // 驱动中给出“改的是恢复值”的提示
                     self.commitHistory("调整 BPM");
                 }
             },
@@ -13869,6 +13954,128 @@ test "app: 同内容提交不换代（自动化曲线类编辑不扰动音频）
     try std.testing.expectEqual(gen0 + 1, app.params.snap_gen.load(.monotonic));
     try std.testing.expect(app.params.snapshot_ptr.load(.monotonic) != 0);
     try std.testing.expectEqual(insts0 + 1, app.snap_slots[app.snap_active].?.insts.len);
+}
+
+test "app: 纯切静音也进历史并置脏（曾被判“无变化”：不可撤销 + 不弹保存确认）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.addNote(.{ .step = 0, .len = 8, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.addClip(.{ .track = 0, .start = 0, .len = 96, .pattern = 0 });
+    app.resetHistory("初始状态");
+    try std.testing.expectEqual(@as(usize, 1), app.history.items.len);
+    app.dirty = false; // resetHistory 不置脏——从“干净”出发测
+
+    // ① 音符静音（唯一改动就是 muted）→ 必须产生条目 + 置脏
+    app.notes.items[0].muted = true;
+    app.commitHistory("音符静音");
+    try std.testing.expectEqual(@as(usize, 2), app.history.items.len);
+    try std.testing.expect(app.dirty);
+    // 撤销 → 静音恢复 false
+    try std.testing.expect(app.undo());
+    try std.testing.expect(!app.notes.items[0].muted);
+    // 重做 → 又静音
+    try std.testing.expect(app.redo());
+    try std.testing.expect(app.notes.items[0].muted);
+
+    // ② 片段静音同理
+    app.clips.items[0].muted = true;
+    app.commitHistory("片段静音");
+    try std.testing.expectEqual(@as(usize, 3), app.history.items.len);
+    try std.testing.expect(app.undo());
+    try std.testing.expect(!app.clips.items[0].muted);
+    try std.testing.expect(app.redo());
+    try std.testing.expect(app.clips.items[0].muted);
+}
+
+test "app: BPM 手动写（曲线驱动中）改的是恢复值并提示；历史恢复不提示" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    // 挂一条有内容的 tempo 曲线 → isTargetDriven
+    try app.auto_curves.append(app.allocator, .{ .id = 77 });
+    const lc = &app.auto_curves.items[0];
+    try lc.points.append(app.allocator, .{ .step = 0, .value = 0.5 });
+    try app.auto_bindings.append(app.allocator, .{ .curve_id = 77, .target = .{ .kind = .tempo } });
+    try std.testing.expect(app.isTargetDriven(.{ .kind = .tempo }));
+
+    // 驱动中：有效值归曲线（applyTempoAt 会按曲线写），手动写只动文档值
+    app.bpm = 123.25;
+    app.setDocBpmManual(140);
+    try std.testing.expectEqual(@as(f32, 140), app.bpm_doc);
+    try std.testing.expectEqual(@as(f32, 123.25), app.bpm); // 有效值未被手动写覆盖
+    try std.testing.expect(app.toast != null); // “暗写”被讲明
+
+    // 历史恢复路径（applyHistoryState 用 setDocBpm）：同样只动文档值，但**不提示**
+    app.clearToast();
+    app.setDocBpm(150);
+    try std.testing.expectEqual(@as(f32, 150), app.bpm_doc);
+    try std.testing.expectEqual(@as(f32, 123.25), app.bpm);
+    try std.testing.expect(app.toast == null);
+
+    // 无曲线时：手动写直接生效（原行为不变）
+    _ = app.removeAutoCurve(77);
+    app.setDocBpmManual(160);
+    try std.testing.expectEqual(@as(f32, 160), app.bpm_doc);
+    try std.testing.expectEqual(@as(f32, 160), app.bpm);
+    try std.testing.expect(app.toast == null); // 没有曲线就没有“暗写”，不提示
+}
+
+test "app: 历史大段共享——内容不变时 notes/clips 引用同一份（内存放大消除）" {
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.addNote(.{ .step = 0, .len = 8, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.addClip(.{ .track = 0, .start = 0, .len = 96, .pattern = 0 });
+    app.resetHistory("初始状态"); // history[0]：独占
+    const n0 = app.history.items[0].notes.ptr;
+    const c0 = app.history.items[0].clips.ptr;
+
+    // ① 不碰音符/片段的编辑（比如调乐器音量）→ 与上一条共享
+    app.instruments.items[0].volume = 0.6;
+    app.commitHistory("调音量");
+    try std.testing.expectEqual(@as(usize, 2), app.history.items.len);
+    try std.testing.expectEqual(n0, app.history.items[1].notes.ptr); // 同一份内存
+    try std.testing.expectEqual(c0, app.history.items[1].clips.ptr);
+    try std.testing.expect(app.history.items[0].notes_refs != null);
+    try std.testing.expectEqual(@as(u32, 2), app.history.items[0].notes_refs.?.*);
+
+    // ② 撤销/重做穿过共享条目照常工作
+    try std.testing.expect(app.undo());
+    try std.testing.expectEqual(@as(f32, 0.75), app.instruments.items[0].volume);
+    try std.testing.expect(app.redo());
+    try std.testing.expectEqual(@as(f32, 0.6), app.instruments.items[0].volume);
+
+    // ③ 再来一条不变提交 → 三条共享同一份
+    app.instruments.items[0].pan = 0.3;
+    app.commitHistory("调声像");
+    try std.testing.expectEqual(n0, app.history.items[2].notes.ptr);
+    try std.testing.expectEqual(@as(u32, 3), app.history.items[0].notes_refs.?.*);
+
+    // ④ 真改了音符 → 新条目自己持有一份（不共享），旧链计数不受影响
+    app.notes.items[0].pitch = 64;
+    app.commitHistory("改音高");
+    try std.testing.expect(app.history.items[3].notes.ptr != n0);
+    try std.testing.expectEqual(@as(u32, 3), app.history.items[0].notes_refs.?.*); // 旧链还是 3 条共享
+
+    // ⑤ 撤销回共享段 → 取到的内容正确（共享不是“共用脏数据”）
+    try std.testing.expect(app.undo());
+    try std.testing.expectEqual(@as(i32, 60), app.notes.items[0].pitch);
+
+    // ⑥ redo 尾巴截断（跨共享条目的 pop）→ 计数正确回收（deinitAll 的
+    //    测试分配器兜底：多释放/泄漏都会报）
 }
 
 test "app: 切 SONG/PAT 与换样式 → 快照必须重建（否则听到的还是旧内容）" {
