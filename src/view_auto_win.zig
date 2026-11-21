@@ -70,14 +70,6 @@ pub fn draw(ui: *Ui, app: *App) void {
     const x = win.x;
     const y = win.y;
 
-    // 窗口底 + 边框 + 标题栏
-    ui.renderer.fillRect(x, y, w, h, ui.theme.panel);
-    ui.renderer.strokeRect(x, y, w, h, ui.theme.accent);
-    ui.renderer.fillRect(x + 1, y + 1, w - 2, util.title_h - 1, ui.theme.toolbar);
-    // **不要整窗登记 `noteOverlayRect`**：那张表是给菜单/弹层用的，
-    // `syncEmbeddedEditor` 拿 `overlay_n != 0` 直接禁掉插件子窗口（输入闸门）→
-    // 一开自动化窗口，插件的 GUI 就点不动了。窗口遮挡走 `win_draw_info`。
-
     // 标题缓冲要够大：`{乐器名} · {参数名}`（插件参数）或 `通道12 · 声像`
     // ——旧版本这里是 `[32]`，VST 参数拼接一超长就 `catch "插件参数"`
     // （实测：标题永远只剩“插件参数”）。
@@ -94,11 +86,21 @@ pub fn draw(ui: *Ui, app: *App) void {
         const tname = targetName(app, win.target, &nm);
         break :blk std.fmt.bufPrint(&tb, "自动化 · {s}", .{tname}) catch "自动化";
     };
-    // 中段省略：名字太长时保留两头（“自动化” + 参数名）
-    ui.labelMiddle(title, x + 8, y + 4, w - 40, ui.theme.text);
 
-    // 关闭按钮（全项目统一：`util.titleCloseButton`）
-    if (util.titleCloseButton(ui, x, y, w, util.title_h)) win.open = false;
+    // ── 窗口外壳（共享 `util.windowChrome`；本窗口不可缩放、拖动 id 沿用哈希 id）──
+    // **不要整窗登记 `noteOverlayRect`**：那张表是给菜单/弹层用的，
+    // `syncEmbeddedEditor` 拿 `overlay_n != 0` 直接禁掉插件子窗口（输入闸门）→
+    // 一开自动化窗口，插件的 GUI 就点不动了。窗口遮挡走 `win_draw_info`。
+    {
+        var rs_w0: i32 = 0; // 缩放快照占位（本窗口不可缩放，只是传参）
+        var rs_h0: i32 = 0;
+        var rs_mx: i32 = 0;
+        var rs_my: i32 = 0;
+        if (util.windowChrome(ui, Ui.idOf("auto_win_title", 0), 0, title, util.title_h, 24, &win.x, &win.y, &w, &h, &win.drag_dx, &win.drag_dy, &rs_w0, &rs_h0, &rs_mx, &rs_my, false)) {
+            win.open = false;
+            return;
+        }
+    }
 
     // ── 状态行 ──
     // `by_target`：基准值 + 游标处合成值。**基准 = 绑定自己设的 `base`；没设 → 静态推子/旋钮值**
@@ -257,22 +259,6 @@ pub fn draw(ui: *Ui, app: *App) void {
             }
             const link_btn = Rect{ .x = bx2, .y = by, .w = bw2, .h = 22 };
             if (win.pick_open) drawPickList(ui, app, x, by - 6, w, link_btn);
-        }
-    }
-
-    // 拖标题栏移动（按下记“鼠标 − 窗口左上”的偏移；按住期间反算）
-    {
-        const id = Ui.idOf("auto_win_title", 0);
-        if (util.hitUI(ui, x, y, w - 24, util.title_h) and ui.mouse_pressed) {
-            ui.active_id = id;
-            win.drag_dx = ui.mouse_x - win.x;
-            win.drag_dy = ui.mouse_y - win.y;
-        }
-        if (ui.active_id == id) {
-            if (ui.mouse_down) {
-                win.x = ui.mouse_x - win.drag_dx;
-                win.y = ui.mouse_y - win.drag_dy;
-            } else ui.active_id = 0;
         }
     }
 
@@ -442,25 +428,11 @@ fn drawRowCtxMenu(ui: *Ui, app: *App) void {
     const menu_h: i32 = @as(i32, @intCast(n_items)) * util.menu_item_h + 4;
     // **夹回窗口内**：菜单不能被窗口边缘截断，也不能跑到窗口外
     // （窗口层是 NoClip 绘制、输入屏蔽只按窗口矩形——跑出去会“看得见但点不到”，
-    //  更糟的是点到下面的视图）
-    const mx = std.math.clamp(win.ctx_x, win.x + 4, win.x + W - menu_w - 4);
-    const my = std.math.clamp(win.ctx_y, win.y + util.title_h + 2, win.y + H - menu_h - 4);
-    ui.renderer.fillRect(mx, my, menu_w, menu_h, ui.theme.panel);
-    ui.renderer.strokeRect(mx, my, menu_w, menu_h, ui.theme.accent);
-    ui.noteOverlayRect(mx, my, menu_w, menu_h);
-
-    var clicked: ?usize = null;
-    var inside = false;
-    for (items[0..n_items], 0..) |it, k| {
-        const iy = my + 2 + @as(i32, @intCast(k)) * util.menu_item_h;
-        const hov = util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, menu_w - 2, util.menu_item_h);
-        if (hov) {
-            inside = true;
-            ui.renderer.fillRect(mx + 1, iy, menu_w - 2, util.menu_item_h, ui.theme.item_hover);
-        }
-        ui.label(it, mx + 8, iy + 2, ui.theme.text);
-        if (hov and ui.mouse_pressed) clicked = k;
-    }
+    //  更糟的是点到下面的视图）。钳制用局部变量传给 `menuPanel`（保留每帧钳制语义）。
+    var mx = std.math.clamp(win.ctx_x, win.x + 4, win.x + W - menu_w - 4);
+    var my = std.math.clamp(win.ctx_y, win.y + util.title_h + 2, win.y + H - menu_h - 4);
+    var open = true;
+    const clicked = util.menuPanel(ui, &mx, &my, &open, false, .{ .cursor = {} }, .{ .x = win.x, .y = win.y, .w = W, .h = H }, items[0..n_items], menu_w, null);
     if (clicked) |k| {
         if (k == 0) {
             // 恢复默认值
@@ -522,7 +494,8 @@ fn drawRowCtxMenu(ui: *Ui, app: *App) void {
         }
         win.ctx_row = null;
         win.ctx_field = .none;
-    } else if (ui.mouse_pressed and !inside and !util.inRect(ui.mouse_x, ui.mouse_y, mx, my, menu_w, menu_h)) {
+    } else if (!open) {
+        // 点菜单外 → 关闭（`menuPanel` 已判定）
         win.ctx_row = null;
         win.ctx_field = .none;
     }

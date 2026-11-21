@@ -319,6 +319,10 @@ pub const AutoTableState = struct {
     /// 上次画的目标（`App.slotRefKey`）：换目标 → 滚动/搜索复位
     last_key: u64 = 0,
     scroll: i32 = 0,
+    /// **上一帧实测的内容高**（画完后由 `view_vst_auto.drawBody` 回填）。
+    /// 滚动界与滚动条都跟它走——曾经用手工公式估高，与实际绘制漂移
+    /// （外层组头没算进/MIDI 段折叠口径不一致），实测“滚到底还差一两条”。
+    drawn_h: i32 = 0,
     midi_fold: bool = false,
     vst_fold: bool = false,
     filter_len: usize = 0,
@@ -1542,7 +1546,52 @@ pub const App = struct {
     /// 已退役但音频线程可能仍在读的快照（帧倒计时后 `deinit + destroy`）
     pub const RetiredSnap = struct { snap: *snapshot.Snapshot, frames: u16 };
 
-    /// **A2**：每帧调用——回收退役快照；若数据脏则重建并发布新快照（影子对拍用，未接主路）。
+    /// 调度内容指纹：把 `snapshot.build` 会读到的**全部**输入压成一个 64 位值。
+    /// 与 `laneSignature` 同款 FNV-1a 64（只要求“变了就不同”，不防碰撞攻击）。
+    /// 覆盖清单（与 `snapshot.build` 的读取一一对应）：
+    /// - 域开关 `sel.song_mode` + PAT 选中样式 `sel.pattern`；
+    /// - 片段：`audio_style`（isAudio）/`track`/`start`/`len`/`pattern`/`offset`/`muted`，
+    ///   以及（SONG）该片段所在轨道是否在静音集里——`build` 只经 `clip.track` 消费
+    ///   `track_muted`，所以按片段混入“是否静音”就是它的完整效应；
+    /// - 音符：`pattern`/`step`/`len`/`pitch`/`instrument`/`velocity`/`pan`/`muted`。
+    /// 数组**顺序敏感**（重排 = 指纹变化 → 多重建一次，安全方向：宁可多建不可漏建）。
+    fn schedSourceHash(self: *const App) u64 {
+        const mix = struct {
+            fn f(x: u64, v: u64) u64 {
+                return (x ^ v) *% 0x100000001b3;
+            }
+        }.f;
+        var h: u64 = 0xcbf29ce484222325;
+        h = mix(h, self.clips.items.len);
+        h = mix(h, self.notes.items.len);
+        h = mix(h, @intFromBool(self.sel.song_mode));
+        h = mix(h, @as(u64, @as(u32, @bitCast(self.sel.pattern))));
+        const song = self.sel.song_mode;
+        for (self.clips.items) |c| {
+            h = mix(h, @as(u32, @bitCast(c.audio_style)));
+            h = mix(h, @as(u32, @bitCast(c.track)));
+            h = mix(h, @as(u32, @bitCast(c.start)));
+            h = mix(h, @as(u32, @bitCast(c.len)));
+            h = mix(h, @as(u32, @bitCast(c.pattern)));
+            h = mix(h, @as(u32, @bitCast(c.offset)));
+            h = mix(h, @intFromBool(c.muted));
+            if (song) h = mix(h, @intFromBool(self.track_muted.contains(c.track)));
+        }
+        for (self.notes.items) |nt| {
+            h = mix(h, @as(u32, @bitCast(nt.pattern)));
+            h = mix(h, @as(u32, @bitCast(nt.step)));
+            h = mix(h, @as(u32, @bitCast(nt.len)));
+            h = mix(h, @as(u32, @bitCast(nt.pitch)));
+            h = mix(h, @as(u32, @bitCast(nt.instrument)));
+            h = mix(h, @as(u32, @bitCast(nt.velocity)));
+            h = mix(h, @as(u32, @bitCast(nt.pan)));
+            h = mix(h, @intFromBool(nt.muted));
+        }
+        return h;
+    }
+
+    /// 每帧调用——回收退役快照；若**调度内容指纹**变了则重建并发布新快照
+    /// （内容没变的置脏提交被门控跳过，见 `schedSourceHash`）。
     pub fn pollSnapshotRebuild(self: *App) void {
         var i: usize = 0;
         while (i < self.snap_retired.items.len) {
@@ -1559,6 +1608,18 @@ pub const App = struct {
         // 否则切到 PAT 后播的还是 SONG 的时间轴（实测：钢琴窗显示样式2、响的是样式1）。
         const stale_scope = self.snap_mode != self.sel.song_mode or self.snap_pattern != self.sel.pattern;
         if (!self.snap_dirty and !stale_scope) return;
+        // **内容门控**：`snap_dirty` 只说明“某条路径拍过脏标”，不保证调度内容真的变了。
+        // 指纹与最近一次发布一致（曲线/EQ/设置类提交、以及导出循环里的逐块置脏）→
+        // **不重建、不发布、不换代**——音频线程的 stash 与声部对账状态保持不动，
+        // “编辑/导出瞬间扰动在响声部”的空转从源头消失。
+        const fp = self.schedSourceHash();
+        if (self.snap_fp_ok and fp == self.snap_fp_pub) {
+            self.snap_dirty = false;
+            // 域/样式记账照样推进（否则同指纹下每帧都会重算一遍哈希）
+            self.snap_mode = self.sel.song_mode;
+            self.snap_pattern = self.sel.pattern;
+            return;
+        }
         self.snap_dirty = false;
 
         // 先退役“当前活动”的旧快照（音频可能还在读它 → 30 帧后 deinit + destroy）
@@ -1585,6 +1646,7 @@ pub const App = struct {
             &self.track_muted,
         ) catch {
             self.params.snapshot_ptr.store(0, .release);
+            self.snap_fp_ok = false; // 音频侧已无快照 → 下次不能靠指纹跳过
             return;
         };
         // **快照必须堆分配**：旧实现把 `Snapshot` **值**存在 `snap_slots` 里，发布的是
@@ -1596,6 +1658,7 @@ pub const App = struct {
             var tmp = built;
             tmp.deinit();
             self.params.snapshot_ptr.store(0, .release);
+            self.snap_fp_ok = false; // 同上
             return;
         };
         box.* = built;
@@ -1609,6 +1672,9 @@ pub const App = struct {
         // 一律丢弃并按新快照重发本块（否则编辑掉的事件还会先响一下：实测 1 次/整场）。
         self.params.snapshot_ptr.store(sp, .release);
         _ = self.params.snap_gen.fetchAdd(1, .monotonic);
+        // 记下这次发布对应的**内容指纹**（供上面的门控比对）
+        self.snap_fp_pub = fp;
+        self.snap_fp_ok = true;
     }
 
     /// 一次调度的耗时与事件数统计（A0：给 Pull 模型改造提供对比基线）
@@ -1825,6 +1891,17 @@ pub const App = struct {
     snap_retired: std.ArrayListUnmanaged(RetiredSnap) = .empty,
     /// 影子对拍统计（最近一次发布时的实例数，便于对照）
     snap_insts: usize = 0,
+    /// **调度内容指纹**（最近一次**发布**的快照所对应的输入内容）。
+    /// `pollSnapshotRebuild` 用它做“内容没变就不重建/不发布/不换代”的门控——
+    /// 曲线/EQ/设置这类**不碰音符**的编辑提交也会置 `snap_dirty`，但它们重建出的
+    /// 快照与在用的一份完全相同：换代只会让音频线程空转一次（清 stash + 对账 +
+    /// 重发本块），既是纯浪费，也是“编辑瞬间扰动在响声部”的来源。
+    /// ⚠️ 指纹必须覆盖 `snapshot.build` 读到的**全部**输入——改 `build` 或模型字段时
+    /// 同步更新 `schedSourceHash`（漏一个 = 那个字段的编辑不再生效）。
+    snap_fp_pub: u64 = 0,
+    /// 音频侧当前是否有**与指纹对应的**有效快照（store(0) 失败路径要清掉，
+    /// 否则下次会靠“指纹没变”跳过重建 → 音频永远没有快照）。
+    snap_fp_ok: bool = false,
 
     // ── 选区与批量操作（框选/剪贴板；瞬态，不存档）──
     /// 待执行的编辑操作（键盘快捷键只登记；由当前视图按上下文执行并清除）
@@ -2135,6 +2212,11 @@ pub const App = struct {
     /// 目前只有钢琴窗 minimap 的预览缓存靠它判断“要不要重建”
     /// （以前每帧全量扫 `notes`，见 `docs/resources.md` §四第 8 条）。
     notes_ver: u64 = 0,
+    /// 样式内容末尾缓存（`patternEndStepCached` 用）：key = (notes_ver, pattern)。
+    /// 每帧调用方（PAT 自动循环的回跳判定、钢琴窗时间轴宽度）共用——notes 没变就不重扫。
+    pat_end_ver: u64 = 0,
+    pat_end_pattern: i32 = -1,
+    pat_end_value: i32 = 0,
 
     // ── 方法 ──
 
@@ -10523,6 +10605,18 @@ pub const App = struct {
         return last;
     }
 
+    /// `patternEndStep` 的**缓存版**：同一 (notes_ver, pattern) 只真扫一遍。
+    /// 供每帧路径用（PAT 自动循环的回跳判定、钢琴窗时间轴宽度）——
+    /// 稳态（不编辑音符）下从 O(全部音符)/帧 变成 O(1)/帧。
+    pub fn patternEndStepCached(self: *App, pattern: i32) i32 {
+        if (self.pat_end_ver != self.notes_ver or self.pat_end_pattern != pattern) {
+            self.pat_end_value = self.patternEndStep(pattern);
+            self.pat_end_ver = self.notes_ver;
+            self.pat_end_pattern = pattern;
+        }
+        return self.pat_end_value;
+    }
+
     /// 指定样式的**有效长度**（步）：按拍号向上取整到小节倍数，至少 1 小节。
     /// 供播放列表“放置片段”的默认长度用（内容 2.5 小节 → 放 3 小节）。
     pub fn patternEffectiveLen(self: *const App, pattern: i32) i32 {
@@ -11138,8 +11232,9 @@ pub const App = struct {
         }
         // ② 自动循环：超过内容末尾
         //    SONG：**最后一个片段的右缘**（不论有无音符；空片段也播完整段）；
-        //    PAT：样式内音符末尾。都为 0（无内容）→ 以一小节为限（防无限右跑）。
-        const end: i32 = if (song_mode) self.clipsEndStep() else self.contentEndStep();
+        //    PAT：样式内音符末尾（**缓存版**——每帧路径，notes 没变就不重扫）。
+        //    都为 0（无内容）→ 以一小节为限（防无限右跑）。
+        const end: i32 = if (song_mode) self.clipsEndStep() else self.patternEndStepCached(self.sel.pattern);
         const limit: i32 = if (end > 0) end else self.steps_per_bar;
         if (cur >= limit) {
             self.jumpPlaybackCursor(0);
@@ -13689,9 +13784,12 @@ test "app: 快照连续重建——发布地址不复用（防“新 by_start + 
     const n1_insts = p1.insts.len;
     try std.testing.expect(n1_start_idx > 0 and n1_by_start > 0);
 
-    // 连续重建两次（模拟 UI 两帧内两次脏）
+    // 连续重建两次（模拟一帧内两次**真编辑**——同内容的脏标会被内容门控跳过，
+    // 见 `schedSourceHash`；这里每次都加一个音符，强制走重建路径）
+    try app.notes.append(app.allocator, .{ .step = 32, .len = 8, .pitch = 67, .pattern = 0, .instrument = 0 });
     app.snap_dirty = true;
     app.pollSnapshotRebuild();
+    try app.notes.append(app.allocator, .{ .step = 48, .len = 8, .pitch = 69, .pattern = 0, .instrument = 0 });
     app.snap_dirty = true;
     app.pollSnapshotRebuild();
 
@@ -13710,6 +13808,63 @@ test "app: 快照连续重建——发布地址不复用（防“新 by_start + 
     var i: usize = 0;
     while (i < 32) : (i += 1) app.pollSnapshotRebuild();
     try std.testing.expectEqual(@as(usize, 0), app.snap_retired.items.len);
+}
+
+test "app: 同内容提交不换代（自动化曲线类编辑不扰动音频）" {
+    // `commitHistory` 无条件置 `snap_dirty`；曲线/EQ/设置类编辑**不进调度内容指纹**
+    // → 门控必须让这类提交零重建、零发布、零换代——音频线程的 stash 与声部
+    // 对账状态保持不动（“调曲线/调 EQ 瞬间扰动在响声部”的空转源头）。
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(model.default_pattern_count);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    try app.notes.append(app.allocator, .{ .step = 0, .len = 8, .pitch = 60, .pattern = 0, .instrument = 0 });
+    app.sel.song_mode = false; // PAT：快照输入 = 选中样式的全部音符
+    app.sel.pattern = 0;
+
+    app.resetHistory("初始状态"); // 基线（history[0]）
+    app.pollSnapshotRebuild(); // 首建（snap_fp_ok=false → 必然发布）
+    try std.testing.expect(app.params.snapshot_ptr.load(.monotonic) != 0);
+    const gen0 = app.params.snap_gen.load(.monotonic);
+    const ptr0 = app.params.snapshot_ptr.load(.monotonic);
+    const insts0 = app.snap_slots[app.snap_active].?.insts.len;
+    try std.testing.expect(insts0 > 0);
+
+    // ① 曲线类编辑：新增一条自动化曲线 + 加一个点（不碰音符/片段/静音）→ 提交
+    try app.auto_curves.append(app.allocator, .{ .id = 1, .target = .{ .kind = .inst_vol, .uid = 1 } });
+    const lane = &app.auto_curves.items[0];
+    try lane.points.append(app.allocator, .{ .step = 0, .value = 0.4 });
+    lane.touch();
+    app.commitHistory("调整自动化曲线");
+    try std.testing.expect(app.snap_dirty); // 脏标确实被拍下
+    app.pollSnapshotRebuild();
+    try std.testing.expectEqual(gen0, app.params.snap_gen.load(.monotonic)); // 代不递增
+    try std.testing.expectEqual(ptr0, app.params.snapshot_ptr.load(.monotonic)); // 指针不换
+    try std.testing.expectEqual(@as(usize, 0), app.snap_retired.items.len); // 旧快照不退役
+    try std.testing.expectEqual(@as(usize, 2), app.history.items.len); // 但历史条目照常产生（曲线编辑可撤销）
+
+    // ② 曲线点再改一下 → 同样零动作
+    lane.points.items[0].value = 0.6;
+    lane.touch();
+    app.commitHistory("调整自动化曲线");
+    app.pollSnapshotRebuild();
+    try std.testing.expectEqual(gen0, app.params.snap_gen.load(.monotonic));
+
+    // ③ 撤销 ②（曲线回到 0.4）→ 仍不换代
+    try std.testing.expect(app.undo());
+    app.pollSnapshotRebuild();
+    try std.testing.expectEqual(gen0, app.params.snap_gen.load(.monotonic));
+
+    // ④ 真编辑（加音符）→ 必须换代 + 内容更新
+    try app.notes.append(app.allocator, .{ .step = 16, .len = 8, .pitch = 64, .pattern = 0, .instrument = 0 });
+    app.commitHistory("放置音符");
+    app.pollSnapshotRebuild();
+    try std.testing.expectEqual(gen0 + 1, app.params.snap_gen.load(.monotonic));
+    try std.testing.expect(app.params.snapshot_ptr.load(.monotonic) != 0);
+    try std.testing.expectEqual(insts0 + 1, app.snap_slots[app.snap_active].?.insts.len);
 }
 
 test "app: 切 SONG/PAT 与换样式 → 快照必须重建（否则听到的还是旧内容）" {

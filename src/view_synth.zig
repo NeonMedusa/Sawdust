@@ -11,7 +11,6 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const r_mod = @import("render.zig");
 const Ui = @import("ui.zig").Ui;
 const App = @import("app.zig").App;
 const PresetSaveSource = @import("app.zig").PresetSaveSource;
@@ -84,16 +83,9 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         sw.open = false;
         return true;
     };
-    // 阴影 + 背景 + 边框
-    ui.renderer.fillRect(x + 3, y + 3, ww, hh, r_mod.rgb(10, 11, 13));
-    ui.renderer.fillRect(x, y, ww, hh, ui.theme.panel);
-    ui.renderer.strokeRect(x, y, ww, hh, ui.theme.accent);
-
-    // 标题栏
-    ui.renderer.fillRect(x + 1, y + 1, ww - 2, win_title_h - 1, ui.theme.toolbar);
-    // 标题栏按钮本帧是否被点（点了就**不要**再在本帧把本窗口置顶——
-    // 否则刚打开的子窗口（VST 参数自动化）会被顶到下面去）
-    var title_btn_used = false;
+    // 标题文本（动态：乐器/层名；外壳负责画标题栏与文字）
+    // （标题栏按钮被点的那一帧不启动拖动——由外壳的 160px 排除区保证：
+    //   预设/保存为/自动化/关闭全部落在排除区内，拖动命中区碰不到它们）
     var tbuf: [192]u8 = undefined;
     const title: []const u8 = switch (sw.target) {
         .instrument => |ii| blk: {
@@ -124,7 +116,17 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
             break :blk std.fmt.bufPrint(&tbuf, "{s} — {s} · {s} 层{d}", .{ kind_label, iname, pname, ref.layer + 1 }) catch "层";
         },
     };
-    ui.label(title, x + 8, y + 4, ui.theme.text);
+
+    // ── 窗口外壳（共享 `util.windowChrome`；标题右侧 160px 留给
+    //    预设/保存为/自动化/关闭——VST3 嵌入时面板尺寸跟随插件，不提供手动缩放）──
+    if (util.windowChrome(ui, 5000, 5001, title, win_title_h, 160, &sw.x, &sw.y, &sw.w, &sw.h, &sw.grab_dx, &sw.grab_dy, &sw.resize_w0, &sw.resize_h0, &sw.resize_mx, &sw.resize_my, !embedded)) {
+        sw.open = false;
+        return true;
+    }
+    // 拖出主窗口时**当场钳制**（顶部 clamp 下帧才生效——期间子窗口会跟着
+    // 鼠标跑出面板/主窗口，用户实测“插件 UI 跑出去”；外壳只做纯赋值）
+    sw.x = std.math.clamp(sw.x, 0, @max(0, w - ww));
+    sw.y = std.math.clamp(sw.y, 0, @max(0, h - hh));
 
     // 预设按钮（标题栏右侧）：[预设 ▾] [保存为…]
     // 减法/VST3 乐器都有预设库——VST3 分类 = 插件 CID（`vst3_<cid>`）；
@@ -146,7 +148,6 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         const bx0 = bx1 - gap - auto_w;
         const bh2: i32 = win_title_h - 6;
         const by2 = y + 3;
-        title_btn_used = false;
         // `自动化` 按钮：**乐器（含内置合成器/鼓组）+ 鼓组层**（§11.47 A）。
         // 以前要求 `target_is_vst3`——内置乐器因此没入口；现在乐器级入口不需要插件
         // （无插件时窗口里只画 MIDI 段）。鼓组层依旧只在它是 VST3 层时出现（参数表靠插件）。
@@ -177,7 +178,6 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
                 } else {
                     app.openPresetBrowser(.{ .replace = sw.target }); // 同插件限定
                 }
-                title_btn_used = true;
                 ui.active_id = 0; // 防误触发标题拖动（同一位置按下）
             }
             // [保存为…]
@@ -191,7 +191,6 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
                 const save_src = PresetSaveSource{ .params = sw.target };
                 app.beginRenamePreset(bx2 - 60, y + win_title_h + 4, save_src, app.presetPrefillName(save_src));
                 app.preset_browser.open = false;
-                title_btn_used = true;
                 ui.active_id = 0; // 防误触发标题拖动
             }
             // [自动化]：VST 参数自动化（v3：乐器 / 鼓组层同一套）
@@ -222,62 +221,14 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
                             }
                         },
                     }
-                    title_btn_used = true; // 别让下面的“点窗口内任意处 → 置顶”把新窗口顶回去
                     ui.active_id = 0; // 防误触发标题拖动
                 }
             }
         }
     }
 
-    // 关闭按钮
-    if (util.titleCloseButton(ui, x, y, ww, win_title_h)) {
-        sw.open = false;
-        return true;
-    }
-
     // 点窗口即置顶由 main.drawApp 统一处理（只提升最上层那个）：
     // 标题栏按钮“刚打开子窗口”的置顶已在上面直接 `bringToFront`（z 更大 → 仍在上面）。
-
-    // 标题拖动（**排除右侧按钮区**：预设/保存为/自动化/关闭——否则按按钮也会启动拖动）
-    if (!title_btn_used and util.hitUI(ui, x, y, ww - 160, win_title_h) and ui.mouse_pressed) {
-        ui.active_id = 5000;
-        sw.grab_dx = ui.mouse_x - x;
-        sw.grab_dy = ui.mouse_y - y;
-    }
-    if (ui.active_id == 5000) {
-        if (!ui.mouse_down) {
-            ui.active_id = 0;
-        } else {
-            // 拖出主窗口时**当场钳制**（顶部 clamp 下帧才生效——期间子窗口会跟着
-            // 鼠标跑出面板/主窗口，用户实测“插件 UI 跑出去”）
-            sw.x = std.math.clamp(ui.mouse_x - sw.grab_dx, 0, @max(0, w - ww));
-            sw.y = std.math.clamp(ui.mouse_y - sw.grab_dy, 0, @max(0, h - hh));
-        }
-    }
-
-    // 右下角缩放柄（VST3 嵌入：面板尺寸跟随插件，不提供手动缩放）
-    if (!embedded) {
-        const grip = 14;
-        const grip_hovered = util.hitUI(ui, x + ww - grip, y + hh - grip, grip, grip);
-        if (grip_hovered) ui.cursor = .resize_h;
-        if (grip_hovered and ui.mouse_pressed) {
-            ui.active_id = 5001;
-            sw.resize_w0 = ww;
-            sw.resize_h0 = hh;
-            sw.resize_mx = ui.mouse_x;
-            sw.resize_my = ui.mouse_y;
-        }
-        if (ui.active_id == 5001) {
-            if (!ui.mouse_down) {
-                ui.active_id = 0;
-            } else {
-                sw.w = sw.resize_w0 + (ui.mouse_x - sw.resize_mx);
-                sw.h = sw.resize_h0 + (ui.mouse_y - sw.resize_my);
-            }
-        }
-        ui.renderer.line(x + ww - 10, y + hh - 2, x + ww - 2, y + hh - 10, ui.theme.panel_border);
-        ui.renderer.line(x + ww - 6, y + hh - 2, x + ww - 2, y + hh - 6, ui.theme.panel_border);
-    }
 
     // ── VST3 乐器：插件界面嵌入（子窗口）或兜底参数列表（须在振荡器/ADSR 之前分流）──
     if (target_is_vst3) {

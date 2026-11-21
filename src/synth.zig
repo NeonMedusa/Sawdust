@@ -190,8 +190,8 @@ pub const SchedEvent = struct {
 };
 
 /// 调度事件排序：步升序；**同一步 off 先于 on**（允许同音高快速重触发）。
-/// 序列器 gather 与音频 stash 共用（播放中补发的事件会乱序到达——
-/// 见 `sequencer.scheduleAdded` 与 `audio.stashInsert`）。
+/// 音频侧 `stashInsert` 用它保持 stash 有序（快照的 gather 是“先全部 on、
+/// 再全部 off”两条链各自按步序追加，需要插序才能交错成全局步序）。
 pub fn schedEventLess(_: void, a: SchedEvent, b: SchedEvent) bool {
     if (a.step != b.step) return a.step < b.step;
     const pa: u8 = if (a.kind == .off) 0 else 1;

@@ -1177,7 +1177,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
         app.pollGestureHistory();
         app.pollCapacityReclaim();
-        app.pollSnapshotRebuild(); // A2：影子对拍快照（未接主路）
+        app.pollSnapshotRebuild(); // pull 模型：内容指纹门控的快照重建/发布
 
         // 容量自动回收（删除/装载后滞回缩容；无声时几乎零开销）
 
@@ -2801,27 +2801,15 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
 }
 
 /// **BPM 右键菜单**（输入值… / 自动化…）——必须由主循环在**所有视图/窗口之后**调用，
-/// 否则会被播放列表/钢琴窗/拍号控件盖住（实测）。
+/// 否则会被播放列表/钢琴窗/拍号控件盖住（实测）。走共享 `util.menuPanel`。
 pub fn drawBpmCtxMenu(ui: *Ui, app: *App) void {
     const items = [_][]const u8{ "输入值…", "自动化…" };
     const mw: i32 = 96;
-    const mh: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
-    const mx = app.panels.ctx_bpm_x;
-    const my = app.panels.ctx_bpm_y;
-    ui.renderer.fillRect(mx, my, mw, mh, ui.theme.panel);
-    ui.renderer.strokeRect(mx, my, mw, mh, ui.theme.accent);
-    var hit: ?usize = null;
-    var inside = false;
-    for (items, 0..) |item, ii| {
-        const iy = my + 2 + @as(i32, @intCast(ii)) * util.menu_item_h;
-        const hov = util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, mw - 2, util.menu_item_h);
-        if (hov) {
-            inside = true;
-            ui.renderer.fillRect(mx + 1, iy, mw - 2, util.menu_item_h, ui.theme.item_hover);
-        }
-        ui.label(item, mx + 8, iy + 2, ui.theme.text);
-        if (hov and ui.mouse_pressed) hit = ii;
-    }
+    var mx = app.panels.ctx_bpm_x; // 固定位置（打开时快照，不跟鼠标跑）
+    var my = app.panels.ctx_bpm_y;
+    var open = app.panels.ctx_bpm;
+    const bounds: @import("ui.zig").Rect = .{ .x = 0, .y = 0, .w = ui.renderer.logicalWidth(), .h = ui.renderer.logicalHeight() };
+    const hit = util.menuPanel(ui, &mx, &my, &open, false, .{ .cursor = {} }, bounds, &items, mw, null);
     if (hit) |ii| {
         if (ii == 0) {
             app.beginInputBpm(mx + 4, my + 6);
@@ -2829,7 +2817,8 @@ pub fn drawBpmCtxMenu(ui: *Ui, app: *App) void {
             app.openAutoWin(.{ .kind = .tempo });
         }
         app.panels.ctx_bpm = false;
-    } else if (ui.mouse_pressed and !inside) {
+    } else if (!open) {
+        // 点菜单外 → 关闭（`menuPanel` 已判定）
         app.panels.ctx_bpm = false;
     }
 }
@@ -3008,43 +2997,13 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
             app.setDocBpm(shown);
             app.history_pending = "调整 BPM"; // 松手时 coalesce 提交
         }
-        // **右键 → 菜单（输入值… / 自动化…）**——不再直接开自动化窗口
+        // **右键 → 菜单（输入值… / 自动化…）**——不再直接开自动化窗口。
+        // 菜单本体由主循环收尾处的 `drawBpmCtxMenu` 统一绘制/命中（在所有视图之后，
+        // 不会被播放列表/钢琴窗盖住；这里只置状态）。
         if (util.hitUI(ui, x, by, 56, bh) and ui.mouse_right_pressed) {
             app.panels.ctx_bpm = true;
             app.panels.ctx_bpm_x = ui.mouse_x;
             app.panels.ctx_bpm_y = ui.mouse_y;
-        }
-        // 菜单绘制 + 点击（主循环统一画在工具栏之后也行；这里就地画，位置在鼠标处）
-        if (app.panels.ctx_bpm) {
-            const items = [_][]const u8{ "输入值…", "自动化…" };
-            const mw: i32 = 96;
-            const mh: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
-            const mx = app.panels.ctx_bpm_x;
-            const my = app.panels.ctx_bpm_y;
-            ui.renderer.fillRect(mx, my, mw, mh, ui.theme.panel);
-            ui.renderer.strokeRect(mx, my, mw, mh, ui.theme.accent);
-            var hit: ?usize = null;
-            var inside = false;
-            for (items, 0..) |item, ii| {
-                const iy = my + 2 + @as(i32, @intCast(ii)) * util.menu_item_h;
-                const hov = util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, mw - 2, util.menu_item_h);
-                if (hov) {
-                    inside = true;
-                    ui.renderer.fillRect(mx + 1, iy, mw - 2, util.menu_item_h, ui.theme.item_hover);
-                }
-                ui.label(item, mx + 8, iy + 2, ui.theme.text);
-                if (hov and ui.mouse_pressed) hit = ii;
-            }
-            if (hit) |ii| {
-                if (ii == 0) {
-                    app.beginInputBpm(mx + 4, my + 4);
-                } else {
-                    app.openAutoWin(.{ .kind = .tempo });
-                }
-                app.panels.ctx_bpm = false;
-            } else if (ui.mouse_pressed and !inside) {
-                app.panels.ctx_bpm = false;
-            }
         }
         x += 62;
     }

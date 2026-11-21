@@ -273,11 +273,8 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     // ── 时间轴长度与缩放下限（**同一个值**，否则会出现“滑块有行程但拖不动”）──
     // 时间轴 = 内容右缘（保底 4 小节）+ 右侧 3 小节留白。
     // 缩放下限 = 视图恰好容纳整个时间轴 → 缩到底时滑块**满宽**（无假行程）。
-    var max_step: i32 = 0;
-    for (app.notes.items) |n| {
-        if (n.pattern != pattern) continue;
-        max_step = @max(max_step, n.step + n.len);
-    }
+    // （**缓存版**：每帧路径，notes 没变就不重扫；语义 = 只数 len>0 的音符）
+    const max_step: i32 = app.patternEndStepCached(pattern);
     const bars_right = @max(4, @divTrunc(max_step + spb - 1, spb));
     const timeline_w: i32 = (bars_right + 3) * bar_w;
     const min_content: i32 = @max(timeline_w, 1); // 滚动条时间轴下限

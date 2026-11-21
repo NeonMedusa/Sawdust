@@ -99,58 +99,13 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     const hh = mw.h;
     const body_y = y + win_title_h;
 
-    // 阴影 + 背景 + 边框
-    ui.renderer.fillRect(x + 3, y + 3, ww, hh, r_mod.rgb(10, 11, 13));
-    ui.renderer.fillRect(x, y, ww, hh, ui.theme.panel);
-    ui.renderer.strokeRect(x, y, ww, hh, ui.theme.accent);
-
-    // 标题栏
-    ui.renderer.fillRect(x + 1, y + 1, ww - 2, win_title_h - 1, ui.theme.toolbar);
-    ui.label("调音台 (Mixer)", x + 8, y + 4, ui.theme.text);
-
-    // 关闭按钮
-    if (util.titleCloseButton(ui, x, y, ww, win_title_h)) {
+    // ── 窗口外壳（阴影/边框/标题栏/关闭/拖动/缩放柄，共享 `util.windowChrome`）──
+    // 关闭：本窗口的收尾 = 顺手关效果器菜单（调用方语义，外壳不管）
+    if (util.windowChrome(ui, 7160, 7161, "调音台 (Mixer)", win_title_h, 24, &mw.x, &mw.y, &mw.w, &mw.h, &mw.grab_dx, &mw.grab_dy, &mw.resize_w0, &mw.resize_h0, &mw.resize_mx, &mw.resize_my, true)) {
         mw.open = false;
         mw.ctx_effect = null;
         return true;
     }
-
-    // 标题拖动
-    if (util.hitUI(ui, x, y, ww - 24, win_title_h) and ui.mouse_pressed) {
-        ui.active_id = 7160; // 独立 id 段（7100 与钢琴卷帘 SONG 标尺撞车；7150 = 分割条）
-        mw.grab_dx = ui.mouse_x - x;
-        mw.grab_dy = ui.mouse_y - y;
-    }
-    if (ui.active_id == 7160) {
-        if (!ui.mouse_down) {
-            ui.active_id = 0;
-        } else {
-            mw.x = ui.mouse_x - mw.grab_dx;
-            mw.y = ui.mouse_y - mw.grab_dy;
-        }
-    }
-
-    // 右下角缩放柄
-    const grip = 14;
-    const grip_hovered = util.hitUI(ui, x + ww - grip, y + hh - grip, grip, grip);
-    if (grip_hovered) ui.cursor = .resize_h;
-    if (grip_hovered and ui.mouse_pressed) {
-        ui.active_id = 7161;
-        mw.resize_w0 = ww;
-        mw.resize_h0 = hh;
-        mw.resize_mx = ui.mouse_x;
-        mw.resize_my = ui.mouse_y;
-    }
-    if (ui.active_id == 7161) {
-        if (!ui.mouse_down) {
-            ui.active_id = 0;
-        } else {
-            mw.w = mw.resize_w0 + (ui.mouse_x - mw.resize_mx);
-            mw.h = mw.resize_h0 + (ui.mouse_y - mw.resize_my);
-        }
-    }
-    ui.renderer.line(x + ww - 10, y + hh - 2, x + ww - 2, y + hh - 10, ui.theme.panel_border);
-    ui.renderer.line(x + ww - 6, y + hh - 2, x + ww - 2, y + hh - 6, ui.theme.panel_border);
 
     // ── 分区：左块（标尺 + 通道条）/ 右区（效果器链）──
     // 右区宽度 = `fx_w`（可拖动分割条调整）。分割条拖动改的是**左区宽**
@@ -585,34 +540,20 @@ fn drawCtxMenu(ui: *Ui, app: *App, ctx: app_mod.EffectRef) void {
     }
 }
 
-/// 通用右键菜单（效果器/通道共用）：位置由**打开时快照**提供
-/// （绘制时再**钳制到窗口内**——菜单不得超出窗口，否则超出部分点击会
-/// 穿透到下层；见 `ctxMenuPos`）。`slot` 为 `null` 时是**通道菜单**。
+/// 通用右键菜单（效果器/通道共用，走共享 `util.menuPanel`）：
+/// 位置由**打开时快照**提供，绘制时再**钳制到窗口内**——菜单不得超出窗口，
+/// 否则超出部分点击会穿透到下层（见 `ctxMenuPos`；用局部变量传给
+/// `menuPanel` 即可保留“每帧钳制”语义）。`slot` 为 `null` 时是**通道菜单**。
 /// `ok`：逐项可用性（null = 全可用；置灰项不响应点击）。
 fn drawCtxMenuGeneric(ui: *Ui, app: *App, ch: usize, slot: ?usize, items: []const []const u8, ok: ?[]const bool, has_relocate: bool) void {
     const mw_win = &app.mixer_win;
     const menu_w: i32 = 130;
     const menu_h: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
     const pos = ctxMenuPos(mw_win, menu_w, menu_h);
-    const mx = pos[0];
-    const my = pos[1];
-    ui.renderer.fillRect(mx, my, menu_w, menu_h, ui.theme.panel);
-    ui.renderer.strokeRect(mx, my, menu_w, menu_h, ui.theme.accent);
-    ui.noteOverlayRect(mx, my, menu_w, menu_h); // 遮挡插件子窗口
-
-    var clicked: ?usize = null;
-    var inside = false;
-    for (items, 0..) |item, i| {
-        const enabled = if (ok) |o| (i < o.len and o[i]) else true;
-        const iy = my + 2 + @as(i32, @intCast(i)) * util.menu_item_h;
-        const ih = enabled and util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, menu_w - 2, util.menu_item_h);
-        if (ih) {
-            inside = true;
-            ui.renderer.fillRect(mx + 1, iy, menu_w - 2, util.menu_item_h, ui.theme.item_hover);
-        }
-        ui.label(item, mx + 8, iy + 2, if (enabled) ui.theme.text else ui.theme.text_dim);
-        if (ih and ui.mouse_pressed) clicked = i;
-    }
+    var mx = pos[0];
+    var my = pos[1];
+    var open = true;
+    const clicked = util.menuPanel(ui, &mx, &my, &open, false, .{ .cursor = {} }, .{ .x = mw_win.x, .y = mw_win.y, .w = mw_win.w, .h = mw_win.h }, items, menu_w, ok);
 
     if (clicked) |ci| {
         if (slot == null) {
@@ -665,7 +606,8 @@ fn drawCtxMenuGeneric(ui: *Ui, app: *App, ch: usize, slot: ?usize, items: []cons
         mw_win.ctx_channel = null;
         mw_win.ctx_menu_x = 0;
         mw_win.ctx_menu_y = 0;
-    } else if (ui.mouse_pressed and !inside) {
+    } else if (!open) {
+        // 点外部关闭（`menuPanel` 已判定）：清掉打开身份
         mw_win.ctx_effect = null;
         mw_win.ctx_channel = null;
         mw_win.ctx_menu_x = 0;
@@ -684,25 +626,12 @@ fn drawPanVolCtxMenu(ui: *Ui, app: *App, ch: usize, is_vol: bool) void {
     const items = [_][]const u8{ "恢复默认值", "输入值…", "自动化…" };
     const menu_w: i32 = 140;
     const menu_h: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
+    // 位置钳制到窗口内（`ctxMenuPos`）；`menuPanel` 用局部坐标 → 保留每帧钳制语义
     const pos = ctxMenuPos(mw_win, menu_w, menu_h);
-    const mx = pos[0];
-    const my = pos[1];
-    ui.renderer.fillRect(mx, my, menu_w, menu_h, ui.theme.panel);
-    ui.renderer.strokeRect(mx, my, menu_w, menu_h, ui.theme.accent);
-    ui.noteOverlayRect(mx, my, menu_w, menu_h); // 遮挡插件子窗口
-
-    var clicked: ?usize = null;
-    var inside = false;
-    for (items, 0..) |item, k| {
-        const iy = my + 2 + @as(i32, @intCast(k)) * util.menu_item_h;
-        const hovered = util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, menu_w - 2, util.menu_item_h);
-        if (hovered) {
-            inside = true;
-            ui.renderer.fillRect(mx + 1, iy, menu_w - 2, util.menu_item_h, ui.theme.item_hover);
-        }
-        ui.label(item, mx + 8, iy + 2, ui.theme.text);
-        if (hovered and ui.mouse_pressed) clicked = k;
-    }
+    var mx = pos[0];
+    var my = pos[1];
+    var open = true;
+    const clicked = util.menuPanel(ui, &mx, &my, &open, false, .{ .cursor = {} }, .{ .x = mw_win.x, .y = mw_win.y, .w = mw_win.w, .h = mw_win.h }, &items, menu_w, null);
     if (clicked) |k| {
         if (ch < app.mixer_channels_state.items.len) {
             const mc = &app.mixer_channels_state.items[ch];
@@ -731,7 +660,8 @@ fn drawPanVolCtxMenu(ui: *Ui, app: *App, ch: usize, is_vol: bool) void {
             }
         }
         if (is_vol) mw_win.ctx_vol = null else mw_win.ctx_pan = null;
-    } else if (ui.mouse_pressed and !inside and !util.inRect(ui.mouse_x, ui.mouse_y, mx, my, menu_w, menu_h)) {
+    } else if (!open) {
+        // 点外部关闭（`menuPanel` 已判定）
         if (is_vol) mw_win.ctx_vol = null else mw_win.ctx_pan = null;
     }
 }

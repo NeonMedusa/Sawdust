@@ -2,7 +2,6 @@
 //! 文案以**实际键位**为准——改动快捷键时记得同步这里。
 
 const std = @import("std");
-const r_mod = @import("render.zig");
 const Ui = @import("ui.zig").Ui;
 const app_mod = @import("app.zig");
 const App = app_mod.App;
@@ -64,56 +63,11 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     const ww = hw.w;
     const hh = hw.h;
 
-    // 阴影 + 背景 + 边框
-    ui.renderer.fillRect(x + 3, y + 3, ww, hh, r_mod.rgb(10, 11, 13));
-    ui.renderer.fillRect(x, y, ww, hh, ui.theme.panel);
-    ui.renderer.strokeRect(x, y, ww, hh, ui.theme.accent);
-
-    // 标题栏
-    ui.renderer.fillRect(x + 1, y + 1, ww - 2, title_h - 1, ui.theme.toolbar);
-    ui.label("帮助 — 基本操作", x + 8, y + 4, ui.theme.text);
-
-    // 关闭按钮
-    if (util.titleCloseButton(ui, x, y, ww, title_h)) {
+    // ── 窗口外壳（共享 `util.windowChrome`；关闭时本窗口无额外清理）──
+    if (util.windowChrome(ui, 9500, 9501, "帮助 — 基本操作", title_h, 24, &hw.x, &hw.y, &hw.w, &hw.h, &hw.grab_dx, &hw.grab_dy, &hw.resize_w0, &hw.resize_h0, &hw.resize_mx, &hw.resize_my, true)) {
         hw.open = false;
         return true;
     }
-
-    // 标题拖动
-    if (util.hitUI(ui, x, y, ww - 24, title_h) and ui.mouse_pressed) {
-        ui.active_id = 9500;
-        hw.grab_dx = ui.mouse_x - x;
-        hw.grab_dy = ui.mouse_y - y;
-    }
-    if (ui.active_id == 9500) {
-        if (!ui.mouse_down) {
-            ui.active_id = 0;
-        } else {
-            hw.x = ui.mouse_x - hw.grab_dx;
-            hw.y = ui.mouse_y - hw.grab_dy;
-        }
-    }
-
-    // 右下角缩放柄（同设置页/机架窗：三角形区 + 拖动改尺寸）
-    const grip = 14;
-    const grip_hovered = util.hitUI(ui, x + ww - grip, y + hh - grip, grip, grip);
-    if (grip_hovered) ui.cursor = .resize_h;
-    if (grip_hovered and ui.mouse_pressed) {
-        ui.active_id = 9501;
-        hw.resize_w0 = ww;
-        hw.resize_h0 = hh;
-        hw.resize_mx = ui.mouse_x;
-        hw.resize_my = ui.mouse_y;
-    }
-    if (ui.active_id == 9501) {
-        if (!ui.mouse_down) {
-            ui.active_id = 0;
-        } else {
-            hw.w = hw.resize_w0 + (ui.mouse_x - hw.resize_mx);
-            hw.h = hw.resize_h0 + (ui.mouse_y - hw.resize_my);
-        }
-    }
-    ui.renderer.line(x + ww - 10, y + hh - 2, x + ww - 2, y + hh - 10, ui.theme.panel_border);
 
     // 内容：两列（键位 / 说明），节标题用强调色。
     // **可滚动**：标题栏固定，内容区裁剪 + 滚轮（以前靠“窗口高刚刚好”，加两行就露尾巴）。

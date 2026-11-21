@@ -48,13 +48,7 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     const ww = ew.w;
     const hh = ew.h;
 
-    // 阴影 + 背景 + 边框
-    ui.renderer.fillRect(x + 3, y + 3, ww, hh, r_mod.rgb(10, 11, 13));
-    ui.renderer.fillRect(x, y, ww, hh, ui.theme.panel);
-    ui.renderer.strokeRect(x, y, ww, hh, ui.theme.accent);
-
-    // 标题栏
-    ui.renderer.fillRect(x + 1, y + 1, ww - 2, win_title_h - 1, ui.theme.toolbar);
+    // 标题文本（动态：效果器 — 通道号 + 路由乐器名；外壳负责画标题栏与文字）
     var tbuf: [96]u8 = undefined;
     var inst_names_buf: [64]u8 = undefined;
     // 路由到此通道的乐器名摘要（**0 起基准**——见 `model.routedInstrumentNames`；
@@ -66,10 +60,21 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         if (inst_names.len > 0) " · " else "",
         inst_names,
     }) catch "效果器";
-    ui.label(title, x + 8, y + 4, ui.theme.text);
+
+    // ── 窗口外壳（共享 `util.windowChrome`；标题右侧 ~216px 留给
+    //    自动化/预设/保存为/关闭——按钮区整体排除在拖动命中之外；
+    //    嵌入模式：面板尺寸跟随插件，不提供手动缩放）──
+    if (util.windowChrome(ui, 7600, 7601, title, win_title_h, 216, &ew.x, &ew.y, &ew.w, &ew.h, &ew.grab_dx, &ew.grab_dy, &ew.resize_w0, &ew.resize_h0, &ew.resize_mx, &ew.resize_my, !embedded_expected)) {
+        app.mixer_win.panel = null;
+        ew.eq_drag = null;
+        return true;
+    }
+    // 拖出主窗口时**当场钳制**（顶部 clamp 下帧才生效——期间子窗口会跟着
+    // 鼠标跑出面板/主窗口，用户实测“插件 UI 跑出去”；外壳只做纯赋值）
+    ew.x = std.math.clamp(ew.x, 0, @max(0, w - ww));
+    ew.y = std.math.clamp(ew.y, 0, @max(0, h - hh));
 
     // 预设按钮（标题栏右侧）：[自动化][预设 ▾][保存为…]——与乐器窗标题栏同一顺序/同款按钮
-    var title_btn_used = false;
     {
         const save_w: i32 = 62;
         const menu_w: i32 = 58;
@@ -91,7 +96,6 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
                 ui.label("自动化", bx0 + 5, by2 + 2, ui.theme.text);
                 if (h0 and ui.mouse_pressed) {
                     app.openVstAutoWin(.{ .kind = .fx, .a = @intCast(panel.ch), .b = @intCast(panel.slot) });
-                    title_btn_used = true;
                     ui.active_id = 0; // 防误触发标题拖动
                 }
             }
@@ -112,7 +116,6 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
                 } else {
                     app.openPresetBrowser(.{ .replace_effect = .{ .ch = panel.ch, .slot = panel.slot } });
                 }
-                title_btn_used = true;
                 ui.active_id = 0; // 防误触发标题拖动
             }
             const h2 = util.hitUI(ui, bx2, by2, save_w, bh2);
@@ -123,59 +126,9 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
                 const save_src = app_mod.PresetSaveSource{ .effect = .{ .ch = panel.ch, .slot = panel.slot } };
                 app.beginRenamePreset(bx2 - 60, y + win_title_h + 4, save_src, app.presetPrefillName(save_src));
                 app.preset_browser.open = false;
-                title_btn_used = true;
                 ui.active_id = 0;
             }
         }
-    }
-
-    // 关闭按钮
-    if (util.titleCloseButton(ui, x, y, ww, win_title_h)) {
-        app.mixer_win.panel = null;
-        ew.eq_drag = null;
-        return true;
-    }
-
-    // 标题拖动
-
-    if (!title_btn_used and util.hitUI(ui, x, y, ww - 24, win_title_h) and ui.mouse_pressed) {
-        ui.active_id = 7600;
-        ew.grab_dx = ui.mouse_x - x;
-        ew.grab_dy = ui.mouse_y - y;
-    }
-    if (ui.active_id == 7600) {
-        if (!ui.mouse_down) {
-            ui.active_id = 0;
-        } else {
-            // 拖出主窗口时**当场钳制**（顶部 clamp 下帧才生效——期间子窗口会跟着
-            // 鼠标跑出面板/主窗口，用户实测“插件 UI 跑出去”）
-            ew.x = std.math.clamp(ui.mouse_x - ew.grab_dx, 0, @max(0, w - ww));
-            ew.y = std.math.clamp(ui.mouse_y - ew.grab_dy, 0, @max(0, h - hh));
-        }
-    }
-
-    // 右下角缩放柄（嵌入模式：面板尺寸跟随插件，不提供手动缩放）
-    if (!embedded_expected) {
-        const grip = 14;
-        const grip_hovered = util.hitUI(ui, x + ww - grip, y + hh - grip, grip, grip);
-        if (grip_hovered) ui.cursor = .resize_h;
-        if (grip_hovered and ui.mouse_pressed) {
-            ui.active_id = 7601;
-            ew.resize_w0 = ww;
-            ew.resize_h0 = hh;
-            ew.resize_mx = ui.mouse_x;
-            ew.resize_my = ui.mouse_y;
-        }
-        if (ui.active_id == 7601) {
-            if (!ui.mouse_down) {
-                ui.active_id = 0;
-            } else {
-                ew.w = ew.resize_w0 + (ui.mouse_x - ew.resize_mx);
-                ew.h = ew.resize_h0 + (ui.mouse_y - ew.resize_my);
-            }
-        }
-        ui.renderer.line(x + ww - 10, y + hh - 2, x + ww - 2, y + hh - 10, ui.theme.panel_border);
-        ui.renderer.line(x + ww - 6, y + hh - 2, x + ww - 2, y + hh - 6, ui.theme.panel_border);
     }
 
     const cy = y + win_title_h + 6;

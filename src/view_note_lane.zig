@@ -507,26 +507,47 @@ fn hitNoteIndex(
     bar_w: i32,
 ) ?usize {
     if (mouse_y < y or mouse_y > y + h) return null;
+    if (step_ws <= 0) return null;
     var best: ?usize = null;
     var best_dx: i32 = std.math.maxInt(i32);
     // 命中半宽见 `lane_hit_tol`（≈1.5cm；与缩放无关）。
     // 区间重叠时由下面的 `dx < best_dx` 取“离鼠标最近的那一列”。
-    for (app.notes.items, 0..) |nt, i| {
-        if (nt.pattern != pattern or nt.instrument != app.sel.instrument) continue;
-        const bx = barX(nt.step, track_x, step_ws, scroll_s);
-        if (mouse_x >= bx - lane_hit_tol and mouse_x < bx + bar_w + lane_hit_tol) {
-            const dx: i32 = @intCast(@abs(mouse_x - (bx + @divTrunc(bar_w, 2))));
-            var take = dx < best_dx;
-            if (!take and dx == best_dx) {
-                if (best) |b| {
-                    // 同距（叠放柱条同 x）：层级规则——左端更右 / 数组序更大者在上
-                    const bn = app.notes.items[b];
-                    if (nt.step > bn.step or (nt.step == bn.step and i > b)) take = true;
+    // **只扫鼠标所在（±1）的时间桶**（与钢琴窗 `noteAtMousePx` 同一套索引，随
+    // `notes_ver` 失效；以前是每帧全量扫 `notes`）。桶远比命中容差宽，±1 足够。
+    app.ensureNoteIndex(pattern);
+    const ix = &app.note_index;
+    const nb: usize = ix.starts.items.len - 1;
+    if (nb == 0) return null;
+    const mx_f: f32 = @as(f32, @floatFromInt(mouse_x - track_x));
+    const step_at: i32 = @intFromFloat(@floor((mx_f + scroll_s) / step_ws));
+    const b_at: i32 = @divFloor(step_at, @import("app.zig").bucket_units);
+    var bb: i32 = @max(0, b_at - 1);
+    const b_end: i32 = @min(b_at + 1, @as(i32, @intCast(nb)) - 1);
+    while (bb <= b_end) : (bb += 1) {
+        const b: usize = @intCast(bb);
+        const lo_i: usize = ix.starts.items[b];
+        const hi_i: usize = ix.starts.items[b + 1];
+        for (ix.items.items[lo_i..hi_i]) |ni| {
+            const i: usize = ni;
+            if (i >= app.notes.items.len) continue; // 防御：索引过期也只漏扫，不越界
+            const nt = app.notes.items[i];
+            if (nt.pattern != pattern or nt.instrument != app.sel.instrument) continue;
+            const bx = barX(nt.step, track_x, step_ws, scroll_s);
+            if (mouse_x >= bx - lane_hit_tol and mouse_x < bx + bar_w + lane_hit_tol) {
+                const dx: i32 = @intCast(@abs(mouse_x - (bx + @divTrunc(bar_w, 2))));
+                var take = dx < best_dx;
+                if (!take and dx == best_dx) {
+                    if (best) |b2| {
+                        // 同距（叠放柱条同 x）：层级规则——左端更右 / 数组序更大者在上
+                        //（(step, 下标) 是全序，桶迭代顺序不影响结果）
+                        const bn = app.notes.items[b2];
+                        if (nt.step > bn.step or (nt.step == bn.step and i > b2)) take = true;
+                    }
                 }
-            }
-            if (take) {
-                best_dx = dx;
-                best = i;
+                if (take) {
+                    best_dx = dx;
+                    best = i;
+                }
             }
         }
     }
@@ -567,30 +588,60 @@ fn paintAt(
     mode: NoteLaneMode,
     selected_only: bool,
 ) bool {
+    if (step_ws <= 0) return false;
+    // 与 `hitNoteIndex` 同一套**时间桶索引**（±1 桶找列；列 = 音符起点，与长度无关）
+    app.ensureNoteIndex(pattern);
+    const ix = &app.note_index;
+    const nb: usize = ix.starts.items.len - 1;
     // ① 先找**离鼠标最近的那一列**（1cm 内可能有多列，一次只动一列）
     var best_step: ?i32 = null;
     var best_dx: i32 = std.math.maxInt(i32);
-    for (app.notes.items) |*nt| {
-        if (nt.pattern != pattern or nt.instrument != app.sel.instrument) continue;
-        if (selected_only and !nt.selected) continue;
-        const bx = barX(nt.step, track_x, step_ws, scroll_s);
-        if (mouse_x < bx - lane_hit_tol or mouse_x >= bx + bar_w + lane_hit_tol) continue;
-        const dx: i32 = @intCast(@abs(mouse_x - (bx + @divTrunc(bar_w, 2))));
-        if (dx < best_dx) {
-            best_dx = dx;
-            best_step = nt.step;
+    if (nb > 0) {
+        const mx_f: f32 = @as(f32, @floatFromInt(mouse_x - track_x));
+        const step_at: i32 = @intFromFloat(@floor((mx_f + scroll_s) / step_ws));
+        const b_at: i32 = @divFloor(step_at, @import("app.zig").bucket_units);
+        var bb: i32 = @max(0, b_at - 1);
+        const b_end: i32 = @min(b_at + 1, @as(i32, @intCast(nb)) - 1);
+        while (bb <= b_end) : (bb += 1) {
+            const b: usize = @intCast(bb);
+            const lo_i: usize = ix.starts.items[b];
+            const hi_i: usize = ix.starts.items[b + 1];
+            for (ix.items.items[lo_i..hi_i]) |ni| {
+                const i: usize = ni;
+                if (i >= app.notes.items.len) continue; // 防御：索引过期也只漏扫，不越界
+                const nt = &app.notes.items[i];
+                if (nt.pattern != pattern or nt.instrument != app.sel.instrument) continue;
+                if (selected_only and !nt.selected) continue;
+                const bx = barX(nt.step, track_x, step_ws, scroll_s);
+                if (mouse_x < bx - lane_hit_tol or mouse_x >= bx + bar_w + lane_hit_tol) continue;
+                const dx: i32 = @intCast(@abs(mouse_x - (bx + @divTrunc(bar_w, 2))));
+                if (dx < best_dx) {
+                    best_dx = dx;
+                    best_step = nt.step;
+                }
+            }
         }
     }
     const step = best_step orelse return false;
     // ② 该列上的**所有音符**（同 step，可能多个音高）都改成目标值（原设计：一列一起改）
+    //    同一步的音符全在**同一个桶**里 → 只扫那一桶。
     var changed = false;
-    for (app.notes.items) |*nt| {
-        if (nt.pattern != pattern or nt.instrument != app.sel.instrument) continue;
-        if (selected_only and !nt.selected) continue;
-        if (nt.step != step) continue;
-        if (noteValue(nt.*, mode) == target) continue; // 已是目标值
-        setNoteValue(nt, mode, target);
-        changed = true;
+    if (nb > 0) {
+        const b_i: i32 = @min(@max(0, @divFloor(step, @import("app.zig").bucket_units)), @as(i32, @intCast(nb)) - 1);
+        const b: usize = @intCast(b_i);
+        const lo_i: usize = ix.starts.items[b];
+        const hi_i: usize = ix.starts.items[b + 1];
+        for (ix.items.items[lo_i..hi_i]) |ni| {
+            const i: usize = ni;
+            if (i >= app.notes.items.len) continue; // 防御：索引过期也只漏扫，不越界
+            const nt = &app.notes.items[i];
+            if (nt.pattern != pattern or nt.instrument != app.sel.instrument) continue;
+            if (selected_only and !nt.selected) continue;
+            if (nt.step != step) continue;
+            if (noteValue(nt.*, mode) == target) continue; // 已是目标值
+            setNoteValue(nt, mode, target);
+            changed = true;
+        }
     }
     return changed;
 }

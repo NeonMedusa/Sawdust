@@ -29,17 +29,9 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     const ww = sw.w;
     const hh = sw.h;
 
-    // 阴影 + 背景 + 边框
-    ui.renderer.fillRect(x + 3, y + 3, ww, hh, r_mod.rgb(10, 11, 13));
-    ui.renderer.fillRect(x, y, ww, hh, ui.theme.panel);
-    ui.renderer.strokeRect(x, y, ww, hh, ui.theme.accent);
-
-    // 标题栏
-    ui.renderer.fillRect(x + 1, y + 1, ww - 2, title_h - 1, ui.theme.toolbar);
-    ui.label("设置", x + 8, y + 4, ui.theme.text);
-
-    // 关闭按钮 → 等同“取消”（丢弃待应用改动）
-    if (util.titleCloseButton(ui, x, y, ww, title_h)) {
+    // ── 窗口外壳（共享 `util.windowChrome`；缩放柄 id = 9541——9521 被 toggle2 占着）──
+    // 关闭 → 等同“取消”（丢弃待应用改动）
+    if (util.windowChrome(ui, 9520, 9541, "设置", title_h, 24, &sw.x, &sw.y, &sw.w, &sw.h, &sw.grab_dx, &sw.grab_dy, &sw.resize_w0, &sw.resize_h0, &sw.resize_mx, &sw.resize_my, true)) {
         sw.open = false;
         app.settings_draft = null;
         return true;
@@ -65,42 +57,6 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         (!d.ui_scale_auto and @abs(d.ui_scale - app.ui_scale) > 0.001) or
         d.audio_backend != audio_pref.current.backend or
         !std.mem.eql(u8, d.audioDevice(), audio_pref.current.deviceName());
-
-    // 标题拖动
-    if (util.hitUI(ui, x, y, ww - 24, title_h) and ui.mouse_pressed) {
-        ui.active_id = 9520;
-        sw.grab_dx = ui.mouse_x - x;
-        sw.grab_dy = ui.mouse_y - y;
-    }
-    if (ui.active_id == 9520) {
-        if (!ui.mouse_down) {
-            ui.active_id = 0;
-        } else {
-            sw.x = ui.mouse_x - sw.grab_dx;
-            sw.y = ui.mouse_y - sw.grab_dy;
-        }
-    }
-
-    // 右下角缩放柄（三角形区；同通道机架/混音台的拖拽手感）
-    const grip = 14;
-    const grip_hovered = util.hitUI(ui, x + ww - grip, y + hh - grip, grip, grip);
-    if (grip_hovered) ui.cursor = .resize_h;
-    if (grip_hovered and ui.mouse_pressed) {
-        ui.active_id = 9541;
-        sw.resize_w0 = ww;
-        sw.resize_h0 = hh;
-        sw.resize_mx = ui.mouse_x;
-        sw.resize_my = ui.mouse_y;
-    }
-    if (ui.active_id == 9541) {
-        if (!ui.mouse_down) {
-            ui.active_id = 0;
-        } else {
-            sw.w = sw.resize_w0 + (ui.mouse_x - sw.resize_mx);
-            sw.h = sw.resize_h0 + (ui.mouse_y - sw.resize_my);
-        }
-    }
-    ui.renderer.line(x + ww - 10, y + hh - 2, x + ww - 2, y + hh - 10, ui.theme.panel_border);
 
     // ── 内容区（可滚动；底部按钮条不随之滚动）──
     // 页面总高写死在这里：加/删段时同步调（不然滚不到底）。

@@ -4,7 +4,6 @@
 //! 或 `util.hitUI`（尊重 input_blocked，供非菜单控件用）。
 
 const std = @import("std");
-const r_mod = @import("render.zig");
 const Ui = @import("ui.zig").Ui;
 const app_mod = @import("app.zig");
 const App = app_mod.App;
@@ -27,7 +26,6 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
     const y = rk.y;
     const ww = rk.w;
     const hh = rk.h;
-    const title_y = y;
     const body_y = y + util.rack_title_h;
     const body_h = hh - util.rack_title_h;
     const add_btn_h = util.rack_add_h;
@@ -45,59 +43,13 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
     const menu_modal = menu_was_open or app.rack.ctx_instrument != null or app.rack.ctx_pan != null;
     if (menu_modal) ui.input_blocked = true;
 
-    // 窗口阴影 + 背景 + 边框
-    ui.renderer.fillRect(x + 3, y + 3, ww, hh, r_mod.rgb(10, 11, 13));
-    ui.renderer.fillRect(x, y, ww, hh, ui.theme.panel);
-    // 亮蓝描边（与合成器/调音台/效果器面板一致）
-    ui.renderer.strokeRect(x, y, ww, hh, ui.theme.accent);
-
-    // 标题栏
-    ui.renderer.fillRect(x + 1, title_y + 1, ww - 2, util.rack_title_h - 1, ui.theme.toolbar);
-    ui.label("乐器（通道机架）", x + 8, title_y + 4, ui.theme.text);
-    // 关闭按钮（右上角 ×）
-    if (util.titleCloseButton(ui, x, title_y, ww, util.rack_title_h)) {
+    // ── 窗口外壳（阴影/边框/标题栏/关闭/拖动/缩放柄，共享 `util.windowChrome`）──
+    // 关闭：本窗口的收尾 = 顺手关乐器菜单（调用方语义，外壳不管）
+    if (util.windowChrome(ui, 3000, 3001, "乐器（通道机架）", util.rack_title_h, 24, &rk.x, &rk.y, &rk.w, &rk.h, &rk.grab_dx, &rk.grab_dy, &rk.resize_w0, &rk.resize_h0, &rk.resize_mx, &rk.resize_my, true)) {
         rk.open = false;
         app.rack.ctx_instrument = null;
         return true;
     }
-
-    // 标题拖动
-    const title_hovered = util.hitUI(ui, x, title_y, ww - 24, util.rack_title_h);
-    if (title_hovered and ui.mouse_pressed) {
-        ui.active_id = 3000;
-        rk.grab_dx = ui.mouse_x - x;
-        rk.grab_dy = ui.mouse_y - y;
-    }
-    if (ui.active_id == 3000) {
-        if (!ui.mouse_down) {
-            ui.active_id = 0;
-        } else {
-            rk.x = ui.mouse_x - rk.grab_dx;
-            rk.y = ui.mouse_y - rk.grab_dy;
-        }
-    }
-
-    // 右下角缩放柄（三角形区）
-    const grip = 14;
-    const grip_hovered = util.hitUI(ui, x + ww - grip, y + hh - grip, grip, grip);
-    if (grip_hovered) ui.cursor = .resize_h;
-    if (grip_hovered and ui.mouse_pressed) {
-        ui.active_id = 3001;
-        rk.resize_w0 = ww;
-        rk.resize_h0 = hh;
-        rk.resize_mx = ui.mouse_x;
-        rk.resize_my = ui.mouse_y;
-    }
-    if (ui.active_id == 3001) {
-        if (!ui.mouse_down) {
-            ui.active_id = 0;
-        } else {
-            rk.w = rk.resize_w0 + (ui.mouse_x - rk.resize_mx);
-            rk.h = rk.resize_h0 + (ui.mouse_y - rk.resize_my);
-        }
-    }
-    ui.renderer.line(x + ww - 10, y + hh - 2, x + ww - 2, y + hh - 10, ui.theme.panel_border);
-    ui.renderer.line(x + ww - 6, y + hh - 2, x + ww - 2, y + hh - 6, ui.theme.panel_border);
 
     // ── 乐器行（可滚动；右侧滚动条，溢出时显示——与效果器链面板同款）──
     const content_h: i32 = @intCast(app.instruments.items.len * @as(usize, @intCast(util.rack_row_h)));
@@ -170,25 +122,16 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
                 .{ .label = "下移", .act = .down },
             };
             const mw: i32 = 160;
-            const mh: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
-            const mx = app.rack.ctx_x; // 固定位置（打开时记录，不跟鼠标跑）
-            const my = app.rack.ctx_y;
-            ui.renderer.fillRect(mx, my, mw, mh, ui.theme.panel);
-            ui.renderer.strokeRect(mx, my, mw, mh, ui.theme.accent);
-            ui.noteOverlayRect(mx, my, mw, mh); // 遮挡插件子窗口
-            var clicked: ?Act = null;
-            var inside = false;
-            for (items, 0..) |e, i| {
-                const iy = my + 2 + @as(i32, @intCast(i)) * util.menu_item_h;
-                const ih = util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, mw - 2, util.menu_item_h);
-                if (ih) {
-                    inside = true;
-                    ui.renderer.fillRect(mx + 1, iy, mw - 2, util.menu_item_h, ui.theme.item_hover);
-                }
-                ui.label(e.label, mx + 8, iy + 2, ui.theme.text);
-                if (ih and ui.mouse_pressed) clicked = e.act;
-            }
-            if (clicked) |act| {
+            // 走共享 `util.menuPanel`：固定位置（打开时快照进 `ctx_x/ctx_y`，不跟鼠标跑）
+            var labels: [8][]const u8 = undefined;
+            for (items, 0..) |e, i| labels[i] = e.label;
+            var mx = app.rack.ctx_x;
+            var my = app.rack.ctx_y;
+            var open = true;
+            const bounds: @import("ui.zig").Rect = .{ .x = 0, .y = 0, .w = ui.renderer.logicalWidth(), .h = ui.renderer.logicalHeight() };
+            const clicked = util.menuPanel(ui, &mx, &my, &open, false, .{ .cursor = {} }, bounds, labels[0..items.len], mw, null);
+            if (clicked) |k| {
+                const act = items[k].act;
                 switch (act) {
                     // 「打开」= 双击打开（同一个 `openInstrumentEditor`）
                     .open => app.openInstrumentEditor(ci),
@@ -212,7 +155,8 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
                     },
                 }
                 app.rack.ctx_instrument = null;
-            } else if (ui.mouse_pressed and !inside) {
+            } else if (!open) {
+                // 点外部关闭（`menuPanel` 已判定）
                 app.rack.ctx_instrument = null;
             }
         } else {
@@ -228,24 +172,11 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
         if (pi < app.instruments.items.len) {
             const items = [_][]const u8{ "恢复默认值", "输入值…", "自动化…" };
             const mw2: i32 = 140;
-            const mh2: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
-            const mx = app.rack.ctx_x;
-            const my = app.rack.ctx_y;
-            ui.renderer.fillRect(mx, my, mw2, mh2, ui.theme.panel);
-            ui.renderer.strokeRect(mx, my, mw2, mh2, ui.theme.accent);
-            ui.noteOverlayRect(mx, my, mw2, mh2); // 遮挡插件子窗口
-            var clicked: ?usize = null;
-            var inside = false;
-            for (items, 0..) |item, k| {
-                const iy = my + 2 + @as(i32, @intCast(k)) * util.menu_item_h;
-                const hovered = util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, mw2 - 2, util.menu_item_h);
-                if (hovered) {
-                    inside = true;
-                    ui.renderer.fillRect(mx + 1, iy, mw2 - 2, util.menu_item_h, ui.theme.item_hover);
-                }
-                ui.label(item, mx + 8, iy + 2, ui.theme.text);
-                if (hovered and ui.mouse_pressed) clicked = k;
-            }
+            var mx = app.rack.ctx_x; // 固定位置（打开时快照，不跟鼠标跑）
+            var my = app.rack.ctx_y;
+            var open = true;
+            const bounds: @import("ui.zig").Rect = .{ .x = 0, .y = 0, .w = ui.renderer.logicalWidth(), .h = ui.renderer.logicalHeight() };
+            const clicked = util.menuPanel(ui, &mx, &my, &open, false, .{ .cursor = {} }, bounds, &items, mw2, null);
             if (clicked) |k| {
                 const inst = &app.instruments.items[pi];
                 if (k == 0) {
@@ -278,7 +209,8 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32, menu_was_open: bool) bool {
                 }
                 app.rack.ctx_vol = null;
                 app.rack.ctx_pan = null;
-            } else if (ui.mouse_pressed and !inside and !util.inRect(ui.mouse_x, ui.mouse_y, mx, my, mw2, mh2)) {
+            } else if (!open) {
+                // 点外部关闭（`menuPanel` 已判定）
                 app.rack.ctx_vol = null;
                 app.rack.ctx_pan = null;
             }

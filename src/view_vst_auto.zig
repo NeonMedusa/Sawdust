@@ -1,4 +1,4 @@
-//! **VST 参数自动化（v1：UI 侧施加）**
+//! **VST 参数自动化**（v1 起步于 UI 侧施加，v2 起求值在音频线程）
 //!
 //! 一个乐器一个窗口，三段式（像常见 DAW 的“参数列表”）：
 //!
@@ -16,10 +16,10 @@
 //! - Windows：乐器窗口标题栏 `自动化` 按钮 → 浮动窗口（`draw`）；
 //! - Linux：插件面板正文直接是本文件的 `drawBody`（编辑器是独立窗口，正文空着）。
 //!
-//! 施加在 `App.applyVstParamAutomation()`（UI 侧每帧 + 逐绑定平滑 τ）。
+//! 求值施加在**音频线程**（`LaneSet.collectPluginParams` 每段取段首/段末两点 →
+//! `queueAuto` 逐绑定极点平滑；v1 时代的 UI 侧每帧直写已退役）。
 
 const std = @import("std");
-const r_mod = @import("render.zig");
 const app_mod = @import("app.zig");
 const App = app_mod.App;
 const PluginSlotRef = app_mod.PluginSlotRef;
@@ -359,16 +359,11 @@ pub fn draw(ui: *Ui, app: *App) void {
         return;
     }
 
-    // 窗口底 + 边框 + 标题栏
-    ui.renderer.fillRect(x + 3, y + 3, w, h, r_mod.rgb(10, 11, 13));
-    ui.renderer.fillRect(x, y, w, h, ui.theme.panel);
-    ui.renderer.strokeRect(x, y, w, h, ui.theme.accent);
-    ui.renderer.fillRect(x + 1, y + 1, w - 2, title_h - 1, ui.theme.toolbar);
-    // **注意：不登记 `noteOverlayRect`**。
+    // ── 窗口外壳（共享 `util.windowChrome`；本窗口不可缩放、标题右侧 60px 保留）──
+    // **注意：外壳不登记 `noteOverlayRect`**。
     // 那张表是给**菜单/弹层**用的，而 `syncEmbeddedEditor` 拿 `overlay_n != 0`
     // 直接把插件子窗口禁掉（输入闸门）——整窗登记 = 一开自动化窗口，
     // 插件自己的 GUI 就再也不可交互（实测 bug）。窗口的遮挡靠 `win_draw_info` 处理。
-
     var tb: [192]u8 = undefined;
     // 标题：乐器级入口用「自动化参数 — 乐器名」（内置合成器没有“槽标题”可读）；
     // 插件槽入口（效果器/鼓组层）仍用 `slotTitle`。
@@ -381,33 +376,21 @@ pub fn draw(ui: *Ui, app: *App) void {
         }
         break :blk app.slotTitle(st.ref, &tb);
     };
-    ui.labelClipped(title, x + 8, y + 4, w - 60, ui.theme.text);
-
-    // 标题拖动（存抓取偏移，避免拿起来就跳）
-    const drag_id: u64 = id_win + 1;
-    if (util.hitUI(ui, x, y, w - 60, title_h) and ui.mouse_pressed) {
-        ui.active_id = drag_id;
-        st.drag_dx = ui.mouse_x - x;
-        st.drag_dy = ui.mouse_y - y;
-    }
-    if (ui.active_id == drag_id) {
-        if (!ui.mouse_down) {
+    {
+        var rs_w0: i32 = 0; // 缩放快照占位（本窗口不可缩放，只是传参）
+        var rs_h0: i32 = 0;
+        var rs_mx: i32 = 0;
+        var rs_my: i32 = 0;
+        if (util.windowChrome(ui, id_win + 1, 0, title, title_h, 60, &st.x, &st.y, &w, &h, &st.drag_dx, &st.drag_dy, &rs_w0, &rs_h0, &rs_mx, &rs_my, false)) {
+            st.open = false;
+            st.menu_open = false;
             ui.active_id = 0;
-        } else {
-            const scr_w = ui.renderer.logicalWidth();
-            const scr_h = ui.renderer.logicalHeight();
-            st.x = std.math.clamp(ui.mouse_x - st.drag_dx, 0, @max(0, scr_w - w));
-            st.y = std.math.clamp(ui.mouse_y - st.drag_dy, 0, @max(0, scr_h - h));
+            return;
         }
     }
-
-    // 关闭按钮（全项目统一：`util.titleCloseButton`）
-    if (util.titleCloseButton(ui, x, y, w, title_h)) {
-        st.open = false;
-        st.menu_open = false;
-        ui.active_id = 0;
-        return;
-    }
+    // 拖出屏幕时**当场钳制**（原实现就在拖动分支里钳；外壳只做纯赋值）
+    st.x = std.math.clamp(st.x, 0, @max(0, ui.renderer.logicalWidth() - w));
+    st.y = std.math.clamp(st.y, 0, @max(0, ui.renderer.logicalHeight() - h));
 
     // **乐器级入口 + 无插件**（内置合成器 / 鼓组）：正文只有「乐器参数」（§11.47 A）。
     // 有插件的乐器（VSTi）仍走下面的 `drawBody`（它自己会画 MIDI 段 + 三段 VST）。
@@ -436,24 +419,12 @@ fn drawMidiMenu(ui: *Ui, app: *App) void {
     const tgt = view_lane.Target{ .kind = mm.kind, .uid = uid };
     const items = [_][]const u8{ "恢复默认值", "输入值…", "自动化…" };
     const mw2: i32 = 140;
-    const mh2: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
-    const mx = mm.x;
-    const my = mm.y;
-    ui.renderer.fillRect(mx, my, mw2, mh2, ui.theme.panel);
-    ui.renderer.strokeRect(mx, my, mw2, mh2, ui.theme.accent);
-    ui.noteOverlayRect(mx, my, mw2, mh2); // 遮挡插件子窗口
-    var clicked: ?usize = null;
-    var inside = false;
-    for (items, 0..) |item, k| {
-        const iy = my + 2 + @as(i32, @intCast(k)) * util.menu_item_h;
-        const hov = util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, mw2 - 2, util.menu_item_h);
-        if (hov) {
-            inside = true;
-            ui.renderer.fillRect(mx + 1, iy, mw2 - 2, util.menu_item_h, ui.theme.item_hover);
-        }
-        ui.label(item, mx + 8, iy + 2, ui.theme.text);
-        if (hov and ui.mouse_pressed) clicked = k;
-    }
+    // 走共享 `util.menuPanel`；位置固定（打开时快照进 mm.x/mm.y，不跟鼠标跑）
+    var mx = mm.x;
+    var my = mm.y;
+    var open = true;
+    const bounds: @import("ui.zig").Rect = .{ .x = 0, .y = 0, .w = ui.renderer.logicalWidth(), .h = ui.renderer.logicalHeight() };
+    const clicked = util.menuPanel(ui, &mx, &my, &open, false, .{ .cursor = {} }, bounds, &items, mw2, null);
     if (clicked) |k| {
         if (app.instrumentIndexByUid(uid)) |ii| {
             const inst = &app.instruments.items[ii];
@@ -495,8 +466,8 @@ fn drawMidiMenu(ui: *Ui, app: *App) void {
             }
         }
         st.midi_menu = null;
-    } else if (ui.mouse_pressed and !inside) {
-        st.midi_menu = null; // 点菜单外 = 关闭
+    } else if (!open) {
+        st.midi_menu = null; // 点菜单外 = 关闭（`menuPanel` 已判定）
     }
 }
 
@@ -588,7 +559,6 @@ pub fn drawBody(ui: *Ui, app: *App, ref: PluginSlotRef, x: i32, y: i32, w: i32, 
             break :blk app.instruments.items[ref.a].uid;
         break :blk 0;
     };
-    const n_midi: i32 = if (inst_uid == 0) 0 else midiVisibleCount(q);
     var n_all: i32 = 0;
     {
         var pi: usize = 0;
@@ -599,15 +569,18 @@ pub fn drawBody(ui: *Ui, app: *App, ref: PluginSlotRef, x: i32, y: i32, w: i32, 
         }
     }
 
-    // **VST 组高度**：折叠时只留标题行（§11.47：组内 = 已链接（置顶）→ 最近改动 → 全部参数）
+    // **VST 组折叠**：折叠时只留组标题行（§11.47：组内 = 已链接（置顶）→ 最近改动 → 全部参数）。
     // TODO（未做，见 `docs/automation.md` 同名小节）：改成“固定高度分区”（上区内容高、下区独立滚动），
     // 理由是现在「最近改动」变长会把「全部参数」整体往下推（行数跳变）。
     const vst_folded = t.vst_fold and q.len == 0;
-    const vst_h: i32 = if (vst_folded) sect_h else (sect_h + @max(n_linked, 1) * row_h) +
-        (sect_h + @max(n_recent, 1) * row_h) +
-        (sect_h + @max(n_all, 1) * row_h);
-    const content_h: i32 = (sect_h + @max(n_midi, 0) * row_h) + vst_h + 8;
-    const scroll_max: i32 = @max(0, content_h - list_h);
+
+    // **滚动界跟“上一帧实测的内容高”**（`t.drawn_h`，由下方绘制循环画完后回填）：
+    // 旧实现用手工公式估高，与实际绘制漂移——外层“插件参数”组头没算进去、
+    // MIDI 段折叠/缺失的口径不一致——实测“滚到底还差一两条”（“最近改动”一长
+    // 就复现）。实测值从根上消灭这类漂移：以后改布局不用同步任何公式。
+    // 首帧（还没量过）：先假设内容很长——滚动条从第一帧就占位，避免开窗时行宽跳一下。
+    const measured_h: i32 = if (t.drawn_h > 0) t.drawn_h else (1 << 30);
+    const scroll_max: i32 = @max(0, measured_h - list_h);
     if (util.hitUI(ui, x + 8, list_y, w - 16, list_h)) {
         t.scroll = std.math.clamp(t.scroll - util.scrollDelta(ui), 0, scroll_max);
     }
@@ -683,19 +656,25 @@ pub fn drawBody(ui: *Ui, app: *App, ref: PluginSlotRef, x: i32, y: i32, w: i32, 
             while (pi < n_params) : (pi += 1) {
                 if ((pl.params[pi].flags & 0x2) != 0) continue;
                 if (q.len > 0 and std.ascii.findIgnoreCase(pl.params[pi].name(), q) == null) continue;
-                // 视口外直接跳过（Serum 这类 2000+ 参数不要每帧排版/取值）
-                if (cy + row_h < list_y) {
+                // 视口外（上/下两侧）：**只累计不画、不 break**——绘制循环的 `cy`
+                // 必须走到真实内容底（`t.drawn_h` 靠它回填；break 会让量出的高度
+                // 停在视口底 → 滚动界又变小）。`n_all` 的计数循环本来就要全量扫，
+                // 这里多做的只是加法。
+                if (cy + row_h < list_y or cy > list_bot) {
                     cy += row_h;
                     continue;
                 }
-                if (cy > list_bot) break;
                 drawParamRow(ui, app, pl, pi, rowId(host, sec_all, pi), row_x, cy, row_w, ref);
                 cy += row_h;
             }
         }
     } // if (!vst_folded)
 
-    if (scroll_max > 0) ui.drawScrollbar(x + w - 11, list_y, 5, list_h, t.scroll, content_h, list_h);
+    // **实测内容高**：本帧画完后的 `cy` 就是内容底在屏幕上的位置——
+    // 还原成内容高度并回填，下一帧的滚动界/滚动条都用它。
+    t.drawn_h = cy - list_y + t.scroll;
+    // 滚动条与滚动界同源（`measured_h`）——首帧（还没量过）也不会画出怪异的滑块
+    if (scroll_max > 0) ui.drawScrollbar(x + w - 11, list_y, 5, list_h, t.scroll, measured_h, list_h);
 }
 fn sectionLabel(ui: *Ui, text: []const u8, x: i32, y: i32, w: i32, count: i32) void {
     var b: [64]u8 = undefined;
@@ -850,25 +829,14 @@ pub fn drawMenu(ui: *Ui, app: *App) void {
     const mh: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
     const scr_w = ui.renderer.logicalWidth();
     const scr_h = ui.renderer.logicalHeight();
-    const mx = std.math.clamp(st.menu_x, 0, @max(0, scr_w - menu_w));
-    const my = std.math.clamp(st.menu_y, 0, @max(0, scr_h - mh));
-    ui.noteOverlayRect(mx, my, menu_w, mh); // 遮挡插件子窗口（这张表正是给菜单用的）
-    ui.renderer.fillRect(mx, my, menu_w, mh, ui.theme.panel);
-    ui.renderer.strokeRect(mx, my, menu_w, mh, ui.theme.accent);
-
-    var hit: ?usize = null;
-    var inside = false;
-    for (items, 0..) |item, k| {
-        const iy = my + 2 + @as(i32, @intCast(k)) * util.menu_item_h;
-        const hov = util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, menu_w - 2, util.menu_item_h);
-        if (hov) {
-            inside = true;
-            ui.renderer.fillRect(mx + 1, iy, menu_w - 2, util.menu_item_h, ui.theme.item_hover);
-        }
-        ui.label(item, mx + 8, iy + 2, ui.theme.text);
-        if (!just and hov and ui.mouse_pressed) hit = k;
-    }
-
+    // 位置：打开时快照 + 每帧钳制到屏幕内（局部变量传给 `menuPanel`）。
+    // **开帧保护**（`just`）：本菜单是**左键**打开的——那次 mouse_pressed 还压在
+    // 菜单项上，开帧不得判定点击（`menuPanel` 的 just_opened + `.snapshot` 锚）。
+    var mx = std.math.clamp(st.menu_x, 0, @max(0, scr_w - menu_w));
+    var my = std.math.clamp(st.menu_y, 0, @max(0, scr_h - mh));
+    var open = true;
+    const bounds: @import("ui.zig").Rect = .{ .x = 0, .y = 0, .w = scr_w, .h = scr_h };
+    const hit = util.menuPanel(ui, &mx, &my, &open, just, .{ .snapshot = {} }, bounds, &items, menu_w, null);
     if (hit) |k| {
         // 恢复默认值 / 输入值… 都直接作用于发起菜单的那个插件槽（存于菜单状态）
         const slot_ref = st.menu_ref;
@@ -894,8 +862,8 @@ pub fn drawMenu(ui: *Ui, app: *App) void {
         ui.active_id = 0;
         return;
     }
-    // 点菜单外 → 收起（打开它的那一帧不判）
-    if (!just and ui.mouse_pressed and !inside and !util.inRect(ui.mouse_x, ui.mouse_y, mx, my, menu_w, mh)) {
+    // 点菜单外 → 收起（开启帧不判——`menuPanel` 的 just_opened 已处理）
+    if (!open) {
         st.menu_open = false;
         ui.active_id = 0;
     }

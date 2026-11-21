@@ -11,7 +11,6 @@
 //! 预设文件 IO 走 `pending_preset` 在 main 帧末执行（本模块不碰 io）。
 
 const std = @import("std");
-const r_mod = @import("render.zig");
 const Ui = @import("ui.zig").Ui;
 const App = @import("app.zig").App;
 const PresetSaveSource = @import("app.zig").PresetSaveSource;
@@ -58,23 +57,28 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     if (dw.sel_pitch < 0 or dw.sel_pitch > 127) dw.sel_pitch = 36;
     const sel: u8 = @intCast(dw.sel_pitch);
 
-    // 阴影 + 背景 + 边框
-    ui.renderer.fillRect(x + 3, y + 3, ww, hh, r_mod.rgb(10, 11, 13));
-    ui.renderer.fillRect(x, y, ww, hh, ui.theme.panel);
-    ui.renderer.strokeRect(x, y, ww, hh, ui.theme.accent);
+    // 标题文本（动态：鼓组 — 乐器名；外壳画标题栏与文字）
+    var tbuf: [96]u8 = undefined;
+    const title = std.fmt.bufPrint(&tbuf, "鼓组 — {s}", .{inst.name}) catch "鼓组";
 
-    // 标题栏：鼓组 — 乐器名（右侧：[预设 ▾] [保存为…] 层 n/16 ×）
-    ui.renderer.fillRect(x + 1, y + 1, ww - 2, win_title_h - 1, ui.theme.toolbar);
+    // ── 窗口外壳（共享 `util.windowChrome`；标题右侧 ~170px 留给
+    //    层数概览/预设/保存为/关闭）──
+    if (util.windowChrome(ui, 7060, 7061, title, win_title_h, 170, &dw.x, &dw.y, &dw.w, &dw.h, &dw.grab_dx, &dw.grab_dy, &dw.resize_w0, &dw.resize_h0, &dw.resize_mx, &dw.resize_my, true)) {
+        dw.open = false;
+        if (dw.audition_pitch) |ap| {
+            app.auditionOffInst(inst_idx, ap);
+            dw.audition_pitch = null;
+        }
+        return true;
+    }
+
+    // 标题栏右侧：层数概览 + [预设 ▾] [保存为…]（与合成器窗口同款：整组套鼓的存/取）
     {
-        var tbuf: [96]u8 = undefined;
-        const title = std.fmt.bufPrint(&tbuf, "鼓组 — {s}", .{inst.name}) catch "鼓组";
-        ui.label(title, x + 8, y + 4, ui.theme.text);
-        // 层数概览
         var cb: [24]u8 = undefined;
         const cnt = std.fmt.bufPrint(&cb, "层 {d}/{d}", .{ kit.totalLayers(), audio.kit_max_layers }) catch "";
         const cw: i32 = @intFromFloat(ui.font.measure(cnt));
         ui.label(cnt, x + ww - 30 - cw, y + 4, ui.theme.text_dim);
-        // [预设 ▾] [保存为…]（与合成器窗口同款：整组套鼓的存/取）
+        // [预设 ▾] [保存为…]
         const save_w: i32 = 62;
         const menu_w: i32 = 58;
         const gap: i32 = 6;
@@ -115,53 +119,6 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
             }
         }
     }
-
-    // 关闭按钮
-    if (util.titleCloseButton(ui, x, y, ww, win_title_h)) {
-        dw.open = false;
-        if (dw.audition_pitch) |ap| {
-            app.auditionOffInst(inst_idx, ap);
-            dw.audition_pitch = null;
-        }
-        return true;
-    }
-
-    // 标题拖动（排除右侧按钮区；按钮区≈150px）
-    if (util.hitUI(ui, x, y, ww - 170, win_title_h) and ui.mouse_pressed) {
-        ui.active_id = 7060;
-        dw.grab_dx = ui.mouse_x - x;
-        dw.grab_dy = ui.mouse_y - y;
-    }
-    if (ui.active_id == 7060) {
-        if (!ui.mouse_down) {
-            ui.active_id = 0;
-        } else {
-            dw.x = ui.mouse_x - dw.grab_dx;
-            dw.y = ui.mouse_y - dw.grab_dy;
-        }
-    }
-
-    // 右下角缩放柄
-    const grip = 14;
-    const grip_hovered = util.hitUI(ui, x + ww - grip, y + hh - grip, grip, grip);
-    if (grip_hovered) ui.cursor = .resize_h;
-    if (grip_hovered and ui.mouse_pressed) {
-        ui.active_id = 7061;
-        dw.resize_w0 = ww;
-        dw.resize_h0 = hh;
-        dw.resize_mx = ui.mouse_x;
-        dw.resize_my = ui.mouse_y;
-    }
-    if (ui.active_id == 7061) {
-        if (!ui.mouse_down) {
-            ui.active_id = 0;
-        } else {
-            dw.w = dw.resize_w0 + (ui.mouse_x - dw.resize_mx);
-            dw.h = dw.resize_h0 + (ui.mouse_y - dw.resize_my);
-        }
-    }
-    ui.renderer.line(x + ww - 10, y + hh - 2, x + ww - 2, y + hh - 10, ui.theme.panel_border);
-    ui.renderer.line(x + ww - 6, y + hh - 2, x + ww - 2, y + hh - 6, ui.theme.panel_border);
 
     const body_h = hh - win_title_h;
 

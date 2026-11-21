@@ -494,8 +494,12 @@ const Snapshot = struct {
 
 ```
 UI 线程：编辑 → commitHistory → snap_dirty
-        每帧 pollSnapshotRebuild()：脏则 build 快照 → atomic 发布(snapshot_ptr) + snap_gen++
-                                    旧快照进退休队列，30 帧后释放
+        每帧 pollSnapshotRebuild()：
+           · 先算**调度内容指纹**（schedSourceHash）——与最近一次发布一致 → 不重建、不发布、
+             不换代（commitHistory 无条件置脏，但曲线/EQ/设置类提交不改调度内容；换代只会
+             让音频空转一次：清 stash + 对账 + 重发本块）。导出的逐块置脏同样被它吃掉。
+           · 真变了 → build 快照 → atomic 发布(snapshot_ptr) + snap_gen++
+             旧快照进退休队列，30 帧后释放
 音频线程：每 block
           · snap_gen 变化 → 丢弃 stash 待触发事件 + snap_step = 本块起点 + **换代对账**
           · 从快照取 [snap_step, s1) 的事件 → stashInsert → 原有触发流水线
@@ -520,6 +524,12 @@ UI 线程：编辑 → commitHistory → snap_dirty
    凡“把帧换成步”的地方（事件收集窗口 / 自动化曲线求值 / 音频片段位置 / VST3 PPQ）**必须基于它**；
    写 `start_step + (abs0−start_frame)/step_frames` 的地方都属于 BPM 自动化之前的历史遗留，
    一旦有 tempo 曲线就会两边分家（已踩：吞音头）。
+7. **换代只跟内容走**（2026-11 增）：`snap_gen` 只在**调度内容指纹**（`schedSourceHash`）
+   变化时递增。指纹覆盖 `snapshot.build` 读到的**全部**输入（片段的
+   audio_style/track/start/len/pattern/offset/muted + 轨道静音效应 + 音符的
+   pattern/step/len/pitch/instrument/velocity/pan/muted + 域/样式）——
+   **改 `snapshot.build` 或模型调度字段时必须同步指纹清单**（漏一个 = 那个字段的编辑不再生效）。
+   回归测试：`app: 同内容提交不换代（自动化曲线类编辑不扰动音频）`。
 
 **诊断（现行）**
 
@@ -551,8 +561,11 @@ UI 线程：编辑 → commitHistory → snap_dirty
   `sched_edit_gen`（改读 `snap_gen`——**数据代即编辑代**）、`sched_rescan_from`、`dbg_ring_used`；
   `Scheduler` 的 `scheduled_upto` / `edit_gen` / `rescan_from` / `push_events_*`。
   现在 `Scheduler` 只剩 `gen`（传输代）与 `muted`（静音轨道集合）。
-- **唯一剩下的痕迹**：`synth.SchedEvent.edit_gen` 字段（已无人读写，保留以免改动
-  `snapshot`/`audio`/`sched_stress` 的签名；下一轮可直接删）。
+- **`synth.SchedEvent.edit_gen` 字段也已删**（曾保留以免改动签名；现已无人读写，连同
+  字段一起移除——`grep edit_gen src/` 无匹配）。
+- **内容门控（2026-11 增）**：`pollSnapshotRebuild` 里加了**调度内容指纹**比对——
+  曲线/EQ/设置类提交（置脏但内容没变）不再重建/发布/换代，音频侧 stash 与对账
+  状态保持不动；离线导出的逐块置脏同样被吃掉（导出不再每块全量重建快照）。
 - **保留**：`gatherRange` / `mapSong` / `mapPat` / `makeEv`——`snapshot` 对拍测试的参考实现。
 
 ### 11.9 鼓组（kind == 1）纳入对账

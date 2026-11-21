@@ -2466,9 +2466,9 @@ fn gatherWindow(engine: *const Engine, abs0: u64, frames: u32, step_frames: f64)
 
 /// 按步序插入一个调度事件（保持 stash 有序）。
 ///
-/// 为什么不是追加：播放中补发的新增音符事件可能**早于**已 stash 的事件
-/// （如新增音符在窗口最前端——见 `sequencer.scheduleAdded`）；
-/// 追加会被前面的事件挡着，拖到很晚才触发（表现：补发的 on 迟到/整段不响）。
+/// 为什么不是追加：快照的 `gatherRaw` 是**两条链**——先按步序把窗口内全部 `on`
+/// 收进来，再按步序收 `off`；直接追加的话，早步的 off 会排在晚步的 on 之后
+/// （表现：off 迟到 → 音符拖长；换代补发的 mid-on 也会被挡住）。
 /// 插不进去（stash 满）时丢弃——宁可丢一个事件也不阻塞音频线程；
 /// stash 溢出本身会由下一块的重扫/正常排水自愈。
 fn stashInsert(engine: *Engine, ev: synth.SchedEvent) void {

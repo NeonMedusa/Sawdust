@@ -148,25 +148,11 @@ pub fn drawTrackCtxMenu(ui: *Ui, app: *App) void {
     }
     const items = [_][]const u8{ "重命名", "上移", "下移", "清空轨道", "删除轨道" };
     const menu_w: i32 = 150;
-    const menu_h: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
-    const mx = app.panels.ctx_trk_x;
-    const my = app.panels.ctx_trk_y;
-    ui.renderer.fillRect(mx, my, menu_w, menu_h, ui.theme.panel);
-    ui.renderer.strokeRect(mx, my, menu_w, menu_h, ui.theme.accent);
-    ui.noteOverlayRect(mx, my, menu_w, menu_h); // 遮挡插件子窗口
-
-    var clicked: ?usize = null;
-    var inside = false;
-    for (items, 0..) |item, ii| {
-        const iy = my + 2 + @as(i32, @intCast(ii)) * util.menu_item_h;
-        const hovered = util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, iy, menu_w - 2, util.menu_item_h);
-        if (hovered) {
-            inside = true;
-            ui.renderer.fillRect(mx + 1, iy, menu_w - 2, util.menu_item_h, ui.theme.item_hover);
-        }
-        ui.label(item, mx + 8, iy + 2, ui.theme.text);
-        if (hovered and ui.mouse_pressed) clicked = ii;
-    }
+    var mx = app.panels.ctx_trk_x; // 固定位置（打开时快照，不跟鼠标跑）
+    var my = app.panels.ctx_trk_y;
+    var open = true;
+    const bounds: @import("ui.zig").Rect = .{ .x = 0, .y = 0, .w = ui.renderer.logicalWidth(), .h = ui.renderer.logicalHeight() };
+    const clicked = util.menuPanel(ui, &mx, &my, &open, false, .{ .cursor = {} }, bounds, &items, menu_w, null);
     if (clicked) |ci| {
         switch (ci) {
             0 => app.beginRenameTrack(idx, mx + 6, my + 4),
@@ -205,7 +191,8 @@ pub fn drawTrackCtxMenu(ui: *Ui, app: *App) void {
             else => {},
         }
         app.panels.ctx_track = null;
-    } else if (ui.mouse_pressed and !inside) {
+    } else if (!open) {
+        // 点菜单外 → 关闭（`menuPanel` 已判定）
         app.panels.ctx_track = null;
     }
 }
@@ -1785,8 +1772,7 @@ pub fn drawCurveMenu(ui: *Ui, app: *App) void {
             },
         }
     }
-    // 遮挡插件子窗口 + 菜单展开期间禁掉插件编辑器（与其它右键菜单一致）
-    ui.noteOverlayRect(cm.x, cm.y, 128, @as(i32, @intCast(items.len)) * util.menu_item_h + 4);
+    // 菜单展开期间禁掉插件编辑器（遮挡登记已在 `util.menuPanel` 内统一处理）
     cm.just_opened = false;
 }
 

@@ -241,23 +241,11 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) void {
                     const items = [_][]const u8{ "重命名", "删除…" };
                     const mw: i32 = 120;
                     const mh: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
-                    const mx = std.math.clamp(app.preset_browser.ctx_x, 0, @max(0, w - mw));
-                    const my = std.math.clamp(app.preset_browser.ctx_y, 0, @max(0, h - mh));
-                    ui.renderer.fillRect(mx, my, mw, mh, ui.theme.panel);
-                    ui.renderer.strokeRect(mx, my, mw, mh, ui.theme.accent);
-                    ui.noteOverlayRect(mx, my, mw, mh); // 遮挡插件子窗口
-                    var clicked: ?usize = null;
-                    var inside = false;
-                    for (items, 0..) |item, mi| {
-                        const my2 = my + 2 + @as(i32, @intCast(mi)) * util.menu_item_h;
-                        const ih = util.inRect(ui.mouse_x, ui.mouse_y, mx + 1, my2, mw - 2, util.menu_item_h);
-                        if (ih) {
-                            inside = true;
-                            ui.renderer.fillRect(mx + 1, my2, mw - 2, util.menu_item_h, ui.theme.item_hover);
-                        }
-                        ui.label(item, mx + 8, my2 + 2, ui.theme.text);
-                        if (ih and ui.mouse_pressed) clicked = mi;
-                    }
+                    // 钳制到浏览器窗口内（局部变量传给 `menuPanel`，保留每帧钳制）
+                    var mx = std.math.clamp(app.preset_browser.ctx_x, 0, @max(0, w - mw));
+                    var my = std.math.clamp(app.preset_browser.ctx_y, 0, @max(0, h - mh));
+                    var open = true;
+                    const clicked = util.menuPanel(ui, &mx, &my, &open, false, .{ .cursor = {} }, .{ .x = 0, .y = 0, .w = w, .h = h }, &items, mw, null);
                     if (clicked) |mi| {
                         const pname = cat.presets.items[ci];
                         if (mi == 0) {
@@ -266,7 +254,8 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) void {
                             app.setDeletePrompt(cat_idx, pname);
                         }
                         app.preset_browser.ctx = null;
-                    } else if (ui.mouse_pressed and !inside) {
+                    } else if (!open) {
+                        // 点菜单外 → 关闭（`menuPanel` 已判定）
                         app.preset_browser.ctx = null;
                     }
                 }

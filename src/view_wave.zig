@@ -3,7 +3,6 @@
 //! 试听 = **局部预览**（不动主播放游标；走目标各自通道——用户拍板 2026-10）。
 
 const std = @import("std");
-const r_mod = @import("render.zig");
 const Ui = @import("ui.zig").Ui;
 const app_mod = @import("app.zig");
 const App = app_mod.App;
@@ -112,37 +111,22 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     const ww_w = ww.w;
     const ww_h = ww.h;
 
-    // 阴影 + 背景 + 边框 + 标题栏
-    ui.renderer.fillRect(x + 3, y + 3, ww_w, ww_h, r_mod.rgb(10, 11, 13));
-    ui.renderer.fillRect(x, y, ww_w, ww_h, ui.theme.panel);
-    ui.renderer.strokeRect(x, y, ww_w, ww_h, ui.theme.accent);
-    ui.renderer.fillRect(x + 1, y + 1, ww_w - 2, title_h - 1, ui.theme.toolbar);
+    // ── 窗口外壳（共享 `util.windowChrome`；本窗口不可缩放、标题动态）──
     var tbuf: [192]u8 = undefined;
     const kind_label: []const u8 = if (tgt.layer_ref != null) "采样器层" else if (app.wave_win.style != null) "音频样式" else "音频片段";
     const title = std.fmt.bufPrint(&tbuf, "{s} — {s}", .{ kind_label, tgt.name }) catch "音频";
-    ui.label(title, x + 8, y + 4, ui.theme.text);
-
-    // 关闭按钮（全项目统一：`util.titleCloseButton`）
-    if (util.titleCloseButton(ui, x, y, ww_w, title_h)) {
+    var rs_w0: i32 = 0; // 缩放快照占位（本窗口不可缩放，只是传参）
+    var rs_h0: i32 = 0;
+    var rs_mx: i32 = 0;
+    var rs_my: i32 = 0;
+    if (util.windowChrome(ui, 9600, 0, title, title_h, 24, &ww.x, &ww.y, &ww.w, &ww.h, &ww.grab_dx, &ww.grab_dy, &rs_w0, &rs_h0, &rs_mx, &rs_my, false)) {
         app.previewStop();
         ww.open = false;
         return true;
     }
-
-    // 标题拖动（点窗口即置顶由 main.drawApp 统一处理：只提升最上层那个）
-    if (util.hitUI(ui, x, y, ww_w - 24, title_h) and ui.mouse_pressed) {
-        ui.active_id = 9600;
-        ww.grab_dx = ui.mouse_x - x;
-        ww.grab_dy = ui.mouse_y - y;
-    }
-    if (ui.active_id == 9600) {
-        if (!ui.mouse_down) {
-            ui.active_id = 0;
-        } else {
-            ww.x = std.math.clamp(ui.mouse_x - ww.grab_dx, 0, @max(0, w - ww_w));
-            ww.y = std.math.clamp(ui.mouse_y - ww.grab_dy, 0, @max(0, h - ww_h));
-        }
-    }
+    // 拖动后即时钳制（原实现就在拖动分支里钳；外壳只做纯赋值）
+    ww.x = std.math.clamp(ww.x, 0, @max(0, w - ww.w));
+    ww.y = std.math.clamp(ww.y, 0, @max(0, h - ww.h));
 
     // ── 控制行：[循环][▶/⏸][■] / 增益 / 速度 / 通道（采样器层无通道框——跟随鼓组乐器）──
     const ctl_y = y + title_h + 4;

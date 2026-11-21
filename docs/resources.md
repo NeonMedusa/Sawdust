@@ -112,8 +112,11 @@ A. 同一行相邻等色矩形合并为一次 `fillRect`（渲染层通用）；
 B. 音符层缓存位图（key 含 `notes_ver/zoom/scroll/尺寸`，静止只 blit，滚动退化）。
 
 **仍然全量扫 `notes` 的地方（均非预览，故意保留）**：选区快照/每帧重建选区、
-“有没有选中项”“整体加减力度”、`dyn_zoom_min` 的 `max_step`、每样式音域统计
+“有没有选中项”“整体加减力度”、每样式音域统计
 （后者已 `notes_ver` 门控，稳态 0）。
+（2026-11 增：`dyn_zoom_min` 的 `max_step` 与 PAT 自动循环的样式末尾
+改走 `patternEndStepCached`（`notes_ver` 门控）；力度/声像轨的 hover 命中
+`hitNoteIndex` 与画笔 `paintAt` 改走**时间桶索引**（同钢琴窗 `noteAtMousePx`）。）
 
 ## 五、刻意保留的取舍（勿当 bug）
 

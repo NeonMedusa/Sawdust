@@ -5,7 +5,6 @@
 //! 不直接碰 io / 进程）。UI 与行为约定见 `tmp/changes-notes.md`「插件管理器」。
 
 const std = @import("std");
-const r_mod = @import("render.zig");
 const Ui = @import("ui.zig").Ui;
 const app_mod = @import("app.zig");
 const App = app_mod.App;
@@ -43,34 +42,14 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     const ww = pm.w;
     const hh = pm.h;
 
-    // 阴影 + 背景 + 边框
-    ui.renderer.fillRect(x + 3, y + 3, ww, hh, r_mod.rgb(10, 11, 13));
-    ui.renderer.fillRect(x, y, ww, hh, ui.theme.panel);
-    ui.renderer.strokeRect(x, y, ww, hh, ui.theme.accent);
-
-    // 标题栏
-    ui.renderer.fillRect(x + 1, y + 1, ww - 2, title_h - 1, ui.theme.toolbar);
-    ui.label("插件管理", x + 8, y + 4, ui.theme.text);
-
-    // 关闭按钮
-    if (util.titleCloseButton(ui, x, y, ww, title_h)) {
+    // ── 窗口外壳（共享 `util.windowChrome`；本窗口不可缩放）──
+    var rs_w0: i32 = 0; // 缩放快照占位（本窗口不可缩放，只是传参）
+    var rs_h0: i32 = 0;
+    var rs_mx: i32 = 0;
+    var rs_my: i32 = 0;
+    if (util.windowChrome(ui, 9700, 0, "插件管理", title_h, 24, &pm.x, &pm.y, &pm.w, &pm.h, &pm.grab_dx, &pm.grab_dy, &rs_w0, &rs_h0, &rs_mx, &rs_my, false)) {
         pm.open = false;
         return true;
-    }
-
-    // 标题拖动
-    if (util.hitUI(ui, x, y, ww - 24, title_h) and ui.mouse_pressed) {
-        ui.active_id = 9700;
-        pm.grab_dx = ui.mouse_x - x;
-        pm.grab_dy = ui.mouse_y - y;
-    }
-    if (ui.active_id == 9700) {
-        if (!ui.mouse_down) {
-            ui.active_id = 0;
-        } else {
-            pm.x = ui.mouse_x - pm.grab_dx;
-            pm.y = ui.mouse_y - pm.grab_dy;
-        }
     }
 
     var yy = y + title_h + 8;

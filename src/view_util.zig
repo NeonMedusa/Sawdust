@@ -66,6 +66,99 @@ pub fn titleCloseButton(ui: *Ui, x: i32, y: i32, w: i32, title_h_: i32) bool {
     return hovered and ui.mouse_pressed;
 }
 
+/// 浮动窗口**外壳**（阴影 + 背景 + 边框 + 标题栏 + 关闭按钮 + 标题拖动 +
+/// 右下角缩放柄）：机架/混音台/合成器/鼓组/效果器/帮助/设置/波形/插件/自动化
+/// 等浮动窗口共用——以前各写一份（~50 行 × 10 处），拖动/关帧序各踩一遍坑。
+///
+/// **调用方状态约定**（传指针进来；各窗口字段名保持一致，不改布局）：
+/// `x/y/w/h` 窗口矩形 + `grab_dx/grab_dy` 拖动抓取偏移 +
+/// `resize_w0/resize_h0/resize_mx/resize_my` 缩放起点快照（按下时存，全程用它换算——
+/// 见 `docs/pitfalls.md`《拖动换算必须用按下时快照》）。
+///
+/// - `drag_id` / `grip_id`：拖动与缩放的 active_id——**两者都显式传**（不搞
+///   `id+1` 约定：设置窗的缩放柄就是 9541 而 9521 被 toggle2 占着，隐式约定必撞）。
+///   **必须查 `ui.zig` 的号段表取本窗口专属段**——撞车 = 串窗口（历史事故多发区）；
+/// - `title_right_pad`：标题栏**右侧保留宽度**（关闭按钮 + 标题栏内嵌按钮；
+///   只有 `w - title_right_pad` 那段可拖动）；
+/// - `resizable`：false = 不画缩放柄、不响应缩放（拖动照常；w/h 指针仍要传，占位即可）；
+/// - 返回 `true` = **点了关闭**——调用方做自己的清理（关菜单/停预览…）、置
+///   `open = false` 并从 draw 返回；本函数不做任何清理（各窗口的收尾语义不同）。
+///
+/// 位置钳制（`clampWindow`）由调用方在**帧首**做（缩放/拖动写回的极值由它兜底）。
+pub fn windowChrome(
+    ui: *Ui,
+    drag_id: u64,
+    grip_id: u64,
+    title: []const u8,
+    title_h_: i32,
+    title_right_pad: i32,
+    x: *i32,
+    y: *i32,
+    w: *i32,
+    h: *i32,
+    grab_dx: *i32,
+    grab_dy: *i32,
+    resize_w0: *i32,
+    resize_h0: *i32,
+    resize_mx: *i32,
+    resize_my: *i32,
+    resizable: bool,
+) bool {
+    const px = x.*;
+    const py = y.*;
+    const pw = w.*;
+    const ph = h.*;
+    // 阴影 + 背景 + 边框（亮蓝描边，全项目统一）
+    ui.renderer.fillRect(px + 3, py + 3, pw, ph, r_mod.rgb(10, 11, 13));
+    ui.renderer.fillRect(px, py, pw, ph, ui.theme.panel);
+    ui.renderer.strokeRect(px, py, pw, ph, ui.theme.accent);
+    // 标题栏
+    ui.renderer.fillRect(px + 1, py + 1, pw - 2, title_h_ - 1, ui.theme.toolbar);
+    // 标题用**中段省略**（`labelMiddle`）：动态标题（乐器/参数名）超长时保留两头，
+    // 不会溢出到右侧按钮区（原各窗口用裸 `label`，长名会压到关闭按钮上）
+    ui.labelMiddle(title, px + 8, py + 4, @max(0, pw - 8 - title_right_pad), ui.theme.text);
+    // 关闭按钮（右上角 ×；全项目统一件）
+    if (titleCloseButton(ui, px, py, pw, title_h_)) return true;
+    // 标题拖动（存抓取偏移，避免拿起来就跳；右侧 `title_right_pad` 留给按钮/关闭）
+    if (hitUI(ui, px, py, @max(0, pw - title_right_pad), title_h_) and ui.mouse_pressed) {
+        ui.active_id = drag_id;
+        grab_dx.* = ui.mouse_x - px;
+        grab_dy.* = ui.mouse_y - py;
+    }
+    if (ui.active_id == drag_id) {
+        if (!ui.mouse_down) {
+            ui.active_id = 0;
+        } else {
+            x.* = ui.mouse_x - grab_dx.*;
+            y.* = ui.mouse_y - grab_dy.*;
+        }
+    }
+    // 右下角缩放柄（三角形区；快照式换算）
+    if (resizable) {
+        const grip = 14;
+        const grip_hovered = hitUI(ui, px + pw - grip, py + ph - grip, grip, grip);
+        if (grip_hovered) ui.cursor = .resize_h;
+        if (grip_hovered and ui.mouse_pressed) {
+            ui.active_id = grip_id;
+            resize_w0.* = pw;
+            resize_h0.* = ph;
+            resize_mx.* = ui.mouse_x;
+            resize_my.* = ui.mouse_y;
+        }
+        if (ui.active_id == grip_id) {
+            if (!ui.mouse_down) {
+                ui.active_id = 0;
+            } else {
+                w.* = resize_w0.* + (ui.mouse_x - resize_mx.*);
+                h.* = resize_h0.* + (ui.mouse_y - resize_my.*);
+            }
+        }
+        ui.renderer.line(px + pw - 10, py + ph - 2, px + pw - 2, py + ph - 10, ui.theme.panel_border);
+        ui.renderer.line(px + pw - 6, py + ph - 2, px + pw - 2, py + ph - 6, ui.theme.panel_border);
+    }
+    return false;
+}
+
 /// 视图切换按钮（标题栏**最右侧**）：播放列表 ⇄ 钢琴卷帘。
 /// `x` = 面板右缘；按钮右对齐。返回 true = 本帧被点击（调用方执行切换）。
 /// 图标用**自绘双向箭头**（不依赖字体字形——`⇄` 在常见 UI 字体里缺失）。
@@ -247,6 +340,10 @@ pub const MenuAnchor = union(enum) {
     /// 跟随鼠标（位置在**开启那一帧快照后固定**——否则菜单会跟着鼠标跑，
     /// “钓竿上的胡萝卜”，永远点不到）
     cursor: void,
+    /// **位置已由调用方快照**（打开帧写进 `mx`/`my`，可能还带每帧钳制）：
+    /// 不重算位置，只享受“开启帧不判定点击”的保护（左键打开的菜单必需——
+    /// 打开它的那次 mouse_pressed 还压在菜单项上）。
+    snapshot: void,
 };
 
 /// 帧首调用：清零“刚打开”标记（必须逐帧做，否则“点外部关闭”永久失效）
@@ -300,6 +397,8 @@ pub fn menuPanel(
                 my.* = ui.mouse_y + 6;
                 if (my.* + mh > bounds.y + bounds.h) my.* = @max(bounds.y, ui.mouse_y - mh - 6);
             },
+            // 快照锚：位置已由调用方存好（含每帧钳制）——这里什么都不改
+            .snapshot => {},
         }
         // 右/下越界兜底
         mx.* = std.math.clamp(mx.*, bounds.x, @max(bounds.x, bounds.x + bounds.w - item_w));
@@ -310,19 +409,22 @@ pub fn menuPanel(
     const pmy = my.*;
     ui.renderer.fillRect(pmx, pmy, item_w, mh, ui.theme.panel);
     ui.renderer.strokeRect(pmx, pmy, item_w, mh, ui.theme.accent);
+    ui.noteOverlayRect(pmx, pmy, item_w, mh); // 遮挡插件子窗口（菜单/弹层专用表）
 
     var clicked: ?usize = null;
     var inside_any = false;
     for (items, 0..) |item, i| {
         const iy = pmy + 2 + @as(i32, @intCast(i)) * menu_item_h;
         const ih = inRect(ui.mouse_x, ui.mouse_y, pmx + 1, iy, item_w - 2, menu_item_h);
-        const ok = enabled == null or enabled.?[i];
+        const ok = enabled == null or (i < enabled.?.len and enabled.?[i]);
         if (ih) {
             inside_any = true;
             if (ok) ui.renderer.fillRect(pmx + 1, iy, item_w - 2, menu_item_h, ui.theme.item_hover);
         }
         ui.labelClipped(item, pmx + 8, iy + 2, item_w - 16, if (!ok) ui.theme.text_dim else if (ih) ui.theme.accent else ui.theme.text);
-        if (ih and ok and ui.mouse_pressed) clicked = i;
+        // **开启帧不判定条目点击**：左键打开的菜单，打开那次 mouse_pressed 还压在
+        // 菜单项上（右键打开的菜单天然无此帧——mouse_pressed 是左键专用位）
+        if (ih and ok and ui.mouse_pressed and !just_opened) clicked = i;
     }
     // 点外部关闭（**跳过“刚打开”那一帧**：同帧点击会立刻把它关掉，
     // 实测 bug：菜单闪一下消失）
