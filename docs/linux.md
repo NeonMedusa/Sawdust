@@ -172,9 +172,18 @@ zig build test --cache-dir "$HOME/.cache/sawdust-build" --summary all
 # Windows
 zig build test --summary all
 ```
+
+> **产物一律不进仓库**（用户拍板）：在 WSL 里构建时把 `--prefix` 也指到临时目录，
+> 别在仓库里生成 `zig-out-linux/`：
+> ```bash
+> zig build -Doptimize=Debug --cache-dir /tmp/sd-cache --prefix /tmp/sd-out
+> # 跑：/tmp/sd-out/bin/Sawdust（需要 X11；WSLg 直接 DISPLAY=:0 即可）
+> ```
+> 仓库里的 `zig-out/`、`zig-out-linux/`、`.zig-cache/` 都已在 `.gitignore`，但**别提交**（也不该暂存）。
+
 **动过 UI 代码（`view_*` / `ui` / `main`）必须 `zig build` + `zig build test` 都跑**：`zig build test` 不分析 UI。
 
-当前基线：**Linux 352 pass / 22 skip（374）；Windows 370 pass / 3 skip（373）**。
+当前基线：**Linux 440 pass / 26 skip；Windows 460 pass / 5 skip**（数字会随新增用例变，以实际输出为准）。
 
 ### 6.3 调试技巧
 | 目的 | 做法 |

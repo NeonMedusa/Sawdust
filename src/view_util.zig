@@ -445,6 +445,32 @@ pub fn inRect(mx: i32, my: i32, x: i32, y: i32, w: i32, h: i32) bool {
     return mx >= x and mx < x + w and my >= y and my < y + h;
 }
 
+/// **自绘勾选标记**（对勾）：菜单勾选项用。
+/// 为什么不直接用 `✔`(U+2714)：很多字体没有这个字形 → 渲染成方块/乱码（用户实测）。
+/// 画法 = 两段斜线采样成 2×2 小方块（10px 尺寸下比 1px 线清楚）。
+pub fn drawCheckMark(ui: *Ui, x: i32, y: i32, size: i32, color: r_mod.Color) void {
+    const s: f32 = @floatFromInt(@max(6, size));
+    const x0: f32 = @floatFromInt(x);
+    const y0: f32 = @floatFromInt(y);
+    // 归一化坐标下的三段点：左上 → 下中 → 右上
+    strokeSeg(ui, x0, y0, s, 0.10, 0.55, 0.40, 0.85, color);
+    strokeSeg(ui, x0, y0, s, 0.40, 0.85, 0.95, 0.15, color);
+}
+
+/// `drawCheckMark` 的一段（归一化坐标 → 每 ~1px 采样一个 2×2 方块）
+fn strokeSeg(ui: *Ui, ox: f32, oy: f32, size: f32, ax: f32, ay: f32, bx: f32, by: f32, color: r_mod.Color) void {
+    const dx = (bx - ax) * size;
+    const dy = (by - ay) * size;
+    const steps: i32 = @intFromFloat(@max(1.0, @ceil(@abs(dx) + @abs(dy))));
+    var i: i32 = 0;
+    while (i <= steps) : (i += 1) {
+        const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(steps));
+        const px: i32 = @intFromFloat(ox + (ax + (bx - ax) * t) * size);
+        const py: i32 = @intFromFloat(oy + (ay + (by - ay) * t) * size);
+        ui.renderer.fillRect(px, py, 2, 2, color);
+    }
+}
+
 /// 直接坐标命中 + 尊重 input_blocked（浮动窗口内部控件用：
 /// 当菜单展开（模态）时，窗口自身的其它控件也要让位）
 pub fn hitUI(ui: *Ui, x: i32, y: i32, w: i32, h: i32) bool {

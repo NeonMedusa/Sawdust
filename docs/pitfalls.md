@@ -2296,3 +2296,19 @@ MIDI 导入 CC10=64 → `64/127 = 0.5039` → 按 L/R 百分比四舍五入后�
 运行时跟随该走 `WM_DPICHANGED`（换显示器 / 改缩放 / 改分辨率**若导致 DPI 变**都会来），
 `wParam & 0xFFFF` = 新 DPI，`lParam` = 系统建议的新窗口矩形（照它 `SetWindowPos` 以保持逻辑尺寸）。
 X11 侧没有这个消息，靠 `RESOURCE_MANAGER` / `_XSETTINGS_SETTINGS` 的 `PropertyNotify`。
+
+## 撤销/读档把乐器“换出 VST3”时必须退役实例（2026-11 用户实测 bug）
+
+- **复现**：新建工程 → 把自带减法合成器换成 Vital → 打开自动化参数表（能看到 Vital 的参数）→
+  在操作历史里点回“新建”→ 乐器已经变回减法合成器，**参数表里还是 Vital 的参数**。
+- **根因**：`applySavedInstrument` 只处理了“**换插件**”（`si.kind == 2` 且路径变化 → `retirePlugin`），
+  没处理“**换走插件**”（存档 kind = 内置合成器 / 鼓组）。于是 `inst.kind` 回到了 `.synth`，
+  但 `inst.plugin` 仍指着 Vital：`slotPlugin()`（参数表/面板/同步全靠它）照旧拿到 Vital，
+  实例也永不释放（不 `retirePlugin` 就没人管它，音频线程可能还在跑它的 process）。
+- **修法**：非 VST3 分支必须先退役 + 清 `plugin_path_len` + 清 pending/失败退避——
+  与 UI 路径 `changeInstrumentKind` 同一套清理。
+- **测试**：`app: 撤销“换成 VST3”后旧实例必须退役——参数表不得再看到插件参数`
+  （`zig-out/bin/zig_vst3_sine_synth.dll`；无插件/非 Windows → skip。故意禁用修复时该用例\.FAIL）。
+- **推广（同类不变式）**：任何“把槽位从插件改回非插件”的路径都必须退役实例。
+  目前 `changeInstrumentKind` / `relocate*` / `applyVst3Instrument` / 效果链重建（`importMixerChannels`
+  整链重建后统一退役旧槽）/ 鼓组层（`importDrumKit` 救援表 + 未用到即退役）都已覆盖。

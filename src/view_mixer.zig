@@ -310,9 +310,9 @@ fn drawStrip(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32) void
         const pan_tgt = view_lane.Target{ .kind = .mixer_pan, .uid = mc.uid };
         const pan_eff = app.autoValueFor(pan_tgt, @floatFromInt(app.playback.cursorStep(true)), mc.pan);
         var pan = pan_eff;
-        // **有启用中的自动化绑定 → 进度弧 + 中心点变绿**
-        const pan_bound = app.isTargetDriven(pan_tgt);
-        if (ui.knobAuto(id_pan_base + @as(u64, ci), &pan, cx, ky, knob_size, pan_bound)) {
+        // 显示口径（§11.48.1）：**实际应用的值**——驱动跟随中 = 曲线输出；锁定中 = 静态值；无曲线 = 静态值。
+        const pan_bound = app.isAutoActive(pan_tgt);
+        if (ui.knobAutoState(id_pan_base + @as(u64, ci), &pan, cx, ky, knob_size, pan_bound, app.isAutoTakeover(pan_tgt))) {
             // 同推子：拖动期间手动接管（写回 = 旋钮显示值本身）
             mc.pan = app.dragWriteback(pan_tgt, pan);
             app.history_pending = "调整通道声像";
@@ -351,9 +351,9 @@ fn drawStrip(ui: *Ui, app: *App, ci: usize, x: i32, y: i32, w: i32, h: i32) void
         const vol_tgt = view_lane.Target{ .kind = if (ci == 0) .master_vol else .mixer_vol, .uid = mc.uid };
         const vol_eff = app.autoValueFor(vol_tgt, @floatFromInt(app.playback.cursorStep(true)), mc.volume);
         var vol = vol_eff;
-        // **有启用中的自动化绑定 → 填充段 + 把手变绿**
-        const vol_bound = app.isTargetDriven(vol_tgt);
-        const tint: ?r_mod.Color = if (vol_bound) ui.theme.auto_active else null;
+        // **有启用中的自动化绑定 → 填充段 + 把手变绿**（锁定中 = 橙色，表示本场听你的）
+        const vol_bound = app.isAutoActive(vol_tgt);
+        const tint: ?r_mod.Color = if (vol_bound) ui.theme.auto_active else if (app.isAutoTakeover(vol_tgt)) ui.theme.auto_takeover else null;
         if (ui.sliderTint(id_vol_base + @as(u64, ci), &vol, cx, sy, slider_w, 18, tint, tint)) {
             // 拖动期间“手动接管”（音频/UI 都暂不吃曲线，松手恢复）；
             // **写回 = 推子显示值本身**（不是“旧静态值 + 增量” → 那会让音量起手跳一大下 = 爆音）
@@ -623,6 +623,14 @@ fn drawCtxMenuGeneric(ui: *Ui, app: *App, ch: usize, slot: ?usize, items: []cons
 /// 与自动化目标（`master_vol`·`mixer_vol` / `mixer_pan`）。
 fn drawPanVolCtxMenu(ui: *Ui, app: *App, ch: usize, is_vol: bool) void {
     const mw_win = &app.mixer_win;
+    // 目标：主通道音量 / 通道音量 / 通道声像（“自动化…”开窗用）
+    const tgt: view_lane.Target = if (ch < app.mixer_channels_state.items.len) blk: {
+        const mc0 = &app.mixer_channels_state.items[ch];
+        break :blk if (is_vol)
+            (if (ch == 0) .{ .kind = .master_vol } else .{ .kind = .mixer_vol, .uid = mc0.uid })
+        else
+            .{ .kind = .mixer_pan, .uid = mc0.uid };
+    } else .{ .kind = .none };
     const items = [_][]const u8{ "恢复默认值", "输入值…", "自动化…" };
     const menu_w: i32 = 140;
     const menu_h: i32 = @as(i32, @intCast(items.len)) * util.menu_item_h + 4;
@@ -652,10 +660,6 @@ fn drawPanVolCtxMenu(ui: *Ui, app: *App, ch: usize, is_vol: bool) void {
                     app.beginEditChannelPan(ch, view_lane.formatValue(.pan, mc.pan, &vb), mx + 4, my + 4, menu_w - 8);
                 }
             } else {
-                const tgt: view_lane.Target = if (is_vol)
-                    (if (ch == 0) .{ .kind = .master_vol } else .{ .kind = .mixer_vol, .uid = mc.uid })
-                else
-                    .{ .kind = .mixer_pan, .uid = mc.uid };
                 app.openAutoWin(tgt);
             }
         }

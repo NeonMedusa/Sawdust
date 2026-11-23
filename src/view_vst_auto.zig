@@ -2,8 +2,8 @@
 //!
 //! 一个乐器一个窗口，三段式（像常见 DAW 的“参数列表”）：
 //!
-//! 1. **已链接**：这个乐器上已有绑定的参数（**绿色、只读**——值由曲线决定，
-//!    想改去自动化窗口；手动扭也会被自动化覆盖回去）；
+//! 1. **已链接**：这个乐器上已有绑定的参数（**绿色**——值由曲线决定，拖动时变**橙**表示“现在听你的”）；
+//!    **链接了也照样能拖**（touch 语义：拖动期间该车道临时下线，松手曲线立刻接手；§11.48 结论）；
 //! 2. **最近改动**：用户最近动过的 10 个参数（取自插件 `edit_ring` 的 `performEdit`，
 //!    见 `App.noteVstParamTouched`）；
 //! 3. **全部参数**：插件报的全表（带搜索框；`kIsReadOnly` 不列）。
@@ -260,13 +260,20 @@ fn drawAutoRow(
     w: i32,
     is_midi: bool,
 ) void {
-    const driven = app.isTargetDriven(tgt);
+    // 显示/交互口径（touch 语义）：
+    // - `driven` = 曲线正在驱动 → 绿、值跟曲线；
+    // - `manual` = 正在拖这一行 → **橙**（“现在听你的”），松手回绿（curve 接手）。
+    const driven = app.isAutoActive(tgt);
+    const manual = app.isAutoTakeover(tgt); // 已链接 + 正在拖 → 橙（未链接的拖动保持常态）
     const rw = w - menu_btn_w - 4;
     const hovered = util.hitUI(ui, x, y, rw, row_h - 1);
     ui.renderer.fillRect(x, y, rw, row_h - 1, if (hovered) ui.theme.toolbar else ui.theme.panel);
     ui.renderer.strokeRect(x, y, rw, row_h - 1, ui.theme.panel_border);
 
+    // 值 = **实际应用的值**：曲线在驱动时就是曲线值（与机架/混音台同一口径）。
+    // 拖动锚点也用它——否则按下那一瞬会从曲线值跳到静态值（推子侧踩过的坑）。
     var cur = val.read(app);
+    if (driven) cur = @floatCast(app.autoValueFor(tgt, @floatFromInt(app.playback.cursorStep(true)), @floatCast(cur)));
     // **音高目标的特殊口径**（MIDI 段的音高行 / VST 段的弯音别名行共用）：
     // 显示用半音、双击复位到 0.5（不弯）——插件自己报的 default_norm 往往是 0（=拉满向下）。
     const is_pitch = tgt.kind == .pitch_bend;
@@ -276,8 +283,10 @@ fn drawAutoRow(
             val.write(app, d);
             cur = val.read(app);
         }
-    } else if (!driven) {
-        // 被自动化驱动时值只读（拖了也会被曲线拉回去）
+    } else {
+        // **链接了自动化也能手动拖**（不是“绿色 = 只读”）：拖动期间 `beginAutoDrag` 让该车道
+        // 临时下线（touch：松手即恢复跟随，main 帧首 `clearAutoDrag`）。
+        if (ui.active_id == id_base) app.beginAutoDrag(tgt);
         var v: f64 = cur;
         if (ui.dragNormV(id_base, x, y, rw, row_h - 1, &v)) {
             if (@abs(v - cur) > 0.0002) {
@@ -287,14 +296,14 @@ fn drawAutoRow(
         }
     }
 
-    // 右：值（被驱动时绿色，与 VST 行原有语义一致）；音高 → 半音读数（按乐器行程换算）
+    // 右：值（跟随曲线 = 绿；拖动中 = 橙）；音高 → 半音读数（按乐器行程换算）
     var vb: [64]u8 = undefined;
     const vt = if (is_pitch)
         view_lane.formatSemitone(@floatCast(cur), app.bendRangeForTarget(tgt), &vb)
     else
         val.text(&vb, cur);
     const vw: i32 = @min(92, @as(i32, @intFromFloat(ui.font.measure(vt))));
-    ui.labelClipped(vt, x + rw - 6 - vw, y + 3, vw + 2, if (driven) ui.theme.auto_active else ui.theme.text);
+    ui.labelClipped(vt, x + rw - 6 - vw, y + 3, vw + 2, if (driven) ui.theme.auto_active else if (manual) ui.theme.auto_takeover else ui.theme.text);
 
     // 左：参数名（链接中 → 绿；否则白） + 蓝字徽标（**紧贴值左侧**，名字让位）
     var cb2: [48]u8 = undefined;
@@ -752,7 +761,7 @@ fn drawLinkedRow(ui: *Ui, app: *App, pl: *vst_host.Plugin, ref: PluginSlotRef, r
     if (pl.findParamIndex(pid)) |pix| {
         // **与「最近改动 / 全部参数 / MIDI 参数」完全同一套行渲染**：
         // 徽标（曲线信息）紧贴值左侧、绿名/绿值、[自动化] 按钮、右键菜单全部一致。
-        // 被曲线驱动时自动只读（`drawAutoRow` 内部判 `isTargetDriven`）。
+        // 被曲线驱动时照样可拖——拖动期 `beginAutoDrag` 让车道临时下线（touch：松手回曲线）。
         // `ref` 由调用方传入（不能用 `vst_auto.ref`：那是浮动窗口的目标，面板正文可能不同）。
         drawAutoRow(ui, app, row.target, pl.params[pix].name(), .{ .vst = .{ .pl = pl, .pi = pix, .ref = ref } }, id_base, x, y, w, false);
         return;

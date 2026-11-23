@@ -471,6 +471,8 @@ pub const Settings = struct {
     audio_device: []const u8 = "",
     /// 自选字体文件路径（"" = 自动探测：fontconfig → 系统名单 → data/fonts/）
     font_path: []const u8 = "",
+    /// **节拍器开关**（§11.48.5：监听信号；不进工程存档，只存这里）
+    metronome: bool = false,
 };
 
 /// 设置 → JSON（归调用方释放）

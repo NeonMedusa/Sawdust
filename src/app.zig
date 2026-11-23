@@ -300,7 +300,7 @@ pub const PresetTarget = union(enum) {
 
 /// 预设浏览器弹窗状态（**统一的插件+预设选择器**；见 `docs/drumkit.md` §5.2）
 /// 浮动窗口种类（绘制序列表与插件子窗口裁切共用）
-pub const WinKind = enum { rack, synth, mixer, effect, drumkit, help, settings, plugin_mgr, auto, vst_auto };
+pub const WinKind = enum { rack, synth, mixer, effect, drumkit, help, settings, plugin_mgr, auto, vst_auto, tap };
 
 /// 自动化窗口的**视角**：按参数看（这个参数绑了哪些曲线）/ 按曲线看（这条曲线驱动哪些参数）
 pub const AutoWinView = enum { by_target, by_curve };
@@ -1332,6 +1332,41 @@ pub const HelpWindow = struct {
     grab_dy: i32 = 0,
 };
 
+/// **敲击测速窗**（§11.48.4）：窗口状态 + **会话数据**（纯会话态——不进历史/存档）。
+pub const TapWindow = struct {
+    /// 间隔环形缓冲容量（最近 8 个间隔取中位数）
+    pub const max_intervals = 8;
+
+    open: bool = false,
+    x: i32 = 460,
+    y: i32 = 220,
+    w: i32 = 300,
+    h: i32 = 272,
+    /// Z 序（越大越靠上；点窗口即置顶）
+    z: i32 = 32,
+    grab_dx: i32 = 0,
+    grab_dy: i32 = 0,
+    resize_w0: i32 = 0,
+    resize_h0: i32 = 0,
+    resize_mx: i32 = 0,
+    resize_my: i32 = 0,
+
+    // ── 会话（窗口关闭/会话重置即清）──
+    /// 最近若干次敲击间隔（秒；`[0..n_int]` 有效，满了左移）
+    intervals: [max_intervals]f32 = @splat(0),
+    n_int: usize = 0,
+    /// 上次敲击时刻（ns；null = 会话还没开始）
+    last_ns: ?i64 = null,
+    /// 当前估计（整数 BPM；0 = 还没出数）
+    est: i32 = 0,
+    /// 本会话敲击次数
+    taps: u32 = 0,
+    /// **本会话那条历史的下标**（null = 还没写过值 / 刚开新会话）。
+    /// 敲击测速的历史合并是**自己管**的，不用 `Gesture`：main 每次鼠标按下都会
+    /// `pinPendingGesture()`（“新操作起手”），而敲击本身就是按下 → 手势每敲一下就断（实测：一条变多条）。
+    hist_index: ?usize = null,
+};
+
 /// 设置页的**待应用副本**：滑块/开关只改它，点“应用”才真正生效。
 /// 为什么：UI 缩放如果边拖边生效，缩放变了滑块跟着变，手感糊成一团（用户实测反馈）。
 pub const SettingsDraft = struct {
@@ -2071,7 +2106,7 @@ pub const App = struct {
     notice_text: ?[]u8 = null,
     /// 自动化超预算的提示是否已弹过（一次性；不再超额时自动复位）
     lane_warned: bool = false,
-    /// 发布节流：上次发布的内容签名 + 调用计数 + 是否发过
+    /// 自动发布节流：上次发布的内容签名 + 调用计数 + 是否发过
     lane_sig_pub: u64 = 0,
     lane_tick: u32 = 0,
     lane_published: bool = false,
@@ -2124,6 +2159,8 @@ pub const App = struct {
     mixer_win: MixerWindow = .{},
     effect_win: EffectWindow = .{},
     help_win: HelpWindow = .{},
+    /// **敲击测速窗**（BPM 右键菜单→「敲击测速…」；§11.48.4）
+    tap_win: TapWindow = .{},
     /// 波形窗口（音频片段 / 鼓组采样器层）
     wave_win: WaveWindow = .{},
     settings_win: SettingsWindow = .{},
@@ -2172,6 +2209,9 @@ pub const App = struct {
     scale_confirm: ?ScaleConfirm = null,
     /// 设置需要落盘（变更 / 工程路径变化时置位）
     settings_dirty: bool = false,
+    /// **节拍器开关**（§11.48.5）：纯监听信号——进 `settings.json`、**不进**工程存档、不进导出。
+    /// 每帧同步给 `params.metronome`；开关入口 = BPM 右键菜单「节拍器」（勾选态自绘）。
+    metronome_on: bool = false,
     /// 待处理的文件对话框请求（null = 无；见 `PickRequest`）
     pick: ?PickRequest = null,
     drumkit_win: DrumKitWindow = .{},
@@ -3515,6 +3555,20 @@ pub const App = struct {
             target.kind = .vst3;
             return;
         }
+        // **离开 VST3**（撤销/读档把乐器换回内置合成器 / 鼓组）：
+        // 必须**退役旧实例 + 清路径**。漏了这一步的后果（用户实测 bug）：
+        // 撤销“把减法合成器换成 Vital”后 `kind` 已回到 `.synth`，但 `inst.plugin` 还指着 Vital →
+        // 参数表用 `slotPlugin()` 照旧拿到 Vital → **“乐器参数/插件参数”里还是 Vital 的参数**；
+        // 实例也永不释放（退役/卸载路径全靠 `retirePlugin`）。
+        // 与 `changeInstrumentKind`（UI 换类型路径）保持同一套清理。
+        if (target.plugin) |pl| {
+            target.plugin = null;
+            self.retirePlugin(pl);
+        }
+        target.plugin_path_len = 0;
+        target.clearPendingState(self.allocator);
+        target.load_failed = false;
+        target.fail_wait = 0;
         if (si.kind == 1) {
             // 鼓组：确保 kit 存在并重建内容
             if (target.kit == null) {
@@ -6060,9 +6114,27 @@ pub const App = struct {
         st.param_edits = recs;
         st.structural_refs = srefs;
         self.clearGesture();
-        const old = &self.history.items[g.index];
-        self.freeHistoryState(old);
-        old.* = st;
+        self.replaceHistoryState(g.index, st);
+    }
+
+    /// 用新快照**替换**第 `index` 条历史（释放旧内容）。两处替换逻辑共用：
+    /// `pinPendingGesture`（手势钉值）与 `rewriteHistoryEntry`（敲击测速原地合并）。
+    fn replaceHistoryState(self: *App, index: usize, st: HistoryState) void {
+        self.freeHistoryState(&self.history.items[index]);
+        self.history.items[index] = st;
+    }
+
+    /// 把第 `index` 条历史**原地更新**成当前状态（“同一次操作持续修改”的历史合并）。
+    /// 与 `pinPendingGesture` 的替换逻辑同构，但**不碰手势/增量列表**——用于"自己管合并"的场景
+    /// （敲击测速：一个会话一条，每敲一下把那条刷新成最新值）。
+    /// 前提：它必须是**当前顶条**且未被导航离开（否则静默不动，调用方应改走 `commitHistory`）。
+    fn rewriteHistoryEntry(self: *App, index: usize) void {
+        if (index != self.history_current or index + 1 != self.history.items.len) return;
+        self.snap_dirty = true;
+        self.touchNotes();
+        const st = self.captureHistory(self.history.items[index].label) catch return;
+        self.replaceHistoryState(index, st);
+        self.dirty = self.history_current != self.history_saved_index or self.plugin_dirty;
     }
 
     /// 参数增量排序：按槽（kind,a,b）+ 参数 ID——同槽记录连续，应用侧取子切片
@@ -6700,6 +6772,7 @@ pub const App = struct {
         for (self.auto_bindings.items) |b| {
             if (!b.enabled) continue;
             if (b.target.kind == .none) continue;
+            // **手动接管**（拖动中 **或** 本场 latch 锁定）：不发布这条车道 → 音频侧用静态值
             // **手动接管中（拖动）**：不发布这条车道 → 音频侧用静态推子/旋钮值（跟手、不掺曲线）
             if (self.isAutoDrag(b.target)) continue;
             // 目标 → 通道/乐器**当前下标**（按 uid 解析：上下移/重排后仍跟着走）
@@ -6910,6 +6983,7 @@ pub const App = struct {
     /// 注：`evalAt` 对空曲线返 **−1**（契约就是“无 lane → 调用方回落静态值”），
     /// 音频侧也是“不发布车道 → 用静态值”；这里必须一致，否则推子会画到 0（静音）。
     pub fn autoValueFor(self: *const App, target: view_lane.Target, step: f32, base: f32) f32 {
+        // 手动接管（拖动中 / 本场锁定）= 静态值说了算（推子跟鼠标、也不吃曲线）
         // 拖动中 = 手动接管：直接返回静态值（推子跟鼠标，也不吃曲线）
         if (self.isAutoDrag(target)) return base;
         var start: f32 = base;
@@ -6991,6 +7065,117 @@ pub const App = struct {
     pub fn isAutoDrag(self: *const App, target: view_lane.Target) bool {
         const d = self.auto_drag_target orelse return false;
         return view_lane.Target.eql(d, target);
+    }
+
+    /// **曲线此刻是否真的拥有这个目标**（="被驱动" 且 "没在拖"）——
+    /// 显示侧用它判“绿字/跟曲线”；拖动期间变 false（显示换成“橙 = 现在听你的”）。
+    /// 仍是 **touch 语义**：松手就 `clearAutoDrag` → 曲线立刻接手（main 帧首清）。
+    pub fn isAutoActive(self: *const App, target: view_lane.Target) bool {
+        return !self.isAutoDrag(target) and self.isTargetDriven(target);
+    }
+
+    /// 显示用：**已链接自动化 + 正在手动拖** → 橙（“现在听你的”）。
+    /// **未链接的目标拖它不变橙**（保持常态蓝）——用户拍板的颜色语义：
+    /// 蓝 = 普通，绿 = 跟随曲线，**橙 = 接管一条正在跑曲线的旋钮**。
+    pub fn isAutoTakeover(self: *const App, target: view_lane.Target) bool {
+        return self.isAutoDrag(target) and self.isTargetDriven(target);
+    }
+
+    // ── **敲击测速**（§11.48.4）会话算法（纯逻辑，UI 只负责画与命中）──
+
+    /// 中位数 → 整数 BPM（0 = 还不到 2 个间隔，不出数）
+    fn tapMedianBpm(tw: *const TapWindow) i32 {
+        if (tw.n_int < 2) return 0;
+        var buf: [TapWindow.max_intervals]f32 = undefined;
+        const n = tw.n_int;
+        @memcpy(buf[0..n], tw.intervals[0..n]);
+        var i: usize = 1;
+        while (i < n) : (i += 1) { // 插入排序（≤8 个）
+            const v = buf[i];
+            var j = i;
+            while (j > 0 and buf[j - 1] > v) : (j -= 1) buf[j] = buf[j - 1];
+            buf[j] = v;
+        }
+        const med = if (n % 2 == 1) buf[n / 2] else (buf[n / 2 - 1] + buf[n / 2]) * 0.5;
+        if (med <= 0.001) return 0;
+        return @intFromFloat(std.math.clamp(@round(60.0 / med), model.bpm_min, model.bpm_max));
+    }
+
+    /// 结束敲击会话（**关窗/Esc 与 ±30% 会话重置**两个边沿调）：关掉“本会话那条历史”的跟踪。
+    /// 下个会话再敲出值时，会新建一条。
+    pub fn tapTempoEnd(self: *App) void {
+        const tw = &self.tap_win;
+        tw.n_int = 0;
+        tw.taps = 0;
+        tw.last_ns = null;
+        tw.est = 0;
+        tw.hist_index = null;
+    }
+
+    /// 一次敲击：推间隔 → 中位数估 BPM → 即时写回（触发 latch）→ 播 click 预览。
+    /// `now_ns` = 本帧时基（main 的 hi-res 帧首时刻；帧内误差 ≤ 一帧）。
+    pub fn tapTempo(self: *App, now_ns: i64) void {
+        const tw = &self.tap_win;
+        // `last_ns == null` ⇔ 会话未开始 ⇔ `n_int/taps` 已经是 0（只有这两个入口写它们）
+        if (tw.last_ns) |last| {
+            const dt: f32 = @as(f32, @floatFromInt(now_ns - last)) / 1e9;
+            // **±30% 会话重置**（已有 ≥2 个间隔才判；前两击只是取样）→ 本次作新会话第一击
+            var reset = false;
+            if (tw.n_int >= 2 and tw.est > 0 and dt > 0.001) {
+                const est_f: f32 = @floatFromInt(tw.est);
+                reset = @abs(60.0 / dt - est_f) / est_f > 0.30;
+            }
+            if (reset) {
+                self.tapTempoEnd(); // 重置也提交（设计：一条历史 = 一个会话）
+            } else if (dt > 0.001) {
+                if (tw.n_int == TapWindow.max_intervals) { // 环形：丢最旧
+                    std.mem.copyForwards(f32, tw.intervals[0 .. tw.n_int - 1], tw.intervals[1..tw.n_int]);
+                    tw.n_int -= 1;
+                }
+                tw.intervals[tw.n_int] = dt;
+                tw.n_int += 1;
+            }
+        }
+        const first = tw.taps == 0; // 会话第一击（含重置后的第一击）
+        tw.last_ns = now_ns;
+        tw.taps += 1;
+        const est = tapMedianBpm(tw);
+        if (est > 0) {
+            tw.est = est;
+            // **touch 语义**：BPM 正被自动化曲线驱动时不写值（写进去也会立刻被曲线盖掉，白改）——
+            // 窗口里显示一行提示告诉用户（见 `view_tap`），估计值照常显示、click 照常响。
+            if (!self.isTargetDriven(.{ .kind = .tempo })) {
+                const v: f32 = @floatFromInt(est);
+                if (@abs(self.bpm_doc - v) > 0.001) {
+                    self.setDocBpm(v);
+                    self.tapRecordHistory();
+                }
+            }
+        }
+        // 预览 click：首击用重音档（给一个“这是第 1 拍”的听感锚点）
+        self.params.click_req.store(if (first) 0b11 else 0b01, .monotonic);
+    }
+
+    /// **敲击测速的历史：一个会话一条**（首次写值 append，后续敲击**原地更新**那条）。
+    /// 不用 `touchGesture` 合并：main 每次鼠标按下都会 `pinPendingGesture()`，而敲击本身就是按下
+    /// → 手势每敲一下就断 → 每敲一下一条（用户实测）。
+    /// 可复用的条件除了“仍是当前顶条”，还要求那条**标签就是“敲击测速”**——
+    /// 否则读档/新建后 `history_current/len` 碰巧重合时会改写别人的条目。
+    fn tapRecordHistory(self: *App) void {
+        const tw = &self.tap_win;
+        if (tw.hist_index) |idx| {
+            const still_ours = idx == self.history_current and
+                idx + 1 == self.history.items.len and
+                std.mem.eql(u8, self.history.items[idx].label, "敲击测速");
+            if (still_ours) {
+                self.rewriteHistoryEntry(idx);
+                return;
+            }
+        }
+        const before = self.history.items.len;
+        self.commitHistory("敲击测速");
+        // commit 可能因“内容未变”而跳过 → 那就别记下标（下次会再试）
+        tw.hist_index = if (self.history.items.len > before) self.history_current else null;
     }
 
     pub fn initQueues(self: *App) void {
@@ -9178,6 +9363,8 @@ pub const App = struct {
     /// 重置历史（启动/打开工程时）：以当前状态为基线（`label` 如“初始状态”）。
     pub fn resetHistory(self: *App, label: []const u8) void {
         self.snap_dirty = true; // A2：新基线 → 重建快照
+        // 敲击测速的“本会话那条历史”指向被清空了 → 忘掉下标（否则可能改写新基线）
+        self.tap_win.hist_index = null;
         for (self.history.items) |*st| self.freeHistoryState(st);
         self.history.clearRetainingCapacity();
         self.history_pending = null;
@@ -10859,6 +11046,8 @@ pub const App = struct {
             .t0_ns = @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds),
         };
         self.export_win = .{}; // 进度窗复位（首帧居中）
+        // **导出渲染期间节拍器/敲击声一律静音**（监听信号不进产物；§11.48.5）
+        self.params.export_render.store(true, .monotonic);
         // 导出日志头（完成时写入 `<wav>.log`——现场排障用）
         if (self.export_wav) |*ew| {
             var hb: [256]u8 = undefined;
@@ -11036,6 +11225,7 @@ pub const App = struct {
 
     /// 释放导出状态（状态机终点）。
     fn exportWavFree(self: *App) void {
+        self.params.export_render.store(false, .monotonic); // 导出结束：恢复监听信号
         if (self.export_wav) |*ew| {
             for (ew.states.items) |s| s.blobs.deinit(self.allocator);
             ew.states.deinit(self.allocator);
@@ -11149,6 +11339,8 @@ pub const App = struct {
     /// → 判定为“插件在回报输入队列的功效”，整条丢弃（不记历史、**不接管**）。
     /// 三种插件参数目标（乐器/效果器/鼓组层）共用。
     fn vstParamEchoByTarget(self: *const App, t: view_lane.Target, value: f64) bool {
+        // 拖动中：现在根本没有自动化在写 → 不存在回声
+        if (self.isAutoDrag(t)) return false;
         if (!self.isTargetDriven(t)) return false;
         const step: f32 = if (self.playing)
             self.params.play_step.load(.monotonic)
@@ -11208,7 +11400,11 @@ pub const App = struct {
     /// 共同实现：曲线 → （极点）→ `self.bpm`
     fn applyTempoAt(self: *App, step: f32, dt_s: f32) void {
         const tgt = view_lane.Target{ .kind = .tempo };
-        if (!self.isTargetDriven(tgt)) {
+        // 无曲线，**或正被手动拖动**（touch 接管）→ 用文档值。
+        // 拖动中必须真正跟手（否则：数字在动、声音不跟——用户实测的“老问题”：
+        // 以前只写 `bpm_doc` 当恢复值，曲线每帧又把 `bpm` 写回曲线值）。
+        // 松手 → main 帧首 `clearAutoDrag` → 这里回到曲线驱动。
+        if (self.isAutoDrag(tgt) or !self.isTargetDriven(tgt)) {
             self.bpm = self.bpm_doc;
             self.tempo_sm = std.math.nan(f32); // 下次挂上直接取曲线值
             return;
@@ -11233,13 +11429,14 @@ pub const App = struct {
     }
 
     /// 手动改 BPM 的**用户入口**（工具栏拖动 / 右键键入；历史恢复走 `setDocBpm` 不提示）。
-    /// 驱动中曲线拥有有效值与显示——这次写改变的是“**取消自动化后恢复到的值**”，
-    /// toast 把这个暗写讲明白（否则拖完数字弹回曲线值，用户以为操作完全没生效，
-    /// 实测反馈就是“BPM 推子是坏的”）。拖动中每帧刷新同一条 toast（值跟手），
-    /// 松手后正常计时消失。
+    /// **拖动中**（touch 接管，见 `applyTempoAt`）：值立即生效——不提示“只是恢复值”。
+    /// 驱动中但没在拖（右键键入）：与推子/旋钮同口径，改的是“**取消自动化后恢复到的值**”，
+    /// toast 把这个暗写讲明白（否则数字弹回曲线值，用户以为操作完全没生效）。
     pub fn setDocBpmManual(self: *App, v: f32) void {
         self.setDocBpm(v);
-        if (self.isTargetDriven(.{ .kind = .tempo })) {
+        const tgt = view_lane.Target{ .kind = .tempo };
+        if (self.isAutoDrag(tgt)) return; // 拖住不放：正在实时生效
+        if (self.isTargetDriven(tgt)) {
             self.setToastWith("BPM 文档值 → {d}（当前由自动化曲线驱动，取消链接后生效）", .{self.bpm_doc});
         }
     }
@@ -13992,6 +14189,39 @@ test "app: 纯切静音也进历史并置脏（曾被判“无变化”：不可
     try std.testing.expect(app.clips.items[0].muted);
 }
 
+test "app: 颜色语义——蓝（普通）/ 绿（跟随曲线）/ 橙（已链接 + 正拖）" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.resetMixerChannels(2);
+    const uid1 = app.mixer_channels_state.items[1].uid;
+    const tgt = view_lane.Target{ .kind = .mixer_vol, .uid = uid1 };
+
+    // ① 未链接：拖也不变橙（常态蓝）
+    app.beginAutoDrag(tgt);
+    try std.testing.expect(app.isAutoDrag(tgt));
+    try std.testing.expect(!app.isAutoActive(tgt)); // 不是绿
+    try std.testing.expect(!app.isAutoTakeover(tgt)); // **也不是橙**（用户拍板）
+    app.clearAutoDrag();
+
+    // ② 链接了自动化（有内容的曲线）→ 跟随中 = 绿
+    const cid = app.addAutoCurve("c");
+    app.auto_sel = cid;
+    _ = app.autoCurve().?.insertPoint(alloc, 0, 0.5);
+    try std.testing.expect(app.bindCurveTarget(cid, tgt));
+    try std.testing.expect(app.isAutoActive(tgt));
+    try std.testing.expect(!app.isAutoTakeover(tgt));
+
+    // ③ 已链接 + 正在拖 → 橙（且不再算“跟随中”）
+    app.beginAutoDrag(tgt);
+    try std.testing.expect(!app.isAutoActive(tgt));
+    try std.testing.expect(app.isAutoTakeover(tgt));
+    app.clearAutoDrag();
+    try std.testing.expect(app.isAutoActive(tgt));
+}
+
 test "app: BPM 手动写（曲线驱动中）改的是恢复值并提示；历史恢复不提示" {
     var app = App{ .allocator = std.testing.allocator };
     defer app.clips.deinit(app.allocator);
@@ -14007,21 +14237,37 @@ test "app: BPM 手动写（曲线驱动中）改的是恢复值并提示；历�
     try app.auto_bindings.append(app.allocator, .{ .curve_id = 77, .target = .{ .kind = .tempo } });
     try std.testing.expect(app.isTargetDriven(.{ .kind = .tempo }));
 
-    // 驱动中：有效值归曲线（applyTempoAt 会按曲线写），手动写只动文档值
+    // 驱动中：有效值归曲线（`applyTempoAt` 会按曲线写），手动写只动文档值 + toast 讲明
     app.bpm = 123.25;
     app.setDocBpmManual(140);
     try std.testing.expectEqual(@as(f32, 140), app.bpm_doc);
-    try std.testing.expectEqual(@as(f32, 123.25), app.bpm); // 有效值未被手动写覆盖
+    try std.testing.expectEqual(@as(f32, 123.25), app.bpm); // 有效值未被手动写覆盖（touch）
     try std.testing.expect(app.toast != null); // “暗写”被讲明
+    try std.testing.expect(app.isAutoActive(.{ .kind = .tempo })); // 曲线仍拥有它（非拖动中）
 
-    // 历史恢复路径（applyHistoryState 用 setDocBpm）：同样只动文档值，但**不提示**
+    // 历史恢复路径（`setDocBpm`）：同样只动文档值，但**不提示**
     app.clearToast();
+    app.bpm = 123.25;
     app.setDocBpm(150);
     try std.testing.expectEqual(@as(f32, 150), app.bpm_doc);
     try std.testing.expectEqual(@as(f32, 123.25), app.bpm);
     try std.testing.expect(app.toast == null);
 
-    // 无曲线时：手动写直接生效（原行为不变）
+    // 拖动中（`beginAutoDrag`）：有效值归手动（拖动期临时接管），显示侧不再算“曲线拥有”；
+    // **并且真的一眼跟手**：`applyTempoAt` 走文档值，不再被曲线每帧写回。
+    app.beginAutoDrag(.{ .kind = .tempo });
+    try std.testing.expect(!app.isAutoActive(.{ .kind = .tempo }));
+    app.setDocBpmManual(142); // 拖动中每帧调的就是它
+    app.applyTempoAutomation(16_000_000);
+    try std.testing.expectApproxEqAbs(@as(f32, 142), app.bpm, 1e-4); // 有效 BPM 跟手
+    try std.testing.expect(app.toast == null); // 拖动中不提示“只是恢复值”（它正在生效）
+    app.clearAutoDrag();
+    try std.testing.expect(app.isAutoActive(.{ .kind = .tempo }));
+    // 松手 → 曲线立刻接手（曲线 0.5 → 20 + 0.5×979 = 509.5 BPM）
+    app.applyTempoAutomation(16_000_000);
+    try std.testing.expectApproxEqAbs(view_lane.Target.bpmFromNorm(0.5), app.bpm, 1.0);
+
+    // 无曲线时：手动写直接生效、不提示
     _ = app.removeAutoCurve(77);
     app.setDocBpmManual(160);
     try std.testing.expectEqual(@as(f32, 160), app.bpm_doc);
@@ -19790,4 +20036,149 @@ test "app: 片段批量拖动——撞轨道头时**全组停**（保持相对�
     // 轨道：**上方到 0 为止，下方不限**（行轴向下无限延伸——不能把 track 999 往下拖卡在留白处）
     try std.testing.expectEqual(@as(i32, 0), app.clampClipBatchDelta(0, -99).track);
     try std.testing.expectEqual(@as(i32, 500), app.clampClipBatchDelta(0, 500).track);
+}
+
+// ── 敲击测速（§11.48.4）──
+
+fn msToNs(ms: i64) i64 {
+    return ms * 1_000_000;
+}
+
+test "tap: 中位数估 BPM / ≥3 击才出数 / 抖动不敏感" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.bpm_doc = 100;
+
+    // 120 BPM = 500ms/拍
+    app.tapTempo(msToNs(0)); // 1 击
+    try std.testing.expectEqual(@as(i32, 0), app.tap_win.est); // 不出数
+    app.tapTempo(msToNs(500)); // 2 击（1 个间隔）
+    try std.testing.expectEqual(@as(i32, 0), app.tap_win.est);
+    app.tapTempo(msToNs(1000)); // 3 击（2 个间隔）→ 出数
+    try std.testing.expectEqual(@as(u32, 3), app.tap_win.taps);
+    try std.testing.expectEqual(@as(i32, 120), app.tap_win.est);
+    try std.testing.expectEqual(@as(f32, 120), app.bpm_doc); // 即时写回
+
+    // 手抖：多一个 510ms 的间隔 → 中位数仍 120
+    app.tapTempo(msToNs(1510));
+    try std.testing.expectEqual(@as(i32, 120), app.tap_win.est);
+}
+
+test "tap: BPM 受自动化驱动时不写值（估计值照常显示、会话不进历史）" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    // 挂一条有内容的 tempo 曲线 → 驱动中
+    try app.auto_curves.append(alloc, .{ .id = 77 });
+    try app.auto_curves.items[0].points.append(alloc, .{ .step = 0, .value = 0.5 });
+    try app.auto_bindings.append(alloc, .{ .curve_id = 77, .target = .{ .kind = .tempo } });
+    try std.testing.expect(app.isTargetDriven(.{ .kind = .tempo }));
+    app.bpm_doc = 100;
+    const hist_before = app.history.items.len;
+
+    app.tapTempo(msToNs(0));
+    app.tapTempo(msToNs(500));
+    app.tapTempo(msToNs(1000));
+    // 估计值照常出（UI 里照常显示）…
+    try std.testing.expectEqual(@as(i32, 120), app.tap_win.est);
+    // …但**不写 BPM**（touch：写进去也会被曲线盖掉，所以干脆不写）
+    try std.testing.expectEqual(@as(f32, 100), app.bpm_doc);
+    app.tapTempoEnd();
+    try std.testing.expectEqual(hist_before, app.history.items.len); // 没写 → 不进历史
+}
+
+test "tap: 历史＝一会话一条（含每次敲击间的“鼠标按下”钉值也不刷屏）；±30% 重置才开新条" {
+    const alloc = std.testing.allocator;
+    var app = App{ .allocator = alloc };
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    defer app.deinitAll();
+    app.bpm_doc = 100; // 与 120 不同 → 敲击会真的改值
+    const hist0 = app.history.items.len;
+
+    app.tapTempo(msToNs(0));
+    app.tapTempo(msToNs(500));
+    // 不到 3 击 → 没写过值 → 没历史
+    try std.testing.expectEqual(hist0, app.history.items.len);
+    app.tapTempo(msToNs(1000)); // 出数 120 → 写值 + **新建一条**
+    try std.testing.expectEqual(@as(i32, 120), app.tap_win.est);
+    try std.testing.expectEqual(hist0 + 1, app.history.items.len);
+
+    // **回归重点**：main 每次鼠标按下都会 `pinPendingGesture()`（“新操作起手”），
+    // 而敲击本身就是一下点击——这里每敲一下前都模拟它，条目仍然只能是一条。
+    app.pinPendingGesture();
+    app.tapTempo(msToNs(1510));
+    try std.testing.expectEqual(@as(i32, 120), app.tap_win.est);
+    try std.testing.expectEqual(hist0 + 1, app.history.items.len);
+    app.pinPendingGesture();
+    app.tapTempo(msToNs(2010));
+    try std.testing.expectEqual(hist0 + 1, app.history.items.len);
+    // 那条条目已经**原地更新**成最新值（不等关窗/静置）
+    try std.testing.expectEqual(app.bpm_doc, app.history.items[app.history_current].bpm);
+
+    // 突然慢一倍（890ms ≈ 67 BPM，与 120 差 44% > 30%）→ 会话重置：本次算新会话第一击
+    app.pinPendingGesture();
+    app.tapTempo(msToNs(2900));
+    try std.testing.expectEqual(@as(u32, 1), app.tap_win.taps);
+    try std.testing.expectEqual(@as(usize, 0), app.tap_win.n_int);
+    try std.testing.expectEqual(@as(i32, 0), app.tap_win.est);
+    try std.testing.expectEqual(hist0 + 1, app.history.items.len); // 重置本身不新增
+
+    // 新会话：两击出数（67）→ **这才开一条新的**
+    app.tapTempo(msToNs(3800));
+    app.tapTempo(msToNs(4700));
+    try std.testing.expect(app.tap_win.est > 0);
+    try std.testing.expectEqual(hist0 + 2, app.history.items.len);
+    try std.testing.expectEqual(app.bpm_doc, app.history.items[app.history_current].bpm);
+
+    // 关窗：条目数不变（值已是最新）
+    app.tapTempoEnd();
+    try std.testing.expectEqual(hist0 + 2, app.history.items.len);
+    try std.testing.expectEqual(app.bpm_doc, app.history.items[app.history_current].bpm);
+    // 会话清空
+    try std.testing.expectEqual(@as(usize, 0), app.tap_win.n_int);
+    try std.testing.expectEqual(@as(i32, 0), app.tap_win.est);
+}
+
+// ── 撤销“VST3 → 内置”必须退役实例（用户实测 bug：撤销后参数表还显示 Vital 的参数）──
+
+test "app: 撤销“换成 VST3”后旧实例必须退役——参数表不得再看到插件参数" {
+    try skipIfNoVst();
+    const alloc = std.testing.allocator;
+    const dll_z = alloc.dupeSentinel(u8, "zig-out/bin/zig_vst3_sine_synth.dll", 0) catch return;
+    defer alloc.free(dll_z);
+
+    var app = App{ .allocator = alloc };
+    defer app.deinitAll();
+    defer app.clips.deinit(alloc);
+    defer app.notes.deinit(alloc);
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    _ = app.addInstrument("减法合成器");
+    app.resetHistory("新建"); // 态 0：内置合成器
+
+    // 换成 VST3 插件（生产路径：`applyVst3Instrument` + 帧末惰性加载；这里直接挂实例）
+    const pl = vst_host.loadPlugin(alloc, dll_z, 48000, 4096, .instrument) catch return;
+    const inst = &app.instruments.items[0];
+    app.applyVst3Instrument(0, "zig-out/bin/zig_vst3_sine_synth.dll");
+    inst.plugin = pl;
+    pl.refreshParamCache(); // 生产：实例就绪帧自动建齐（测试手动）
+    app.pinPendingGesture();
+    app.commitHistory("更换乐器"); // 态 1：VST3
+    const iref = PluginSlotRef{ .kind = .instrument, .a = 0 };
+    try std.testing.expect(app.slotPlugin(iref) != null); // 参数表/面板能看到插件
+
+    // 撤销回态 0（内置合成器）
+    try std.testing.expect(app.undo());
+    try std.testing.expectEqual(model.InstrumentKind.synth, app.instruments.items[0].kind);
+    // **核心断言**：实例被退役（而不是“kind 回去了、plugin 还挂着”）
+    try std.testing.expect(app.instruments.items[0].plugin == null);
+    try std.testing.expectEqual(@as(usize, 0), app.instruments.items[0].pluginPath().len);
+    try std.testing.expect(app.slotPlugin(iref) == null);
+    try std.testing.expect(app.instruments.items[0].pending_state == null);
 }

@@ -36,6 +36,7 @@ const view_panels = @import("view_panels.zig");
 const view_presets = @import("view_presets.zig");
 const view_drumkit = @import("view_drumkit.zig");
 const view_help = @import("view_help.zig");
+const view_tap = @import("view_tap.zig");
 const view_auto_win = @import("view_auto_win.zig");
 const view_vst_auto = @import("view_vst_auto.zig");
 const view_wave = @import("view_wave.zig");
@@ -118,6 +119,9 @@ pub fn main(init: std.process.Init) !u8 {
         return 1;
     };
     defer font.deinit();
+    // **大字号字体**（超大读数：敲击测速的 BPM 数字）——加载失败就退回普通字号
+    var font_big: ?Font = makeBigFont(allocator, io, dpi_res.scale);
+    defer if (font_big) |*fb| fb.deinit();
     // 初始窗口按**逻辑尺寸** 1280×760 重新落地（物理尺寸由后端按 scale 换算，并夹到屏幕内）：
     // 建窗前还不知道真实 DPI，所以先开一个“物理 1280×760”，拿到 scale 后再校正。
     win.setClientSizeLogical(1280, 760, dpi_res.scale);
@@ -177,6 +181,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     var ui_input = InputState{};
     var ui = Ui.init(r_mod.Renderer.init(&win.fb), &font);
+    ui.font_big = if (font_big) |*fb| fb else null;
 
     // 帧率两档（均设置页可调，见 `App.fps_limit` / `App.fps_idle`）：
     //   · 忙时上限：默认 120fps（帧预算 = 1e9 / fps），播放/拖拽/动画期间生效；
@@ -216,6 +221,7 @@ pub fn main(init: std.process.Init) !u8 {
             ui.active_id != 0 or ui.mouse_capture or
             app.text_input.active or app.toast != null or app.scale_confirm != null or
             app.export_wav != null or app.import_mgr.busy() or app.plugin_mgr.scanning or
+            app.tap_win.open or
             app.playlist.zoom != app.playlist.zoom_target or
             app.playlist.scroll != app.playlist.scroll_target or
             app.piano.zoom != app.piano.zoom_target or
@@ -251,6 +257,10 @@ pub fn main(init: std.process.Init) !u8 {
                 font.deinit();
                 font = nf;
                 ui.font = &font;
+                // 大字号字体同步重建（同文件、4× 字号）
+                if (font_big) |*fb| fb.deinit();
+                font_big = makeBigFont(allocator, io, scale);
+                ui.font_big = if (font_big) |*fb| fb else null;
             } else |e| {
                 app.setToastWith("重建字体失败（{s}）", .{@errorName(e)});
             }
@@ -698,6 +708,9 @@ pub fn main(init: std.process.Init) !u8 {
                             app.help_win.open = false;
                         } else if (app.settings_win.open) {
                             app.settings_win.open = false;
+                        } else if (app.tap_win.open) {
+                            app.tap_win.open = false;
+                            app.tapTempoEnd(); // 关窗 = 会话终点（有改动 → 提交一条历史）
                         } else if (app.preset_browser.open) {
                             app.preset_browser.open = false; // 预设浏览器
                         } else if (app.panels.ctx_pattern != null) {
@@ -1034,6 +1047,8 @@ pub fn main(init: std.process.Init) !u8 {
         app.params.time_num.store(app.time_num, .monotonic);
         app.params.time_den.store(app.time_den, .monotonic);
         app.params.steps_per_beat.store(@intCast(model.stepsPerBeat(app.time_den)), .monotonic);
+        // 节拍器开关（settings.json 持久；UI 每帧同步 → 音频线程只读）
+        app.params.metronome.store(app.metronome_on and app.export_wav == null, .monotonic);
 
         ui.renderer = r_mod.Renderer.init(&win.fb);
         ui.renderer.scale = scale; // **DPI 缩放**：所有图元在 renderer 内部乘 scale
@@ -1109,7 +1124,7 @@ pub fn main(init: std.process.Init) !u8 {
         // X11 另有 Expose→present 兜底）。`endFrame` 照常跑——输入边沿每帧被清理，
         // 不会把最小化期间收不到的点击攒到恢复后重放。
         if (!minimized) {
-            drawApp(&ui, &app, ui.renderer.logicalWidth(), ui.renderer.logicalHeight());
+            drawApp(&ui, &app, ui.renderer.logicalWidth(), ui.renderer.logicalHeight(), frame_start_ns);
             // 文件菜单：在 UI 之后、endFrame **之前**（endFrame 会清 mouse_pressed——
             // 放在之后则菜单永远收不到点击，实测“点菜单没反应”）
             if (app.file_menu_open) drawFileMenu(&ui, &app);
@@ -1300,6 +1315,9 @@ pub fn main(init: std.process.Init) !u8 {
                 font.deinit();
                 font = nf;
                 ui.font = &font;
+                if (font_big) |*fb| fb.deinit();
+                font_big = makeBigFont(allocator, io, scale);
+                ui.font_big = if (font_big) |*fb| fb else null;
             } else |_| {}
         }
 
@@ -2578,6 +2596,7 @@ fn winRectOf(app: *App, kind: app_mod.WinKind, scr_w: i32, scr_h: i32) @import("
         .help => .{ .x = app.help_win.x, .y = app.help_win.y, .w = app.help_win.w, .h = app.help_win.h },
         .settings => .{ .x = app.settings_win.x, .y = app.settings_win.y, .w = app.settings_win.w, .h = app.settings_win.h },
         .plugin_mgr => .{ .x = app.plugin_mgr.x, .y = app.plugin_mgr.y, .w = app.plugin_mgr.w, .h = app.plugin_mgr.h },
+        .tap => .{ .x = app.tap_win.x, .y = app.tap_win.y, .w = app.tap_win.w, .h = app.tap_win.h },
         .auto => blk: {
             // 常量尺寸 + 同一套锤钳制（与 `view_auto_win.draw` 一致，否则点击/置顶与画面错位）
             const va = @import("view_auto_win.zig");
@@ -2629,7 +2648,7 @@ fn raiseTopmostUnderCursor(app: *App, items: []const WinEntry, mouse_x: i32, mou
     return hit;
 }
 
-fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
+fn drawApp(ui: *Ui, app: *App, w: i32, h: i32, frame_ns: i64) void {
     app.layout.initIfNeeded(w);
 
     // **手动接管结束**：鼠标松开 → 拖动结束，自动化重新接管（见 `App.beginAutoDrag`）
@@ -2711,6 +2730,10 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
     }
     if (app.vst_auto.open) {
         wins[nwin] = .{ .zp = &app.vst_auto.z, .draw = .vst_auto };
+        nwin += 1;
+    }
+    if (app.tap_win.open) {
+        wins[nwin] = .{ .zp = &app.tap_win.z, .draw = .tap };
         nwin += 1;
     }
     sortWinEntries(wins[0..nwin]);
@@ -2816,6 +2839,7 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
             .plugin_mgr => _ = view_plugins.draw(ui, app, w, h),
             .auto => view_auto_win.draw(ui, app),
             .vst_auto => view_vst_auto.draw(ui, app),
+            .tap => _ = view_tap.draw(ui, app, w, h, frame_ns),
         }
         ui.endLayer();
     }
@@ -2841,16 +2865,45 @@ fn drawApp(ui: *Ui, app: *App, w: i32, h: i32) void {
 /// **BPM 右键菜单**（输入值… / 自动化…）——必须由主循环在**所有视图/窗口之后**调用，
 /// 否则会被播放列表/钢琴窗/拍号控件盖住（实测）。走共享 `util.menuPanel`。
 pub fn drawBpmCtxMenu(ui: *Ui, app: *App) void {
-    const items = [_][]const u8{ "输入值…", "自动化…" };
-    const mw: i32 = 96;
+    // 动态标签：**勾选标记自绘**（`✔` 字形在多数字体里缺失 → 乱码）。
+    // **只有节拍器这一行**在勾上时前面留空位画勾（三个空格 ≈ 10.8 px），其它行不留空位。
+    var items_buf: [4][]const u8 = undefined;
+    var n: usize = 0;
+    const input_i = n;
+    items_buf[n] = "输入值…";
+    n += 1;
+    const tap_i = n;
+    items_buf[n] = "敲击测速…";
+    n += 1;
+    const metro_i = n;
+    // 勾选槽 = **三个半角空格**（实测本字体空格 3.59 px @scale1 → 10.76 px，刚好容下 10px 的对勾）
+    items_buf[n] = if (app.metronome_on) "   节拍器" else "节拍器";
+    n += 1;
+    items_buf[n] = "自动化…";
+    n += 1;
+    const items: []const []const u8 = items_buf[0..n];
+    const mw: i32 = 124;
     var mx = app.panels.ctx_bpm_x; // 固定位置（打开时快照，不跟鼠标跑）
     var my = app.panels.ctx_bpm_y;
     var open = app.panels.ctx_bpm;
     const bounds: @import("ui.zig").Rect = .{ .x = 0, .y = 0, .w = ui.renderer.logicalWidth(), .h = ui.renderer.logicalHeight() };
-    const hit = util.menuPanel(ui, &mx, &my, &open, false, .{ .cursor = {} }, bounds, &items, mw, null);
+    const hit = util.menuPanel(ui, &mx, &my, &open, false, .{ .cursor = {} }, bounds, items, mw, null);
+    // **自绘勾选**（菜单还开着时画在“节拍器”行的左侧勾选槽里）
+    if (open and app.metronome_on) {
+        const iy = my + 2 + @as(i32, @intCast(metro_i)) * util.menu_item_h;
+        util.drawCheckMark(ui, mx + 5, iy + @divTrunc(util.menu_item_h - 10, 2), 10, ui.theme.accent);
+    }
     if (hit) |ii| {
-        if (ii == 0) {
+        // 按**下标**分派（index 稳定；列表长度只随“锁定中”变化，而那项的下标已存好）
+        if (ii == input_i) {
             app.beginInputBpm(mx + 4, my + 6);
+        } else if (ii == tap_i) {
+            app.tap_win.open = true;
+            app.bringToFront(&app.tap_win.z);
+        } else if (ii == metro_i) {
+            app.metronome_on = !app.metronome_on;
+            app.settings_dirty = true;
+            app.setToast(if (app.metronome_on) "节拍器开" else "节拍器关");
         } else {
             app.openAutoWin(.{ .kind = .tempo });
         }
@@ -3022,7 +3075,9 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
     ui.labelCentered("BPM", x, by, bh, ui.theme.text_dim);
     x += @as(i32, @intFromFloat(ui.font.measure("BPM"))) + 8;
     {
-        const tempo_auto = app.isTargetDriven(.{ .kind = .tempo });
+        // 显示口径：跟随中 = 曲线值 + 绿字（touch：拖动期间临时接管 → **橙字**）；
+        // 无曲线 = 文档值 + 普通色。
+        const tempo_auto = app.isAutoActive(.{ .kind = .tempo });
         // **拖动期间以文档值为基准**（它逐帧被 `setDocBpmManual` 写回 → 控件的
         // 单帧增量能跨帧累积）。曾以曲线值为基准：`shown` 每帧从 `app.bpm` 重取，
         // 增量式拖动每帧都被拉回“曲线值 + 单帧增量”——**推子完全推不动**（实测）。
@@ -3033,10 +3088,15 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
         // **与以前同样的手感**：拖 8px = 1 BPM，且**只改整数位**
         // （小数由右键「输入值…」键入，如 `120.555`；推到边界时小数清零）
         // 数字在被曲线驱动时**变绿**（与其它控件的 auto_active 绿同语义）。
-        const num_color: ?r_mod.Color = if (tempo_auto) ui.theme.auto_active else null;
+        // 拖动中且被曲线驱动 → 橙（“现在听你的”）；否则跟曲线 = 绿。
+        const num_color: ?r_mod.Color = if (tempo_auto) ui.theme.auto_active else if (app.isAutoTakeover(.{ .kind = .tempo })) ui.theme.auto_takeover else null;
+        // **touch：拖 BPM 期间临时接管**（与推子/旋钮同一套 `auto_drag_target` 机制）——
+        // 否则曲线每帧把 `bpm` 写回曲线值 → 拖动只有数字在动、声音不跟（用户实测的“老问题”）。
+        // 松手后 main 帧首的 `clearAutoDrag` 把它交还给曲线。
+        if (bpm_dragging) app.beginAutoDrag(.{ .kind = .tempo });
         const edited = ui.dragNumberBpm(350, x, by, 56, bh, &shown, model.bpm_min, model.bpm_max, 8, num_color);
         if (edited and shown != shown_before) {
-            app.setDocBpmManual(shown); // 驱动中 toast 说明“改的是取消自动化后恢复的值”
+            app.setDocBpmManual(shown); // 拖动中立即生效；松手回曲线，文档值 = 恢复值
             app.history_pending = "调整 BPM"; // 松手时 coalesce 提交
         }
         // **右键 → 菜单（输入值… / 自动化…）**——不再直接开自动化窗口。
@@ -4540,6 +4600,7 @@ fn loadSettings(app: *App, st: persist.Settings) void {
     app.ui_scale = std.math.clamp(st.ui_scale, dpi.min_scale, dpi.max_scale);
     app.setFontPath(st.font_path);
     app.font_dirty = false; // 启动时字体已按设置加载过，不必重建
+    app.metronome_on = st.metronome;
     if (st.open_last and st.last_project.len > 0) app.setPendingOpen(st.last_project);
 }
 
@@ -4572,6 +4633,7 @@ fn saveSettings(app: *App, io: std.Io) void {
         .audio_backend = audio_pref.backendToInt(audio_pref.current.backend),
         .audio_device = audio_pref.current.deviceName(),
         .font_path = app.fontPath(),
+        .metronome = app.metronome_on,
     }) catch return;
     defer app.allocator.free(json);
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = spath, .data = json }) catch return;
@@ -5348,6 +5410,25 @@ fn probeFontconfig(io: std.Io, exe_dir: []const u8, out: []u8) ?[]const u8 {
 /// **字体物理像素高**（= 16 × UI 缩放；仅 `loadFont` 入口写入）
 var font_px: f32 = 16;
 
+/// **大字号字体**（超大读数用）：与当前字体同一文件、**4× 字号**，同样带 `px_scale`。
+/// 失败 → null（调用方退回普通字号，不能因为大字号加载失败就不给用）。
+/// **大字号字体**（超大读数用）：与当前字体同一文件、**4× 字号**，同样带 `px_scale`。
+/// 失败 → null（调用方退回普通字号，不能因为大字号加载失败就不给用）。
+/// 字号自己算（不依赖 `font_px` 全局）：调用点不必关心先后顺序。
+fn makeBigFont(allocator: std.mem.Allocator, io: std.Io, scale: f32) ?Font {
+    const path = font_info.active();
+    if (path.len == 0) return null;
+    const s = std.math.clamp(scale, dpi.min_scale, dpi.max_scale);
+    var f = Font.initFromFile(allocator, io, path, font_base_px * font_big_mul * s) catch return null;
+    f.px_scale = s;
+    return f;
+}
+
+/// 基础字号（逻辑像素；普通字号 = 16 × UI 缩放，大字号 = 再 × 4）
+const font_base_px: f32 = 16.0;
+/// 大字号倍率（普通 16 → 64 逻辑像素）
+const font_big_mul: f32 = 4.0;
+
 /// 记录实际生效的字体并加载（统一出口，顺带把路径报给设置页）
 fn useFont(allocator: std.mem.Allocator, io: std.Io, p: []const u8) !Font {
     const f = try Font.initFromFile(allocator, io, p, font_px);
@@ -5404,7 +5485,7 @@ inline fn lpx(v: i32, scale: f32) i32 {
 /// 否则字形是物理尺寸、度量却按逻辑算 → 缩放后文字排版全错位。
 fn loadFont(allocator: std.mem.Allocator, io: std.Io, scale: f32, preferred: []const u8) !Font {
     const s = std.math.clamp(scale, dpi.min_scale, dpi.max_scale);
-    font_px = 16.0 * s;
+    font_px = font_base_px * s;
     var f = try loadFontRaw(allocator, io, preferred);
     f.px_scale = s;
     return f;
@@ -5753,4 +5834,24 @@ test "main: 拖放只有两片——播放列表网格内 vs 网格外" {
     // 没有几何（未绘制/布局未初始化）→ 一律无落点
     app.playlist.geom = .{};
     try std.testing.expect(view_playlist.hitAt(&app, 400, 200) == null);
+}
+
+test "main: 大字号字体 = 普通字号的 4×（逻辑度量一致，不串 px_scale）" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    var f = loadFont(alloc, io, 1.0, "") catch return error.SkipZigTest;
+    defer f.deinit();
+    var fb = makeBigFont(alloc, io, 1.0) orelse return error.SkipZigTest;
+    defer fb.deinit();
+    // 行高/字宽大致 4×（光栅化按 64 逻辑像素；度量已除回逻辑像素）
+    try std.testing.expectApproxEqAbs(f.lineHeight() * 4.0, fb.lineHeight(), 2.0);
+    try std.testing.expectApproxEqAbs(f.measure("120") * 4.0, fb.measure("120"), 6.0);
+    // 字号翻倍后仍然能装进敲击测速的按钮（300 宽窗口 − 24 边 → 276）
+    try std.testing.expect(fb.measure("999") < 276.0);
+    // **菜单勾选槽**：BPM 菜单里“节拍器”被勾上时标签前缀两空格，
+    // 要足够宽装下自绘对勾（10px）→ 否则勾会压到文字上。
+    // **菜单勾选槽**：BPM 菜单里“节拍器”被勾上时标签前缀**三个空格**，
+    // 要足够宽装下自绘对勾（10px）→ 否则勾会压到文字上（实测本字体空格 3.59 px/字）。
+    try std.testing.expect(f.measure("   ") >= 10.0);
+    try std.testing.expect(f.measure("节拍器") + 16.0 + 12.0 < 140.0); // 菜单宽 140 里装得下（勾选槽 + 文字）
 }

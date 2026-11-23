@@ -97,6 +97,9 @@ pub const Theme = struct {
     mute_on: Color = r_mod.rgb(190, 70, 70),
     /// **自动化激活**（旋钮/推子被启用中的自动化曲线驱动 → 绿色标记）
     auto_active: Color = r_mod.rgb(96, 210, 140),
+    /// **自动化颜色：橙**（`theme.auto_takeover`）——表示“已链接自动化、正在被手动接管”，
+    /// 不是淡出用的橙色。命名曾叫 `auto_latched`（latch 时代），latch 回退后改成中性名。
+    auto_takeover: Color = r_mod.rgb(232, 152, 62),
     /// 琴键：白键 / 黑键 / 键上音名
     key_white: Color = r_mod.rgb(196, 200, 206),
     key_black: Color = r_mod.rgb(28, 30, 34),
@@ -113,6 +116,10 @@ pub const UiRect = struct { x: i32, y: i32, w: i32, h: i32 };
 pub const Ui = struct {
     renderer: Renderer,
     font: *Font,
+    /// **大字号字体**（可选）：超大读数用（如敲击测速的 BPM 数字）。
+    /// 与 `font` 同一字体文件、**4× 字号**（真正的字形光栅化，不是位图放大）；
+    /// `null` → 回退到普通字号（无头/测试环境、或其他平台未装大字号时）。
+    font_big: ?*Font = null,
     theme: Theme = .{},
 
     /// 本帧登记的“遮罩”矩形（菜单/弹层；插件子窗口遮挡判定，见 `noteOverlayRect`）
@@ -162,6 +169,7 @@ pub const Ui = struct {
     /// - `7150-7161`：调音台窗口交互（分割条/拖动/缩放）
     /// - `7600-7900`：效果器窗口（窗口 7600/7601、干湿 7602、EQ 7800+、VST3 参数行 7900+）
     /// - `8100-8711`：调音台控件（声像 8100+ / 音量 8150+ / 干湿 8200+）
+    /// - `9000-9601`：工具/管理浮窗（帮助 9500/9501、设置 9400+、插件管理、**敲击测速 9600/9601**）
     active_id: u64 = 0,
     /// Debug：本帧已认领的 id（撞车检测用；见 `claimActive`）
     seen_ids: [128]u64 = @splat(0),
@@ -634,9 +642,12 @@ pub const Ui = struct {
         return self.knobRange(id, value, x, y, size, 0, 1);
     }
 
-    /// **自动化激活的旋钮**：进度弧与中心点换成绿色（其余与 `knob` 一致）
-    pub fn knobAuto(self: *Ui, id: u64, value: *f32, x: i32, y: i32, size: i32, auto_active: bool) bool {
-        return self.knobRangeTint(id, value, x, y, size, 0, 1, if (auto_active) self.theme.auto_active else null);
+    /// **自动化状态着色的旋钮**（颜色语义见 `App.isAutoActive` / `isAutoTakeover`）：
+    /// `auto_active` = 曲线正在驱动 → **绿**；`takeover` = 已链接且**正在手动拖** → **橙**；
+    /// 两者都假 → 常态（**蓝**）。旋钮只能接受一种着色，优先级写死在这里。
+    pub fn knobAutoState(self: *Ui, id: u64, value: *f32, x: i32, y: i32, size: i32, auto_active: bool, takeover: bool) bool {
+        const tint: ?Color = if (auto_active) self.theme.auto_active else if (takeover) self.theme.auto_takeover else null;
+        return self.knobRangeTint(id, value, x, y, size, 0, 1, tint);
     }
 
     /// 带值域的旋钮（如 Q 值 0.1..4.0）——绘制按 `(v - vmin) / (vmax - vmin)` 归一化。
@@ -743,6 +754,34 @@ pub const Ui = struct {
     /// 如工具栏一整排控件共用的 `(by, bh)`）
     pub fn labelCentered(self: *Ui, text: []const u8, x: i32, y: i32, h: i32, color: Color) void {
         self.font.draw(self.renderer, text, @floatFromInt(x), @floatFromInt(self.centeredBaselineY(y, h)), color);
+    }
+
+    /// 实际用于**超大读数**的字体（有 `font_big` 就用它，否则回退普通字号；本文件内部用）
+    fn fontBig(self: *const Ui) *Font {
+        return self.font_big orelse self.font;
+    }
+
+    /// 大字号文本宽度（逻辑像素）
+    pub fn measureBig(self: *const Ui, text: []const u8) i32 {
+        const f = if (self.font_big) |fb| fb else self.font;
+        return @intFromFloat(f.measure(text));
+    }
+
+    /// 大字号文本的**基线居中** `y`（与 `labelCentered` 同一算法，只是换成大字体）
+    fn centeredBaselineYBig(self: *const Ui, y: i32, h: i32) i32 {
+        const f = self.fontBig();
+        return y + @divTrunc(h, 2) + @divTrunc(@as(i32, @intFromFloat(f.ascentL() + f.descentL())), 2);
+    }
+
+    /// 大字号文本（水平由调用方定位，垂直在 `h` 内居中）
+    pub fn labelBigCentered(self: *Ui, text: []const u8, x: i32, y: i32, h: i32, color: Color) void {
+        self.fontBig().draw(self.renderer, text, @floatFromInt(x), @floatFromInt(self.centeredBaselineYBig(y, h)), color);
+    }
+
+    /// 大字号的行高（逻辑像素）——排版预留高度用
+    pub fn lineHeightBig(self: *const Ui) i32 {
+        const f = if (self.font_big) |fb| fb else self.font;
+        return @intFromFloat(f.lineHeight());
     }
 
     /// 文本输入框（自绘；聚焦样式 = accent 边框 + 光标竖线 + 选区高亮）。

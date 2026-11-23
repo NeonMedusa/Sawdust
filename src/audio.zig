@@ -590,6 +590,14 @@ pub const Params = struct {
     /// **A2 影子对拍**：当前快照指针（0 = 无；UI 用 release 发布，音频 acquire 读取）。
     /// 快照释放由 UI 侧**延迟退休**（≥30 帧 ≫ 一个 block），因此音频持有指针安全。
     snapshot_ptr: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    /// **节拍器开关**（§11.48.5；settings.json 持久化，UI 每帧同步）。
+    metronome: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// **tap 测速的「嗒」请求**（UI 置位、音频块首消费）：bit0 = 待响、bit1 = 重音。
+    /// 单槽即可——tap 一次只响一声；来得慢了丢掉也无感。
+    click_req: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+    /// **离线导出中**（导出循环置位）：节拍器 / tap click 静音——导出产物不含
+    /// 监听信号（§11.48.5；live 播放专属）。
+    export_render: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// A2：UI 侧的调度水位线（步）。音频用它判断“队列是否已覆盖到本块”——
     /// 重扫后水位线回退期间队列会短暂落后，此时**跳过**影子比对（否则是假不一致）。
     sched_upto: std.atomic.Value(i32) = std.atomic.Value(i32).init(0),
@@ -1083,6 +1091,50 @@ fn setDefaultEqBands(r: []eq.BandParams) void {
     for (r, 0..) |*b, i| b.* = if (i < d.len) d[i] else .{};
 }
 
+/// **节拍器 / 敲击测速的「嗒」**（§11.48.5）：实时演算合成，零素材、零分配、采样率无关。
+/// 配方：1.8kHz 正弦主成分 + 2.6kHz 弱分量（0.35）× 指数包络（τ ≈ 8ms，总长 ~40ms）；
+/// 重音档（小节头）= 2.2kHz + 稍高电平。
+const ClickState = struct {
+    /// 距触发已过的采样数（< 0 = 静默）
+    t: i32 = -1,
+    /// 重音档
+    accent: bool = false,
+
+    pub fn trigger(self: *ClickState, accent: bool) void {
+        self.t = 0;
+        self.accent = accent;
+    }
+
+    /// 总长（采样）：~40ms
+    fn lenOf(sr: f32) i32 {
+        return @intFromFloat(@max(2.0, sr * 0.040));
+    }
+
+    /// 取一个采样（内部推进状态）；静默 → 0
+    pub fn next(self: *ClickState, sr: f32) f32 {
+        const n = lenOf(sr);
+        if (self.t < 0) return 0;
+        if (self.t >= n) {
+            self.t = -1;
+            return 0;
+        }
+        const t: f32 = @floatFromInt(self.t);
+        const tau: f32 = @max(1.0, sr * 0.008); // τ ≈ 8ms
+        const f1: f32 = if (self.accent) 2200.0 else 1800.0;
+        const f2: f32 = if (self.accent) 3100.0 else 2600.0;
+        const a: f32 = if (self.accent) 0.42 else 0.30;
+        const w: f32 = 2.0 * std.math.pi / @max(1.0, sr);
+        const s = a * @exp(-t / tau) * (@sin(w * f1 * t) + 0.35 * @sin(w * f2 * t));
+        self.t += 1;
+        return s;
+    }
+};
+
+/// 本块内的 click 触发点（采样偏移 + 是否重音）；收集后块尾统一混入。
+/// 容量：50 ms 去重 ⇒ 每块最多 1 个拍点，再加 1 个 tap 预览；8 格留足余量。
+const ClickTrig = struct { at: u32, accent: bool };
+const click_max_trigs = 8;
+
 pub const Engine = struct {
     device: ma.ma_device = undefined,
     /// 显式选后端时用（`.auto` 走 `ma_device_init(null, …)`，不用它）
@@ -1192,6 +1244,13 @@ pub const Engine = struct {
     stash_gen: u32 = 1,
     /// 上一块的播放状态（用于检测“播放 → 暂停”下降沿）
     was_playing: bool = false,
+    /// **节拍器 / 敲击声状态**（§11.48.5；仅音频线程访问）
+    click: ClickState = .{},
+    /// **节拍器最短间隔守卫**（绝对帧）：拍点放行时写 `abs_frame + gap`，在那之前的拍点全丢。
+    /// 解决“循环回跳时节拍器响两次”（用户实测）：一拍刚好落在块尾（= 循环末尾那个小节头），
+    /// 回跳后下一块的小节头又是**同一个音乐位置**，相隔不到一个块（典型 5–25 ms，大块设备 ~46 ms）
+    /// → 两声叠在一起（听起来加倍、还带点“合唱”感）。窗口大小见 `click_min_gap_s`。
+    beat_guard_until: u64 = 0,
 
     // ── 调音台（音频线程状态；仅本人访问）──
     /// 每通道效果链上的 EQ 滤波器（**堆分配**：槽 × 段 × 2 声道；
@@ -3517,6 +3576,19 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
     // 2) 清空输出（之后按分段叠加渲染）
     @memset(out[0 .. @as(usize, frames) * 2], 0);
 
+    // 2.0) click 触发点（**节拍器拍点** + **敲击测速预览**）：先收集，块尾统一混入。
+    // 导出中一律静音（监听信号不进产物）；拍点只在下面的播放分支里扫。
+    var trigs: [click_max_trigs]ClickTrig = undefined;
+    var n_trigs: usize = 0;
+    const click_allowed = !params.export_render.load(.monotonic);
+    // tap 预览：单槽请求（bit0 = 待响、bit1 = 重音）。**总是取走**——
+    // 导出期间也得清掉，否则导出结束后会闪出一声陈旧 click。
+    const req = params.click_req.swap(0, .monotonic);
+    if (click_allowed and (req & 1) != 0) {
+        trigs[0] = .{ .at = 0, .accent = (req & 2) != 0 };
+        n_trigs = 1;
+    }
+
     // 2.1) 乐器**类型切换边沿**：两个声部池都全释音
     applyKindEdges(engine);
 
@@ -3550,6 +3622,8 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
         // “上一块播放”的位置 → 下次起播的第一帧 UI 拿到陈旧值，游标在旧位置闪一下
         // （实测反馈：“停止后再播放，游标先在原处闪一下再跳回开头”）。
         params.play_step.store(@floatCast(engine.ref_step), .monotonic);
+        // tap 预览（停止态也能响）——节拍器本身不响（拍点只在播放分支扫）
+        renderClicks(engine, out, frames, sr, trigs[0..n_trigs]);
         publishOutMeter(params, out, frames);
         return;
     }
@@ -3579,6 +3653,23 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
     }
     // **停止态：步位置跟 UI 游标**已经在上面 `!playing` 分支处理了（不会走到这里）。
     engine.blk_abs0 = abs0;
+    // ── 节拍器拍点（本块跨越的拍边界；按当前播放域的传输步扫）──
+    if (click_allowed and params.metronome.load(.monotonic)) {
+        // 本块有 tap 预览（偏移 0）→ 先占住守卫：与它太近的拍点不再叠一声
+        const gap_frames: u64 = @intFromFloat(@max(1.0, sr * click_min_gap_s));
+        if (n_trigs > 0) engine.beat_guard_until = @max(engine.beat_guard_until, abs0 + gap_frames);
+        const prefix = n_trigs;
+        n_trigs = gatherBeats(
+            params.steps_per_beat.load(.monotonic),
+            params.time_num.load(.monotonic),
+            engine.ref_step,
+            step_frames,
+            frames,
+            trigs[0..],
+            n_trigs,
+        );
+        n_trigs = dedupeBeats(engine, abs0, gap_frames, trigs[0..n_trigs], prefix);
+    }
     // 本块的“步 ↔ 帧”参考系（事件触发 / 音频片段 / 自动化求值共用）
     const ref_step_i: i32 = @intFromFloat(@floor(engine.ref_step));
     const ref_frac: f64 = engine.ref_step - @as(f64, @floatFromInt(ref_step_i));
@@ -3866,7 +3957,78 @@ pub fn renderBlock(engine: *Engine, params: *Params, out: [*]f32, frames: u32, s
     // 步位置推进（**用本块实际的 step_frames** → BPM 变化自然积分）
     engine.ref_step += @as(f64, @floatFromInt(frames)) / step_frames;
     params.play_step.store(@floatCast(engine.ref_step), .monotonic);
+    // 节拍器 / tap：**在总音量之后**混入（随工具栏音量；不受调音台主推子/静音影响）
+    renderClicks(engine, out, frames, sr, trigs[0..n_trigs]);
     publishOutMeter(params, out, frames);
+}
+
+/// 节拍器 / 敲击的去重窗口（秒）：循环回跳时“块尾那拍 + 回跳后的小节头”是同一个
+/// 音乐位置，相隔 = 一个音频块（典型 5–25 ms；大块设备最长 ~46 ms）→ 两声叠在一起。
+/// 50 ms 足够盖掉，又不会误杀真拍点（最快 999 BPM = 60 ms/拍）。
+const click_min_gap_s: f32 = 0.050;
+
+/// 节拍器拍点**去重**：丢掉与「上次已放行拍点」绝对帧距离 < `gap_frames` 的条目。
+/// `abs0` = 本块首的绝对帧；`prefix` = 前缀条数（tap 预览等，不参与去重也不动）。
+/// 就地压缩（写指针 ≤ 读指针），保留原顺序；返回总条数。
+fn dedupeBeats(engine: *Engine, abs0: u64, gap_frames: u64, out: []ClickTrig, prefix: usize) usize {
+    var w = prefix;
+    var i = prefix;
+    while (i < out.len) : (i += 1) {
+        const at_abs = abs0 + out[i].at;
+        if (engine.beat_guard_until > 0 and at_abs < engine.beat_guard_until) continue;
+        engine.beat_guard_until = at_abs + gap_frames;
+        out[w] = out[i];
+        w += 1;
+    }
+    return w;
+}
+
+/// 本块内扫描**拍边界**（节拍器）：返回追加后的条数。
+/// 拍域 = 当前播放域的传输步（SONG 模式 = 播放列表时间轴、PAT 模式 = 钢琴窗时间轴），
+/// 所以域切换/拍号变化时拍点自然跟随；重音 = 小节头（`拍序号 % 分子 == 0`）。
+/// 参数都是**值**（不传 `Params`）：一口适合单测，二来避免在大结构上取值。
+fn gatherBeats(
+    steps_per_beat: u32,
+    time_num: i32,
+    ref_step: f64,
+    step_frames: f64,
+    frames: u32,
+    out: []ClickTrig,
+    n0: usize,
+) usize {
+    var n = n0;
+    if (step_frames <= 0) return n;
+    const spb: f64 = @floatFromInt(@max(1, steps_per_beat));
+    const num: i64 = @max(1, time_num);
+    const f64_frames: f64 = @floatFromInt(frames);
+    // 本块覆盖的步区间 [ref_step, ref_step + frames/step_frames)
+    var k: f64 = @floor(ref_step / spb);
+    if (k < 0) k = 0;
+    while (n < out.len) : (k += 1) {
+        const off_f = (k * spb - ref_step) * step_frames;
+        if (off_f >= f64_frames) break;
+        if (off_f < 0) continue;
+        const at: u32 = @intFromFloat(@floor(off_f));
+        const beat_i: i64 = @intFromFloat(k);
+        out[n] = .{ .at = @min(at, frames -| 1), .accent = @mod(beat_i, num) == 0 };
+        n += 1;
+    }
+    return n;
+}
+
+/// 块尾把 click 混进输出（跨块尾巴靠 `engine.click` 的状态续接）。
+fn renderClicks(engine: *Engine, out: [*]f32, frames: u32, sr: f32, trigs: []const ClickTrig) void {
+    if (trigs.len == 0 and engine.click.t < 0) return; // 无触发也无尾巴
+    var ti: usize = 0;
+    var i: u32 = 0;
+    while (i < frames) : (i += 1) {
+        while (ti < trigs.len and trigs[ti].at <= i) : (ti += 1) engine.click.trigger(trigs[ti].accent);
+        const s = engine.click.next(sr);
+        if (s != 0) {
+            out[i * 2] += s;
+            out[i * 2 + 1] += s;
+        }
+    }
 }
 
 /// 主输出电平/削波统计（音频线程→UI 原子量）：峰值 + |x|>1 采样计数
@@ -5415,4 +5577,94 @@ test "audio: 鼓组采样器层——声像居中时左右声道都响（回归�
     try std.testing.expect(pl > 0.3); // 回归：曾经左声道恒 0（pan 单位错）
     try std.testing.expect(pr > 0.3);
     try std.testing.expectApproxEqAbs(pl, pr, 0.02); // 居中 → 两侧等功率
+}
+
+// ── 节拍器 / 敲击声（§11.48.5）──
+
+test "audio: 节拍器 click——无触发时静默；触发后 ~40ms 内衰减到 0；重音更响" {
+    const sr: f32 = 44100;
+    var c = ClickState{};
+    try std.testing.expectEqual(@as(f32, 0), c.next(sr)); // 未触发 = 静默
+
+    // 普通拍：峰值 > 0.05，且在 40ms（1764 采样）内收尾
+    c.trigger(false);
+    var peak: f32 = 0;
+    var n: u32 = 0;
+    while (c.t >= 0 and n < 4096) : (n += 1) peak = @max(peak, @abs(c.next(sr)));
+    try std.testing.expect(peak > 0.05);
+    try std.testing.expect(n <= @as(u32, @intFromFloat(sr * 0.041))); // 总长 ≈ 40ms
+    try std.testing.expectEqual(@as(f32, 0), c.next(sr)); // 结束后保持静默
+
+    // 重音拍（小节头）：电平更高
+    var a = ClickState{};
+    a.trigger(true);
+    var peak_a: f32 = 0;
+    var k: u32 = 0;
+    while (a.t >= 0 and k < 4096) : (k += 1) peak_a = @max(peak_a, @abs(a.next(sr)));
+    try std.testing.expect(peak_a > peak);
+}
+
+test "audio: 节拍器拍点扫描——块内偏移正确、小节头重音" {
+    var out: [16]ClickTrig = undefined;
+    const frames: u32 = 4096;
+    // 每拍 24 步、4/4；100 帧/步；从第 0 步开始 → 拍点在 0 / 2400 / 4800 帧……（块只到 4096）
+    var n = gatherBeats(24, 4, 0.0, 100.0, frames, &out, 0);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(@as(u32, 0), out[0].at);
+    try std.testing.expect(out[0].accent); // 小节头
+    try std.testing.expectEqual(@as(u32, 2400), out[1].at);
+    try std.testing.expect(!out[1].accent); // 第 2 拍
+
+    // 从小节中开始：第 3 拍（k = 2）不重音，而下一拍 k = 3 也不重音（4/4 的 k4 才重音）……
+    // 注：k 是**绝对拍序号**，所以 k % 4 == 0 才是小节头；从 k = 2 起扫 → 第二个拍点是 k = 3。
+    n = gatherBeats(24, 4, 48.0, 100.0, frames, &out, 0);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(@as(u32, 0), out[0].at);
+    try std.testing.expect(!out[0].accent); // k = 2
+    try std.testing.expect(!out[1].accent); // k = 3
+
+    // 已有 tap 触发点时是**追加**（保持升序；tap 在块首）
+    var out2: [16]ClickTrig = undefined;
+    out2[0] = .{ .at = 0, .accent = true };
+    n = gatherBeats(24, 4, 0.0, 100.0, frames, &out2, 1);
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expect(out2[0].accent); // 原 tap 徽标不被覆盖
+    try std.testing.expect(out2[1].accent); // 追加的小节头
+}
+
+test "audio: 节拍器去重——循环回跳（块尾一拍 + 回跳后小节头）只响一次" {
+    const sr: f32 = 48000;
+    const gap_frames: u64 = @intFromFloat(sr * click_min_gap_s);
+    // 只需要 `beat_guard_until`：`dedupeBeats` 不碰 `Engine` 的其它字段（不初始化整个 Engine）
+    var e: Engine = undefined;
+    e.beat_guard_until = 0;
+    const step_frames: f64 = 1000.0; // 1 步 = 1000 帧（便于算）
+    var buf: [8]ClickTrig = undefined;
+
+    // ① 循环末尾：ref_step = 95 → 小节头拍点 k=4（步 96）落在块内偏移 1000 → 放行
+    var n = gatherBeats(24, 4, 95.0, step_frames, 2048, &buf, 0);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    n = dedupeBeats(&e, 100_000, gap_frames, buf[0..n], 0);
+    try std.testing.expectEqual(@as(usize, 1), n);
+
+    // ② 回跳后：ref_step = 0，同一个音乐位置的小节头（相隔 1000 帧 ≈ 21 ms）→ **被丢掉**
+    n = gatherBeats(24, 4, 0.0, step_frames, 2048, &buf, 0);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    n = dedupeBeats(&e, 101_000, gap_frames, buf[0..n], 0);
+    try std.testing.expectEqual(@as(usize, 0), n);
+
+    // ③ 正常速度下的下一拍（隔 24 步 = 24000 帧）照常响
+    n = gatherBeats(24, 4, 24.0, step_frames, 2048, &buf, 0);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    n = dedupeBeats(&e, 124_000, gap_frames, buf[0..n], 0);
+    try std.testing.expectEqual(@as(usize, 1), n);
+
+    // ④ tap 预览（前缀）不受影响，但它会占住守卫 → 紧接着的拍点不再叠一声
+    buf[0] = .{ .at = 0, .accent = false };
+    var n2 = gatherBeats(24, 4, 0.0, step_frames, 2048, &buf, 1);
+    try std.testing.expectEqual(@as(usize, 2), n2); // tap + 小节头
+    e.beat_guard_until = @max(e.beat_guard_until, 200_000 + gap_frames);
+    n2 = dedupeBeats(&e, 200_000, gap_frames, buf[0..n2], 1);
+    try std.testing.expectEqual(@as(usize, 1), n2); // 只剩 tap
+    try std.testing.expectEqual(@as(u32, 0), buf[0].at);
 }
