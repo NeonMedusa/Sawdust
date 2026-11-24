@@ -1177,6 +1177,11 @@ pub const Shell = struct {
     bar_steps: i32,
     beat_steps: i32,
     snap_steps: i32,
+    /// 三层的**最小屏上间距**（设置项「网格最小间距」；细 → 粗，见 `drawTimelineGrid`）
+    /// **必填**（不设默认值）：每个调用方都要显式传 `app.grid_min_px_*`
+    g_snap: f32,
+    g_beat: f32,
+    g_bar: f32,
     /// 播放游标（步；null = 不画）
     cursor_step: ?f32,
     playing: bool,
@@ -1212,6 +1217,9 @@ pub fn drawShell(ui: *Ui, sh: Shell) void {
             sh.bar_steps,
             @max(1, sh.beat_steps),
             sh.snap_steps,
+            sh.g_snap,
+            sh.g_beat,
+            sh.g_bar,
         );
         // 播放游标：与音符区/标尺**同一映射**（只画竖线，不带标尺倒三角）
         if (sh.cursor_step) |cs| {

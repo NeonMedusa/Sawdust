@@ -1003,10 +1003,16 @@ pub const Ui = struct {
         return changed;
     }
 
+    /// **推子的统一拖动灵敏度**（像素 / 单位）：以 BPM 推子为准。
+    /// 为什么要有这个常量：旧代码各写自己的一份（网格/fps 是 2、BPM 是 8），
+    /// 同一个界面里手感不一致（用户实测：“网格/fps 比 BPM 推子飘”）。
+    /// 新增数字控件默认用它；确实需要别的档（如音分、百分比）再显式传别的值。
+    pub const drag_px_per_unit: i32 = 8;
+
     /// 拖动数值控件（BPM 等）：按住上下拖 = 调值，**光标隐藏并冻结在原位**。
     /// 与 `zoomSquare` 共用同一套机制（冻结位移 `frozen_dy` → `zoomStep` 步进），
     /// 只是绘制不同（显示数值文本而非方块）。
-    /// `pixels_per_unit`：几像素一单位（BPM 用 8 → 拖 8px 变 1 BPM）。
+    /// `pixels_per_unit`：几像素一单位（一般都传 `drag_px_per_unit` = 8 → 拖 8px 变 1 单位）。
     /// 余数**跨帧累积**（慢拖不丢步）；上拖增大、下拖减小。
     /// 返回 true = 值变了。
     pub fn dragNumber(self: *Ui, id: u64, x: i32, y: i32, w: i32, h: i32, value: *i32, min_v: i32, max_v: i32, pixels_per_unit: i32) bool {

@@ -1,14 +1,21 @@
-//! 设置窗口（工具栏「选项」打开）：启动行为 / 最高帧率。
-//! 变更即置 `settings_dirty`，由 main 帧末落盘到数据目录 `settings.json`。
+//! 设置窗口（工具栏「选项」打开）：启动行为 / 帧率 / 网格密度 / 界面缩放 / 字体 / 音频。
+//! 变更先落在 `SettingsDraft`（草案），点底栏「应用」才生效并置 `settings_dirty`，
+//! 由 main 帧末落盘到数据目录 `settings.json`。
 
 const std = @import("std");
 const r_mod = @import("render.zig");
 const Ui = @import("ui.zig").Ui;
+const Rect = @import("ui.zig").Rect;
 const app_mod = @import("app.zig");
 const App = app_mod.App;
 const util = @import("view_util.zig");
 const font_info = @import("font_info.zig");
 const audio_pref = @import("audio_pref.zig");
+const persist = @import("persist.zig");
+
+/// 设置项的**默认值**的 i32 形态（唯一来源 = `persist.grid_min_px_default`；
+/// 控件是整数拖拽，这里转一次，不另写一份字面量）
+const grid_min_px_default_i32: i32 = @intFromFloat(persist.grid_min_px_default);
 
 const title_h: i32 = 22;
 // 允许窗口缩得很小：内容区本来就能滚动，**底部“应用/取消”必须永远可见**
@@ -39,11 +46,21 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
 
     // 打开时建一份**待应用副本**：所有控件只改它，点“应用”才真正生效。
     // 为什么要草案：UI 缩放如果边拖边生效，缩放变了滑块又跟着变，手感糊成一团（实测）。
+    // 网格间距的“生效值 ↔ 控件值”换算只写一遍（草案初始化 + “应用”可点判断都用它）。
+    const app_grid: [3]i32 = .{
+        @intFromFloat(@round(app.grid_min_px_snap)),
+        @intFromFloat(@round(app.grid_min_px_beat)),
+        @intFromFloat(@round(app.grid_min_px_bar)),
+    };
     if (app.settings_draft == null) {
+        sw.ctx_grid = null; // 刚打开：清掉上次可能残留的右键菜单
         app.settings_draft = .{
             .open_last = app.settings_open_last,
             .fps = app.fps_limit,
             .fps_idle = app.fps_idle,
+            .grid_min_px_snap = app_grid[0],
+            .grid_min_px_beat = app_grid[1],
+            .grid_min_px_bar = app_grid[2],
             .ui_scale_auto = app.ui_scale_auto,
             .ui_scale = if (app.ui_scale_auto) app.ui_scale_detected else app.ui_scale,
             .audio_backend = audio_pref.current.backend,
@@ -55,6 +72,9 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     const dirty = d.open_last != app.settings_open_last or
         d.fps != app.fps_limit or
         d.fps_idle != app.fps_idle or
+        d.grid_min_px_snap != app_grid[0] or
+        d.grid_min_px_beat != app_grid[1] or
+        d.grid_min_px_bar != app_grid[2] or
         d.ui_scale_auto != app.ui_scale_auto or
         (!d.ui_scale_auto and @abs(d.ui_scale - app.ui_scale) > 0.001) or
         d.audio_backend != audio_pref.current.backend or
@@ -104,21 +124,75 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     // 削峰（不削会出现“闲置比忙时还快”的怪状态），最高往上调时闲置不跟着动。
     ui.label("最高帧率", x + 14, yy, ui.theme.text_dim);
     var fps = d.fps;
-    if (ui.dragNumber(9522, x + 14, yy + 16, 64, 22, &fps, 30, 360, 2)) {
+    if (ui.dragNumber(9522, x + 14, yy + 16, 64, 22, &fps, 30, 360, Ui.drag_px_per_unit)) {
         d.fps = fps;
         if (d.fps_idle > d.fps) d.fps_idle = d.fps; // 闲置随最高削峰（上调不跟随）
     }
     ui.label("fps", x + 82, yy + 20, ui.theme.text);
     ui.label("闲置帧率", x + 160, yy, ui.theme.text_dim);
     var fps_idle = d.fps_idle;
-    if (ui.dragNumber(9523, x + 160, yy + 16, 64, 22, &fps_idle, 30, d.fps, 2)) {
+    if (ui.dragNumber(9523, x + 160, yy + 16, 64, 22, &fps_idle, 30, d.fps, Ui.drag_px_per_unit)) {
         d.fps_idle = fps_idle;
     }
     ui.label("fps", x + 228, yy + 20, ui.theme.text);
     ui.label("（完全无事或最小化时降到闲置档，任何操作立即回满速）", x + 14, yy + 44, ui.theme.text_dim);
     yy += 68;
 
-    // ── 数据交换：JSON 通道已于 v9 删除（存档只剩二进制 `.saw`）──
+    // ── 网格（时间轴网格的最小屏上间距 × 三层）──
+    // 三层各有自己的阈值（网格 / 拍线 / 小节，由细到粗），默认均 18px，**互不约束**。
+    // 排序自由：“网格比拍线还稀”= 网格平时不画、放大后才出现（真实需求）——
+    // 不会因此画出两套线（`drawTimelineGrid` 的层级钳制保证）；只有 1..64 范围钳制。
+    // 刻度尺数字间距是**固定常量**（不影响任何线）。
+    // 垂直布局（固定 68px）：标题行 / 三个数字框 / 一行条件提示。
+    // “右键恢复默认”写进**标题行**（不占额外高度）；条件提示与下一段之间留 10px。
+    var ttl: [96]u8 = undefined;
+    const title_t = std.fmt.bufPrint(&ttl, "网格最小间距（右键恢复默认 {d}）", .{grid_min_px_default_i32}) catch "网格最小间距";
+    ui.label(title_t, x + 14, yy, ui.theme.text_dim);
+    {
+        const gx = x + 14;
+        const gy = yy + 16;
+        // 三个“标签 + 数字框”横排。宽度**按字体实测**（换字体/换语言都不会顶到隔壁），
+        // 框宽 32 够放 2 位数（文字居中）；整行 < 最小窗宽 300。
+        const box_w: i32 = 32;
+        const gap: i32 = 6;
+        var name_w: f32 = 0;
+        var ii: u2 = 0;
+        while (ii < 3) : (ii += 1) name_w = @max(name_w, ui.font.measure(grid_layer_name(ii)));
+        const item_w: i32 = @as(i32, @intFromFloat(name_w)) + gap + box_w + 10;
+        const lo: i32 = @intFromFloat(util.grid_min_px_min);
+        const hi: i32 = @intFromFloat(util.grid_min_px_max);
+        ii = 0;
+        while (ii < 3) : (ii += 1) {
+            const ix = gx + @as(i32, ii) * item_w;
+            const bx = ix + @as(i32, @intFromFloat(name_w)) + gap;
+            const num: *i32 = switch (ii) {
+                0 => &d.grid_min_px_snap,
+                1 => &d.grid_min_px_beat,
+                else => &d.grid_min_px_bar,
+            };
+            ui.label(grid_layer_name(ii), ix, gy + 4, ui.theme.text_dim);
+            var v = num.*;
+            if (ui.dragNumber(9531 + @as(u32, ii), bx, gy, box_w, 22, &v, lo, hi, Ui.drag_px_per_unit)) {
+                num.* = v; // 各层独立（不连带其他层）
+            }
+            // 右键 → 「恢复默认值」（与机架/调音台同一套 `menuPanel`）
+            if (util.hitUI(ui, bx, gy, box_w, 22) and ui.mouse_right_pressed) {
+                sw.ctx_grid = .{ .x = ui.mouse_x, .y = ui.mouse_y, .layer = ii };
+            }
+        }
+        // 单位画在最后一行框后
+        ui.label("px", gx + 3 * item_w, gy + 4, ui.theme.text);
+        // 条件提示（优先级：<3px 的极端 > 反序说明）：不禁止任何组合，只解释“为什么看不到”
+        const low = @min(d.grid_min_px_snap, @min(d.grid_min_px_beat, d.grid_min_px_bar));
+        if (low < 3) {
+            ui.label("低于 3px 的层会糊成一片，且可能掉帧", gx, gy + 26, ui.theme.auto_takeover);
+        } else if (d.grid_min_px_snap > d.grid_min_px_beat) {
+            ui.label("网格比拍线稀：网格平时不画，放大才出现", gx, gy + 26, ui.theme.text_dim);
+        } else if (d.grid_min_px_beat > d.grid_min_px_bar) {
+            ui.label("拍线比小节稀：拍线平时不画，放大才出现", gx, gy + 26, ui.theme.text_dim);
+        }
+    }
+    yy += 68;
 
     // ── 界面缩放（DPI）──
     // 上层是“自动”，下面是 5% 档位滑块（75% – 400%）。手拖滑块 = 自动取消。
@@ -303,6 +377,10 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         app.settings_open_last = open_last;
         app.fps_limit = fps_want;
         app.fps_idle = fps_idle_want;
+        // 网格三层：控件已保证 1..64（拖拽自带范围、右键复位回默认值），这里直接类型转换
+        app.grid_min_px_snap = @floatFromInt(d.grid_min_px_snap);
+        app.grid_min_px_beat = @floatFromInt(d.grid_min_px_beat);
+        app.grid_min_px_bar = @floatFromInt(d.grid_min_px_bar);
         app.ui_scale_auto = auto_want;
         app.settings_dirty = true;
         app.settings_draft = null; // 下一帧按生效值重建 → “应用”自动变灰
@@ -324,5 +402,34 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         return true;
     }
 
+    // 网格最小间距的右键菜单（恢复默认值）——画在内容/底栏之上，点外部收起
+    if (sw.ctx_grid) |p0| {
+        var mx = p0.x;
+        var my = p0.y;
+        var open = true;
+        const items = [_][]const u8{"恢复默认值"};
+        const bounds: Rect = .{ .x = 0, .y = 0, .w = ui.renderer.logicalWidth(), .h = ui.renderer.logicalHeight() };
+        const hit = util.menuPanel(ui, &mx, &my, &open, false, .{ .cursor = {} }, bounds, &items, 120, null);
+        if (hit != null) {
+            // **只改草案**（点“应用”才生效）；各层独立，不需要再钳制什么
+            switch (p0.layer) {
+                0 => d.grid_min_px_snap = grid_min_px_default_i32,
+                1 => d.grid_min_px_beat = grid_min_px_default_i32,
+                else => d.grid_min_px_bar = grid_min_px_default_i32,
+            }
+            app.setToast("已恢复默认（点“应用”生效）");
+        }
+        if (hit != null or !open) sw.ctx_grid = null;
+    }
+
     return util.inRect(ui.mouse_x, ui.mouse_y, x, y, ww, hh);
+}
+
+/// 层的显示名（细 → 粗；两字以内 → 三个数字框能并排）
+fn grid_layer_name(i: u2) []const u8 {
+    return switch (i) {
+        0 => "网格",
+        1 => "拍线",
+        else => "小节",
+    };
 }

@@ -473,7 +473,18 @@ pub const Settings = struct {
     font_path: []const u8 = "",
     /// **节拍器开关**（§11.48.5：监听信号；不进工程存档，只存这里）
     metronome: bool = false,
+    /// **网格最小间距**（屏幕像素）× 三层（网格 / 拍线 / 小节线）：都是“最小的屏幕间距”，
+    /// 默认均 18 = 实测舒服的密度；1 是最密（会糊、可能掉帧）、64 是很稀。
+    /// **三层互不约束**：各层只做 1..64 的范围钳制（`view_util.clampGridThresh`），
+    /// 顺序随便（反序 = 那层平时不画、放大后出现，见 `drawTimelineGrid` 的层级钳制）。
+    /// 这是“我看不看得清”的 UI 偏好 → 只存这里，**不进工程存档**。
+    grid_min_px_snap: f32 = grid_min_px_default,
+    grid_min_px_beat: f32 = grid_min_px_default,
+    grid_min_px_bar: f32 = grid_min_px_default,
 };
+
+/// **网格最小间距的默认值**（三层共用；App 字段 / 设置页 / 右键恢复都读它）
+pub const grid_min_px_default: f32 = 18.0;
 
 /// 设置 → JSON（归调用方释放）
 pub fn settingsToJson(allocator: std.mem.Allocator, s: Settings) ![]u8 {
@@ -525,6 +536,14 @@ test "persist: 设置 JSON 往返（含路径转义；未知字段忽略、缺�
     try std.testing.expectEqualStrings("", parsed2.value.font_path);
     try std.testing.expect(!parsed2.value.open_last);
     try std.testing.expectEqualStrings("", parsed2.value.last_project);
+
+    // 网格密度的**旧格式兼容**：早期版本只有一个 `grid_min_px` 字段 → 被忽略，
+    // 新三层字段全部回默认 18（不会因为升级而把用户的 settings.json 读坏）。
+    var parsed3 = try settingsFromJson(allocator, "{\"grid_min_px\":40}");
+    defer parsed3.deinit();
+    try std.testing.expectEqual(grid_min_px_default, parsed3.value.grid_min_px_snap);
+    try std.testing.expectEqual(grid_min_px_default, parsed3.value.grid_min_px_beat);
+    try std.testing.expectEqual(grid_min_px_default, parsed3.value.grid_min_px_bar);
 }
 
 // ── 二进制格式（**唯一存档格式**）──

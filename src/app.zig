@@ -1375,6 +1375,10 @@ pub const SettingsDraft = struct {
     fps_idle: i32 = 30,
     ui_scale_auto: bool = true,
     ui_scale: f32 = 1.0,
+    /// **网格最小间距**（像素）× 三层（网格 / 拍线 / 小节线，从小到大）
+    grid_min_px_snap: i32 = @intFromFloat(persist.grid_min_px_default),
+    grid_min_px_beat: i32 = @intFromFloat(persist.grid_min_px_default),
+    grid_min_px_bar: i32 = @intFromFloat(persist.grid_min_px_default),
     /// 音频输出（**也是草案**：点“应用”才提交，见 view_settings 底栏）
     audio_backend: audio_pref.Backend = .auto,
     audio_device: [audio_pref.device_name_cap]u8 = @splat(0),
@@ -1442,13 +1446,15 @@ pub const RackPreview = struct {
     }
 };
 
-/// 设置窗口（启动行为 / 最高帧率；工具栏“选项”打开）
+/// 设置窗口（启动行为 / 帧率 / 网格 / 界面缩放 / 字体 / 音频；工具栏“选项”打开）
 pub const SettingsWindow = struct {
     open: bool = false,
+    /// 网格最小间距的右键菜单位置 + 哪一层（窗口打开时清；null = 未展开）
+    ctx_grid: ?struct { x: i32, y: i32, layer: u2 } = null,
     x: i32 = 460,
     y: i32 = 130,
     w: i32 = 520,
-    /// 高度要装得下“启动时 / 帧率 / 界面缩放 / 字体 / 音频”五段（加段时同步调 `total_h`）
+    /// 高度要装得下六段内容（加段时不用改这里：`content_h` 每帧按实际布局回写，多出来的可滚动）
     h: i32 = 590,
     /// 内容滚动（内容比可视区高时可用滚轮；底部按钮条不随之滚动）
     scroll: i32 = 0,
@@ -2212,6 +2218,13 @@ pub const App = struct {
     /// **节拍器开关**（§11.48.5）：纯监听信号——进 `settings.json`、**不进**工程存档、不进导出。
     /// 每帧同步给 `params.metronome`；开关入口 = BPM 右键菜单「节拍器」（勾选态自绘）。
     metronome_on: bool = false,
+    /// **网格最小间距**（屏幕像素）× 三层（网格 / 拍线 / 小节线）：每层都是自己的密度门槛，
+    /// 见 `view_util.drawTimelineGrid`；设置页可调（1..64，右键恢复默认）。
+    /// **三层互不约束**（怎么排都合法；反序 = 该层平时不画、放大后出现）。
+    /// 唯一默认值来源 = `persist.grid_min_px_default`。
+    grid_min_px_snap: f32 = persist.grid_min_px_default,
+    grid_min_px_beat: f32 = persist.grid_min_px_default,
+    grid_min_px_bar: f32 = persist.grid_min_px_default,
     /// 待处理的文件对话框请求（null = 无；见 `PickRequest`）
     pick: ?PickRequest = null,
     drumkit_win: DrumKitWindow = .{},

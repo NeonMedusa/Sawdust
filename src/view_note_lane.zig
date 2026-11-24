@@ -125,6 +125,9 @@ pub fn draw(
         .bar_steps = app.steps_per_bar,
         .beat_steps = model.stepsPerBeat(app.time_den),
         .snap_steps = snap_steps,
+        .g_snap = app.grid_min_px_snap,
+        .g_beat = app.grid_min_px_beat,
+        .g_bar = app.grid_min_px_bar,
         .cursor_step = cur_vis,
         .playing = app.playing,
     });

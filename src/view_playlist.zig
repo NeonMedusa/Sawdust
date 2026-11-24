@@ -300,7 +300,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
     const timeline_w: i32 = (bars_right + 3) * bar_w;
     const min_content: i32 = @max(timeline_w, 1); // 滚动条时间轴下限
     const content_span: i32 = timeline_w; // 缩放拉回限制（同值）
-    const dyn_zoom_min: f32 = @min(8.0, @as(f32, @floatFromInt(view_w)) / @as(f32, @floatFromInt(timeline_w)));
+    const dyn_zoom_min: f32 = @min(util.zoom_min_cap, @as(f32, @floatFromInt(view_w)) / @as(f32, @floatFromInt(timeline_w)));
 
     // 横向时间轴滚动条（minimap 语义：拖主体=平移、拖端点继续拖=延长/回缩、拖边缘=缩放）
     {
@@ -333,7 +333,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         // 注：步进像素不可为 0（最细网格 1 步 = 0.125 px）→ 兜底 4px
         ui.scrollbar_nudge = @max(4, @as(i32, @intFromFloat(@round(@as(f32, @floatFromInt(model.snapSteps(app.playlist.snap))) * util.pianoStepPx()))));
         ui.scrollbar_target = &app.playlist.scroll_x_target; // 步进走补间（拖动仍直接写 scroll_x）
-        _ = ui.scrollbarTimelineEx(8, x + 1, hsb_y, w - 2, ruler_h, &app.playlist.scroll_x, min_content, &app.playlist.zoom, view_w, dyn_zoom_min, 8.0, bars_right < util.overhang_map_limit, .{ .blocks = mini_buf[0..nmini] });
+        _ = ui.scrollbarTimelineEx(8, x + 1, hsb_y, w - 2, ruler_h, &app.playlist.scroll_x, min_content, &app.playlist.zoom, view_w, dyn_zoom_min, util.zoom_max, bars_right < util.overhang_map_limit, .{ .blocks = mini_buf[0..nmini] });
     }
     ui.renderer.hline(x + 1, ruler_y, w - 2, ui.theme.panel_border);
 
@@ -359,8 +359,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
         const saved = ui.renderer.pushClip(lane_x, ruler_y, view_w, ruler_h);
         defer ui.renderer.popClip(saved);
         var bar: i32 = @divFloor(app.playlist.scroll_x, bar_w) + 1;
-        // 小节数字**分级渲染**（1-2-5 系列）：标签太密时只显 1、2、5、10… 的切点
-        const label_step: i32 = util.barLabelEveryBars(bar_ws);
+        // 小节数字**分级渲染**（标签太密→按 2 的幂抽稀：1/2/4/8…）
+        // 分级阈值跟小节线走（数字永远长在小节线上）
+        const label_step: i32 = util.barLabelEveryBars(bar_ws, app.grid_min_px_bar);
         while (true) : (bar += 1) {
             const bx = lane_x + @as(i32, @intFromFloat(@as(f32, @floatFromInt(bar - 1)) * bar_ws - scroll_s));
             if (bx > main_x + main_w) break;
@@ -520,6 +521,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
                     spb,
                     model.stepsPerBeat(app.time_den),
                     model.snapSteps(app.playlist.snap), // 播放列表**独立**的吸附档位
+                    app.grid_min_px_snap, // 三层的最小屏上间距（设置项）
+                    app.grid_min_px_beat,
+                    app.grid_min_px_bar,
                 );
                 // 行分隔线：必须在片段**之前**绘制——
                 // 否则它（画在 ty+track_h-1）会盖住片段底边的亮色描边（只有上/左/右亮、下不亮）。
@@ -1363,7 +1367,7 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             if ((ui.wheel > 0 and tgt < app.playlist.zoom) or (ui.wheel < 0 and tgt > app.playlist.zoom)) tgt = app.playlist.zoom;
             // 下限取 min(动态下限，当前)：内容缩短（动态下限被动抬高）时
             // 不得把视口突然放大——只拦“继续缩小”。
-            app.playlist.zoom_target = std.math.clamp(tgt * std.math.pow(f32, util.wheel_zoom_factor, @as(f32, @floatFromInt(ui.wheel))), @min(dyn_zoom_min, tgt), 8.0);
+            app.playlist.zoom_target = std.math.clamp(tgt * std.math.pow(f32, util.wheel_zoom_factor, @as(f32, @floatFromInt(ui.wheel))), @min(dyn_zoom_min, tgt), util.zoom_max);
             // 缩小/已到下限：把视口右缘拉回内容跨度内（全装得下 → 贴左）——悬空量保留
             const vcw: i32 = @max(1, @as(i32, @intFromFloat(@as(f32, @floatFromInt(view_w)) / app.playlist.zoom)));
             const over: i32 = @max(0, app.playlist.scroll_x - @max(0, content_span - vcw));
@@ -1632,6 +1636,9 @@ pub fn draw(ui: *Ui, app: *App, x: i32, y: i32, w: i32, h: i32) void {
             .bar_steps = app.steps_per_bar,
             .beat_steps = @max(1, @divTrunc(app.steps_per_bar, 4)),
             .snap_steps = model.snapSteps(app.playlist.snap),
+            .g_snap = app.grid_min_px_snap,
+            .g_beat = app.grid_min_px_beat,
+            .g_bar = app.grid_min_px_bar,
             .cursor_step = if (ghost) null else cur_steps,
             .playing = app.playing,
         });

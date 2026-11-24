@@ -3094,7 +3094,7 @@ fn drawToolbar(ui: *Ui, app: *App, w: i32) void {
         // 否则曲线每帧把 `bpm` 写回曲线值 → 拖动只有数字在动、声音不跟（用户实测的“老问题”）。
         // 松手后 main 帧首的 `clearAutoDrag` 把它交还给曲线。
         if (bpm_dragging) app.beginAutoDrag(.{ .kind = .tempo });
-        const edited = ui.dragNumberBpm(350, x, by, 56, bh, &shown, model.bpm_min, model.bpm_max, 8, num_color);
+        const edited = ui.dragNumberBpm(350, x, by, 56, bh, &shown, model.bpm_min, model.bpm_max, Ui.drag_px_per_unit, num_color);
         if (edited and shown != shown_before) {
             app.setDocBpmManual(shown); // 拖动中立即生效；松手回曲线，文档值 = 恢复值
             app.history_pending = "调整 BPM"; // 松手时 coalesce 提交
@@ -4601,10 +4601,15 @@ fn loadSettings(app: *App, st: persist.Settings) void {
     app.setFontPath(st.font_path);
     app.font_dirty = false; // 启动时字体已按设置加载过，不必重建
     app.metronome_on = st.metronome;
+    // 网格最小间距（手改 settings.json 超范围 → 钳回 1..64；**不检查顺序**，反序是合法的）
+    app.grid_min_px_snap = st.grid_min_px_snap;
+    app.grid_min_px_beat = st.grid_min_px_beat;
+    app.grid_min_px_bar = st.grid_min_px_bar;
+    util.clampGridThresh(&app.grid_min_px_snap, &app.grid_min_px_beat, &app.grid_min_px_bar);
     if (st.open_last and st.last_project.len > 0) app.setPendingOpen(st.last_project);
 }
 
-test "main: 设置装载——闲置帧率随最高削峰（高于即钳回；上调不跟随）" {
+test "main: 设置装载——闲置帧率钳回最高值；网格三层只钳范围、反序照用" {
     const alloc = std.testing.allocator;
     var app = App{ .allocator = alloc };
     defer app.deinitAll();
@@ -4616,6 +4621,17 @@ test "main: 设置装载——闲置帧率随最高削峰（高于即钳回；�
     loadSettings(&app, .{ .fps = 240, .fps_idle = 30 });
     try std.testing.expectEqual(@as(i32, 240), app.fps_limit);
     try std.testing.expectEqual(@as(i32, 30), app.fps_idle);
+
+    // 网格三层：**反序也尊重**（用户手改 settings.json 写 40/8/8 就让它生效，不被“纠正”）；
+    // 只钳范围（0 / 999 → 1 / 64）
+    loadSettings(&app, .{ .grid_min_px_snap = 40, .grid_min_px_beat = 8, .grid_min_px_bar = 8 });
+    try std.testing.expectEqual(@as(f32, 40), app.grid_min_px_snap);
+    try std.testing.expectEqual(@as(f32, 8), app.grid_min_px_beat);
+    try std.testing.expectEqual(@as(f32, 8), app.grid_min_px_bar);
+    loadSettings(&app, .{ .grid_min_px_snap = 0, .grid_min_px_beat = 999, .grid_min_px_bar = 12 });
+    try std.testing.expectEqual(util.grid_min_px_min, app.grid_min_px_snap);
+    try std.testing.expectEqual(util.grid_min_px_max, app.grid_min_px_beat);
+    try std.testing.expectEqual(@as(f32, 12), app.grid_min_px_bar);
 }
 
 /// 写入设置（静默失败；下一步变更会重试）。
@@ -4634,6 +4650,9 @@ fn saveSettings(app: *App, io: std.Io) void {
         .audio_device = audio_pref.current.deviceName(),
         .font_path = app.fontPath(),
         .metronome = app.metronome_on,
+        .grid_min_px_snap = app.grid_min_px_snap,
+        .grid_min_px_beat = app.grid_min_px_beat,
+        .grid_min_px_bar = app.grid_min_px_bar,
     }) catch return;
     defer app.allocator.free(json);
     std.Io.Dir.cwd().writeFile(io, .{ .sub_path = spath, .data = json }) catch return;
