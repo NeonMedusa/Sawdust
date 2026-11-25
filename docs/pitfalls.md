@@ -299,7 +299,7 @@ id_base_float / id_base_synth_panel / id_base_fx_panel = 1e9 / 2e9 / 3e9
 
 “最近改动”的 id 用**行序号**而不是参数下标（参数下标可能上万，会把 id 挤出本段）。
 
-### 插件窗口抢键盘焦点 → 我们的输入框打不了字（系统“嘟”一声）
+### 插件窗口抢键盘焦点 → 输入框打不了字（系统“嘟”一声）/ 快捷键失效
 
 **症状**：把乐器换成 VSTi（如 Vital）后，点自动化参数表的搜索框 / 重命名输入框，
 **敲键盘没反应**，Windows 发出“无效按键”提示音；必须先点一下主窗口外面再点回来才能输入。
@@ -319,6 +319,35 @@ prev_text_input_active = app.text_input.active;
 ```
 
 副作用：插件编辑器里的输入框在自己被点击时会重新拿到焦点（Windows 点子窗口即聚焦），不受影响。
+
+**同一根因的第二个症状（快捷键也失效）**：编辑器开着时，Ctrl+C / Ctrl+V / Ctrl+S 这些
+**不依赖文本输入框的快捷键也全部没反应**——它们同样只在主窗口的 `WM_KEYDOWN` 里识别。
+上面那个“输入框打开时才抢”的边沿触发拦不住它：用户只是**用鼠标改音符**，没开输入框。
+
+**通用修法（窗口层，与 VST 无关）**：**鼠标按到主窗口上就把焦点抢回来**。
+
+```zig
+// window.zig（Win32）：WM_LBUTTONDOWN / WM_RBUTTONDOWN / WM_MBUTTONDOWN / WM_LBUTTONDBLCLK
+fn grabFocusOnClick(hwnd: ?*anyopaque) void {
+    if (hwnd == null) return;
+    if (GetFocus() == hwnd) return;   // 常态（99% 的点击）：不调系统
+    _ = SetFocus(hwnd);
+}
+// window_x11.zig：ButtonPress（滚轮 4–7 除外）→ self.focusMain()
+```
+
+为什么必须手动做（两个容易漏的点）：
+1. **主窗口是自绘的**：鼠标按下消息被我们吃掉（`return 0`，不走 `DefWindowProc`），
+   而 `DefWindowProc(WM_LBUTTONDOWN)` 正是系统“点窗口 = 拿焦点”的实现；
+2. 更关键：**主窗口已经是活动窗口时，再点它自己的客户区不会触发激活**（不会有
+   `WM_MOUSEACTIVATE`），于是焦点可以**永久**留在嵌入式插件子窗口上——以前只有
+   “关插件 / 点外面再点回来 / 开文本输入框”三条路能把焦点弄回来。
+
+双击也要抢：第二下系统发的是 `WM_LBUTTONDBLCLK`（**不再发** `WM_LBUTTONDOWN`）。
+滚轮**不**抢（与 Windows 标准行为一致，也避免滚一下就把插件里的焦点弄丢）。
+
+**实测**（2026-11，Win11 + 用户自己的 VSTi）：编辑器开着 —— 不动它、直接鼠标改音符，
+Ctrl+C/V 立即生效；插件界面里的自身控件/文本框照旧正常。
 
 ### 拖拽控件“松手就回退”（真因：捕获在帧首被清 → `frozen_dy` 变 0）
 

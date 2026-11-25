@@ -1180,6 +1180,9 @@ pub const X11Window = struct {
                 self.last_click_y = b.y;
                 self.push(.{ .mouse_down = .{ .x = b.x, .y = b.y, .button = btn } });
                 if (dbl) self.push(.{ .mouse_double = .{ .x = b.x, .y = b.y } });
+                // 点回主窗口 = 把 X 键盘焦点抢回来（与 Win32 侧同一策略；滚轮 4–7 不抢）。
+                // 插件的独立顶层窗口点过之后焦点在那边，“点自己的窗口”不一定能靠 WM 拿回来。
+                self.focusMain();
             },
             ButtonRelease => {
                 const b = ev.button;

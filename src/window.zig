@@ -357,11 +357,10 @@ const WindowsWindow = struct {
         _ = SetCapture(@ptrCast(self.hwnd));
     }
 
-    /// **把键盘焦点抢回主窗口**（文本输入框刚打开时调用）。
-    /// 嵌入式插件编辑器是 `WS_CHILD` 子窗口，它显示时会 `SetFocus(自己)` →
-    /// 之后按键全被它吃掉，我们的输入框收不到字符（系统还会“嘟”一声）。
+    /// **把键盘焦点抢回主窗口**（焦点本来就在时不做系统调用）——文本输入框刚打开时用。
+    /// 实现在 `grabFocusOnClick`（那里写清了为什么必须手动抢）。
     pub fn focusMain(self: *WindowsWindow) void {
-        if (self.hwnd) |h| _ = SetFocus(h);
+        grabFocusOnClick(self.hwnd);
     }
 
     /// 结束鼠标冻结（未冻结时无操作）
@@ -472,6 +471,23 @@ const WindowsWindow = struct {
         return @as(i16, @bitCast(w));
     }
 
+    /// **把键盘焦点抢回主窗口**（鼠标点主窗口 / 文本输入框刚打开，两个入口都走这里）。
+    ///
+    /// 为什么必须手动作：主窗口是自绘的，鼠标按下消息被我们吃掉（return 0，不走 DefWindowProc），
+    /// 而 `DefWindowProc(WM_LBUTTONDOWN)` 正是系统“点窗口 = 拿焦点”的实现；
+    /// 更关键：**主窗口已经是活动窗口时，再点它自己的客户区不会触发激活**，
+    /// 于是焦点可以永远留在**嵌入式插件编辑器**（`WS_CHILD`）身上——
+    /// 表现为“开着 VST 界面时 Ctrl+C/V 完全没反应”（按键全进了插件窗口），
+    /// 以及“插件开着时输入框打不了字”（系统还会“嘟”一声）。见 docs/pitfalls.md「插件窗口抢键盘焦点」。
+    ///
+    /// 注：点在**插件编辑器上**时这条根本不会跑到（那是另一个 HWND 的消息）——
+    /// 所以插件里的输入框/快捷键照旧正常。
+    fn grabFocusOnClick(hwnd: ?*anyopaque) void {
+        if (hwnd == null) return;
+        if (GetFocus() == hwnd) return; // 常态：焦点本来就在主窗口上 → 不做系统调用
+        _ = SetFocus(hwnd);
+    }
+
     fn wndProc(hwnd: ?*anyopaque, msg: u32, wparam: usize, lparam: isize) callconv(.winapi) isize {
         const userdata = GetWindowLongPtrW(@ptrCast(hwnd), GWLP_USERDATA);
         const self: ?*WindowsWindow = if (userdata != 0) @ptrFromInt(@as(usize, @intCast(userdata))) else null;
@@ -553,6 +569,7 @@ const WindowsWindow = struct {
                 return 0;
             },
             WM_LBUTTONDOWN, WM_RBUTTONDOWN, WM_MBUTTONDOWN => {
+                grabFocusOnClick(hwnd);
                 if (self) |s| {
                     const button: MouseButton = switch (msg) {
                         WM_LBUTTONDOWN => .left,
@@ -568,6 +585,7 @@ const WindowsWindow = struct {
                 return 0;
             },
             WM_LBUTTONDBLCLK => {
+                grabFocusOnClick(hwnd); // 双击的第二下收不到 WM_LBUTTONDOWN，焦点同样要抢
                 if (self) |s| {
                     const lp: u32 = @bitCast(@as(i32, @truncate(lparam)));
                     const x = lowWordSigned(lp);
@@ -816,6 +834,8 @@ extern "user32" fn DestroyCursor(*anyopaque) callconv(.winapi) i32;
 extern "user32" fn SetCapture(*anyopaque) callconv(.winapi) ?*anyopaque;
 extern "user32" fn ReleaseCapture() callconv(.winapi) i32;
 extern "user32" fn SetFocus(hwnd: ?*anyopaque) callconv(.winapi) ?*anyopaque;
+/// 当前线程的键盘焦点窗口（焦点在别的线程/进程时返回 null → 当作“不在主窗口”）
+extern "user32" fn GetFocus() callconv(.winapi) ?*anyopaque;
 extern "user32" fn SetProcessDpiAwarenessContext(?*anyopaque) callconv(.winapi) i32;
 /// DPI 查询：`GetDpiForWindow`（Win10 1607+）—— Win32 把"系统 DLL 里存在"的导出全部声明为 extern，
 /// 老系统上调用会失败，但**运行时只会在有窗口的 Win10+ 上被调用**；取到 0 → 退回 1.0。
