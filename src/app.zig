@@ -2225,6 +2225,11 @@ pub const App = struct {
     grid_min_px_snap: f32 = persist.grid_min_px_default,
     grid_min_px_beat: f32 = persist.grid_min_px_default,
     grid_min_px_bar: f32 = persist.grid_min_px_default,
+    /// **面板标题栏折叠菜单**（`▾`）：哪个面板 + 菜单左上角（null = 未展开）。
+    /// 面板窄到放不下 `自动化/预设/保存为…` 三个按钮时，它们折叠进这个菜单。
+    /// 全局只允许一个（同一时刻只有一块面板在吃点击）。
+    chrome_menu: ?struct { panel: WinKind, x: i32, y: i32 } = null,
+
     /// 待处理的文件对话框请求（null = 无；见 `PickRequest`）
     pick: ?PickRequest = null,
     drumkit_win: DrumKitWindow = .{},
@@ -10090,7 +10095,8 @@ pub const App = struct {
     /// （实测：混音台音量推子右键“恢复默认值”点好几次才生效一次）。
     /// 回归测试：`app: menuIsOpen——每种菜单都必须计入`。
     pub fn menuIsOpen(self: *const App) bool {
-        return self.rack.ctx_instrument != null or
+        return self.chrome_menu != null or // 面板标题栏折叠菜单（`▾`：自动化/预设/保存为…）
+            self.rack.ctx_instrument != null or
             self.rack.ctx_vol != null or self.rack.ctx_pan != null or
             self.file_menu_open or self.panels.ctx_pattern != null or self.panels.ctx_audio_style != null or
             self.panels.ctx_track != null or self.panels.ctx_bpm or
@@ -14733,6 +14739,12 @@ test "app: menuIsOpen——每种菜单都必须计入（漏项会穿透下层�
     app.preset_browser.open = true;
     try std.testing.expect(app.menuIsOpen());
     app.preset_browser.open = false;
+
+    // 面板标题栏的折叠菜单（`▾`）——实测 bug：漏项 → 菜单项点击直接穿透到
+    // 它身后的音符/片段/合成器旋钮（内置乐器的正文是我们自己画的，没有插件子窗口捣回）。
+    app.chrome_menu = .{ .panel = .synth, .x = 0, .y = 0 };
+    try std.testing.expect(app.menuIsOpen());
+    app.chrome_menu = null;
 
     // 调音台右键菜单（通道/效果器/声像/**音量推子**）——实测 bug：漏项 → 点击穿透到通道条；
     // **`ctx_vol` 漏项的表现是“恢复默认值点不生效”**：菜单底下的推子也收到这次点击 →

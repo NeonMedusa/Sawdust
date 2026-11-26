@@ -702,7 +702,9 @@ pub fn main(init: std.process.Init) !u8 {
                         continue;
                     }
                     if (k.code == 0x1B) { // Esc：关闭菜单 / 返回播放列表（**不退出程序**）
-                        if (app.file_menu_open) {
+                        if (app.chrome_menu != null) {
+                            app.chrome_menu = null; // 面板标题栏的折叠菜单（最轻的弹层，先收它）
+                        } else if (app.file_menu_open) {
                             app.file_menu_open = false;
                         } else if (app.help_win.open) {
                             app.help_win.open = false;

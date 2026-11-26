@@ -7,7 +7,7 @@ const std = @import("std");
 const Ui = @import("ui.zig").Ui;
 const Theme = @import("ui.zig").Theme;
 const r_mod = @import("render.zig");
-const Rect = @import("ui.zig").Rect;
+pub const Rect = @import("ui.zig").Rect;
 const model = @import("model.zig");
 const App = @import("app.zig").App;
 const vst_host = @import("vst_host.zig");
@@ -78,8 +78,8 @@ pub fn titleCloseButton(ui: *Ui, x: i32, y: i32, w: i32, title_h_: i32) bool {
 /// - `drag_id` / `grip_id`：拖动与缩放的 active_id——**两者都显式传**（不搞
 ///   `id+1` 约定：设置窗的缩放柄就是 9541 而 9521 被 toggle2 占着，隐式约定必撞）。
 ///   **必须查 `ui.zig` 的号段表取本窗口专属段**——撞车 = 串窗口（历史事故多发区）；
-/// - `title_right_pad`：标题栏**右侧保留宽度**（关闭按钮 + 标题栏内嵌按钮；
-///   只有 `w - title_right_pad` 那段可拖动）；
+/// - `title_right_pad`：标题**文本**的右侧保留宽度（关闭键 + 标题栏内的控件；
+///   只影响文本裁剪，**不再影响拖动命中**）；
 /// - `resizable`：false = 不画缩放柄、不响应缩放（拖动照常；w/h 指针仍要传，占位即可）；
 /// - 返回 `true` = **点了关闭**——调用方做自己的清理（关菜单/停预览…）、置
 ///   `open = false` 并从 draw 返回；本函数不做任何清理（各窗口的收尾语义不同）。
@@ -119,8 +119,14 @@ pub fn windowChrome(
     ui.labelMiddle(title, px + 8, py + 4, @max(0, pw - 8 - title_right_pad), ui.theme.text);
     // 关闭按钮（右上角 ×；全项目统一件）
     if (titleCloseButton(ui, px, py, pw, title_h_)) return true;
-    // 标题拖动（存抓取偏移，避免拿起来就跳；右侧 `title_right_pad` 留给按钮/关闭）
-    if (hitUI(ui, px, py, @max(0, pw - title_right_pad), title_h_) and ui.mouse_pressed) {
+    // 标题拖动（存抓取偏移，避免拿起来就跳）
+    // 命中区 = **整条标题栏减去关闭键**（`drag_pad`），而**不是** `title_right_pad`：
+    // 后者是给标题文本留的宽度；右侧的按钮/▾ 按下时自己会 `ui.active_id = 0` 取消拖动
+    // （各面板都这么写），所以不需要把它们排他。
+    // 历史坑：按 `title_right_pad`(=160/216) 排他 → 按钮放不下时那段就变成
+    // “既没按钮也不能拖”的**死区**（实测：窄插件面板的标题栏右半截拖不动）。
+    const drag_pad: i32 = 26; // ✕（20 + 右边距 2）+ 4px 间隙
+    if (hitUI(ui, px, py, @max(0, pw - drag_pad), title_h_) and ui.mouse_pressed) {
         ui.active_id = drag_id;
         grab_dx.* = ui.mouse_x - px;
         grab_dy.* = ui.mouse_y - py;
@@ -157,6 +163,244 @@ pub fn windowChrome(
         ui.renderer.line(px + pw - 6, py + ph - 2, px + pw - 2, py + ph - 6, ui.theme.panel_border);
     }
     return false;
+}
+
+// ── 面板标题栏右侧的**动作条**（乐器 / 效果 / 鼓组三个面板共用）──
+//
+// 三个面板原本各自写死一套“按钮宽度 + 右侧保留宽度 + 放不下就不画”的阈值
+// （`58/62` + `160/216/170` + `x+180/200/150`），**三份数字全部漂移**，而且那个阈值
+// 苛刻得多（乐器面板要 `ww > 398` 才画按钮，实际只需要 ~190），窄面板（如 SFLT ≈130px）
+// 就完全不画 → 用户既看不到入口、右侧 160px 还成了“既没按钮也不能拖”的死区。
+//
+// 现在的规矩（唯一实现）：
+//  1. 宽度**字体实测**（标签宽 + 内边距 + 间隙），不再写死；
+//  2. 放得下三个 → 逐个按（从左到右 `自动化 / 预设 / 保存为…`）；
+//     放不下 → **只留一个 `▾`**（紧贴 ✕ 左边），点开同一组动作的菜单；
+//  3. **`▾` 永远显示**，宁可盖掉左边的标题文本（标题本来就会中略）。
+
+/// 标题栏动作（顺序 = 从左到右；也是折叠菜单的项序）
+pub const ChromeAct = enum { auto, preset, save };
+
+/// 哪些动作可用（乐器：全开；鼓组：无 auto；内置效果器：无 auto）
+pub const ChromeEnable = struct { auto: bool = false, preset: bool = true, save: bool = true };
+
+/// 一个动作按钮的矩形
+pub const ChromeBtn = struct { act: ChromeAct, r: Rect };
+
+/// 动作条布局（**由 `planChrome` 算，不要自己写坐标**）
+pub const ChromePlan = struct {
+    /// 展开时的按钮（按 `ChromeAct` 声明顺序，仅含启用的）
+    btns: [3]ChromeBtn = undefined,
+    n: usize = 0,
+    /// 折叠时的 `▾`（展开 = null）
+    arrow: ?Rect = null,
+    /// 标题文本右侧要保留的宽度（传给 `windowChrome` 的 `title_right_pad`）
+    reserve: i32 = chrome_close_area,
+    /// 折叠态下菜单的项（与 `btns` 无关；按 `ChromeAct` 顺序，仅含启用的）
+    acts: [3]ChromeAct = undefined,
+};
+
+const chrome_gap: i32 = 6;
+const chrome_btn_h: i32 = 6; // 上下留白（按钮高 = 标题栏高 - 此值）
+const chrome_arrow_w: i32 = 24;
+const chrome_close_area: i32 = 26; // ✕（20 + 右边距 2）+ 4px 间隙
+/// 标题文本至少想留多少（再挤下去就只剩“拖动把手”了）：折叠判据用
+const chrome_title_min: i32 = 40;
+
+/// 单个动作按钮的宽度（字体实测）：标签 + 内边距（`预设` 还要加自绘下拉箭头）
+fn chromeBtnWidth(ui: *Ui, act: ChromeAct) i32 {
+    return switch (act) {
+        .auto => @as(i32, @intFromFloat(@ceil(ui.font.measure("自动化")))) + 22,
+        .preset => @as(i32, @intFromFloat(@ceil(ui.font.measure("预设")))) + 4 + menu_arrow_w + 16,
+        .save => @as(i32, @intFromFloat(@ceil(ui.font.measure("保存为…")))) + 15,
+    };
+}
+
+/// 动作条布局（**唯一**决定“三个按钮还是 ▾”的地方）：只负责测量，几何全交给 `planChromeGeom`。
+pub fn planChrome(ui: *Ui, x: i32, y: i32, ww: i32, ttl_h: i32, title: []const u8, en: ChromeEnable) ChromePlan {
+    const widths = ChromeWidths{
+        .auto = if (en.auto) chromeBtnWidth(ui, .auto) else null,
+        .preset = if (en.preset) chromeBtnWidth(ui, .preset) else null,
+        .save = if (en.save) chromeBtnWidth(ui, .save) else null,
+    };
+    return planChromeGeom(x, y, ww, ttl_h, @intFromFloat(@ceil(ui.font.measure(title))), widths);
+}
+
+/// 各动作按钮的实测宽（null = 该动作不启用）
+pub const ChromeWidths = struct { auto: ?i32 = null, preset: ?i32 = null, save: ?i32 = null };
+
+/// **纯几何**（无字体依赖 → 可单测）：`ww ≥ 关闭区 + 按钮条 + 标题想占的宽`
+/// 就展开成三个按钮，否则折叠成一个 `▾`。“标题想占的宽”封顶为 `chrome_title_min`
+/// （标题可以让位给按钮，但至少给它 40px 的余地：那也是**可拖动把手**的最小宽度）。
+pub fn planChromeGeom(x: i32, y: i32, ww: i32, ttl_h: i32, title_w: i32, widths: ChromeWidths) ChromePlan {
+    var plan = ChromePlan{};
+    const bh = ttl_h - chrome_btn_h;
+    const by = y + 3;
+
+    // 1) 收集启用的动作 + 总宽
+    var strip: i32 = 0;
+    for ([_]ChromeAct{ .auto, .preset, .save }) |act| {
+        const w = switch (act) {
+            .auto => widths.auto,
+            .preset => widths.preset,
+            .save => widths.save,
+        } orelse continue;
+        plan.acts[plan.n] = act;
+        plan.n += 1;
+        strip += w;
+    }
+    if (plan.n > 1) strip += chrome_gap * @as(i32, @intCast(plan.n - 1));
+
+    // 2) 放得下吗？
+    const title_need = @min(title_w + 16, chrome_title_min);
+    const fits = plan.n > 0 and ww >= chrome_close_area + strip + title_need;
+
+    if (fits) {
+        // 3a) 展开：从右往左排（右对齐，不依赖前面几张按钮的累计宽）
+        var rx = x + ww - chrome_close_area;
+        var i: usize = plan.n;
+        while (i > 0) {
+            i -= 1;
+            const w = switch (plan.acts[i]) {
+                .auto => widths.auto.?,
+                .preset => widths.preset.?,
+                .save => widths.save.?,
+            };
+            rx -= w;
+            plan.btns[i] = .{ .act = plan.acts[i], .r = .{ .x = rx, .y = by, .w = w, .h = bh } };
+            rx -= chrome_gap;
+        }
+        plan.reserve = x + ww - plan.btns[0].r.x;
+    } else if (plan.n > 0) {
+        // 3b) 折叠：▾ 紧贴 ✕ 左侧，**永远画**（宁可盖住标题）
+        plan.arrow = .{ .x = x + ww - chrome_close_area - chrome_arrow_w, .y = by, .w = chrome_arrow_w, .h = bh };
+        plan.reserve = chrome_close_area + chrome_arrow_w + 2;
+    }
+    return plan;
+}
+
+test "view_util: 面板标题栏动作条——宽了摆三个按钮，窄了折叠成 ▾" {
+    // 模拟字体实测得到的宽度（≈ 现状：自动化 58 / 预设 58 / 保存为 62）
+    const ws = ChromeWidths{ .auto = 58, .preset = 58, .save = 62 };
+    const strip = 58 + 58 + 62 + 6 * 2; // 间隙 6 × 2
+    // 刚好放得下（关闭区 26 + 按钮条 + 标题 40）；标题很长也不会多要（封顶 40）
+    const just = chrome_close_area + strip + chrome_title_min;
+    {
+        const p = planChromeGeom(10, 10, just, 22, 400, ws);
+        try std.testing.expectEqual(@as(usize, 3), p.n);
+        try std.testing.expect(p.arrow == null);
+        try std.testing.expectEqual(chrome_close_area + strip, p.reserve);
+        // 右对齐：最后一个按钮的右缘紧贴关闭区
+        try std.testing.expectEqual(@as(i32, 10 + just - chrome_close_area), p.btns[2].r.x + p.btns[2].r.w);
+        // 从左到右 = auto / preset / save，互不重叠（留着 gap）
+        try std.testing.expectEqual(@as(i32, 6), p.btns[1].r.x - (p.btns[0].r.x + p.btns[0].r.w));
+        try std.testing.expectEqual(ChromeAct.auto, p.btns[0].act);
+        try std.testing.expectEqual(ChromeAct.save, p.btns[2].act);
+    }
+    // 差 1px → 折叠；`▾` 紧贴关闭区左侧，reserve 变小
+    {
+        const p = planChromeGeom(10, 10, just - 1, 22, 400, ws);
+        try std.testing.expectEqual(@as(usize, 3), p.n); // 动作清单仍在（菜单要用）
+        try std.testing.expect(p.arrow != null);
+        try std.testing.expectEqual(@as(i32, 10 + just - 1 - chrome_close_area - chrome_arrow_w), p.arrow.?.x);
+        try std.testing.expectEqual(chrome_close_area + chrome_arrow_w + 2, p.reserve);
+    }
+    // 标题很短（“FX”→ 16+16=32 < 40）→ 门槛降低 8px：标题宽也算进去，但不超封顶
+    {
+        const need_short = chrome_close_area + strip + 32;
+        try std.testing.expect(planChromeGeom(0, 0, need_short, 22, 16, ws).arrow == null);
+        try std.testing.expect(planChromeGeom(0, 0, need_short - 1, 22, 16, ws).arrow != null);
+    }
+    // 只启用两个动作（鼓组：无自动化）→ 需要的宽度变小
+    {
+        const two = ChromeWidths{ .preset = 58, .save = 62 };
+        const need2 = chrome_close_area + 58 + 62 + 6 + chrome_title_min;
+        const p = planChromeGeom(0, 0, need2, 22, 100, two);
+        try std.testing.expectEqual(@as(usize, 2), p.n);
+        try std.testing.expect(p.arrow == null);
+        try std.testing.expect(need2 < just); // 确实比三个按钮省地方
+        try std.testing.expect(planChromeGeom(0, 0, need2 - 1, 22, 100, two).arrow != null);
+    }
+    // 全部禁用（空效果槽）→ 两者都不画，只给关闭键留位
+    {
+        const p = planChromeGeom(0, 0, 500, 22, 100, .{});
+        try std.testing.expectEqual(@as(usize, 0), p.n);
+        try std.testing.expect(p.arrow == null);
+        try std.testing.expectEqual(chrome_close_area, p.reserve);
+    }
+}
+
+/// 画一个动作按钮（统一样式：`预设` 带自绘下拉箭头）。返回 true = 本帧被点击。
+/// `active` = 强制高亮（预设面板已打开 / 菜单展开）。
+pub fn chromeButton(ui: *Ui, b: ChromeBtn, active: bool) bool {
+    const hov = hitUI(ui, b.r.x, b.r.y, b.r.w, b.r.h);
+    ui.renderer.fillRect(b.r.x, b.r.y, b.r.w, b.r.h, if (active) ui.theme.accent else if (hov) ui.theme.item_hover else ui.theme.slider_track);
+    ui.renderer.strokeRect(b.r.x, b.r.y, b.r.w, b.r.h, ui.theme.panel_border);
+    switch (b.act) {
+        .auto => ui.label("自动化", b.r.x + 5, b.r.y + 2, ui.theme.text),
+        .save => ui.label("保存为…", b.r.x + 4, b.r.y + 2, ui.theme.text),
+        .preset => {
+            // “预设” + 自绘下拉箭头（字体缺 `▾`；居中成组）
+            const tw: i32 = @intFromFloat(ui.font.measure("预设"));
+            const gap: i32 = 4;
+            const total = tw + gap + menu_arrow_w;
+            const tx = b.r.x + @divTrunc(b.r.w - total, 2);
+            ui.label("预设", tx, b.r.y + 2, ui.theme.text);
+            menuArrow(ui, tx + tw + gap, b.r.y + @divTrunc(b.r.h - menu_arrow_h, 2), ui.theme.text);
+        },
+    }
+    return hov and ui.mouse_pressed;
+}
+
+/// 画折叠态的 `▾` 按钮（只有一个三角）。返回 true = 本帧被点击。
+pub fn chromeArrowButton(ui: *Ui, r: Rect, active: bool) bool {
+    const hov = hitUI(ui, r.x, r.y, r.w, r.h);
+    ui.renderer.fillRect(r.x, r.y, r.w, r.h, if (active) ui.theme.accent else if (hov) ui.theme.item_hover else ui.theme.slider_track);
+    ui.renderer.strokeRect(r.x, r.y, r.w, r.h, ui.theme.panel_border);
+    menuArrow(
+        ui,
+        r.x + @divTrunc(r.w - menu_arrow_w, 2),
+        r.y + @divTrunc(r.h - menu_arrow_h, 2),
+        ui.theme.text,
+    );
+    return hov and ui.mouse_pressed;
+}
+
+/// 折叠菜单里的项名（与按钮同文案；菜单宽度按最长一项实测）
+pub fn chromeActionLabel(act: ChromeAct) []const u8 {
+    return switch (act) {
+        .auto => "自动化",
+        .preset => "预设…",
+        .save => "保存为…",
+    };
+}
+
+/// 折叠菜单（`▾` 展开的那组动作）——返回被选中的动作（null = 未选）。
+/// 宽度按项名**实测**。
+/// - `opened_by` != null：**刚打开的那一帧**（传 `▾` 的矩形）→ 用 `.button` 锚定位到它下方，
+///   并把 `just_opened = true` 传下去。
+///   ⚠️ **必须这么传**：`▾` 是左键打开的，而 `menuPanel` 的“点外部关闭”用的也是同一个
+///   `ui.mouse_pressed` → 不传 `just_opened` 的话，打开那一帧鼠标还压在 `▾` 上（不在菜单里），
+///   菜单会被判成“点了外面”→ **弹出后立刻消失**（实测 bug）。
+/// - 否则（后续帧）：按调用方存好的 `x/y` 画（每帧钳到 `bounds` 内；调用方每帧会按 `▾`
+///   位置重写 `x/y`，所以面板拖动时菜单会跟着走）。
+pub fn chromeMenuPanel(ui: *Ui, x: *i32, y: *i32, open: *bool, acts: []const ChromeAct, bounds: Rect, opened_by: ?Rect) ?ChromeAct {
+    var labels: [3][]const u8 = undefined;
+    var maxw: f32 = 0;
+    for (acts, 0..) |a, i| {
+        labels[i] = chromeActionLabel(a);
+        maxw = @max(maxw, ui.font.measure(labels[i]));
+    }
+    const w: i32 = @as(i32, @intFromFloat(@ceil(maxw))) + 28;
+    if (opened_by) |b| {
+        const hit = menuPanel(ui, x, y, open, true, .{ .button = .{ .x = b.x, .y = b.y, .w = b.w, .h = b.h } }, bounds, labels[0..acts.len], w, null);
+        return if (hit) |i| acts[i] else null;
+    }
+    const h: i32 = @as(i32, @intCast(acts.len)) * menu_item_h + 4;
+    x.* = std.math.clamp(x.*, bounds.x, @max(bounds.x, bounds.x + bounds.w - w));
+    y.* = std.math.clamp(y.*, bounds.y, @max(bounds.y, bounds.y + bounds.h - h));
+    const hit = menuPanel(ui, x, y, open, false, .{ .snapshot = {} }, bounds, labels[0..acts.len], w, null);
+    return if (hit) |i| acts[i] else null;
 }
 
 /// 视图切换按钮（标题栏**最右侧**）：播放列表 ⇄ 钢琴卷帘。

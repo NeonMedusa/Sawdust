@@ -14,6 +14,7 @@ const builtin = @import("builtin");
 const Ui = @import("ui.zig").Ui;
 const App = @import("app.zig").App;
 const PresetSaveSource = @import("app.zig").PresetSaveSource;
+const PresetTarget = @import("app.zig").PresetTarget;
 const synth = @import("synth.zig");
 const model = @import("model.zig");
 const util = @import("view_util.zig");
@@ -60,6 +61,14 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     }
     const embedded = vst3_pl != null and vst3_pl.?.view != null;
     const expect_ui = vst3_pl != null and !vst3_pl.?.editor_no_ui;
+    // 当前目标是 VST3 吗（预设库分类 / 自动化入口 / 标题栏按钮都用它）
+    const target_is_vst3 = vst3_pl != null or switch (sw.target) {
+        .instrument => |ii| (ii >= 0 and ii < @as(i32, @intCast(app.instruments.items.len)) and app.instruments.items[@intCast(ii)].kind == .vst3),
+        .kit_layer_replace => |ref| blk: {
+            const ly = app.kitLayerPtr(ref.instrument, ref.pitch, ref.layer) orelse break :blk false;
+            break :blk ly.kind == .vst3;
+        },
+    };
     const min_w: i32 = if (expect_ui) 80 else win_min_w;
     const min_h: i32 = if (expect_ui) 80 else win_min_h;
     sw.w = std.math.clamp(sw.w, min_w, @max(min_w, w - 20));
@@ -84,8 +93,8 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         return true;
     };
     // 标题文本（动态：乐器/层名；外壳负责画标题栏与文字）
-    // （标题栏按钮被点的那一帧不启动拖动——由外壳的 160px 排除区保证：
-    //   预设/保存为/自动化/关闭全部落在排除区内，拖动命中区碰不到它们）
+    // （右侧控件区的宽度由 `plan.reserve` 传入，标题不够位置就自动中略——
+    //   控件区不再排除拖动命中：按钮自己按下时会 `ui.active_id = 0`）
     var tbuf: [192]u8 = undefined;
     const title: []const u8 = switch (sw.target) {
         .instrument => |ii| blk: {
@@ -117,10 +126,26 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         },
     };
 
-    // ── 窗口外壳（共享 `util.windowChrome`；标题右侧 160px 留给
-    //    预设/保存为/自动化/关闭——VST3 嵌入时面板尺寸跟随插件，不提供手动缩放）──
-    if (util.windowChrome(ui, 5000, 5001, title, win_title_h, 160, &sw.x, &sw.y, &sw.w, &sw.h, &sw.grab_dx, &sw.grab_dy, &sw.resize_w0, &sw.resize_h0, &sw.resize_mx, &sw.resize_my, !embedded)) {
+    // 标题栏动作条：[自动化] [预设 ▾] [保存为…]——窄面板自动折叠成 `▾`（`util.planChrome`）
+    // 减法/VST3 乐器都有预设库——VST3 分类 = 插件 CID（`vst3_<cid>`）；
+    // 见 main 的 loadVst3Preset/saveVst3Preset。
+    // `自动化`：**乐器（含内置合成器/鼓组层）**（§11.47 A）——乐器级入口不需要插件
+    // （无插件时窗口里只画 MIDI 段）；鼓组层依旧只在它是 VST3 层时出现。
+    // **唯一的隐藏条件 = 面板正文已经嵌了参数表**（Linux 的 VST 乐器/鼓组层）。
+    const show_auto_btn = blk_auto: {
+        const body_embedded = builtin.os.tag == .linux and target_is_vst3;
+        break :blk_auto !body_embedded and switch (sw.target) {
+            .instrument => true,
+            .kit_layer_replace => target_is_vst3,
+        };
+    };
+    const plan = util.planChrome(ui, sw.x, sw.y, sw.w, win_title_h, title, .{ .auto = show_auto_btn });
+
+    // ── 窗口外壳（共享 `util.windowChrome`；右侧动作条的宽度/折叠由
+    //    `util.planChrome` 算——VST3 嵌入时面板尺寸跟随插件，不提供手动缩放）──
+    if (util.windowChrome(ui, 5000, 5001, title, win_title_h, plan.reserve, &sw.x, &sw.y, &sw.w, &sw.h, &sw.grab_dx, &sw.grab_dy, &sw.resize_w0, &sw.resize_h0, &sw.resize_mx, &sw.resize_my, !embedded)) {
         sw.open = false;
+        app.chrome_menu = null;
         return true;
     }
     // 拖出主窗口时**当场钳制**（顶部 clamp 下帧才生效——期间子窗口会跟着
@@ -128,102 +153,33 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     sw.x = std.math.clamp(sw.x, 0, @max(0, w - ww));
     sw.y = std.math.clamp(sw.y, 0, @max(0, h - hh));
 
-    // 预设按钮（标题栏右侧）：[预设 ▾] [保存为…]
-    // 减法/VST3 乐器都有预设库——VST3 分类 = 插件 CID（`vst3_<cid>`）；
-    // 见 main 的 loadVst3Preset/saveVst3Preset
-    const target_is_vst3 = vst3_pl != null or switch (sw.target) {
-        .instrument => |ii| (ii >= 0 and ii < @as(i32, @intCast(app.instruments.items.len)) and app.instruments.items[@intCast(ii)].kind == .vst3),
-        .kit_layer_replace => |ref| blk: {
-            const ly = app.kitLayerPtr(ref.instrument, ref.pitch, ref.layer) orelse break :blk false;
-            break :blk ly.kind == .vst3;
-        },
-    };
+    // 动作按钮 / 折叠 `▾`
+    var opened_now: ?util.Rect = null; // 本帧刚点开 `▾`（传给菜单：它要跳过“点外部关闭”）
     {
-        const save_w: i32 = 62;
-        const menu_w: i32 = 58;
-        const auto_w: i32 = 58;
-        const gap: i32 = 6;
-        const bx2 = x + ww - 22 - 6 - save_w;
-        const bx1 = bx2 - gap - menu_w;
-        const bx0 = bx1 - gap - auto_w;
-        const bh2: i32 = win_title_h - 6;
-        const by2 = y + 3;
-        // `自动化` 按钮：**乐器（含内置合成器/鼓组）+ 鼓组层**（§11.47 A）。
-        // 以前要求 `target_is_vst3`——内置乐器因此没入口；现在乐器级入口不需要插件
-        // （无插件时窗口里只画 MIDI 段）。鼓组层依旧只在它是 VST3 层时出现（参数表靠插件）。
-        // **唯一的隐藏条件 = 面板正文已经嵌了参数表**（Linux 的 VST 乐器/鼓组层）；
-        // 内置乐器的正文是合成器 GUI → 必须给标题按钮，否则 Linux 上没有自动化入口。
-        const body_embedded = builtin.os.tag == .linux and target_is_vst3;
-        const show_auto_btn = !body_embedded and switch (sw.target) {
-            .instrument => true,
-            .kit_layer_replace => target_is_vst3,
-        };
-        if ((if (show_auto_btn) bx0 else bx1) > x + 180) { // 标题放不下就不画（窄窗）
-            // [预设 ▾]
-            const h1 = util.hitUI(ui, bx1, by2, menu_w, bh2);
-            ui.renderer.fillRect(bx1, by2, menu_w, bh2, if (app.preset_browser.open) ui.theme.accent else if (h1) ui.theme.item_hover else ui.theme.slider_track);
-            ui.renderer.strokeRect(bx1, by2, menu_w, bh2, ui.theme.panel_border);
-            {
-                // “预设” + 自绘下拉箭头（字体缺 `▾`；居中成组）
-                const tw: i32 = @intFromFloat(ui.font.measure("预设"));
-                const arrow_gap: i32 = 4;
-                const total = tw + arrow_gap + util.menu_arrow_w;
-                const tx = bx1 + @divTrunc(menu_w - total, 2);
-                ui.label("预设", tx, by2 + 2, ui.theme.text);
-                util.menuArrow(ui, tx + tw + arrow_gap, by2 + @divTrunc(bh2 - util.menu_arrow_h, 2), ui.theme.text);
-            }
-            if (h1 and ui.mouse_pressed) {
-                if (app.preset_browser.open) {
-                    app.preset_browser.open = false;
+        var clicked: ?struct { act: util.ChromeAct, r: util.Rect } = null;
+        for (plan.btns[0..plan.n]) |b| {
+            const active = b.act == .preset and app.preset_browser.open;
+            if (util.chromeButton(ui, b, active)) clicked = .{ .act = b.act, .r = b.r };
+        }
+        if (plan.arrow) |r| {
+            const menu_open = if (app.chrome_menu) |cm| cm.panel == .synth else false;
+            if (util.chromeArrowButton(ui, r, menu_open)) {
+                // 菜单砸在按钮下方；已经开着再点 = 收起
+                if (menu_open) {
+                    app.chrome_menu = null;
                 } else {
-                    app.openPresetBrowser(.{ .replace = sw.target }); // 同插件限定
+                    app.chrome_menu = .{ .panel = .synth, .x = r.x, .y = r.y + r.h };
+                    opened_now = r;
                 }
-                ui.active_id = 0; // 防误触发标题拖动（同一位置按下）
-            }
-            // [保存为…]
-            const h2 = util.hitUI(ui, bx2, by2, save_w, bh2);
-            ui.renderer.fillRect(bx2, by2, save_w, bh2, if (h2) ui.theme.item_hover else ui.theme.slider_track);
-            ui.renderer.strokeRect(bx2, by2, save_w, bh2, ui.theme.panel_border);
-            ui.label("保存为…", bx2 + 4, by2 + 2, ui.theme.text);
-            if (h2 and ui.mouse_pressed) {
-                // 输入框弹在按钮下方（复用文本输入基建：支持中文 IME）；
-                // **预填当前关联预设名**（直接回车 → 覆写确认）
-                const save_src = PresetSaveSource{ .params = sw.target };
-                app.beginRenamePreset(bx2 - 60, y + win_title_h + 4, save_src, app.presetPrefillName(save_src));
-                app.preset_browser.open = false;
                 ui.active_id = 0; // 防误触发标题拖动
+            } else if (menu_open) {
+                app.chrome_menu.?.x = r.x; // 跟着面板走（菜单不掉队）
+                app.chrome_menu.?.y = r.y + r.h;
             }
-            // [自动化]：VST 参数自动化（v3：乐器 / 鼓组层同一套）
-            // 底色与 `预设/保存为…` 完全同款（不因“已打开”而常显蓝：那看着像开关）
-            if (show_auto_btn) {
-                const h0 = util.hitUI(ui, bx0, by2, auto_w, bh2);
-                ui.renderer.fillRect(bx0, by2, auto_w, bh2, if (h0) ui.theme.item_hover else ui.theme.slider_track);
-                ui.renderer.strokeRect(bx0, by2, auto_w, bh2, ui.theme.panel_border);
-                ui.label("自动化", bx0 + 5, by2 + 2, ui.theme.text);
-                if (h0 and ui.mouse_pressed) {
-                    switch (sw.target) {
-                        .instrument => |ii| {
-                            // §11.47 A：乐器级入口（内置合成器也能开，窗口里只有 MIDI 段）
-                            const iidx: usize = @intCast(@max(0, ii));
-                            if (iidx < app.instruments.items.len) {
-                                app.openAutoWinForInstrument(app.instruments.items[iidx].uid);
-                            } else {
-                                app.openVstAutoWin(.{ .kind = .instrument, .a = @intCast(iidx) });
-                            }
-                        },
-                        .kit_layer_replace => |kr| {
-                            if (app.kitLayerSlot(@intCast(@max(0, kr.instrument)), kr.pitch, kr.layer)) |slot| {
-                                app.openVstAutoWin(.{
-                                    .kind = .kit_layer,
-                                    .a = @intCast(@max(0, kr.instrument)),
-                                    .b = @intCast(@min(slot, std.math.maxInt(u16))),
-                                });
-                            }
-                        },
-                    }
-                    ui.active_id = 0; // 防误触发标题拖动
-                }
-            }
+        }
+        if (clicked) |c| {
+            runChromeAction(app, sw.target, c.act, c.r);
+            ui.active_id = 0; // 防误触发标题拖动（同一位置按下）
         }
     }
 
@@ -247,6 +203,8 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
                 }
             },
         }
+        // 折叠菜单（见 draw 末尾的 `drawChromeMenu`；VST3 分支提前 return，所以两处都调）
+        drawChromeMenu(ui, app, sw.target, plan.acts[0..plan.n], plan.arrow != null, opened_now);
         return util.inRect(ui.mouse_x, ui.mouse_y, x, y, ww, hh);
     }
 
@@ -365,7 +323,74 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     }
     ry += 24;
 
+    // 折叠菜单（`▾`）——必须在内容**之后**画（盖住面板正文）。
+    // `menuPanel` 会把矩形登记进 `ui.overlay_rects` → 插件子窗口被裁掉/禁用 → 点击不穿透。
+    // （VST3 分支在 185 行提前 return，所以两处都要调）
+    drawChromeMenu(ui, app, sw.target, plan.acts[0..plan.n], plan.arrow != null, opened_now);
+
     return util.inRect(ui.mouse_x, ui.mouse_y, x, y, ww, hh);
+}
+
+/// 标题栏动作的实际行为（**按钮与折叠菜单共用**，避免两套实现漂移）。
+/// `r` = 触发控件的矩形（“保存为…”的输入框锚在它左下）。
+fn runChromeAction(app: *App, target: PresetTarget, act: util.ChromeAct, r: util.Rect) void {
+    switch (act) {
+        .auto => switch (target) {
+            .instrument => |ii| {
+                // §11.47 A：乐器级入口（内置合成器也能开，窗口里只有 MIDI 段）
+                const iidx: usize = @intCast(@max(0, ii));
+                if (iidx < app.instruments.items.len) {
+                    app.openAutoWinForInstrument(app.instruments.items[iidx].uid);
+                } else {
+                    app.openVstAutoWin(.{ .kind = .instrument, .a = @intCast(iidx) });
+                }
+            },
+            .kit_layer_replace => |kr| {
+                if (app.kitLayerSlot(@intCast(@max(0, kr.instrument)), kr.pitch, kr.layer)) |slot| {
+                    app.openVstAutoWin(.{
+                        .kind = .kit_layer,
+                        .a = @intCast(@max(0, kr.instrument)),
+                        .b = @intCast(@min(slot, std.math.maxInt(u16))),
+                    });
+                }
+            },
+        },
+        .preset => {
+            if (app.preset_browser.open) {
+                app.preset_browser.open = false;
+            } else {
+                app.openPresetBrowser(.{ .replace = target }); // 同插件限定
+            }
+        },
+        .save => {
+            // 输入框弹在控件下方（复用文本输入基建：支持中文 IME）；
+            // **预填当前关联预设名**（直接回车 → 覆写确认）
+            const save_src = PresetSaveSource{ .params = target };
+            app.beginRenamePreset(r.x - 60, r.y + r.h + 2, save_src, app.presetPrefillName(save_src));
+            app.preset_browser.open = false;
+        },
+    }
+}
+
+/// 画折叠菜单（仅当 `▾` 处于折叠态且菜单属于本面板）。
+/// `opened_by` = 本帧刚点开 `▾` 时的按钮矩形（发给 `chromeMenuPanel`：
+/// **必须**传下去，否则菜单会在打开那一帧被“点外部关闭”立刻关掉——实测 bug）。
+fn drawChromeMenu(ui: *Ui, app: *App, target: PresetTarget, acts: []const util.ChromeAct, collapsed: bool, opened_by: ?util.Rect) void {
+    if (!collapsed) {
+        // 面板变宽→又摆得下三个按钮了：清掉可能残留的菜单状态（否则它会“隐形地开着”）
+        if (app.chrome_menu) |cm| {
+            if (cm.panel == .synth) app.chrome_menu = null;
+        }
+        return;
+    }
+    const cm = if (app.chrome_menu) |*c| (if (c.panel == .synth) c else null) else null;
+    const p = cm orelse return;
+    var open = true;
+    const bounds = util.Rect{ .x = 0, .y = 0, .w = ui.renderer.logicalWidth(), .h = ui.renderer.logicalHeight() };
+    const picked = util.chromeMenuPanel(ui, &p.x, &p.y, &open, acts, bounds, opened_by);
+    if (open) return;
+    if (picked) |act| runChromeAction(app, target, act, .{ .x = p.x + 40, .y = p.y, .w = 0, .h = 0 });
+    app.chrome_menu = null;
 }
 
 /// 时间→秒的紧凑显示（单位固定为秒；< 1s 两位/三位小数保证可读）

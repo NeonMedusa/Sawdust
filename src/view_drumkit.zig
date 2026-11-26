@@ -60,11 +60,17 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
     // 标题文本（动态：鼓组 — 乐器名；外壳画标题栏与文字）
     var tbuf: [96]u8 = undefined;
     const title = std.fmt.bufPrint(&tbuf, "鼓组 — {s}", .{inst.name}) catch "鼓组";
+    // 标题栏右侧还有一块“层 x/y”文字（在动作条左侧）——**先算它的宽**，
+    // 并入标题裁剪的保留区，标题文本就不会被它盖住（只会被提前中略）。
+    var cb: [24]u8 = undefined;
+    const cnt = std.fmt.bufPrint(&cb, "层 {d}/{d}", .{ kit.totalLayers(), audio.kit_max_layers }) catch "";
+    const chip_reserve: i32 = @as(i32, @intFromFloat(ui.font.measure(cnt))) + 8;
 
-    // ── 窗口外壳（共享 `util.windowChrome`；标题右侧 ~170px 留给
-    //    层数概览/预设/保存为/关闭）──
-    if (util.windowChrome(ui, 7060, 7061, title, win_title_h, 170, &dw.x, &dw.y, &dw.w, &dw.h, &dw.grab_dx, &dw.grab_dy, &dw.resize_w0, &dw.resize_h0, &dw.resize_mx, &dw.resize_my, true)) {
+    // ── 窗口外壳（共享 `util.windowChrome`；右侧动作条宽度/折叠由 `util.planChrome` 算）──
+    const plan = util.planChrome(ui, dw.x, dw.y, dw.w, win_title_h, title, .{ .auto = false });
+    if (util.windowChrome(ui, 7060, 7061, title, win_title_h, plan.reserve + chip_reserve, &dw.x, &dw.y, &dw.w, &dw.h, &dw.grab_dx, &dw.grab_dy, &dw.resize_w0, &dw.resize_h0, &dw.resize_mx, &dw.resize_my, true)) {
         dw.open = false;
+        app.chrome_menu = null;
         if (dw.audition_pitch) |ap| {
             app.auditionOffInst(inst_idx, ap);
             dw.audition_pitch = null;
@@ -72,51 +78,35 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         return true;
     }
 
-    // 标题栏右侧：层数概览 + [预设 ▾] [保存为…]（与合成器窗口同款：整组套鼓的存/取）
+    // 标题栏右侧：层数概览 + 动作条（[预设 ▾] [保存为…]，窄面板折叠成 `▾`）
+    var opened_now: ?util.Rect = null; // 本帧刚点开 `▾`（菜单要跳过“点外部关闭”）
     {
-        var cb: [24]u8 = undefined;
-        const cnt = std.fmt.bufPrint(&cb, "层 {d}/{d}", .{ kit.totalLayers(), audio.kit_max_layers }) catch "";
-        const cw: i32 = @intFromFloat(ui.font.measure(cnt));
-        ui.label(cnt, x + ww - 30 - cw, y + 4, ui.theme.text_dim);
-        // [预设 ▾] [保存为…]
-        const save_w: i32 = 62;
-        const menu_w: i32 = 58;
-        const gap: i32 = 6;
-        const bx2 = x + ww - 30 - cw - 12 - save_w;
-        const bx1 = bx2 - gap - menu_w;
-        const bh2: i32 = win_title_h - 6;
-        const by2 = y + 3;
-        if (bx1 > x + 150) {
-            const h1 = util.hitUI(ui, bx1, by2, menu_w, bh2);
-            ui.renderer.fillRect(bx1, by2, menu_w, bh2, if (app.preset_browser.open) ui.theme.accent else if (h1) ui.theme.item_hover else ui.theme.slider_track);
-            ui.renderer.strokeRect(bx1, by2, menu_w, bh2, ui.theme.panel_border);
-            {
-                // “预设” + 自绘下拉箭头（字体缺 `▾`；居中成组）
-                const tw: i32 = @intFromFloat(ui.font.measure("预设"));
-                const arrow_gap: i32 = 4;
-                const total = tw + arrow_gap + util.menu_arrow_w;
-                const tx = bx1 + @divTrunc(menu_w - total, 2);
-                ui.label("预设", tx, by2 + 2, ui.theme.text);
-                util.menuArrow(ui, tx + tw + arrow_gap, by2 + @divTrunc(bh2 - util.menu_arrow_h, 2), ui.theme.text);
-            }
-            if (h1 and ui.mouse_pressed) {
-                if (app.preset_browser.open) {
-                    app.preset_browser.open = false;
+        // 层数概览在动作条**左侧**（它的宽度已并入 `chip_reserve`，标题不会被盖住）
+        ui.label(cnt, x + ww - plan.reserve - chip_reserve, y + 4, ui.theme.text_dim);
+
+        var clicked: ?struct { act: util.ChromeAct, r: util.Rect } = null;
+        for (plan.btns[0..plan.n]) |b| {
+            const active = b.act == .preset and app.preset_browser.open;
+            if (util.chromeButton(ui, b, active)) clicked = .{ .act = b.act, .r = b.r };
+        }
+        if (plan.arrow) |r| {
+            const menu_open = if (app.chrome_menu) |cm| cm.panel == .drumkit else false;
+            if (util.chromeArrowButton(ui, r, menu_open)) {
+                if (menu_open) {
+                    app.chrome_menu = null;
                 } else {
-                    app.openPresetBrowser(.{ .replace = .{ .instrument = inst_idx } });
+                    app.chrome_menu = .{ .panel = .drumkit, .x = r.x, .y = r.y + r.h };
+                    opened_now = r;
                 }
                 ui.active_id = 0; // 防误触发标题拖动
+            } else if (menu_open) {
+                app.chrome_menu.?.x = r.x; // 跟着面板走（菜单不掉队）
+                app.chrome_menu.?.y = r.y + r.h;
             }
-            const h2 = util.hitUI(ui, bx2, by2, save_w, bh2);
-            ui.renderer.fillRect(bx2, by2, save_w, bh2, if (h2) ui.theme.item_hover else ui.theme.slider_track);
-            ui.renderer.strokeRect(bx2, by2, save_w, bh2, ui.theme.panel_border);
-            ui.label("保存为…", bx2 + 4, by2 + 2, ui.theme.text);
-            if (h2 and ui.mouse_pressed) {
-                const save_src = PresetSaveSource{ .kit = inst_idx };
-                app.beginRenamePreset(bx2 - 60, y + win_title_h + 4, save_src, app.presetPrefillName(save_src));
-                app.preset_browser.open = false;
-                ui.active_id = 0;
-            }
+        }
+        if (clicked) |c| {
+            runChromeAction(app, inst_idx, c.act, c.r);
+            ui.active_id = 0; // 防误触发标题拖动（同一位置按下）
         }
     }
 
@@ -377,7 +367,51 @@ pub fn draw(ui: *Ui, app: *App, w: i32, h: i32) bool {
         }
     }
 
+    // 折叠菜单（`▾`）——内容之后画（盖住面板正文）；`menuPanel` 会登记 overlay 矩形。
+    drawChromeMenu(ui, app, plan.acts[0..plan.n], plan.arrow != null, opened_now);
+
     return util.inRect(ui.mouse_x, ui.mouse_y, x, y, ww, hh);
+}
+
+/// 标题栏动作的实际行为（**按钮与折叠菜单共用**）。`r` = 触发控件的矩形。
+fn runChromeAction(app: *App, inst_idx: i32, act: util.ChromeAct, r: util.Rect) void {
+    switch (act) {
+        // 鼓组面板没有“自动化”（层级的自动化入口在合成器窗口里）
+        .auto => {},
+        .preset => {
+            if (app.preset_browser.open) {
+                app.preset_browser.open = false;
+            } else {
+                app.openPresetBrowser(.{ .replace = .{ .instrument = inst_idx } });
+            }
+        },
+        .save => {
+            const save_src = PresetSaveSource{ .kit = inst_idx };
+            app.beginRenamePreset(r.x - 60, r.y + r.h + 2, save_src, app.presetPrefillName(save_src));
+            app.preset_browser.open = false;
+        },
+    }
+}
+
+/// 画折叠菜单（仅当 `▾` 处于折叠态且菜单属于本面板）。
+/// `opened_by` = 本帧刚点开 `▾` 时的按钮矩形——**必须**传下去，
+/// 否则菜单会在打开那一帧被“点外部关闭”立刻关掉（实测 bug）。
+fn drawChromeMenu(ui: *Ui, app: *App, acts: []const util.ChromeAct, collapsed: bool, opened_by: ?util.Rect) void {
+    if (!collapsed) {
+        // 面板变宽→又摆得下按钮了：清掉可能残留的菜单状态
+        if (app.chrome_menu) |cm| {
+            if (cm.panel == .drumkit) app.chrome_menu = null;
+        }
+        return;
+    }
+    const cm = if (app.chrome_menu) |*c| (if (c.panel == .drumkit) c else null) else null;
+    const p = cm orelse return;
+    var open = true;
+    const bounds = util.Rect{ .x = 0, .y = 0, .w = ui.renderer.logicalWidth(), .h = ui.renderer.logicalHeight() };
+    const picked = util.chromeMenuPanel(ui, &p.x, &p.y, &open, acts, bounds, opened_by);
+    if (open) return;
+    if (picked) |act| runChromeAction(app, app.drumkit_win.instrument, act, .{ .x = p.x + 40, .y = p.y, .w = 0, .h = 0 });
+    app.chrome_menu = null;
 }
 
 /// 来源预设名 `分类/名字` → 显示名（取 `/` 后部分；无前缀则原样）
