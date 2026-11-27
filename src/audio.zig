@@ -2074,6 +2074,21 @@ fn vstiActiveSet(engine: *Engine, i: usize, pitch: u8, on: bool) void {
 /// 只在快照换代时调用（每次编辑一次，O(实例数)）。
 /// ⚠️ VSTi 没有声部模型：只能按音高发 off（同音高多实例不可区分，**已知限制**）；
 /// ⚠️ 鼓组（pad/层模型）暂不参与，仍走原有释音路径。
+/// **换代对账**用小工具：“这个实例（乐器/音高/可选起点）还在结转集里吗？”
+/// 四处一模一样的嵌套循环收成一处（以前错一处就会变成“误切声部/漏切声部”）。
+/// `start` = null → 只比乐器与音高（VSTi 没有精确实例，见下）。
+inline fn crossHas(insts: []const snapshot.Inst, cross: []const u32, inst: i32, pitch: i32, start: ?i32) bool {
+    for (cross) |ci| {
+        const it = insts[ci];
+        if (it.instrument != inst or it.pitch != pitch) continue;
+        if (start) |s| {
+            if (it.start != s) continue;
+        }
+        return true;
+    }
+    return false;
+}
+
 fn reconcileVoices(engine: *Engine, params: *Params, cur_step: i32, insts: []const snapshot.Inst, cross: []const u32) void {
     const n_cap = @min(@as(usize, 32), params.instruments_cap, engine.synths.len);
 
@@ -2089,15 +2104,7 @@ fn reconcileVoices(engine: *Engine, params: *Params, cur_step: i32, insts: []con
             if (v.start_step < 0) continue;
             const p: u8 = @intCast(@max(0, v.pitch));
             // 结转集里有同 (音高, 起点) 的实例 → 应该在响，留着
-            var keep = false;
-            for (cross) |ci| {
-                const it = insts[ci];
-                if (it.instrument == @as(i32, @intCast(i)) and it.pitch == @as(i32, p) and it.start == v.start_step) {
-                    keep = true;
-                    break;
-                }
-            }
-            if (!keep) _ = synth.noteOff(sy, p, v.start_step);
+            if (!crossHas(insts, cross, @intCast(i), p, v.start_step)) _ = synth.noteOff(sy, p, v.start_step);
         }
     }
 
@@ -2116,28 +2123,12 @@ fn reconcileVoices(engine: *Engine, params: *Params, cur_step: i32, insts: []con
                     for (&st.layers[l].voices) |*sv| {
                         if (!sv.active) continue;
                         if (sv.pitch != pad_pitch or sv.start_step < 0) continue;
-                        var keep = false;
-                        for (cross) |ci| {
-                            const it = insts[ci];
-                            if (it.instrument == @as(i32, @intCast(i)) and it.pitch == @as(i32, pad_pitch) and it.start == sv.start_step) {
-                                keep = true;
-                                break;
-                            }
-                        }
-                        if (!keep) sv.active = false;
+                        if (!crossHas(insts, cross, @intCast(i), pad_pitch, sv.start_step)) sv.active = false;
                     }
                 }
             } else if (lkind == 2) {
                 // VSTi 层：没有声部模型 → 只能 pad 级（同 pad 多实例不可区分，已知限制）
-                var has = false;
-                for (cross) |ci| {
-                    const it = insts[ci];
-                    if (it.instrument == @as(i32, @intCast(i)) and it.pitch == @as(i32, pad_pitch)) {
-                        has = true;
-                        break;
-                    }
-                }
-                if (!has and params.kit_layer_plugin[i][l].load(.acquire) != null) {
+                if (!crossHas(insts, cross, @intCast(i), pad_pitch, null) and params.kit_layer_plugin[i][l].load(.acquire) != null) {
                     kitLayerVstiNoteOff(engine, i, l, pad_pitch, 0, 0);
                 }
             } else {
@@ -2147,15 +2138,7 @@ fn reconcileVoices(engine: *Engine, params: *Params, cur_step: i32, insts: []con
                     if (v.env_stage == .idle or v.env_stage == .release) continue;
                     if (v.start_step < 0) continue;
                     const p: u8 = @intCast(@max(0, v.pitch));
-                    var keep = false;
-                    for (cross) |ci| {
-                        const it = insts[ci];
-                        if (it.instrument == @as(i32, @intCast(i)) and it.pitch == @as(i32, p) and it.start == v.start_step) {
-                            keep = true;
-                            break;
-                        }
-                    }
-                    if (!keep) _ = synth.noteOff(ks, p, v.start_step);
+                    if (!crossHas(insts, cross, @intCast(i), p, v.start_step)) _ = synth.noteOff(ks, p, v.start_step);
                 }
             }
         }
@@ -2171,15 +2154,7 @@ fn reconcileVoices(engine: *Engine, params: *Params, cur_step: i32, insts: []con
             else
                 (engine.vsti_active_hi[k] >> @intCast(p - 64)) & 1 != 0;
             if (!active) continue;
-            var keep = false;
-            for (cross) |ci| {
-                const it = insts[ci];
-                if (it.instrument == @as(i32, @intCast(k)) and it.pitch == @as(i32, p)) {
-                    keep = true;
-                    break;
-                }
-            }
-            if (!keep) vstiNoteOff(engine, k, p, 0, engine.vsti_chan[k]);
+            if (!crossHas(insts, cross, @intCast(k), p, null)) vstiNoteOff(engine, k, p, 0, engine.vsti_chan[k]);
         }
     }
 

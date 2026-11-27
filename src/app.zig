@@ -1661,6 +1661,10 @@ pub const App = struct {
         // 指纹与最近一次发布一致（曲线/EQ/设置类提交、以及导出循环里的逐块置脏）→
         // **不重建、不发布、不换代**——音频线程的 stash 与声部对账状态保持不动，
         // “编辑/导出瞬间扰动在响声部”的空转从源头消失。
+        //
+        // 为何不“内容变了就跳过哈希”：实测代价对比是 **哈希 ≈ 重建的 1/8~1/10**，
+        // 省下的是热路径的 10%；而代价是“指纹未知”会导致下一次曲线类置脏多重建
+        // 一次（大工程 Debug 下为一帧可见卡顿）。收益不可感、代价可见 → 不优化。
         const fp = self.schedSourceHash();
         if (self.snap_fp_ok and fp == self.snap_fp_pub) {
             self.snap_dirty = false;
@@ -1681,11 +1685,10 @@ pub const App = struct {
             self.snap_slots[self.snap_active] = null;
         }
         const slot: usize = 1 - @as(usize, self.snap_active);
-        if (self.snap_slots[slot]) |old| {
-            old.deinit();
-            self.allocator.destroy(old);
-            self.snap_slots[slot] = null;
-        }
+        // 不变量：另一个槽**恒为 null**（上一次发布时它已被退役并置空）——
+        // 旧代码在这里还有一段“非 null 就立即 deinit+destroy”，但它不可达；
+        // 换成 Debug 断言守着这条不变量（ReleaseFast 下零开销）。
+        std.debug.assert(self.snap_slots[slot] == null);
         const built = snapshot.build(
             self.allocator,
             self.clips.items,
@@ -1696,6 +1699,7 @@ pub const App = struct {
         ) catch {
             self.params.snapshot_ptr.store(0, .release);
             self.snap_fp_ok = false; // 音频侧已无快照 → 下次不能靠指纹跳过
+            self.snap_dirty = true; // 失败要重试（否则会一直静音到下一次编辑）
             return;
         };
         // **快照必须堆分配**：旧实现把 `Snapshot` **值**存在 `snap_slots` 里，发布的是
@@ -1708,6 +1712,7 @@ pub const App = struct {
             tmp.deinit();
             self.params.snapshot_ptr.store(0, .release);
             self.snap_fp_ok = false; // 同上
+            self.snap_dirty = true; // 同上：失败重试
             return;
         };
         box.* = built;
@@ -1721,7 +1726,7 @@ pub const App = struct {
         // 一律丢弃并按新快照重发本块（否则编辑掉的事件还会先响一下：实测 1 次/整场）。
         self.params.snapshot_ptr.store(sp, .release);
         _ = self.params.snap_gen.fetchAdd(1, .monotonic);
-        // 记下这次发布对应的**内容指纹**（供上面的门控比对）
+        // 记账：本次发布对应的**内容指纹**（供上面的门控比对）
         self.snap_fp_pub = fp;
         self.snap_fp_ok = true;
     }
@@ -2329,9 +2334,17 @@ pub const App = struct {
         return c.*;
     }
 
-    /// 标“音符内容变了”（供 UI 缓存，目前只有 minimap 预览；多标无妨）
+    /// 标“音符内容变了”——**同时作废 UI 缓存与调度快照**。
+    ///
+    /// 为什么连 `snap_dirty` 一起置：音频只读快照，快照只在 `snap_dirty` 时重建。
+    /// 以前这里只管 UI（`notes_ver`）→ **凡是“手势续接”的编辑（键盘微调、拖动、
+    /// Alt+滚轮改力度/声像）都只让第一下送达音频**，后续变化要等到下一次
+    /// `commitHistory`（实测：视觉上音符已移走、播放还是移动前的）。
+    /// 多标无妨：`pollSnapshotRebuild` 用调度内容指纹门控，
+    /// 内容真没变（EQ/曲线/设置类）的置脏会被直接跳过，不会白重建。
     pub fn touchNotes(self: *App) void {
         self.notes_ver +%= 1;
+        self.snap_dirty = true;
     }
 
     /// 重建/复用**桶索引**（`pattern` = 样式；桶里含该样式的**所有乐器**音符）。
@@ -2810,7 +2823,10 @@ pub const App = struct {
             self.notes.append(self.allocator, copy) catch {};
         }
         const cloned = to_clone.items.len;
-        if (cloned > 0) self.dirty = true;
+        if (cloned > 0) {
+            self.dirty = true;
+            self.touchNotes(); // 新增音符：UI 缓存 + 调度快照
+        }
         return cloned;
     }
 
@@ -2973,6 +2989,7 @@ pub const App = struct {
             nt.pitch += d_pitch;
         }
         self.dirty = true;
+        self.touchNotes(); // 同上：UI 缓存 + 调度快照都要跟上
         return true;
     }
 
@@ -6088,10 +6105,10 @@ pub const App = struct {
         if (self.gesture) |*g| {
             g.last_change_frame = now; // 续接同一手势
             // **续接的改动也要送达调度**（音符类：力度/声像/键盘移音符——
-            // 否则只到 4 小节水位线扫过才生效。实测 bug：Ctrl+A 全选后
-            // Alt+滚轮改力度“不及时生效”：续接分支只续手势、不重扫，
-            // 而钉值（静置 1s）也不重扫——只有第一滚生效）。
-            // 非音符改动（EQ 旋钮等）不重扫（判据同 `commitHistory`）。
+            // 否则只到 4 小节水位线扫过才生效）。注：音符改动已由 `touchNotes()`
+            // 统一置脏；这里再置一次是给“不经过 touchNotes 的编辑”兜底——
+            // 指纹门控会跳过“其实没变”的重建，所以不会白重建。
+            self.snap_dirty = true;
             return;
         }
         const before = self.history.items.len;
@@ -6148,8 +6165,7 @@ pub const App = struct {
     /// 前提：它必须是**当前顶条**且未被导航离开（否则静默不动，调用方应改走 `commitHistory`）。
     fn rewriteHistoryEntry(self: *App, index: usize) void {
         if (index != self.history_current or index + 1 != self.history.items.len) return;
-        self.snap_dirty = true;
-        self.touchNotes();
+        self.touchNotes(); // 置脏 + UI 缓存失效（调度侧指纹门控会跳过“内容没变”的重建）
         const st = self.captureHistory(self.history.items[index].label) catch return;
         self.replaceHistoryState(index, st);
         self.dirty = self.history_current != self.history_saved_index or self.plugin_dirty;
@@ -9128,8 +9144,7 @@ pub const App = struct {
     /// 提交一次历史快照（**操作完成后**调用；`label` 会被复制）。
     /// 若当前状态与所在快照等价（忽略选区）→ 不产生新条目（防“点了没动”噪音）。
     pub fn commitHistory(self: *App, label: []const u8) void {
-        self.snap_dirty = true; // A2：数据变了 → 下一帧重建快照（影子对拍）
-        self.touchNotes(); // UI 缓存（minimap 预览）：宁可多标，漏标只会让预览慢一拍
+        self.touchNotes(); // 置脏 + UI 缓存失效（宁可多标：调度侧还有指纹门控兜底）
         // **先清理悬空绑定**（乐器被删除/换成别的乐器、通道被删、插件参数没了）——
         // 这样新快照里不会留下“指向不存在目标”的绑定；撤销时按旧快照把两者一起恢复。
         _ = self.pruneAutoBindings();
@@ -9223,8 +9238,7 @@ pub const App = struct {
     /// `pinPendingGesture` 钉值），且条目应用后帧末即重放（同帧无第二次导航）。
     fn applyHistoryState(self: *App, st: *const HistoryState, prev_idx: usize, target_idx: usize) void {
         // **A4**：撤销/重做/跳历史改了数据 → 必须重建快照，否则播放中听不到变化（实测：undo 后快照没变）
-        self.snap_dirty = true;
-        self.touchNotes(); // 快照里含音符 → UI 缓存（minimap）也作废
+        self.touchNotes(); // 置脏 + UI 缓存（minimap）作废；内容没变的撤销由指纹门控跳过
         // 曲线内容可能被快照整体替换（`version` 取自快照，可能碰巧相同）→ 强制 bump，
         // 让发布节流（`publishAutoLane` 的内容签名）一定看到“变了”。
         // 播放中**不停播**：撤销/重做/跳转走“编辑重扫”（见 `publishHistoryRescan`）——
@@ -9882,6 +9896,7 @@ pub const App = struct {
             n += 1;
         }
         if (n == 0) return 0;
+        self.touchNotes(); // 静音位也是调度内容（指纹含 `muted`）
 
         // 两个方向都**全段重扫**（见 `rescanSchedulingFull`：补事件的做法会让 VSTi 叠声部）
         if (audio.schedLogOn()) {
@@ -16703,6 +16718,50 @@ test "app: 键盘微调选中音符——半音/八度/网格/小节 + 整组钳
     try std.testing.expect(app.nudgeSelectedNotes(model.units_per_whole, 0));
     try std.testing.expectEqual(model.units_per_whole, app.notes.items[0].step);
     try std.testing.expectEqual(model.units_per_whole + 3, app.notes.items[1].step);
+}
+
+test "app: 键盘微调必须每次都送达调度（手势续接也不能漏快照重建）" {
+    // 实测 bug：连按 Shift/Ctrl+方向键后，**视觉上音符已移走，播放还响旧位置**。
+    // 原因：快照只在 `snap_dirty` 时重建，而它只由 `commitHistory` 拍；
+    // 第二下起是“手势续接”（只续时间戳）→ 只有**第一下**进了音频。
+    var app = App{ .allocator = std.testing.allocator };
+    defer app.clips.deinit(app.allocator);
+    defer app.notes.deinit(app.allocator);
+    defer app.deinitAll();
+    app.resetPatterns(1);
+    app.resetMixerChannels(default_mixer_channels);
+    try app.notes.append(app.allocator, .{ .step = 10, .len = 4, .pitch = 60, .pattern = 0, .selected = true });
+
+    // 模拟“快照已发布、脏标已清”
+    app.snap_dirty = false;
+    const v0 = app.notes_ver;
+    try std.testing.expect(app.nudgeSelectedNotes(0, 1));
+    try std.testing.expect(app.snap_dirty); // 第一下：置脏
+    try std.testing.expect(app.notes_ver != v0); // UI 索引/缓存也失效
+
+    // 第二下（同一手势续接）也必须置脏 + 失效缓存
+    app.snap_dirty = false;
+    const v1 = app.notes_ver;
+    try std.testing.expect(app.nudgeSelectedNotes(0, 1));
+    try std.testing.expect(app.snap_dirty);
+    try std.testing.expect(app.notes_ver != v1);
+
+    // Ctrl 粗移路径以前连 `touchNotes` 都没调（桶索引/最小地图不会重建）
+    app.snap_dirty = false;
+    const v2 = app.notes_ver;
+    try std.testing.expect(app.nudgeSelectedNotesExact(0, 12));
+    try std.testing.expect(app.snap_dirty);
+    try std.testing.expect(app.notes_ver != v2);
+
+    // Alt+滚轮改力度/声像（视图侧入口）同样必须送达调度
+    app.snap_dirty = false;
+    try std.testing.expect(@import("view_note_lane.zig").altWheelAdjust(&app, .velocity, 1, 0));
+    try std.testing.expect(app.snap_dirty);
+
+    // 静音位也是调度内容
+    app.snap_dirty = false;
+    try std.testing.expectEqual(@as(usize, 1), app.toggleNoteMute(&[_]usize{0}));
+    try std.testing.expect(app.snap_dirty);
 }
 
 test "app: 键盘粗移（Ctrl：全有或全无）——拍位/级数不漂移" {

@@ -695,11 +695,13 @@ pub fn altWheelAdjust(app: *App, mode: NoteLaneMode, delta_steps: i32, nearest: 
             if (!o.selected) continue;
             setNoteValue(o, mode, steppedValue(mode, noteValue(o.*, mode), dv));
         }
+        app.touchNotes(); // 力度/声像也是调度内容：不标脏 → 播放跟不上（实测 bug）
         return true;
     }
     if (nearest) |idx| {
         const o = &app.notes.items[idx];
         setNoteValue(o, mode, steppedValue(mode, noteValue(o.*, mode), dv));
+        app.touchNotes(); // 同上
         return true;
     }
     return false;
