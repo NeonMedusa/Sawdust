@@ -39,8 +39,8 @@
 | Zig 0.17 的 `std.process.Child` **只有阻塞 `wait`**，没有 `tryWait` | `std/process/Child.zig` |
 
 **结论**：剩下的唯一阻塞源就是"文件对话框本身走同步调用"，两端各一条：
-- Windows：`GetOpenFileNameW` / `SHBrowseForFolderW`；
-- Linux：`std.process.run(kdialog|zenity)`。
+- Windows：`GetOpenFileNameW` / `GetSaveFileNameW`（**选目录已解决**：`folder_pick.zig` 异步，见 §13.3.1）；
+- Linux：`std.process.run(kdialog|zenity)`（已停用）。
 
 ---
 
@@ -280,7 +280,7 @@ M1 之前写 Portal，会和后面的状态机改动互相踩。
 | 平台 | 用什么 | 阻塞？ | 代码位置 |
 |---|---|---|---|
 | **Linux** | **内置自绘选择器，无条件**（不看桌面装了 kdialog/zenity） | 否 | `src/file_picker.zig`；入口 `main.zig` `handlePick` |
-| **Windows** | **系统对话框**（原生观感，`GetOpenFileNameW` / `SHBrowseForFolderW`） | **是**（已知问题，**单独立项**） | `src/filedialog.zig` |
+| **Windows** | **系统对话框**：`GetOpenFileNameW` / `GetSaveFileNameW`；**选目录** = `IFileOpenDialog` + `FOS_PICKFOLDERS`（Vista+ 现代框） | open/save **是**（已知问题，**单独立项**）；**选目录已改异步（不阻塞）** | `src/filedialog.zig`（open/save）、`src/folder_pick.zig`（选目录） |
 | **Linux 外部提供者**（kdialog → zenity） | **停用保留**，不删 | — | `src/filedialog.zig` 的 `linux` 命名空间；开关 `linux_external_enabled = false` |
 
 **为什么 Linux 直接"无脑自绘"**：三条路（自绘 / shim / Portal）都能做到不阻塞，但
@@ -314,6 +314,23 @@ M1 之前写 Portal，会和后面的状态机改动互相踩。
   5. 弹框时关闭主窗口 → 不卡死、进程能退出。
 - **回归测试**：假 provider 连续 `pending` N 帧 → 断言 `scheduler.scheduled_upto` 持续推进
   （不需要窗口就能证明"音乐不会停"）。
+
+#### 13.3.1 已修：「＋ 添加文件夹…」点击后**程序未响应**（COM 单元 / 对话框选择）
+
+- **现象**（用户实测）：插件管理器点「＋ 添加文件夹…」→ 程序"未响应"，**连对话框都不出现**。
+- **根因**（已用最小复现程序验证）：
+  1. 旧实现用 `SHBrowseForFolderW` + `BIF_NEWDIALOGSTYLE`；
+  2. 该风格要求调用线程是 **STA**，而 **Sawdust 的 UI 线程是 MTA**
+     （miniaudio/WASAPI 在 `ma_context_init` 时对当前线程做了 `CoInitializeEx(COINIT_MULTITHREADED)`）
+     → 我们的 `CoInitializeEx(STA)` 返回 `RPC_E_CHANGED_MODE`（被静默忽略）
+     → shell32 在 MTA 下建框死等（实测：**5~7 秒后仍无任何 `#32770` 窗口，调用永不返回**）；
+  3. 同样的原因不影响 `GetOpenFileNameW`（它自己开模态循环）→ 所以只有"选目录"卡。
+- **修法**：选目录改用 **`IFileOpenDialog` + `FOS_PICKFOLDERS`**（Vista+ 的"打开/另存为"同款外观），
+  并固定跑在**专用 STA 工作线程**上（`src/folder_pick.zig`）；主循环每帧 `poll()` **非阻塞**取结果
+  （工作线程零分配，结果写回固定缓冲）；`FOS_NOCHANGEDIR` 保 CWD（我们的相对路径靠它）。
+  → 顺带：Windows 的选目录**不再阻塞 UI**（弹框期间播放/电平表照常）。
+- **验证**：最小复现程序（UI 线程先 `CoInitializeEx(MTA)`）→ 对话框出现、关闭后正常返回；
+  旧写法（MTA + NEWDIALOGSTYLE）则**永不返回**。
 
 ### 13.4 明确的"暂不做"
 

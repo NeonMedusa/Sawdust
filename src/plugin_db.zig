@@ -227,11 +227,46 @@ pub const Cache = struct {
         self.arena.deinit();
     }
 
+    /// **深拷一份**进本缓存的 arena（字符串/classes 全部重分）。
+    /// 为什么必需：`mergeMissingFrom` 以前是**浅拷**，条目里的字符串指向
+    /// `old.arena`——调用方随后 `old.deinit()` 就把它们释放了 →
+    /// 下次扫描存盘时把野指针交给 JSON 序列化：表中条目先变成 “UUUUUU”（调试分配的毒值）
+    /// 的“[未知] 插件”，再存盘时 **segfault**（用户实测）。
+    ///
+    /// `src` 可以是 `Entry` 也可以是存盘用的 `DiskEntry`（字段同名）。
+    fn dupeEntry(self: *Cache, src: anytype) !Entry {
+        const al = self.alloc();
+        var e = Entry{
+            .path = try al.dupe(u8, src.path),
+            .dll = try al.dupe(u8, src.dll),
+            .ok = src.ok,
+        };
+        e.name = try al.dupe(u8, src.name);
+        e.vendor = try al.dupe(u8, src.vendor);
+        e.version = try al.dupe(u8, src.version);
+        e.role = try al.dupe(u8, src.role);
+        e.err = try al.dupe(u8, src.err);
+        const cs = try al.alloc(Class, src.classes.len);
+        for (src.classes, 0..) |c, i| {
+            cs[i] = .{
+                .cid = try al.dupe(u8, c.cid),
+                .name = try al.dupe(u8, c.name),
+                .vendor = try al.dupe(u8, c.vendor),
+                .version = try al.dupe(u8, c.version),
+                .category = try al.dupe(u8, c.category),
+                .sub = try al.dupe(u8, c.sub),
+                .kind = try al.dupe(u8, c.kind),
+            };
+        }
+        e.classes = cs;
+        return e;
+    }
+
     /// 把 `old` 里**本次没扫到**的条目补进来（按 path 判重）。
     ///
     /// 为什么需要：扫描是分模块跑的，一个坏插件会让某个 worker 崩掉；
     /// 若直接用本次结果替换缓存，崩溃前没轮到的插件就会**从列表里消失**（用户实测踩过）。
-    /// 规则：同 path 以本次为准（能更新失败/成功状态），本次没有的保留旧的。
+    /// 规则：同 path 以本次为准（能更新失败/成功状态），本次没有的**深拷**保留旧的。
     pub fn mergeMissingFrom(self: *Cache, old: *const Cache) void {
         if (old.entries.len == 0) return;
         var extra: std.ArrayListUnmanaged(Entry) = .empty;
@@ -243,13 +278,43 @@ pub const Cache = struct {
                     break;
                 }
             }
-            if (!seen) extra.append(self.alloc(), oe) catch {};
+            if (seen) continue;
+            const copy = self.dupeEntry(oe) catch continue;
+            extra.append(self.alloc(), copy) catch {};
         }
         if (extra.items.len == 0) return;
         const merged = self.alloc().alloc(Entry, self.entries.len + extra.items.len) catch return;
         @memcpy(merged[0..self.entries.len], self.entries);
         @memcpy(merged[self.entries.len..], extra.items);
         self.entries = merged;
+    }
+
+    /// 路径在磁盘上是否存在（绝对/相对都吃）
+    fn pathAlive(io: std.Io, p: []const u8) bool {
+        if (p.len == 0) return false;
+        if (std.fs.path.isAbsolute(p)) {
+            std.Io.Dir.accessAbsolute(io, p, .{}) catch return false;
+        } else {
+            std.Io.Dir.cwd().access(io, p, .{}) catch return false;
+        }
+        return true;
+    }
+
+    /// 把**已从磁盘消失**的条目剔掉（扫描完成后调）。返回剔掉数量。
+    ///
+    /// 用户把插件挪走/删掉 → 列表里不该再留 “[未知]” 幽灵行（预设面板也不该再列）。
+    /// 判据 = 包的 `path` 或裸文件的 `dll` 至少一个还在磁盘上：
+    /// 这样“某个 worker 崩溃导致本轮没扫到”的插件不会被误删（文件还在 → 保留）。
+    pub fn dropMissingFiles(self: *Cache, io: std.Io) usize {
+        var kept: usize = 0;
+        for (self.entries) |e| {
+            if (!pathAlive(io, e.path) and !pathAlive(io, e.dll)) continue;
+            self.entries[kept] = e;
+            kept += 1;
+        }
+        const dropped = self.entries.len - kept;
+        if (dropped > 0) self.entries = self.entries[0..kept];
+        return dropped;
     }
 
     pub fn okCount(self: *const Cache) usize {
@@ -460,31 +525,8 @@ pub const Cache = struct {
         if (parsed.value.crashed_after.len > 0) c.crashed_after = al.dupe(u8, parsed.value.crashed_after) catch null;
         const entries = al.alloc(Entry, parsed.value.entries.len) catch return null;
         for (parsed.value.entries, 0..) |e, i| {
-            var ne = Entry{
-                .path = al.dupe(u8, e.path) catch "",
-                .dll = al.dupe(u8, e.dll) catch "",
-                .ok = e.ok,
-            };
-            ne.name = al.dupe(u8, e.name) catch "";
-            ne.vendor = al.dupe(u8, e.vendor) catch "";
-            ne.version = al.dupe(u8, e.version) catch "";
-            ne.role = al.dupe(u8, e.role) catch "none";
-            ne.err = al.dupe(u8, e.err) catch "";
-            const classes: []Class = al.alloc(Class, e.classes.len) catch return null;
-            for (e.classes, 0..) |cl, j| {
-                if (j >= classes.len) break;
-                classes[j] = .{
-                    .cid = al.dupe(u8, cl.cid) catch "",
-                    .name = al.dupe(u8, cl.name) catch "",
-                    .vendor = al.dupe(u8, cl.vendor) catch "",
-                    .version = al.dupe(u8, cl.version) catch "",
-                    .category = al.dupe(u8, cl.category) catch "",
-                    .sub = al.dupe(u8, cl.sub) catch "",
-                    .kind = al.dupe(u8, cl.kind) catch "other",
-                };
-            }
-            ne.classes = classes;
-            entries[i] = ne;
+            // 与 `mergeMissingFrom` 共用同一套深拷（字段同名：DiskEntry ↔ Entry）
+            entries[i] = c.dupeEntry(e) catch return null;
         }
         c.entries = entries;
         return c;
@@ -619,6 +661,73 @@ test "plugin_db: 缓存存盘往返（含类信息）" {
     try std.testing.expectEqualStrings("0102030405060708090a0b0c0d0e0f10", c2.entries[0].classes[0].cid);
     try std.testing.expectEqualStrings("NoGetPluginFactory", c2.entries[1].err);
     try std.testing.expect(c2.findByCid("0102030405060708090a0b0c0d0e0f10") != null);
+}
+
+test "plugin_db: mergeMissingFrom 必须**深拷**（旧缓存 deinit 后不得悬垂——存盘 segfault 回归）" {
+    const alloc = std.testing.allocator;
+    const jsonl =
+        "{\"t\":\"begin\",\"n\":2}\n" ++
+        "{\"t\":\"ok\",\"path\":\"C:/v/Old.vst3\",\"dll\":\"C:/v/Old.dll\",\"name\":\"OldOne\",\"vendor\":\"V\",\"role\":\"instrument\",\"classes\":[{\"cid\":\"aabb\",\"name\":\"C1\",\"kind\":\"instrument\"}]}\n" ++
+        "{\"t\":\"end\"}\n";
+
+    // “上一轮扫描的缓存”
+    var old = Cache.parseJsonl(alloc, jsonl);
+
+    // 本轮只扫到一个新插件
+    var new = Cache.parseJsonl(alloc, "{\"t\":\"ok\",\"path\":\"C:/v/New.vst3\",\"dll\":\"C:/v/New.dll\",\"name\":\"NewOne\",\"role\":\"effect\",\"classes\":[]}\n");
+    defer new.deinit();
+
+    new.mergeMissingFrom(&old);
+    try std.testing.expectEqual(@as(usize, 2), new.entries.len);
+    const kept = new.entries[1];
+    try std.testing.expectEqualStrings("OldOne", kept.name);
+    try std.testing.expectEqual(@as(usize, 1), kept.classes.len);
+    // **结构断言**：字符串必须是新缓存自己的内存（不是旧缓存 arena 的借用切片）
+    try std.testing.expect(kept.name.ptr != old.entries[0].name.ptr);
+    try std.testing.expect(kept.path.ptr != old.entries[0].path.ptr);
+    try std.testing.expect(kept.classes[0].cid.ptr != old.entries[0].classes[0].cid.ptr);
+
+    old.deinit(); // ← 旧缓存释放（以前这里之后 kept.* 全悬垂）
+    // 释放后仍能安全读（浅拷的话这里是 UB，且存盘时直接 segfault）
+    try std.testing.expectEqualStrings("OldOne", new.entries[1].name);
+    try std.testing.expectEqualStrings("C1", new.entries[1].classes[0].name);
+}
+
+test "plugin_db: dropMissingFiles——被挪走/删掉的条目要消失，还在的必须保留" {
+    const io = std.testing.io;
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.dir.close(io);
+    const root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    defer alloc.free(root);
+
+    // 造两个“还在”的东西：一个包目录 + 一个裸文件
+    tmp.dir.createDir(io, "Alive.vst3", .default_dir) catch {};
+    tmp.dir.writeFile(io, .{ .sub_path = "Bare.vst3", .data = "x" }) catch {};
+    var p1: [1024]u8 = undefined;
+    var p2: [1024]u8 = undefined;
+    const alive_pkg = std.fmt.bufPrint(&p1, "{s}/Alive.vst3", .{root}) catch "";
+    const alive_bare = std.fmt.bufPrint(&p2, "{s}/Bare.vst3", .{root}) catch "";
+
+    var body: [2048]u8 = undefined;
+    const jsonl = std.fmt.bufPrint(
+        &body,
+        "{{\"t\":\"ok\",\"path\":\"{s}\",\"dll\":\"{s}\",\"name\":\"AlivePkg\",\"role\":\"instrument\",\"classes\":[]}}\n" ++
+            "{{\"t\":\"ok\",\"path\":\"{s}\",\"dll\":\"{s}\",\"name\":\"AliveBare\",\"role\":\"effect\",\"classes\":[]}}\n" ++
+            "{{\"t\":\"ok\",\"path\":\"{s}/Gone.vst3\",\"dll\":\"{s}/Gone.dll\",\"name\":\"GoneOne\",\"role\":\"both\",\"classes\":[]}}\n",
+        .{ alive_pkg, alive_pkg, alive_bare, alive_bare, root, root },
+    ) catch "";
+
+    var c = Cache.parseJsonl(alloc, jsonl);
+    defer c.deinit();
+    try std.testing.expectEqual(@as(usize, 3), c.entries.len);
+    const dropped = c.dropMissingFiles(io);
+    try std.testing.expectEqual(@as(usize, 1), dropped);
+    try std.testing.expectEqual(@as(usize, 2), c.entries.len);
+    try std.testing.expectEqualStrings("AlivePkg", c.entries[0].name);
+    try std.testing.expectEqualStrings("AliveBare", c.entries[1].name);
+    // 再跑一次：没东西可丢
+    try std.testing.expectEqual(@as(usize, 0), c.dropMissingFiles(io));
 }
 
 test "plugin_db: 真实扫描输出可解析（文件存在才跑）" {

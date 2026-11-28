@@ -56,6 +56,7 @@ const vstscan = @import("vstscan.zig"); // 插件扫描工具（同二进制自�
 const crash = @import("crash.zig"); // 崩溃日志（GUI 子系统下 panic 看不见）
 const port_io = @import("port_io.zig");
 const file_picker = @import("file_picker.zig"); // 内置文件选择器（B 方案，不阻塞主循环）
+const folder_pick = @import("folder_pick.zig"); // Windows 选目录（异步：STA 线程 + 每帧轮询）
 const text_edit = @import("text_edit.zig"); // 文本编辑公共部分（选择器 / 重命名输入框共用）
 const builtin = @import("builtin");
 
@@ -85,6 +86,10 @@ pub fn main(init: std.process.Init) !u8 {
     // 内置文件选择器（B 方案）：非 null = 模态选择器开着（主循环照常跑）
     var picker: ?file_picker.Picker = null;
     defer if (picker) |*pk| pk.deinit();
+
+    // Windows 选目录（异步：专用 STA 线程 + 每帧轮询；见 src/folder_pick.zig）
+    var folder_pending: ?FolderPickInFlight = null;
+    defer if (folder_pending) |*pf| pf.job.destroy();
 
     var win: window.Window = undefined;
     try win.init(allocator, "Sawdust — Simple Audio Workstation", 1280, 760);
@@ -1237,7 +1242,7 @@ pub fn main(init: std.process.Init) !u8 {
         // 容量自动回收（删除/装载后滞回缩容；无声时几乎零开销）
 
         // 4.1z) 文件对话框：推进待处理的"选文件"请求（B 方案；内部目前仍是外部对话框）
-        handlePick(&app, &win, io, &picker);
+        handlePick(&app, &win, io, &picker, &folder_pending);
 
         // 4.2) 帧末执行待定的文件操作（对话框在此弹出——不在事件迭代/绘制中，
         // 避免 pushEvent realloc 使迭代中的 events slice 悬空）
@@ -4011,10 +4016,45 @@ fn createAudioStyle(app: *App, path: []const u8) ?i32 {
 //   根治方案（工作线程跑系统对话框 + 每帧轮询）见 docs/file-dialogs.md §3。
 // ─────────────────────────────────────────────────────────────────────
 
-/// 每帧调用（帧末）：有请求就**启动内置选择器**（Linux）或系统对话框（其它平台）。
-/// Linux 走内置选择器 → 主循环不阻塞 → 界面不冻结、序列器前瞻不断（音乐不会十秒后停）。
-fn handlePick(app: *App, win: *window.Window, io: std.Io, picker: *?file_picker.Picker) void {
+/// 正在进行的「选目录」作业（Windows；异步：STA 线程 + 每帧轮询）
+const FolderPickInFlight = struct {
+    job: folder_pick.Job,
+    use_: app_mod.PickUse,
+};
+
+/// 每帧调用（帧末）。
+/// Linux：内置自绘选择器，主循环不阻塞。
+/// Windows：`open/save` 走系统对话框（**同步**，已知问题见 docs/file-dialogs.md §13）；
+/// **选目录走 `folder_pick`（异步：专用 STA 线程 + 每帧轮询）**——
+/// 同步版在 MTA 的 UI 线程上会**死锁**（实测：点「＋添加文件夹…」→ 程序未响应，连框都不出）。
+fn handlePick(
+    app: *App,
+    win: *window.Window,
+    io: std.Io,
+    picker: *?file_picker.Picker,
+    pending: *?FolderPickInFlight,
+) void {
     if (picker.* != null) return; // 选择器开着：由绘制阶段推进
+
+    // 选目录作业还在跑 → 轮询（非阻塞；对话框自己在 STA 线程上跟手）
+    if (pending.*) |*pf| {
+        switch (pf.job.poll()) {
+            .pending => return,
+            .finished => |maybe_path| {
+                pf.job.destroy();
+                const use_ = pf.use_;
+                pending.* = null;
+                if (maybe_path) |path| {
+                    defer app.allocator.free(path);
+                    dispatchPick(app, io, use_, path);
+                } else {
+                    app.setToast(app_mod.cancelTextFor(use_));
+                }
+                return;
+            },
+        }
+    }
+
     const req = app.takePick() orelse return;
 
     if (comptime builtin.os.tag == .linux) {
@@ -4025,11 +4065,19 @@ fn handlePick(app: *App, win: *window.Window, io: std.Io, picker: *?file_picker.
         return;
     }
 
-    // 其它平台（Windows）：系统对话框。⚠️ 同步调用 → 阻塞 UI（已知问题，见 docs/file-dialogs.md §13）
+    // **选目录：异步（不阻塞主循环）**——见 `src/folder_pick.zig` 顶部的两条实测原因
+    if (req.kind == .folder) {
+        if (folder_pick.Job.start(app.allocator, win.hwnd, req.title)) |job| {
+            pending.* = .{ .job = job, .use_ = req.use_ };
+        } else app.setToast("无法打开文件夹选择框");
+        return;
+    }
+
+    // open / save：系统对话框。⚠️ 同步调用 → 阻塞 UI（已知问题，见 docs/file-dialogs.md §13）
     const picked: ?[]u8 = switch (req.kind) {
         .open => filedialog.open(app.allocator, win.hwnd, req.title, req.filter) catch null,
         .save => filedialog.save(app.allocator, win.hwnd, req.title, req.default_name, req.filter) catch null,
-        .folder => filedialog.pickFolder(app.allocator, win.hwnd, req.title) catch null,
+        .folder => unreachable, // 上面已分流（异步）
     };
     const path = picked orelse {
         if (filedialog.supported()) app.setToast(req.cancelText());
@@ -4562,6 +4610,8 @@ fn finishPluginScan(app: *App, io: std.Io, exit_code: u32) void {
     c.scanned_at = plugin_db.unixTime();
     c.completed = true;
     if (app.plugin_cache) |*old| c.mergeMissingFrom(old);
+    // 已从磁盘消失（挪走/删掉）的条目直接剔掉——否则列表里会长期挂“[未知]”幽灵行
+    const dropped = c.dropMissingFiles(io);
     c.save(io, root) catch app.setToast("扫描缓存保存失败");
     if (app.plugin_cache) |*old| old.deinit();
     app.plugin_cache = c;
@@ -4571,6 +4621,8 @@ fn finishPluginScan(app: *App, io: std.Io, exit_code: u32) void {
         app.setToastWith("扫描完成：可用 {d} · 失败 {d}（{d} 个插件使扫描进程崩溃，已跳过）", .{
             cache.okCount(), cache.errCount(), pm.scan_crashes,
         });
+    } else if (dropped > 0) {
+        app.setToastWith("扫描完成：可用 {d} · 失败 {d}（清理了 {d} 个已消失的条目）", .{ cache.okCount(), cache.errCount(), dropped });
     } else {
         app.setToastWith("扫描完成：可用 {d} · 失败 {d}", .{ cache.okCount(), cache.errCount() });
     }
@@ -5656,6 +5708,7 @@ test {
     _ = @import("sched_stress.zig");
     _ = @import("snapshot.zig"); // A1：Pull 快照与 gatherRange 的逐事件对拍
     _ = @import("plugin_db.zig");
+    _ = @import("folder_pick.zig"); // Windows 选目录作业（异步 STA 线程）
     _ = @import("ui_test.zig");
 }
 test "main: 编辑器遮挡矩形相交判定（插件子窗口隐藏用）" {

@@ -5,7 +5,7 @@
 //! | 平台 | 用的是什么 | 阻塞吗 |
 //! |---|---|---|
 //! | **Linux** | **内置自绘选择器**（`src/file_picker.zig`）——**无条件**，不看桌面装了谁 | 否（主循环每帧推进） |
-//! | **Windows** | 本文件的 `GetOpenFileNameW` / `SHBrowseForFolderW`（系统原生观感） | **是**（已知问题，单独立项，见文档 §13） |
+//! | **Windows** | `GetOpenFileNameW` / `GetSaveFileNameW`；选目录 = `IFileOpenDialog`+`FOS_PICKFOLDERS`（Vista+ 现代框，跑在专用 STA 线程） | **是**（已知问题，单独立项，见文档 §13） |
 //!
 //! ### Linux 的 kdialog / zenity（**停用保留**）
 //!
@@ -463,42 +463,8 @@ const win = if (is_windows) struct {
         _ = MessageBoxW(owner, @ptrCast(text_w.ptr), @ptrCast(title_w.ptr), MB_OK | MB_ICONINFORMATION);
     }
 
-    // ── 文件夹选择（shell32 SHBrowseForFolderW；插件管理“+ 添加文件夹…”）──
-    const BROWSEINFOW = extern struct {
-        hwndOwner: ?*anyopaque = null,
-        pidlRoot: ?*anyopaque = null,
-        pszDisplayName: ?[*]u16 = null,
-        lpszTitle: ?[*:0]const u16 = null,
-        ulFlags: u32 = 0,
-        lpfn: ?*anyopaque = null,
-        lParam: isize = 0,
-        iImage: i32 = 0,
-    };
-    extern "shell32" fn SHBrowseForFolderW(*BROWSEINFOW) callconv(.winapi) ?*anyopaque;
-    extern "shell32" fn SHGetPathFromIDListW(*anyopaque, [*]u16) callconv(.winapi) i32;
-    extern "ole32" fn CoTaskMemFree(?*anyopaque) callconv(.winapi) void;
-    extern "ole32" fn CoInitializeEx(?*anyopaque, u32) callconv(.winapi) i32;
-
-    /// 文件夹选择框（取消 → null）。`BIF_NEWDIALOGSTYLE` 需要 COM 已初始化 →
-    /// 调用前 `CoInitializeEx`（重复调用无害，返回 S_FALSE）。
-    fn pickFolder(allocator: std.mem.Allocator, owner: ?*anyopaque, title: []const u8) !?[]u8 {
-        _ = CoInitializeEx(null, 2); // COINIT_APARTMENTTHREADED
-        const title_w = toUtf16Z(allocator, title) catch return null;
-        defer allocator.free(title_w);
-        var display: [260]u16 = undefined;
-        var bi = BROWSEINFOW{
-            .hwndOwner = owner,
-            .pszDisplayName = &display,
-            .lpszTitle = title_w.ptr,
-            .ulFlags = 0x0001 | 0x0040, // BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE
-        };
-        const pidl = SHBrowseForFolderW(&bi) orelse return null;
-        defer CoTaskMemFree(pidl);
-        var path_buf: [1024]u16 = undefined;
-        if (SHGetPathFromIDListW(pidl, &path_buf) == 0) return null;
-        const slice = std.mem.sliceTo(&path_buf, 0);
-        return try std.unicode.utf16LeToUtf8Alloc(allocator, slice);
-    }
+    // 文件夹选择（选目录）**不在这里**：Windows 走 `src/folder_pick.zig`（异步 IFileOpenDialog）；
+    // Linux 走自绘 `file_picker`。本文件的 `pickFolder` 仅保留给停用的 kdialog/zenity 适配。
 } else struct {};
 
 // 停用代码的防腐烂守卫：只取函数地址，确保它们**仍然能编译**。
@@ -543,12 +509,9 @@ pub fn alert(allocator: std.mem.Allocator, owner: ?*anyopaque, text: []const u8)
     if (is_linux and linux_external_enabled) return linux.alert(allocator, text);
 }
 
-/// 选择文件夹（null = 取消或不支持）——插件管理的“+ 添加文件夹…”
-pub fn pickFolder(allocator: std.mem.Allocator, owner: ?*anyopaque, title: []const u8) !?[]u8 {
-    if (is_windows) return win.pickFolder(allocator, owner, title);
-    if (is_linux and linux_external_enabled) return linux.pickFolder(allocator, title);
-    return null;
-}
+/// 选目录：**不在本模块**。Windows → `src/folder_pick.zig`（异步 IFileOpenDialog）；
+/// Linux → 自绘 `file_picker`。本文件的 `linux.pickFolder`（kdialog/zenity）停用保留，
+/// 只由“防腐烂守卫”测试取地址。
 
 // ── 工具（可测）──
 

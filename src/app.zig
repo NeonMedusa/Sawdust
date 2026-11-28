@@ -1226,17 +1226,22 @@ pub const PickRequest = struct {
 
     /// 取消时的提示文案（空 = 不提示）
     pub fn cancelText(self: PickRequest) []const u8 {
-        return switch (self.use_) {
-            .project_save => "已取消保存",
-            .project_open => "已取消打开",
-            .import_midi => "已取消导入",
-            .export_midi, .export_wav => "已取消导出",
-            .plugin_folder, .plugin_file, .load_sample => "已取消选择",
-            .font_file => "已取消选择字体",
-            .relocate_instrument, .relocate_effect => "已取消重新定位",
-        };
+        return cancelTextFor(self.use_);
     }
 };
+
+/// 取消文案（按用途；异步选目录作业只存 `use_`，所以单独提成自由函数）
+pub fn cancelTextFor(use_: PickUse) []const u8 {
+    return switch (use_) {
+        .project_save => "已取消保存",
+        .project_open => "已取消打开",
+        .import_midi => "已取消导入",
+        .export_midi, .export_wav => "已取消导出",
+        .plugin_folder, .plugin_file, .load_sample => "已取消选择",
+        .font_file => "已取消选择字体",
+        .relocate_instrument, .relocate_effect => "已取消重新定位",
+    };
+}
 /// 导出日志开关（`SAWDUST_EXPORT_LOG=1`）：默认关闭——`.log` 是当初排障用的，
 /// 平时写它只会往用户目录里丢垃圾。
 var export_log_env: ?bool = null;
